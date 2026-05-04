@@ -13,6 +13,7 @@ import {
   closingPullRequestReferenceTarget,
   codexEnv,
   dashboardClosedAt,
+  fixedPullRequestFromCommitPullsForTest,
   formatRecentClosedRows,
   ghRetryKind,
   hotIntakeRecencyMs,
@@ -399,6 +400,43 @@ test("close comments reference high-confidence merged fixing PRs", () => {
     action.closeComment,
     /fix evidence: merged PR \[#456\]\(https:\/\/github\.com\/openclaw\/openclaw\/pull\/456\), commit/,
   );
+});
+
+test("commit PR lookup selects the newest merged pull request", () => {
+  const fixedPullRequest = fixedPullRequestFromCommitPullsForTest([
+    {
+      number: 455,
+      html_url: "https://github.com/openclaw/openclaw/pull/455",
+      title: "fix: older candidate",
+      merged: true,
+      merged_at: "2026-04-27T12:00:00Z",
+      merge_commit_sha: "1111111111111111",
+    },
+    {
+      number: 456,
+      html_url: "https://github.com/openclaw/openclaw/pull/456",
+      title: "fix: wire the shell check",
+      merged_at: "2026-04-28T12:00:00Z",
+      merge_commit_sha: "fedcba9876543210",
+    },
+    {
+      number: 457,
+      html_url: "https://github.com/openclaw/openclaw/pull/457",
+      title: "open follow-up",
+      merged: false,
+    },
+  ]);
+
+  assert.deepEqual(fixedPullRequest, {
+    repo: "openclaw/openclaw",
+    number: 456,
+    url: "https://github.com/openclaw/openclaw/pull/456",
+    title: "fix: wire the shell check",
+    mergedAt: "2026-04-28T12:00:00Z",
+    sha: "fedcba9876543210",
+    confidence: "high",
+    source: "GitHub commit PR lookup",
+  });
 });
 
 test("report-rendered close comments keep merged fixing PR provenance", () => {

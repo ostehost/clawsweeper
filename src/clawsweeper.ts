@@ -3712,9 +3712,50 @@ function fixedPullRequestFromContext(
   return candidates[0] ?? null;
 }
 
+function fixedPullRequestFromCommitPulls(
+  pulls: readonly unknown[],
+  source: string,
+): FixedPullRequest | null {
+  const candidates = pulls
+    .map((pull) => fixedPullRequestFromUnknown(pull, source))
+    .filter((pull): pull is FixedPullRequest => pull !== null)
+    .sort((left, right) => {
+      const leftTime = left.mergedAt ? Date.parse(left.mergedAt) : 0;
+      const rightTime = right.mergedAt ? Date.parse(right.mergedAt) : 0;
+      return rightTime - leftTime;
+    });
+  return candidates[0] ?? null;
+}
+
+export function fixedPullRequestFromCommitPullsForTest(
+  pulls: readonly unknown[],
+): FixedPullRequest | null {
+  return fixedPullRequestFromCommitPulls(pulls, "GitHub commit PR lookup");
+}
+
+function fixedPullRequestFromCommitSha(decision: Decision): FixedPullRequest | null {
+  if (decision.decision !== "close" || decision.confidence !== "high") return null;
+  const fixedSha = decision.fixedSha?.trim();
+  if (!fixedSha || fixedSha === "unknown") return null;
+  try {
+    const pulls = ghJson<unknown[]>([
+      "api",
+      `repos/${targetRepo()}/commits/${fixedSha}/pulls`,
+      "-H",
+      "Accept: application/vnd.github+json",
+    ]);
+    return fixedPullRequestFromCommitPulls(pulls, "GitHub commit PR lookup");
+  } catch (error) {
+    if (isGitHubNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
 function attachFixedPullRequest(decision: Decision, item: Item, context: ItemContext): Decision {
   if (decision.fixedPullRequest) return decision;
-  const fixedPullRequest = fixedPullRequestFromContext(item, context, decision);
+  const fixedPullRequest =
+    fixedPullRequestFromContext(item, context, decision) ??
+    (item.kind === "issue" ? fixedPullRequestFromCommitSha(decision) : null);
   return fixedPullRequest ? { ...decision, fixedPullRequest } : decision;
 }
 
