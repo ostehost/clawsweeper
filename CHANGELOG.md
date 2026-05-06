@@ -32,6 +32,9 @@ checkpoint, and status-only commits are intentionally omitted.
   cross-issue and cross-PR references instead of shorthand `#123` refs.
 - Added `openclaw/fs-safe` as an event-driven review target with conservative
   PR implemented-on-main close rules and issue review-only behavior.
+- Scoped sweep record/status publishing to the active target repository slug so
+  concurrent runs for other repositories cannot overwrite newly added target
+  records from stale generated state.
 - Reduced default worker fan-out by about 20% across review shards, hot intake,
   commit review pages, repair live-worker caps, and automatic implementation
   dispatches.

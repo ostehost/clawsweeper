@@ -585,6 +585,8 @@ jobs:
         continue-on-error: true
         working-directory: clawsweeper
         run: |
+          target_slug="${{ steps.target.outputs.target_repo }}"
+          target_slug="${target_slug//\//-}"
           pnpm run status -- \
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --state "Planning review" \
@@ -592,7 +594,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           pnpm run repair:publish-main -- \
             --message "chore: mark sweep planning started" \
-            --path results/sweep-status \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - id: mode
@@ -734,6 +736,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
         run: |
+          target_slug="$TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           pnpm run status -- \
             --target-repo "$TARGET_REPO" \
             --state "${{ steps.mode.outputs.hot_intake == 'true' && 'Hot intake in progress' || 'Review in progress' }}" \
@@ -748,7 +752,7 @@ jobs:
             --capacity-reason "${{ steps.select.outputs.capacity_reason }}"
           timeout 20s pnpm run repair:publish-main -- \
             --message "chore: mark sweep review in progress" \
-            --path results/sweep-status \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs || echo "::warning::Skipped slow in-progress dashboard publish so review shards can start."
 
   review:
@@ -1038,6 +1042,8 @@ jobs:
           HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
           TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
         run: |
+          target_slug="$TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           if [ "$HOT_INTAKE" = "true" ] && [ -z "$EXACT_ITEM" ]; then
             echo "Skipping full reconcile for broad hot-intake publish."
           else
@@ -1045,8 +1051,8 @@ jobs:
           fi
           pnpm run repair:publish-main -- \
             --message "chore: update sweep records" \
-            --path records \
-            --path results/sweep-status \
+            --path "records/${target_slug}" \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - name: Dispatch reproducible bug implementation candidates
@@ -1139,6 +1145,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          target_slug="$TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
           if [ -z "$item_numbers" ]; then
             echo "No review artifacts to sync comments for."
@@ -1171,9 +1179,9 @@ jobs:
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
           pnpm run repair:publish-main -- \
             --message "chore: sync selected review comments" \
-            --path records \
+            --path "records/${target_slug}" \
             --path apply-report.json \
-            --path results/sweep-status \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - name: Apply selected safe close proposals
@@ -1185,6 +1193,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          target_slug="$TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
           if [ -z "$item_numbers" ]; then
             echo "No review artifacts to apply."
@@ -1222,9 +1232,9 @@ jobs:
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
           pnpm run repair:publish-main -- \
             --message "chore: apply selected sweep decisions" \
-            --path records \
+            --path "records/${target_slug}" \
             --path apply-report.json \
-            --path results/sweep-status \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - name: Continue sweep
@@ -1436,13 +1446,17 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Commit Audit Health
+        env:
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
         run: |
+          target_slug="$TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep audit state" \
             --path README.md \
-            --path records \
-            --path results/audit \
-            --path results/sweep-status \
+            --path "records/${target_slug}" \
+            --path "results/audit/${target_slug}.json" \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - name: Refresh state dashboard
@@ -1722,11 +1736,13 @@ jobs:
             echo "No proposed closes were ready; no apply results to commit."
             exit 0
           fi
+          target_slug="$APPLY_TARGET_REPO"
+          target_slug="${target_slug//\//-}"
           pnpm run repair:publish-main -- \
             --message "chore: apply sweep decisions" \
-            --path records \
+            --path "records/${target_slug}" \
             --path apply-report.json \
-            --path results/sweep-status \
+            --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy apply-records
 
       - name: Continue apply sweep

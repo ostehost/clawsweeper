@@ -2865,6 +2865,16 @@ test("manual exact-item review dispatches avoid broad review concurrency", () =>
   );
 });
 
+test("sweep workflow publishes target-scoped state paths", () => {
+  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+
+  assert.match(workflow, /target_slug="\$TARGET_REPO"/);
+  assert.match(workflow, /--path "records\/\$\{target_slug\}"/);
+  assert.match(workflow, /--path "results\/sweep-status\/\$\{target_slug\}\.json"/);
+  assert.doesNotMatch(workflow, /--path records\s*\\/);
+  assert.doesNotMatch(workflow, /--path results\/sweep-status\s*\\/);
+});
+
 test("review prompt asks for concise public review fields", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
 
