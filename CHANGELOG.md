@@ -48,6 +48,8 @@ checkpoint, and status-only commits are intentionally omitted.
 - Tightened the live dashboard desktop layout so the pipeline table scrolls
   inside its lane instead of colliding with the side panels, with compact mode
   labels for dense worker rows.
+- Stopped browser-caching the live dashboard HTML shell so UI fixes appear
+  immediately after Worker deploys.
 - Served the last good live dashboard snapshot from a longer edge cache when
   GitHub rate limits transient live refreshes, avoiding zeroed-out status pages.
 - Kept the live dashboard stable during refreshes by caching status snapshots at

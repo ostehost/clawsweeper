@@ -536,7 +536,7 @@ function html(value) {
   return new Response(value, {
     headers: {
       "content-type": "text/html; charset=utf-8",
-      "cache-control": "public, max-age=30",
+      "cache-control": "no-store",
     },
   });
 }
