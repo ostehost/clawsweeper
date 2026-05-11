@@ -141,9 +141,9 @@ function deriveAutomationLimits(workerConfig: WorkerConfig): AutomationLimits {
   const max = workerConfig.workers.max;
   return {
     review_shards: {
-      normal_default: percent(max, 50),
-      normal_active_floor: percent(max, 20),
-      hot_intake_default: percent(max, 25),
+      normal_default: percent(max, 70),
+      normal_active_floor: percent(max, 30),
+      hot_intake_default: percent(max, 35),
       exact_item_default: 1,
       hard_cap: max,
     },

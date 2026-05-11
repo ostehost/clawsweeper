@@ -38,14 +38,14 @@ The mental model:
 
 Derived limits are intentionally percentages of `workers.max`. With
 `workers.max = 100`, the quiet-system ceilings are easy to read directly:
-normal review can use 50 workers, hot intake can use 25, commit review can use 5
+normal review can use 70 workers, hot intake can use 35, commit review can use 5
 commits per page, and repair lanes can dispatch 40 live workers.
 
 | Name | Current | Meaning |
 | --- | ---: | --- |
-| `review_shards.normal_default` | 50 | Quiet-system normal review shard ceiling. |
-| `review_shards.normal_active_floor` | 20 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
-| `review_shards.hot_intake_default` | 25 | Quiet-system broad hot-intake review shard ceiling. |
+| `review_shards.normal_default` | 70 | Quiet-system normal review shard ceiling. |
+| `review_shards.normal_active_floor` | 30 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
+| `review_shards.hot_intake_default` | 35 | Quiet-system broad hot-intake review shard ceiling. |
 | `review_shards.exact_item_default` | 1 | Exact-item hot-intake shard count. |
 | `review_shards.hard_cap` | 100 | Maximum accepted review shard count. |
 | `commit_review.page_size_default` | 5 | Commits selected per commit-review page. |
@@ -58,9 +58,9 @@ commits per page, and repair lanes can dispatch 40 live workers.
 
 Formula summary:
 
-- normal review: 50% of `workers.max`
-- normal active floor: 20% of `workers.max`
-- hot intake: 25% of `workers.max`
+- normal review: 70% of `workers.max`
+- normal active floor: 30% of `workers.max`
+- hot intake: 35% of `workers.max`
 - commit review page size: 5% of `workers.max`
 - repair, automerge repair, and issue implementation: 40% of `workers.max`
 - issue implementation dispatches per sweep: 4% of `workers.max`
@@ -90,8 +90,8 @@ priority work.
 
 Examples with the current config:
 
-- Quiet system: manual normal review can request 50 shards; scheduled normal
-  review gets 50 after reserving 10 slots for exact/manual/urgent work and 20
+- Quiet system: manual normal review can request 70 shards; scheduled normal
+  review gets 70 after reserving 10 slots for exact/manual/urgent work and 20
   slots for in-flight matrix expansion.
 - 30 active repair workers and 20 active background workers: normal review gets
   20 because `100 - 10 interactive reserve - 20 expansion reserve - 30 priority
@@ -109,7 +109,7 @@ pnpm run --silent workflow -- worker-limit commit_review --active-critical 90
 ```
 
 Change `workers.max` first when tuning rate-limit pressure. For example, setting
-`workers.max` to `80` automatically makes normal review `40`, hot intake `20`,
+`workers.max` to `80` automatically makes normal review `56`, hot intake `28`,
 commit review `4`, repair `32`, and hard caps `80`.
 
 ## Runtime Overrides
