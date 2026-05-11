@@ -42,9 +42,9 @@ jobs:
         id: dashboard-config
         run: |
           test -n "$CLAWSWEEPER_STATUS_INGEST_TOKEN"
-          cp dashboard/wrangler.toml "$RUNNER_TEMP/dashboard-wrangler.toml"
-          printf 'INGEST_TOKEN = "%s"\n' "$CLAWSWEEPER_STATUS_INGEST_TOKEN" >> "$RUNNER_TEMP/dashboard-wrangler.toml"
-          echo "config=$RUNNER_TEMP/dashboard-wrangler.toml" >> "$GITHUB_OUTPUT"
+          cp dashboard/wrangler.toml dashboard/wrangler.deploy.toml
+          printf 'INGEST_TOKEN = "%s"\n' "$CLAWSWEEPER_STATUS_INGEST_TOKEN" >> dashboard/wrangler.deploy.toml
+          echo "config=dashboard/wrangler.deploy.toml" >> "$GITHUB_OUTPUT"
 
       - name: Deploy Worker
         run: npx wrangler@4.90.0 deploy --config "${{ steps.dashboard-config.outputs.config }}"
