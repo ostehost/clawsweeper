@@ -5,7 +5,7 @@ import { repairCodexReasoningEffort } from "./process-env.js";
 const SIGNATURE = "ClawSweeper 🐠";
 const EVIDENCE_LIMIT = 5;
 
-function listOrNone(items: LooseRecord[]) {
+function listOrNone(items: JsonValue[]) {
   return items?.length ? items.join("; ") : "none";
 }
 
@@ -238,6 +238,23 @@ function withFishNotes(lines: JsonValue, provenance: LooseRecord) {
   return [...lines, "", fishNotes(provenance)].join("\n");
 }
 
+function contributorCreditLines(contributorCredits: JsonValue) {
+  if (!Array.isArray(contributorCredits) || contributorCredits.length === 0) return [];
+  const lines = contributorCredits
+    .map((credit: JsonValue) => {
+      const login = String(credit?.login ?? "")
+        .replace(/^@/, "")
+        .trim();
+      const trailer =
+        String(credit?.co_authored_by ?? "").trim() ||
+        (credit?.name && credit?.email ? `Co-authored-by: ${credit.name} <${credit.email}>` : "");
+      if (!trailer) return null;
+      return `- ${login ? `@${login}: ` : ""}${trailer}`;
+    })
+    .filter(Boolean);
+  return lines.length > 0 ? ["Co-author credit kept:", ...lines] : [];
+}
+
 export function repairContributorBranchComment({ validationCommands, provenance }: LooseRecord) {
   return withFishNotes(
     [
@@ -301,16 +318,23 @@ export function issueImplementationResultStatusComment({
   return `${body}\n\n${nextSection}`;
 }
 
-export function replacementSourceLinkComment({ replacementPrUrl, provenance }: LooseRecord) {
+export function replacementSourceLinkComment({
+  replacementPrUrl,
+  provenance,
+  contributorCredits,
+}: LooseRecord) {
   return withFishNotes(
     [
       `${SIGNATURE} reef update`,
       "",
       variant(replacementPermissionLines),
       "",
+      "Why replacement: ClawSweeper could not update the source PR branch directly; GitHub did not grant sufficient push rights to the bot for that branch.",
       `Replacement PR: ${replacementPrUrl}`,
+      "Source PR status: left open for maintainer and contributor comparison.",
       variant(sourceStaysOpenLines),
       variant(carriedCreditLines),
+      ...contributorCreditLines(contributorCredits),
     ],
     provenance,
   );
@@ -343,16 +367,23 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function replacementSourceCloseComment({ replacementPrUrl, provenance }: LooseRecord) {
+export function replacementSourceCloseComment({
+  replacementPrUrl,
+  provenance,
+  contributorCredits,
+}: LooseRecord) {
   return withFishNotes(
     [
       `${SIGNATURE} reef update`,
       "",
       variant(replacementPermissionLines),
       "",
+      "Why replacement: ClawSweeper could not update the source PR branch directly; GitHub did not grant sufficient push rights to the bot for that branch.",
       `Replacement PR: ${replacementPrUrl}`,
+      "Why close: this run explicitly closes the superseded source PR after the credited replacement PR is open, so review continues in one place.",
       variant(closeOnlyWhenEnabledLines),
       variant(carriedCreditLines),
+      ...contributorCreditLines(contributorCredits),
     ],
     provenance,
   );
@@ -363,6 +394,7 @@ export function replacementPrBody({
   fallbackReason,
   clusterId,
   provenance,
+  contributorCredits,
 }: LooseRecord) {
   const lines = [
     fixArtifact.pr_body.trim(),
@@ -372,8 +404,11 @@ export function replacementPrBody({
     `- Source PRs: ${(fixArtifact.source_prs ?? []).join(", ") || "none"}`,
     `- Credit: ${listOrNone(fixArtifact.credit_notes)}`,
     `- Validation: ${listOrNone(fixArtifact.validation_commands)}`,
+    "- Replacement reason: ClawSweeper could not update the source PR branch directly, so it opened a writable replacement PR instead.",
   ];
   if (fallbackReason) lines.push(`- Repair fallback: ${fallbackReason}`);
+  const creditLines = contributorCreditLines(contributorCredits);
+  if (creditLines.length > 0) lines.push("", ...creditLines);
   lines.push("", fishNotes(provenance));
   return `${lines.join("\n")}\n`;
 }
@@ -456,6 +491,13 @@ export function sampleExternalMessages() {
       body: replacementSourceLinkComment({
         replacementPrUrl: "https://github.com/openclaw/openclaw/pull/67890",
         sourcePrUrl: "https://github.com/openclaw/openclaw/pull/12345",
+        contributorCredits: [
+          {
+            login: "contributor",
+            co_authored_by:
+              "Co-authored-by: Contributor <123+contributor@users.noreply.github.com>",
+          },
+        ],
         provenance,
       }),
     },
@@ -464,6 +506,13 @@ export function sampleExternalMessages() {
       body: replacementSourceCloseComment({
         replacementPrUrl: "https://github.com/openclaw/openclaw/pull/67890",
         sourcePrUrl: "https://github.com/openclaw/openclaw/pull/12345",
+        contributorCredits: [
+          {
+            login: "contributor",
+            co_authored_by:
+              "Co-authored-by: Contributor <123+contributor@users.noreply.github.com>",
+          },
+        ],
         provenance,
       }),
     },
@@ -479,6 +528,13 @@ export function sampleExternalMessages() {
           validation_commands: ["pnpm check:changed"],
         },
         fallbackReason: "source branch was not safely writable",
+        contributorCredits: [
+          {
+            login: "contributor",
+            co_authored_by:
+              "Co-authored-by: Contributor <123+contributor@users.noreply.github.com>",
+          },
+        ],
         provenance,
       }),
     },

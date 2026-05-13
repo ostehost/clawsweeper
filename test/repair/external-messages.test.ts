@@ -6,6 +6,9 @@ import {
   externalMessageProvenance,
   issueImplementationResultStatusComment,
   repairContributorBranchComment,
+  replacementPrBody,
+  replacementSourceCloseComment,
+  replacementSourceLinkComment,
 } from "../../dist/repair/external-messages.js";
 
 test("automergeRepairOutcomeComment explains no-op repair runs", () => {
@@ -53,6 +56,67 @@ test("repairContributorBranchComment avoids self PR references", () => {
   assert.match(body, /Validation: pnpm check:changed/);
   assert.doesNotMatch(body, /Source PR:/);
   assert.doesNotMatch(body, /75183/);
+});
+
+test("replacement comments explain no push rights and keep co-author credit visible", () => {
+  const contributorCredits = [
+    {
+      login: "octocat",
+      co_authored_by: "Co-authored-by: Mona Octocat <1+octocat@users.noreply.github.com>",
+    },
+  ];
+  const provenance = { model: "gpt-test", reasoning: "medium", reviewedSha: "abcdef1234567890" };
+
+  const linkBody = replacementSourceLinkComment({
+    replacementPrUrl: "https://github.com/openclaw/openclaw/pull/67890",
+    contributorCredits,
+    provenance,
+  });
+  assert.match(linkBody, /Why replacement: .*push rights/i);
+  assert.match(linkBody, /Source PR status: left open/i);
+  assert.match(
+    linkBody,
+    /@octocat: Co-authored-by: Mona Octocat <1\+octocat@users\.noreply\.github\.com>/,
+  );
+
+  const closeBody = replacementSourceCloseComment({
+    replacementPrUrl: "https://github.com/openclaw/openclaw/pull/67890",
+    contributorCredits,
+    provenance,
+  });
+  assert.match(closeBody, /Why replacement: .*push rights/i);
+  assert.match(closeBody, /Why close: .*credited replacement PR is open/i);
+  assert.match(
+    closeBody,
+    /@octocat: Co-authored-by: Mona Octocat <1\+octocat@users\.noreply\.github\.com>/,
+  );
+});
+
+test("replacement PR body records replacement reason and co-author credit", () => {
+  const body = replacementPrBody({
+    clusterId: "ghcrawl-123",
+    fixArtifact: {
+      pr_body: "Fix the focused regression.",
+      source_prs: ["https://github.com/openclaw/openclaw/pull/12345"],
+      credit_notes: ["Thanks @octocat for the original PR."],
+      validation_commands: ["pnpm check"],
+    },
+    fallbackReason: "source PR #12345 has maintainer_can_modify=false",
+    contributorCredits: [
+      {
+        login: "octocat",
+        co_authored_by: "Co-authored-by: Mona Octocat <1+octocat@users.noreply.github.com>",
+      },
+    ],
+    provenance: { model: "gpt-test", reasoning: "medium", reviewedSha: "abcdef1234567890" },
+  });
+
+  assert.match(body, /Replacement reason: ClawSweeper could not update the source PR branch/);
+  assert.match(body, /Repair fallback: source PR #12345 has maintainer_can_modify=false/);
+  assert.match(
+    body,
+    /@octocat: Co-authored-by: Mona Octocat <1\+octocat@users\.noreply\.github\.com>/,
+  );
 });
 
 test("issueImplementationResultStatusComment appends and updates PR link section", () => {

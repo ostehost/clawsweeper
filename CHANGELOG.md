@@ -36,6 +36,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Clarified uneditable source PR replacement comments and PR bodies so they state
+  the push-rights blocker, explain why source PRs are closed after a replacement
+  opens, and show preserved co-author credit.
 - Kept the live dashboard's playful icon treatment while tightening the pipeline
   grid so long commit-review SHAs no longer overlap the automerge/status rail.
 - Replaced `ci unknown` on active live-dashboard rows with immediate workflow

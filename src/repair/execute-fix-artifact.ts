@@ -1016,6 +1016,7 @@ function openReplacementPrFromPreparedRepairCheckout({
     fallbackReason,
     clusterId: result.cluster_id,
     provenance,
+    contributorCredits,
   });
   const bodyPath = path.join(workRoot, "replacement-pr-body.md");
   fs.writeFileSync(bodyPath, body);
@@ -1345,6 +1346,7 @@ function executeReplacementBranch({
     fallbackReason,
     clusterId: result.cluster_id,
     provenance,
+    contributorCredits,
   });
   if (dryRun) {
     return {
@@ -1559,6 +1561,7 @@ function linkReplacementSourcePr({
   parsed,
   replacementPrUrl,
   targetDir,
+  contributorCredits,
   provenance,
 }: LooseRecord) {
   const base = { source, pr: `#${parsed.number}`, action: "link_replacement_source" };
@@ -1579,6 +1582,7 @@ function linkReplacementSourcePr({
     replacementPrUrl,
     sourcePrUrl: source,
     provenance,
+    contributorCredits,
   });
   run("gh", ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment], {
     cwd: targetDir,
@@ -1614,6 +1618,7 @@ function closeSupersededSourcePr({
     replacementPrUrl,
     sourcePrUrl: source,
     provenance,
+    contributorCredits,
   });
   run("gh", ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment], {
     cwd: targetDir,
