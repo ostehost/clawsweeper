@@ -409,6 +409,16 @@ test("dashboard exposes recently closed issues and pull requests", async () => {
   }
 });
 
+test("dashboard shell uses compact linked rows instead of a run column", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/"));
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /class="work-list"/);
+  assert.match(html, /class="side-list"/);
+  assert.match(html, /function renderClosedItems/);
+  assert.doesNotMatch(html, /<th>Run<\/th>/);
+});
+
 async function activePrFetch(input: RequestInfo | URL) {
   const url = String(input);
   if (url.includes("/repos/openclaw/clawsweeper/actions/runs")) {

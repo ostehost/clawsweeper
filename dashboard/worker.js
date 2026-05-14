@@ -902,53 +902,101 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   overflow: hidden;
   border-radius: 14px;
 }
-#pipeline { overflow-x: auto; }
-#pipeline table { min-width: 820px; }
-#pipeline table th:nth-child(1) { width: 112px; }
-#pipeline table th:nth-child(2) { width: auto; }
-#pipeline table th:nth-child(3) { width: 100px; }
-#pipeline table th:nth-child(4) { width: 118px; }
-#pipeline table th:nth-child(5) { width: 68px; }
-#pipeline table th:nth-child(6) { width: 50px; }
-#pipeline table td:nth-child(2) {
-  line-height: 1.35;
+.work-list,
+.side-list {
+  display: grid;
+  gap: 8px;
 }
-#pipeline table td:nth-child(3) {
-  white-space: nowrap;
+.work-row,
+.side-row {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
-#pipeline .item-main {
+.work-row {
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 260px) 82px;
+  align-items: center;
+  padding: 12px 14px;
+}
+.side-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  padding: 11px 12px;
+}
+.work-row:hover,
+.side-row:hover {
+  border-color: rgba(103, 183, 255, 0.35);
+  background: rgba(103, 183, 255, 0.03);
+}
+.work-main,
+.side-main {
+  min-width: 0;
+}
+.row-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.item-link {
   display: block;
-  max-width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 600;
 }
-#pipeline table td:nth-child(2) .muted {
+.work-title,
+.side-title {
   display: -webkit-box;
-  margin-top: 2px;
+  margin-top: 4px;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-#pipeline table td:nth-child(6) a { white-space: nowrap; }
-#automerge table th:nth-child(1) { width: auto; }
-#automerge table th:nth-child(2) { width: 88px; }
-#automerge table th:nth-child(3) { width: 112px; }
-#automerge table td:nth-child(1) .muted {
-  display: -webkit-box;
-  margin-top: 2px;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+.work-state {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
-#closed table th:nth-child(1) { width: auto; }
-#closed table th:nth-child(2) { width: 90px; }
-#closed table td:nth-child(1) .muted {
-  display: -webkit-box;
-  margin-top: 2px;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+.stage-block {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  min-width: 74px;
+}
+.run-link {
+  color: var(--blue);
+}
+.timebox {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  white-space: nowrap;
+}
+.timebox strong {
+  font-size: 18px;
+  line-height: 1;
+}
+.timebox span,
+.side-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.side-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  white-space: nowrap;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
 .empty {
@@ -962,8 +1010,8 @@ a:hover { color: #89c8ff; text-decoration: underline; }
 }
 .empty::before { content: "🦀 "; opacity: 0.3; }
 @media (max-width: 1280px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .split { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } }
-@media (max-width: 760px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } #pipeline table { min-width: 760px; } }
-@media (max-width: 560px) { main { width: min(100vw - 20px, 1440px); padding-top: 16px; } .grid { grid-template-columns: 1fr; } th:nth-child(4), td:nth-child(4), th:nth-child(6), td:nth-child(6) { display: none; } }
+@media (max-width: 760px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .work-row { grid-template-columns: 1fr; align-items: start; } .work-state, .stage-block, .timebox { justify-content: start; justify-items: start; } }
+@media (max-width: 560px) { main { width: min(100vw - 20px, 1440px); padding-top: 16px; } .grid { grid-template-columns: 1fr; } .side-row { grid-template-columns: 1fr; } .side-meta { justify-content: flex-start; } }
 </style>
 </head>
 <body>
@@ -1014,6 +1062,9 @@ function esc(value) {
 function link(url, label) {
   return url ? '<a href="' + esc(url) + '">' + esc(label || url) + '</a>' : esc(label || "");
 }
+function linkClass(url, label, className) {
+  return url ? '<a class="' + esc(className || "") + '" href="' + esc(url) + '">' + esc(label || url) + '</a>' : esc(label || "");
+}
 function compactText(value) {
   return String(value ?? "")
     .replace(/\b([0-9a-f]{10})[0-9a-f]{22,}\b/gi, "$1")
@@ -1022,9 +1073,9 @@ function compactText(value) {
 }
 function pipelineItemLabel(row) {
   if (row.repository && row.item_number) {
-    return link("https://github.com/" + row.repository + "/pull/" + row.item_number, row.repository + "#" + row.item_number);
+    return linkClass("https://github.com/" + row.repository + "/issues/" + row.item_number, row.repository + "#" + row.item_number, "item-link");
   }
-  return esc(compactText(row.title));
+  return '<span class="item-link">' + esc(compactText(row.title)) + '</span>';
 }
 function pipelineItemDetail(row) {
   if (row.repository && row.item_number) return compactText(row.title);
@@ -1108,31 +1159,31 @@ function renderPipeline(rows) {
     document.getElementById("pipeline").innerHTML = '<div class="empty">All quiet in the depths... no active sweeps</div>';
     return;
   }
-  document.getElementById("pipeline").innerHTML = '<table><thead><tr><th>Mode</th><th>Item</th><th>Stage</th><th>CI</th><th>Elapsed</th><th>Run</th></tr></thead><tbody>' + rows.map(row => {
+  document.getElementById("pipeline").innerHTML = '<div class="work-list">' + rows.map(row => {
     const detail = pipelineItemDetail(row);
-    return '<tr><td><span class="pill" title="' + esc(row.mode) + '">' + esc(modeLabel(row.mode)) + '</span></td><td><span class="item-main" title="' + esc(compactText(row.title)) + '">' + pipelineItemLabel(row) + '</span>' + (detail ? '<div class="muted">' + esc(detail) + '</div>' : "") + '</td><td>' + esc(row.stage) + '<div class="muted">' + esc(row.status) + '</div></td><td>' + ciBadge(row.ci) + '</td><td>' + elapsed(row.elapsed_ms) + '</td><td>' + link(row.run_url, "run") + '</td></tr>';
-  }).join("") + '</tbody></table>';
+    return '<article class="work-row"><div class="work-main" title="' + esc(compactText(row.title)) + '"><div class="row-top"><span class="pill" title="' + esc(row.mode) + '">' + esc(modeLabel(row.mode)) + '</span>' + pipelineItemLabel(row) + '</div>' + (detail ? '<div class="muted work-title">' + esc(detail) + '</div>' : "") + '</div><div class="work-state"><div class="stage-block"><strong>' + esc(row.stage) + '</strong><span class="muted">' + esc(row.status) + '</span></div>' + ciBadge(row.ci) + linkClass(row.run_url, "run", "pill run-link") + '</div><div class="timebox"><strong>' + elapsed(row.elapsed_ms) + '</strong><span>elapsed</span></div></article>';
+  }).join("") + '</div>';
 }
 function renderAutomerge(rows) {
   if (!rows.length) {
     document.getElementById("automerge").innerHTML = '<div class="empty">No automerge data yet... claws resting</div>';
     return;
   }
-  document.getElementById("automerge").innerHTML = '<table><thead><tr><th>PR</th><th>Duration</th><th>Merged</th></tr></thead><tbody>' + rows.map(row => '<tr><td>' + link(row.url, "#" + row.number) + '<div class="muted">' + esc(row.title) + '</div></td><td>' + (row.duration_ms ? elapsed(row.duration_ms) : "unknown") + '</td><td>' + (row.merged_at ? since(row.merged_at) : "") + '</td></tr>').join("") + '</tbody></table>';
+  document.getElementById("automerge").innerHTML = '<div class="side-list">' + rows.map(row => '<article class="side-row"><div class="side-main">' + linkClass(row.url, "#" + row.number, "item-link") + '<div class="muted side-title">' + esc(row.title) + '</div></div><div class="side-meta"><span class="pill violet">' + (row.duration_ms ? elapsed(row.duration_ms) : "unknown") + '</span><span>' + (row.merged_at ? since(row.merged_at) : "") + '</span></div></article>').join("") + '</div>';
 }
 function renderClosedItems(rows) {
   if (!rows.length) {
     document.getElementById("closed").innerHTML = '<div class="empty">No recent closes found...</div>';
     return;
   }
-  document.getElementById("closed").innerHTML = '<table><thead><tr><th>Item</th><th>Closed</th></tr></thead><tbody>' + rows.map(row => '<tr><td><span class="pill">' + esc(row.type) + '</span> ' + link(row.url, row.repository + "#" + row.number) + '<div class="muted">' + esc(row.title) + '</div></td><td>' + since(row.closed_at) + '</td></tr>').join("") + '</tbody></table>';
+  document.getElementById("closed").innerHTML = '<div class="side-list">' + rows.map(row => '<article class="side-row"><div class="side-main"><div class="row-top"><span class="pill">' + esc(row.type) + '</span>' + linkClass(row.url, row.repository + "#" + row.number, "item-link") + '</div><div class="muted side-title">' + esc(row.title) + '</div></div><div class="side-meta">' + since(row.closed_at) + '</div></article>').join("") + '</div>';
 }
 function renderEvents(rows) {
   if (!rows.length) {
     document.getElementById("events").innerHTML = '<div class="empty">Listening for signals from the fleet...</div>';
     return;
   }
-  document.getElementById("events").innerHTML = '<table><thead><tr><th>Stage</th><th>Status</th><th>When</th></tr></thead><tbody>' + rows.map(row => '<tr><td>' + esc(row.mode) + " / " + esc(row.stage) + '<div class="muted">' + (row.item_url ? link(row.item_url, row.title || row.item_url) : esc(row.title || row.event_type)) + '</div></td><td>' + esc(row.status) + '</td><td>' + since(row.received_at) + '</td></tr>').join("") + '</tbody></table>';
+  document.getElementById("events").innerHTML = '<div class="side-list">' + rows.map(row => '<article class="side-row"><div class="side-main"><div class="row-top"><span class="pill">' + esc(row.mode) + '</span><span class="item-link">' + esc(row.stage) + '</span></div><div class="muted side-title">' + (row.item_url ? link(row.item_url, row.title || row.item_url) : esc(row.title || row.event_type)) + '</div></div><div class="side-meta"><span>' + esc(row.status) + '</span><span>' + since(row.received_at) + '</span></div></article>').join("") + '</div>';
 }
 load();
 setInterval(load, 15000);
