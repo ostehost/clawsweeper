@@ -26,7 +26,7 @@ checkpoint, and status-only commits are intentionally omitted.
   durable spam audit records without blocking users or mutating repositories.
 - Added a light privacy reminder and stronger screenshot-or-video nudge to real behavior proof review guidance.
 - Added agent-led real behavior proof judgement so ClawSweeper can inspect linked screenshots, videos, logs, and terminal output with a read-only GitHub token, explain the proof verdict in the review comment, tell contributors how to trigger a fresh review after adding proof, and sync `proof: sufficient` when the evidence is convincing.
-- Added a durable review-context budget ledger to generated reports so prompt section sizes, hydrated counts, and truncation state are visible after each run.
+- Added a durable review-context budget ledger to generated reports so prompt section sizes, hydrated counts, and truncation state are visible after each run, thanks @stainlu.
 - Added a real behavior proof assessment to PR reviews so missing, mock-only, or insufficient contributor proof blocks pass/automerge markers and asks for screenshots, terminal output, redacted logs, recordings, linked artifacts, or copied live output instead.
 - Added advisory issue labels for reproduction, linked-PR, work-lane,
   missing-info, product-decision, and security-review routing states, projected
