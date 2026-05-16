@@ -45,6 +45,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Retried sweep target repository checkouts without cached Git references when
+  a stale partial-clone cache breaks shard startup.
 - Reduced the shared Codex worker budget by 10% so review, commit-review,
   repair, automerge, issue-implementation, and dashboard utilization lanes use
   lower default fan-out.

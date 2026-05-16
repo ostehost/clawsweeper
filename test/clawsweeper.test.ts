@@ -4608,6 +4608,23 @@ test("sweep workflow publishes target-scoped state paths", () => {
   assert.doesNotMatch(workflow, /--path results\/sweep-status\s*\\/);
 });
 
+test("sweep target checkouts retry without cached references", () => {
+  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const checkoutBlocks =
+    workflow.match(/- name: Check out target repository[\s\S]*?rev-parse --short HEAD/g) ?? [];
+
+  assert.equal(checkoutBlocks.length, 2);
+  for (const block of checkoutBlocks) {
+    assert.match(block, /Cached target repository fetch failed; rebuilding cache/);
+    assert.match(block, /Cached target checkout failed; retrying without cache reference/);
+    assert.match(block, /rm -rf "\$checkout_dir" "\$cache_dir"/);
+    assert.match(
+      block,
+      /git clone --filter=blob:none --branch main --single-branch "\$url" "\$checkout_dir"/,
+    );
+  }
+});
+
 test("sweep planning-started status publish is bounded", () => {
   const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
   const block = workflow.slice(

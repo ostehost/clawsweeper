@@ -302,14 +302,24 @@ jobs:
             git -C "$cache_dir" config remote.origin.promisor true
             git -C "$cache_dir" config remote.origin.partialclonefilter blob:none
             if [ -f "$cache_dir/shallow" ]; then
-              git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin main
+              cache_fetch=(git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin main)
             else
-              git -C "$cache_dir" fetch --prune --filter=blob:none origin main
+              cache_fetch=(git -C "$cache_dir" fetch --prune --filter=blob:none origin main)
+            fi
+            if ! "${cache_fetch[@]}"; then
+              echo "::warning::Cached target repository fetch failed; rebuilding cache."
+              rm -rf "$cache_dir"
+              git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
             fi
           else
             git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
           fi
-          git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"
+          if ! git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"; then
+            echo "::warning::Cached target checkout failed; retrying without cache reference."
+            rm -rf "$checkout_dir" "$cache_dir"
+            git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
+            git clone --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"
+          fi
           git -C "$checkout_dir" rev-parse --short HEAD
 
       - name: Review exact event item
@@ -920,14 +930,24 @@ jobs:
             git -C "$cache_dir" config remote.origin.promisor true
             git -C "$cache_dir" config remote.origin.partialclonefilter blob:none
             if [ -f "$cache_dir/shallow" ]; then
-              git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin main
+              cache_fetch=(git -C "$cache_dir" fetch --prune --unshallow --filter=blob:none origin main)
             else
-              git -C "$cache_dir" fetch --prune --filter=blob:none origin main
+              cache_fetch=(git -C "$cache_dir" fetch --prune --filter=blob:none origin main)
+            fi
+            if ! "${cache_fetch[@]}"; then
+              echo "::warning::Cached target repository fetch failed; rebuilding cache."
+              rm -rf "$cache_dir"
+              git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
             fi
           else
             git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
           fi
-          git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"
+          if ! git clone --reference-if-able "$cache_dir" --dissociate --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"; then
+            echo "::warning::Cached target checkout failed; retrying without cache reference."
+            rm -rf "$checkout_dir" "$cache_dir"
+            git clone --bare --filter=blob:none --single-branch --branch main "$url" "$cache_dir"
+            git clone --filter=blob:none --branch main --single-branch "$url" "$checkout_dir"
+          fi
           git -C "$checkout_dir" rev-parse --short HEAD
 
       - name: Mark shard start
