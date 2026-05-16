@@ -3453,7 +3453,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
       calls.some(
         (args) =>
           args[0] === "api" &&
-          /\/issues\/321\/timeline\?per_page=100$/.test(args[1] ?? "") &&
+          (args[1] ?? "").endsWith("/issues/321/timeline?per_page=100") &&
           args.includes("--paginate"),
       ),
       true,
