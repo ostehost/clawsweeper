@@ -3649,6 +3649,64 @@ if (args[0] === "api" && commentMatch) {
   }
 });
 
+test("apply-decisions counts unverified local-checkout reports against the processed limit", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const logPath = join(root, "gh.log");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+
+    const unverified = workPlanCandidateReport({ number: 321 }).replace(
+      /^local_checkout_access: verified\n/m,
+      "",
+    );
+    const secondUnverified = workPlanCandidateReport({ number: 322 }).replace(
+      /^local_checkout_access: verified\n/m,
+      "",
+    );
+    writeFileSync(join(itemsDir, "321.md"), unverified, "utf8");
+    writeFileSync(join(itemsDir, "322.md"), secondUnverified, "utf8");
+
+    const ghMock = `
+const { appendFileSync } = require("fs");
+appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+console.error("unexpected gh call");
+process.exit(1);
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({ itemsDir, closedDir, plansDir, reportPath });
+    });
+
+    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
+      {
+        number: 321,
+        action: "kept_open",
+        reason: "review lacks verified local checkout access",
+      },
+    ]);
+    assert.equal(existsSync(logPath), false);
+    assert.match(readFileSync(join(itemsDir, "321.md"), "utf8"), /^apply_checked_at: /m);
+    assert.doesNotMatch(readFileSync(join(itemsDir, "322.md"), "utf8"), /^apply_checked_at: /m);
+
+    runApplyDecisionsForTest({ itemsDir, closedDir, plansDir, reportPath });
+
+    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
+      {
+        number: 322,
+        action: "kept_open",
+        reason: "review lacks verified local checkout access",
+      },
+    ]);
+    assert.match(readFileSync(join(itemsDir, "322.md"), "utf8"), /^apply_checked_at: /m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply-decisions counts advisory label-only syncs against the processed limit", () => {
   const root = mkdtempSync(tmpPrefix);
   try {

@@ -2615,6 +2615,14 @@ export function applyDecisionPriority(markdown: string, applyKind: ApplyKind): n
   return 1;
 }
 
+function applyQueueSortFields(markdown: string, syncCommentsOnly: boolean, applyKind: ApplyKind) {
+  const checkedAt = Date.parse(frontMatterValue(markdown, "apply_checked_at") ?? "");
+  return {
+    priority: syncCommentsOnly ? 0 : applyDecisionPriority(markdown, applyKind),
+    applyCheckedAt: Number.isFinite(checkedAt) ? checkedAt : 0,
+  };
+}
+
 export function shouldSyncReviewComment(options: {
   syncCommentsOnly: boolean;
   isCloseProposal: boolean;
@@ -7855,11 +7863,18 @@ function applyDecisionsCommand(args: Args): void {
     .map((name) => ({
       name,
       number: numberForMarkdownFile(name),
-      priority: syncCommentsOnly
-        ? 0
-        : applyDecisionPriority(readFileSync(join(itemsDir, name), "utf8"), applyKind),
+      ...applyQueueSortFields(
+        readFileSync(join(itemsDir, name), "utf8"),
+        syncCommentsOnly,
+        applyKind,
+      ),
     }))
-    .sort((left, right) => left.priority - right.priority || left.number - right.number)
+    .sort(
+      (left, right) =>
+        left.priority - right.priority ||
+        left.applyCheckedAt - right.applyCheckedAt ||
+        left.number - right.number,
+    )
     .map((entry) => entry.name);
   logProgress(
     `starting apply: files=${files.length} dry_run=${dryRun} apply_kind=${applyKind} min_age=${minAgeDescription} apply_close_reasons=${closeReasonFilterText(applyCloseReasons)} stale_min_age_days=${staleMinAgeDays} close_delay_ms=${closeDelayMs} sync_comments_only=${syncCommentsOnly} comment_sync_min_age_days=${commentSyncMinAgeDays} max_runtime_ms=${maxRuntimeMs} item_numbers=${requestedItemNumbers.join(",") || "all"}`,
@@ -7906,11 +7921,7 @@ function applyDecisionsCommand(args: Args): void {
       return processedCount >= processedLimit;
     };
     if (!hasVerifiedLocalCheckoutAccess(markdown)) {
-      results.push({
-        number,
-        action: "kept_open",
-        reason: "review lacks verified local checkout access",
-      });
+      if (markApplySkipped("kept_open", "review lacks verified local checkout access")) break;
       continue;
     }
     if (!storedHash || (action !== "proposed_close" && action !== "kept_open")) {
