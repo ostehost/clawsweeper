@@ -28,6 +28,24 @@ class MemoryCache {
   }
 }
 
+test("dashboard HTML preserves UTF-8 emoji labels", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/"));
+  assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
+  const html = await response.text();
+  assert.match(html, /<title>🦞 ClawSweeper Live<\/title>/);
+  assert.match(html, /🦾 Claw Workers/);
+  assert.match(html, /🌊 Active Sweeps/);
+  assert.match(html, /⏳ Queue Depth/);
+  assert.match(html, /💥 Recent Snags/);
+  assert.match(html, /⚡ Merge Speed/);
+  assert.match(html, /🎯 Capacity/);
+  assert.match(html, /🌊 Loading pipeline state/);
+  assert.match(html, /🌀 Active Pipeline/);
+  assert.match(html, /✅ Closed by ClawSweeper/);
+  assert.match(html, /📡 Recent Activity/);
+  assert.doesNotMatch(html, /ðŸ|â|âš|âœ/);
+});
+
 test("dashboard reads stored CI status for active PR rows", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
