@@ -59,6 +59,9 @@ checkpoint, and status-only commits are intentionally omitted.
 - Closed live no-diff pull requests as duplicate/superseded during apply and
   let same-author PR/issue close pairs finish together when both sides already
   have closeable reports.
+- Promoted old F-rated stale PRs, recommended `pause_or_close` PRs, and PRs
+  superseded by linked pull requests into duplicate/superseded apply closes when
+  no human has responded after the durable review.
 - Archived live-closed skipped apply records from `items/` during apply so the
   open-state dashboard sheds stale records faster.
 - Kept stale GitHub Actions queued ghosts out of the live dashboard capacity and pipeline counts after GitHub leaves old queued runs around for hours.

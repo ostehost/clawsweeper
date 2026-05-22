@@ -8905,6 +8905,261 @@ function upgradeNoDiffPullRequestReport(markdown: string, item: Item): string {
   return upgraded;
 }
 
+interface PullRequestClosePromotion {
+  bestSolution: string;
+  evidence: string;
+  closeComment: string;
+}
+
+function upgradePullRequestClosePromotionReport(
+  markdown: string,
+  item: Item,
+  context: ItemContext,
+  promotion: PullRequestClosePromotion,
+): string {
+  let upgraded = markdown;
+  upgraded = replaceFrontMatterValue(upgraded, "decision", "close");
+  upgraded = replaceFrontMatterValue(upgraded, "close_reason", "duplicate_or_superseded");
+  upgraded = replaceFrontMatterValue(upgraded, "confidence", "high");
+  upgraded = replaceFrontMatterValue(upgraded, "action_taken", "proposed_close");
+  upgraded = replaceFrontMatterValue(upgraded, "work_candidate", "none");
+  upgraded = replaceFrontMatterValue(upgraded, "work_status", "none");
+  upgraded = replaceFrontMatterValue(upgraded, "item_updated_at", item.updatedAt);
+  upgraded = replaceFrontMatterValue(
+    upgraded,
+    "item_snapshot_hash",
+    itemSnapshotHash(item, context),
+  );
+  upgraded = replaceSectionValue(upgraded, REVIEW_SECTIONS.bestSolution, promotion.bestSolution);
+  upgraded = replaceSectionValue(upgraded, REVIEW_SECTIONS.evidence, promotion.evidence);
+  upgraded = replaceSectionValue(upgraded, REVIEW_SECTIONS.closeComment, promotion.closeComment);
+  return upgraded;
+}
+
+function closePromotionHasNonAutomationActivityAfterReview(
+  markdown: string,
+  context: ItemContext,
+): boolean {
+  const reviewedAtMs = timestampMs(frontMatterValue(markdown, "reviewed_at"));
+  if (reviewedAtMs === null) return true;
+  if (
+    context.counts?.commentsTruncated ||
+    context.counts?.timelineTruncated ||
+    context.counts?.pullReviewCommentsTruncated
+  ) {
+    return true;
+  }
+  const hasNonAutomationComment = (comment: unknown): boolean => {
+    const record = asRecord(comment);
+    return (
+      isAfterReview(comment, reviewedAtMs) &&
+      !isAutomationReportAuthor(stringOrUndefined(record.author))
+    );
+  };
+  const hasNonAutomationEvent = (event: unknown): boolean => {
+    const record = asRecord(event);
+    return (
+      isAfterReview(event, reviewedAtMs) &&
+      !isAutomationReportAuthor(stringOrUndefined(record.actor))
+    );
+  };
+  return (
+    context.comments.some(hasNonAutomationComment) ||
+    (context.pullReviewComments ?? []).some(hasNonAutomationComment) ||
+    context.timeline.some(hasNonAutomationEvent)
+  );
+}
+
+function pullRequestUrlForNumber(number: number): string {
+  return repoUrlFor(targetRepo(), `/pull/${number}`);
+}
+
+function linkedPullRequestNumbersFromText(text: string, currentNumber: number): number[] {
+  const [owner, repo] = targetRepo().split("/");
+  if (!owner || !repo) return [];
+  const escapedRepo = `${escapeRegExp(owner)}\\/${escapeRegExp(repo)}`;
+  const numbers = new Set<number>();
+  for (const match of text.matchAll(
+    new RegExp(`https:\\/\\/github\\.com\\/${escapedRepo}\\/pull\\/(\\d+)\\b`, "gi"),
+  )) {
+    const number = Number(match[1]);
+    if (Number.isInteger(number) && number > 0 && number !== currentNumber) numbers.add(number);
+  }
+  return [...numbers];
+}
+
+function linkedPullRequestNumbersFromReport(markdown: string, currentNumber: number): number[] {
+  const texts = [
+    ...frontMatterStringArray(markdown, "work_cluster_refs"),
+    ...mergeRiskOptionsFromReport(markdown).flatMap((option) => [option.title, option.body]),
+    reviewSectionValue(markdown, "bestSolution"),
+    reviewSectionValue(markdown, "evidence"),
+  ];
+  const numbers = new Set<number>();
+  for (const text of texts) {
+    for (const number of linkedPullRequestNumbersFromText(text, currentNumber)) {
+      numbers.add(number);
+    }
+  }
+  return [...numbers];
+}
+
+function textHasLinkedPullRequest(
+  text: string,
+  currentNumber: number,
+  linkedNumber: number,
+): boolean {
+  return linkedPullRequestNumbersFromText(text, currentNumber).includes(linkedNumber);
+}
+
+function linkedPullRequestHasSupersessionSignal(
+  markdown: string,
+  currentNumber: number,
+  linkedNumber: number,
+): boolean {
+  const signal =
+    /\b(supersed(?:e|ed|es|ing)|replace(?:s|d|ment)?|duplicate|duplicated|canonical|covered by|landed in)\b/i;
+  const texts = [
+    ...frontMatterStringArray(markdown, "work_cluster_refs"),
+    ...mergeRiskOptionsFromReport(markdown).flatMap((option) => [option.title, option.body]),
+    reviewSectionValue(markdown, "bestSolution"),
+    reviewSectionValue(markdown, "evidence"),
+  ];
+  return texts.some(
+    (text) => textHasLinkedPullRequest(text, currentNumber, linkedNumber) && signal.test(text),
+  );
+}
+
+function linkedPullRequestSupersession(
+  markdown: string,
+  item: Item,
+): {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  mergedAt: string | null;
+} | null {
+  for (const number of linkedPullRequestNumbersFromReport(markdown, item.number)) {
+    try {
+      const hasSupersessionSignal = linkedPullRequestHasSupersessionSignal(
+        markdown,
+        item.number,
+        number,
+      );
+      const pull = asRecord(ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${number}`]));
+      const state = stringOrUndefined(pull.state)?.toLowerCase() ?? "";
+      const mergedAt = stringOrUndefined(pull.merged_at) ?? null;
+      if (state !== "open" && !mergedAt) continue;
+      if (!hasSupersessionSignal) continue;
+      return {
+        number,
+        title: stringOrUndefined(pull.title) ?? `PR #${number}`,
+        url: stringOrUndefined(pull.html_url) ?? pullRequestUrlForNumber(number),
+        state,
+        mergedAt,
+      };
+    } catch {
+      // Missing or cross-repo stale references are not close evidence.
+    }
+  }
+  return null;
+}
+
+function recommendedPauseOrCloseOption(markdown: string): MergeRiskOption | null {
+  return (
+    mergeRiskOptionsFromReport(markdown).find(
+      (option) => option.category === "pause_or_close" && option.recommended,
+    ) ?? null
+  );
+}
+
+function staleFRatedPullRequestPromotion(
+  markdown: string,
+  item: Item,
+  staleMinAgeDays: number,
+): PullRequestClosePromotion | null {
+  const proof = reportRealBehaviorProof(markdown);
+  const rating = reportPrRating(markdown);
+  if (rating.overallTier !== "F") return null;
+  if (!isOlderThanDays(item.createdAt, staleMinAgeDays)) return null;
+  if (
+    proof.status !== "missing" &&
+    proof.status !== "mock_only" &&
+    proof.status !== "insufficient" &&
+    rating.proofTier !== "F"
+  ) {
+    return null;
+  }
+  return {
+    bestSolution:
+      "Close this stale PR. The latest review rated it F, the branch still lacks merge-ready proof, and there has been no human follow-up after the durable review.",
+    evidence: [
+      `- **stale F-rated PR:** PR was opened ${item.createdAt}, is older than ${staleMinAgeDays} days, and the latest review rated it \`F\`.`,
+      `- **proof blocker:** real behavior proof is \`${proof.status}\` and proof tier is \`${rating.proofTier}\`, so this branch is not merge-ready without contributor follow-up.`,
+      "- **no human follow-up:** live comments and timeline hydrated by apply contain no non-automation activity after the ClawSweeper review.",
+    ].join("\n"),
+    closeComment:
+      "Thanks for the contribution. I’m closing this stale PR because the latest ClawSweeper review rated it F, it still lacks the proof or branch shape needed for merge, and there has been no human follow-up after the review. A fresh PR against current `main` with the requested proof is the right next step.",
+  };
+}
+
+function pauseOrClosePromotion(
+  markdown: string,
+  item: Item,
+  staleMinAgeDays: number,
+): PullRequestClosePromotion | null {
+  const option = recommendedPauseOrCloseOption(markdown);
+  if (!option || !isOlderThanDays(item.createdAt, staleMinAgeDays)) return null;
+  return {
+    bestSolution: `Close this stale PR as superseded: ${option.title}. ${option.body}`,
+    evidence: [
+      `- **recommended close path:** the latest review's recommended merge-risk option is \`${option.title}\`, categorized as \`pause_or_close\`.`,
+      `- **stale PR:** PR was opened ${item.createdAt}, which is older than the ${staleMinAgeDays}-day stale promotion threshold.`,
+      "- **no human follow-up:** live comments and timeline hydrated by apply contain no non-automation activity after the ClawSweeper review.",
+    ].join("\n"),
+    closeComment: `Thanks for the contribution. I’m closing this stale PR because the latest ClawSweeper review recommended the pause/close path: ${option.title}. ${option.body}`,
+  };
+}
+
+function linkedPullRequestSupersessionPromotion(
+  markdown: string,
+  item: Item,
+): PullRequestClosePromotion | null {
+  const linkedPull = linkedPullRequestSupersession(markdown, item);
+  if (!linkedPull) return null;
+  const stateText = linkedPull.mergedAt
+    ? `merged at ${linkedPull.mergedAt}`
+    : "still open as the canonical replacement";
+  return {
+    bestSolution: `Close this PR as superseded by ${linkedPull.url}.`,
+    evidence: [
+      `- **linked superseding PR:** ${linkedPull.url} (${linkedPull.title}) is ${stateText}.`,
+      "- **cluster evidence:** the durable review links that PR in the work cluster or recommended risk path.",
+      "- **no human follow-up:** live comments and timeline hydrated by apply contain no non-automation activity after the ClawSweeper review.",
+    ].join("\n"),
+    closeComment: `Thanks for the contribution. I’m closing this PR as superseded by ${linkedPull.url}, which is ${stateText}.`,
+  };
+}
+
+function pullRequestClosePromotion(
+  markdown: string,
+  item: Item,
+  context: ItemContext,
+  staleMinAgeDays: number,
+): PullRequestClosePromotion | null {
+  if (item.kind !== "pull_request") return null;
+  if (frontMatterValue(markdown, "decision") !== "keep_open") return null;
+  if (frontMatterValue(markdown, "action_taken") !== "kept_open") return null;
+  if (frontMatterValue(markdown, "review_status") !== "complete") return null;
+  if (closePromotionHasNonAutomationActivityAfterReview(markdown, context)) return null;
+  return (
+    linkedPullRequestSupersessionPromotion(markdown, item) ??
+    pauseOrClosePromotion(markdown, item, staleMinAgeDays) ??
+    staleFRatedPullRequestPromotion(markdown, item, staleMinAgeDays)
+  );
+}
+
 function workPlanPathForReport(file: string, plansDir = defaultPlansDir()): string {
   return join(plansDir, basename(file));
 }
@@ -11575,8 +11830,8 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     const decision = frontMatterValue(markdown, "decision");
     let closeReason = frontMatterValue(markdown, "close_reason") as CloseReason | undefined;
     const action = frontMatterValue(markdown, "action_taken");
-    const storedHash = frontMatterValue(markdown, "item_snapshot_hash");
-    const storedUpdatedAt = frontMatterValue(markdown, "item_updated_at");
+    let storedHash = frontMatterValue(markdown, "item_snapshot_hash");
+    let storedUpdatedAt = frontMatterValue(markdown, "item_updated_at");
     const storedAuthorAssociation = frontMatterValue(markdown, "author_association");
     const shouldProbeClosedState = shouldProbeClosedStateReport(markdown);
     const isRetryableSkippedClose = isRetryableCloseSkipReport(markdown);
@@ -11871,6 +12126,33 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       markdown = upgradeNoDiffPullRequestReport(markdown, item);
       closeReason = "duplicate_or_superseded";
       isCloseProposal = true;
+    }
+    if (
+      state === "open" &&
+      !isCloseProposal &&
+      item.kind === "pull_request" &&
+      decision === "keep_open" &&
+      action === "kept_open"
+    ) {
+      const promotionContext = currentItemContext();
+      const promotion = pullRequestClosePromotion(
+        markdown,
+        item,
+        promotionContext,
+        staleMinAgeDays,
+      );
+      if (promotion) {
+        markdown = upgradePullRequestClosePromotionReport(
+          markdown,
+          item,
+          promotionContext,
+          promotion,
+        );
+        storedUpdatedAt = item.updatedAt;
+        storedHash = itemSnapshotHash(item, promotionContext);
+        closeReason = "duplicate_or_superseded";
+        isCloseProposal = true;
+      }
     }
     let currentPrStatusKind: PrStatusLabelKind | null = null;
     if (state === "open" && item.kind === "pull_request") {
