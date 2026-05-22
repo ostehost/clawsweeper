@@ -54,6 +54,8 @@ checkpoint, and status-only commits are intentionally omitted.
   other protected-label and non-fixed maintainer closes blocked.
 - Retried legacy `skipped_maintainer_authored` and `skipped_invalid_decision`
   reports when they are now verified `implemented_on_main` close candidates.
+- Retried older `kept_open` close reports and cleared linked-PR issue blockers
+  after ClawSweeper closes the linked PR earlier in the same apply run.
 - Archived live-closed skipped apply records from `items/` during apply so the
   open-state dashboard sheds stale records faster.
 - Kept stale GitHub Actions queued ghosts out of the live dashboard capacity and pipeline counts after GitHub leaves old queued runs around for hours.

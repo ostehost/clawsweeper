@@ -1187,6 +1187,7 @@ const RETRYABLE_CLOSE_SKIP_ACTIONS = new Set<string>([
   "skipped_maintainer_authored",
   "skipped_invalid_decision",
 ]);
+const PAIR_BLOCKED_CLOSE_ACTIONS = new Set<string>(["skipped_open_closing_pr"]);
 const CLOSED_STATE_PROBE_ACTIONS = new Set<string>([
   "skipped_already_closed",
   "skipped_changed_since_review",
@@ -2533,7 +2534,7 @@ function closingPullRequestsForIssue(number: number): unknown[] {
   const pullRequests: unknown[] = [];
   for (const reference of closingPullRequestReferencesForIssue(number)) {
     try {
-      pullRequests.push(
+      const pull = asRecord(
         ghJson<unknown>([
           "api",
           `repos/${reference.repo}/pulls/${reference.number}`,
@@ -2541,6 +2542,7 @@ function closingPullRequestsForIssue(number: number): unknown[] {
           "{number,title,state,html_url,body,user:{login:.user.login},merged:.merged,merged_at:.merged_at,merge_commit_sha:.merge_commit_sha,head:{ref:.head.ref,sha:.head.sha},base:{ref:.base.ref,sha:.base.sha}}",
         ]),
       );
+      pullRequests.push({ ...pull, repo: reference.repo });
     } catch (error) {
       if (!isGitHubNotFoundError(error)) throw error;
       console.error(
@@ -2551,15 +2553,23 @@ function closingPullRequestsForIssue(number: number): unknown[] {
   return pullRequests;
 }
 
-export function openClosingPullRequestApplyReason(pullRequests: readonly unknown[]): string | null {
+export function openClosingPullRequestApplyReason(
+  pullRequests: readonly unknown[],
+  canPairClose?: (number: number, repo?: string) => boolean,
+): string | null {
   const openPulls = pullRequests
     .map(asRecord)
     .filter((pull) => typeof pull.state === "string" && pull.state.toLowerCase() === "open")
     .map((pull) => ({
       number: typeof pull.number === "number" ? pull.number : null,
+      repo: typeof pull.repo === "string" ? pull.repo : undefined,
       title: typeof pull.title === "string" ? pull.title : "",
     }))
-    .filter((pull): pull is { number: number; title: string } => pull.number !== null);
+    .filter(
+      (pull): pull is { number: number; repo: string | undefined; title: string } =>
+        pull.number !== null,
+    )
+    .filter((pull) => !canPairClose?.(pull.number, pull.repo));
   const first = openPulls[0];
   if (!first) return null;
   const suffix = openPulls.length > 1 ? ` and ${openPulls.length - 1} other open PR(s)` : "";
@@ -2880,9 +2890,14 @@ function itemKindLabel(kind: ItemKind): string {
   return kind === "pull_request" ? "PR" : "issue";
 }
 
+function pairCloseKey(repo: string, number: number): string {
+  return `${repo}#${number}`;
+}
+
 export function sameAuthorCounterpartApplyReason(
   item: Pick<Item, "number" | "kind" | "author">,
   relatedItems: readonly unknown[],
+  canPairClose?: (number: number, kind: ItemKind) => boolean,
 ): string | null {
   const itemAuthor = normalizeAuthorLogin(item.author);
   if (!itemAuthor) return null;
@@ -2892,6 +2907,7 @@ export function sameAuthorCounterpartApplyReason(
     if (!related.kind || related.kind === item.kind) continue;
     if (related.state !== "open") continue;
     if (related.author !== itemAuthor) continue;
+    if (canPairClose?.(related.number, related.kind)) continue;
     return `open ${itemKindLabel(related.kind)} #${related.number}${related.title ? ` (${related.title})` : ""} by the same author is paired with this ${itemKindLabel(item.kind)}`;
   }
   return null;
@@ -3205,11 +3221,29 @@ function isRetryableCloseSkipReport(markdown: string): boolean {
   );
 }
 
+function isRetryableKeptOpenCloseReport(markdown: string): boolean {
+  return (
+    frontMatterValue(markdown, "action_taken") === "kept_open" &&
+    hasHighConfidenceAllowedCloseMetadata(markdown)
+  );
+}
+
+function isPairBlockedCloseReport(markdown: string): boolean {
+  const action = frontMatterValue(markdown, "action_taken");
+  return (
+    Boolean(action && PAIR_BLOCKED_CLOSE_ACTIONS.has(action)) &&
+    hasHighConfidenceAllowedCloseMetadata(markdown)
+  );
+}
+
 function isApplyCloseCandidateReport(markdown: string): boolean {
   const action = frontMatterValue(markdown, "action_taken");
   return (
     hasHighConfidenceAllowedCloseMetadata(markdown) &&
-    (action === "proposed_close" || isRetryableCloseSkipReport(markdown))
+    (action === "proposed_close" ||
+      isRetryableCloseSkipReport(markdown) ||
+      isRetryableKeptOpenCloseReport(markdown) ||
+      isPairBlockedCloseReport(markdown))
   );
 }
 
@@ -3223,6 +3257,7 @@ export function applyDecisionPriority(markdown: string, applyKind: ApplyKind): n
   const isCloseProposal =
     isApplyCloseCandidateReport(markdown) && hasAutoCloseAllowedMetadata(markdown);
   if (!isCloseProposal) return 2;
+  if (isPairBlockedCloseReport(markdown)) return 1;
   if (applyKind === "all" || itemKind === applyKind || !itemKind) return 0;
   return 1;
 }
@@ -11453,6 +11488,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         left.number - right.number,
     );
   const files = fileEntries.map((entry) => entry.name);
+  const closedThisRun = new Set<string>();
   if (fileEntries.length === 0 && !existsSync(itemsDir)) {
     console.log("No items directory.");
     recordMissingHatchResults(new Set());
@@ -11495,7 +11531,16 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     const storedAuthorAssociation = frontMatterValue(markdown, "author_association");
     const shouldProbeClosedState = shouldProbeClosedStateReport(markdown);
     const isRetryableSkippedClose = isRetryableCloseSkipReport(markdown);
+    const isUpgradedCloseCandidate =
+      isRetryableSkippedClose ||
+      isRetryableKeptOpenCloseReport(markdown) ||
+      isPairBlockedCloseReport(markdown);
     const verifiedLocalCheckout = hasVerifiedLocalCheckoutAccess(markdown);
+    const canClosePairCounterpartInThisRun = (
+      counterpartNumber: number,
+      counterpartRepo = repo,
+    ): boolean =>
+      counterpartRepo === repo && closedThisRun.has(pairCloseKey(repo, counterpartNumber));
     const archiveClosed = (nextMarkdown: string): void => {
       if (dryRun) return;
       ensureDir(closedDir);
@@ -11599,7 +11644,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     if (state === "open" && shouldProbeClosedState && !isCloseProposal) {
       continue;
     }
-    if (isRetryableSkippedClose) {
+    if (isUpgradedCloseCandidate) {
       markdown = replaceFrontMatterValue(markdown, "action_taken", "proposed_close");
     }
     let currentPrStatusKind: PrStatusLabelKind | null = null;
@@ -11887,6 +11932,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       currentClosingPullRequests ??= closingPullRequestsForIssue(number);
       const openClosingPullRequestReason = openClosingPullRequestApplyReason(
         currentClosingPullRequests,
+        (pullNumber, pullRepo) => canClosePairCounterpartInThisRun(pullNumber, pullRepo),
       );
       if (openClosingPullRequestReason) {
         if (markApplySkipped("skipped_open_closing_pr", openClosingPullRequestReason)) break;
@@ -11897,6 +11943,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       const sameAuthorCounterpartReason = sameAuthorCounterpartApplyReason(
         item,
         currentItemContext().relatedItems ?? [],
+        (counterpartNumber) => canClosePairCounterpartInThisRun(counterpartNumber),
       );
       if (sameAuthorCounterpartReason) {
         if (markApplySkipped("skipped_same_author_pair", sameAuthorCounterpartReason)) break;
@@ -12103,6 +12150,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           .join("; "),
       });
       logProgress(`would close #${number}`);
+      closedThisRun.add(pairCloseKey(repo, number));
       if (processedCount >= processedLimit) break;
       continue;
     }
@@ -12131,6 +12179,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       reason: [closeReasonText(closeReason), closeAppliedCommentReason].filter(Boolean).join("; "),
     });
     logProgress(`closed #${number}`);
+    closedThisRun.add(pairCloseKey(repo, number));
     if (processedCount >= processedLimit) break;
   }
   ensureDir(dirname(reportPath));

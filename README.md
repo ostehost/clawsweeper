@@ -131,7 +131,8 @@ ClawSweeper may propose a close only when the item is clearly one of these:
 Maintainer-authored items stay open unless ClawSweeper can verify that the
 request is already implemented on current `main`. Everything else stays open.
 Issues with an open PR that references them using GitHub closing syntax such as
-`Fixes #123` stay open until that PR merges or is closed.
+`Fixes #123` stay open until that PR merges, is closed, or ClawSweeper closes
+that high-confidence PR candidate earlier in the same apply run.
 Open issue/PR pairs from the same author stay open together unless the paired
 item is already resolved or a maintainer explicitly asks to close one side.
 
@@ -405,8 +406,10 @@ without rediscovering a date bucket.
 - Protected labels block close proposals.
 - Apply rechecks older skipped fixed-close reports and archives skipped item
   records when GitHub already shows the item closed.
+- Apply can retry older `kept_open` close reports and clear linked-PR issue
+  blockers after ClawSweeper closes the PR earlier in the same apply run.
 - Open PRs with GitHub closing references block issue closes until the PR is
-  resolved.
+  resolved or closed earlier in the same apply run.
 - Open same-author issue/PR pairs block one-sided closes.
 - Codex runs without GitHub write tokens.
 - Issue/PR event jobs create target write and report-push credentials only after
