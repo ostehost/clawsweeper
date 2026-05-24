@@ -3391,13 +3391,22 @@ function issueImplementationPrAction(report: LooseRecord) {
 }
 
 function issueImplementationTerminalOutcome(report: LooseRecord) {
-  return [...(report.actions ?? [])].reverse().find((action: JsonValue) => {
+  const actionOutcome = [...(report.actions ?? [])].reverse().find((action: JsonValue) => {
     const status = String(action?.status ?? "").toLowerCase();
     if (!["blocked", "skipped", "failed"].includes(status)) return false;
     return ["execute_fix", "open_fix_pr", "repair_contributor_branch"].includes(
       String(action?.action ?? ""),
     );
   });
+  if (actionOutcome) return actionOutcome;
+
+  const status = String(report.status ?? "").toLowerCase();
+  if (!["blocked", "skipped", "failed"].includes(status)) return null;
+  return {
+    action: "issue_implementation",
+    status,
+    reason: report.reason,
+  };
 }
 
 function issueImplementationTargetIssueNumber() {
