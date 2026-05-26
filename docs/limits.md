@@ -144,8 +144,8 @@ hot intake `31`, and commit review `4`. Existing repair lanes keep their
   clusters with at least 75% closed members are skipped unless
   `--skip-closed-percent` is overridden.
 - `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` overrides the scheduled
-  `repair-cluster-intake.yml` import limit. The default is `1` cluster every
-  hour; the upstream gitcrawl-store refreshes every 15 minutes, and ClawSweeper
+  `repair-cluster-intake.yml` import limit. The default is `1` cluster per daily
+  run; the upstream gitcrawl-store refreshes every 15 minutes, and ClawSweeper
   records the processed store SHA so repeated ticks against the same snapshot
   skip.
 - `CLAWSWEEPER_MAX_LIVE_WORKERS` overrides the `job_intent`-derived repair

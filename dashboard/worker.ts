@@ -21,7 +21,6 @@ const GITHUB_TIMEOUT_MS = 4500;
 const DEFAULT_STALE_QUEUED_WORKFLOW_MS = 6 * 60 * 60 * 1000;
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
 const CLUSTER_REPAIR_INTAKE_WORKFLOW = "repair-cluster-intake.yml";
-const CLUSTER_REPAIR_INTAKE_CRON = "8 * * * *";
 const CLAWSWEEPER_COMMAND_PATTERN =
   /(^|[ \t\r\n])@(?:clawsweeper|openclaw-clawsweeper)\b(?:\[bot\])?|(^|[ \t\r\n])\/(?:clawsweeper|review|re-review|rerun[ -]?review|status|explain|fix|build|implement|create[ -]?pr|fix[ -]?issue|autofix|auto[ -]?fix|automerge|auto[ -]?merge|approve|stop|autoclose)\b/i;
 const CLAWSWEEPER_ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -2113,7 +2112,6 @@ async function clusterRepairStatus(env, repo, targetRepos, activeRuns) {
   const intakeRuns = Array.isArray(workflowRuns?.workflow_runs) ? workflowRuns.workflow_runs : [];
   return {
     workflow: CLUSTER_REPAIR_INTAKE_WORKFLOW,
-    schedule: CLUSTER_REPAIR_INTAKE_CRON,
     markers,
     latest_runs: intakeRuns.slice(0, 5).map(workflowRunSummary),
     active_intake_runs: activeRuns
@@ -2167,7 +2165,6 @@ async function readClusterRepairMarker(env, repo, targetRepo) {
 function emptyClusterRepairStatus(targetRepos) {
   return {
     workflow: CLUSTER_REPAIR_INTAKE_WORKFLOW,
-    schedule: CLUSTER_REPAIR_INTAKE_CRON,
     markers: targetRepos.map((targetRepo) => ({
       target_repo: targetRepo,
       marker_path: `results/cluster-repair-intake/${String(targetRepo).replace(/\//g, "-")}.json`,
@@ -3879,6 +3876,9 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   align-items: center;
   padding: 12px 14px;
 }
+.cluster-marker-row {
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 260px);
+}
 .side-row {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
@@ -4168,12 +4168,12 @@ function renderClusterRepair(cluster) {
   const markerRows = (cluster.markers || []).map(marker => {
     const jobs = (marker.generated_jobs || []).slice(0, 3).map(job => '<span class="pill mono">' + esc(job.split("/").pop() || job) + '</span>').join("");
     const jobText = marker.generated_count ? fmt.format(marker.generated_count) + " job" + (marker.generated_count === 1 ? "" : "s") : "no jobs";
-    return '<article class="work-row"><div class="work-main"><div class="row-top"><span class="pill">' + esc(marker.status || "unknown") + '</span><span class="item-link">' + esc(marker.target_repo || "unknown repo") + '</span></div><div class="muted work-title">store ' + esc(marker.last_processed_store_short_sha || "unknown") + " · " + esc(jobText) + (marker.last_processed_store_exported_at ? " · exported " + esc(since(marker.last_processed_store_exported_at)) : "") + '</div><div class="row-top">' + jobs + '</div></div><div class="work-state"><div class="stage-block"><strong>' + esc(marker.updated_at ? since(marker.updated_at) : "never") + '</strong><span class="muted">marker</span></div>' + linkClass(marker.run_url, "run", "pill run-link") + '</div><div class="timebox"><strong>60m</strong><span>tick</span></div></article>';
+    return '<article class="work-row cluster-marker-row"><div class="work-main"><div class="row-top"><span class="pill">' + esc(marker.status || "unknown") + '</span><span class="item-link">' + esc(marker.target_repo || "unknown repo") + '</span></div><div class="muted work-title">store ' + esc(marker.last_processed_store_short_sha || "unknown") + " · " + esc(jobText) + (marker.last_processed_store_exported_at ? " · exported " + esc(since(marker.last_processed_store_exported_at)) : "") + '</div><div class="row-top">' + jobs + '</div></div><div class="work-state"><div class="stage-block"><strong>' + esc(marker.updated_at ? since(marker.updated_at) : "never") + '</strong><span class="muted">marker</span></div>' + linkClass(marker.run_url, "run", "pill run-link") + '</div></article>';
   }).join("");
   const runRows = (cluster.latest_runs || []).slice(0, 3).map(run => '<article class="side-row"><div class="side-main">' + linkClass(run.url, compactText(run.title || run.workflow), "item-link") + '<div class="muted side-title">' + esc(run.status || "") + (run.conclusion ? " · " + esc(run.conclusion) : "") + '</div></div><div class="side-meta"><span>' + esc(run.started_at ? since(run.started_at) : "") + '</span></div></article>').join("");
   const activeText = fmt.format((cluster.active_intake_runs || []).length) + " intake · " + fmt.format((cluster.active_worker_runs || []).length) + " workers";
   target.innerHTML =
-    '<div class="split"><div class="pipeline-col"><div class="muted" style="margin-bottom:8px">Runs on ' + esc(cluster.workflow || "repair-cluster-intake.yml") + " at " + esc(cluster.schedule || "8 * * * *") + " · " + esc(activeText) + '</div><div class="work-list">' + (markerRows || '<div class="empty">No processed-store markers yet.</div>') + '</div></div><aside class="side-col"><div class="muted" style="margin-bottom:8px">Recent intake workflow runs</div><div class="side-list">' + (runRows || '<div class="empty">No intake runs found.</div>') + '</div></aside></div>';
+    '<div class="split"><div class="pipeline-col"><div class="muted" style="margin-bottom:8px">Runs on ' + esc(cluster.workflow || "repair-cluster-intake.yml") + " · " + esc(activeText) + '</div><div class="work-list">' + (markerRows || '<div class="empty">No processed-store markers yet.</div>') + '</div></div><aside class="side-col"><div class="muted" style="margin-bottom:8px">Recent intake workflow runs</div><div class="side-list">' + (runRows || '<div class="empty">No intake runs found.</div>') + '</div></aside></div>';
 }
 function renderAutomerge(rows) {
   if (!rows.length) {

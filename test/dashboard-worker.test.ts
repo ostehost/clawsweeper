@@ -49,7 +49,6 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.match(html, /✅ Closed by ClawSweeper/);
   assert.match(html, /📡 Recent Activity/);
   assert.ok(html.indexOf("🔎 Cluster Intake") > html.indexOf("📡 Recent Activity"));
-  assert.match(html, /<strong>60m<\/strong><span>tick<\/span>/);
   assert.doesNotMatch(html, /ðŸ|â|âš|âœ/);
 });
 
@@ -121,7 +120,7 @@ test("dashboard exposes scheduled cluster intake markers and runs", async () => 
     assert.equal(response.status, 200);
     const status = await response.json();
     assert.equal(status.recent.cluster_repair.workflow, "repair-cluster-intake.yml");
-    assert.equal(status.recent.cluster_repair.schedule, "8 * * * *");
+    assert.equal("schedule" in status.recent.cluster_repair, false);
     assert.equal(status.recent.cluster_repair.markers[0].status, "imported");
     assert.equal(status.recent.cluster_repair.markers[0].generated_count, 1);
     assert.equal(

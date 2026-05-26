@@ -590,7 +590,7 @@ Important gates:
   75% closed members by default; `--skip-closed-percent` is the explicit
   override.
 - `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT`: scheduled imported-cluster intake
-  limit; default `1` cluster per hourly `repair-cluster-intake.yml` run.
+  limit; default `1` cluster per daily `repair-cluster-intake.yml` run.
   The upstream `openclaw/gitcrawl-store` refreshes `openclaw/openclaw` every 15
   minutes, so the intake records the processed portable DB SHA in
   `results/cluster-repair-intake/<repo>.json` and skips duplicate ticks against

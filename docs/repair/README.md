@@ -250,7 +250,7 @@ pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous 
 
 # Automatic imported-cluster intake runs through repair-cluster-intake.yml.
 # gitcrawl-store refreshes openclaw/openclaw every 15 minutes; the ClawSweeper
-# intake runs hourly, records the processed portable DB SHA in
+# intake runs daily, records the processed portable DB SHA in
 # results/cluster-repair-intake/<repo>.json, and skips repeated ticks for the
 # same store snapshot. It imports at most one cluster by default and dispatches
 # through the one-worker cluster_repair lane.
@@ -359,7 +359,7 @@ The workflow needs:
   75% closed members by default; pass `--skip-closed-percent` only for an
   intentional broader import.
 - optional `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` variable for the scheduled
-  imported-cluster intake; default is `1` cluster per hourly run.
+  imported-cluster intake; default is `1` cluster per daily run.
 - merge is separately gated by `CLAWSWEEPER_ALLOW_MERGE`, which defaults to `0`; merge-ready PRs are labeled `clawsweeper:human-review` and `clawsweeper:merge-ready` for a maintainer to merge manually when the global gate is closed
 - optional `CLAWSWEEPER_CODEX_CLI_VERSION` variable to pin and refresh the cached Codex CLI
 - optional `CLAWSWEEPER_MODEL` override for dispatch scripts; default Codex
