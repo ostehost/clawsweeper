@@ -9820,6 +9820,64 @@ ${routineCiRisk}
   );
 });
 
+test("pull request next step does not priority-prefix routine required status checks", () => {
+  const routineStatusSteps = [
+    "Merge after required status checks are green.",
+    "Merge after required checks pass.",
+    "Merge after status checks pass.",
+    "Merge once required checks have passed.",
+    "Wait for status checks to pass.",
+    "Merge after required checks.",
+    "Wait for required checks.",
+    "Merge after required checks pass and no failures are seen.",
+    "Merge after required checks pass without failures.",
+    "Merge after required checks pass without any failures.",
+    "CI checks pass without test failures.",
+    "Merge after required checks pass without any test failures.",
+    "CI checks pass but no failures are seen.",
+    "CI checks pass but maintainer review is still required.",
+    "Required checks pass and required approvals are complete.",
+    "CI checks are red but may pass on rerun.",
+    "Merge after required checks and maintainer review.",
+  ];
+  for (const routineStatusStep of routineStatusSteps) {
+    const comment = renderReviewCommentFromReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74273",
+        decision: "keep_open",
+        close_reason: "none",
+        work_candidate: "none",
+        pull_head_sha: "abc123def460",
+      })}
+
+## Summary
+
+Keep this PR open until normal merge gates pass.
+
+## What This Changes
+
+Updates review guidance.
+
+## Best Possible Solution
+
+${routineStatusStep}
+`,
+      "none",
+    );
+
+    assert.match(comment, /\*\*Next step before merge\*\*/);
+    assert.match(
+      comment,
+      new RegExp(`- ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+    );
+    assert.doesNotMatch(
+      comment,
+      new RegExp(`\\[P[12]\\] ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+    );
+  }
+});
+
 test("pull request risk text keeps diff-caused CI risk actionable", () => {
   const actionableCiRisk = "The workflow change could cause CI checks to fail after merge.";
   const comment = renderReviewCommentFromReport(
@@ -9858,20 +9916,123 @@ ${actionableCiRisk}
   );
 });
 
-test("pull request risk text keeps diff-caused status and required check risks actionable", () => {
-  const riskLines = [
-    "The workflow change could cause status checks to fail after merge.",
-    "The workflow change could cause required checks to fail after merge.",
+test("pull request risk text keeps diff-caused status-check risk actionable", () => {
+  const actionableStatusRisk = "The workflow change could cause status checks to fail after merge.";
+  const comment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "74271",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "abc123def458",
+    })}
+
+## Summary
+
+Keep this PR open while maintainers verify workflow behavior.
+
+## What This Changes
+
+Updates workflow handling.
+
+## Best Possible Solution
+
+Merge after the status-check risk is addressed.
+
+## Risks / Open Questions
+
+${actionableStatusRisk}
+`,
+    "none",
+  );
+
+  assert.match(comment, /\*\*Risk before merge\*\*/);
+  assert.match(
+    comment,
+    new RegExp(`- \\[P1\\] ${actionableStatusRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+  );
+});
+
+test("pull request risk text keeps diff-caused required-check risk actionable", () => {
+  const actionableRequiredRisk =
+    "The workflow change could cause required checks to fail after merge.";
+  const comment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "74272",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "abc123def459",
+    })}
+
+## Summary
+
+Keep this PR open while maintainers verify workflow behavior.
+
+## What This Changes
+
+Updates workflow handling.
+
+## Best Possible Solution
+
+Merge after the required-check risk is addressed.
+
+## Risks / Open Questions
+
+${actionableRequiredRisk}
+`,
+    "none",
+  );
+
+  assert.match(comment, /\*\*Risk before merge\*\*/);
+  assert.match(
+    comment,
+    new RegExp(`- \\[P1\\] ${actionableRequiredRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+  );
+});
+
+test("pull request risk text keeps broken passing-check risk actionable", () => {
+  const actionablePassingRisks = [
+    "The workflow change makes required checks pass even when tests fail.",
+    "CI checks are passing despite tests failing.",
+    "Security exposure remains even though status checks are green.",
+    "CI checks are green but snapshot drift blocks merge.",
+    "CI checks are green but the app crashes on startup.",
+    "Status checks pass despite data loss.",
+    "CI checks pass without running tests for the changed path.",
+    "CI checks pass with tests disabled.",
+    "Required checks pass after skipping the changed-path tests.",
+    "CI checks pass without failures, but required docs are missing.",
+    "CI checks pass and tests fail.",
+    "Required checks pass and required docs are missing.",
+    "Required checks pass and required approvals are complete, but required docs are missing.",
+    "CI checks pass and required approvals are complete, but coverage is too low.",
+    "CI checks pass because tests are mock-only.",
+    "Status checks pass because validation is stubbed.",
+    "CI checks pass but maintainer review is still required because tests were skipped.",
+    "CI checks pass and required approvals are complete, but tests are disabled.",
+    "CI checks pass with no tests for the changed path.",
+    "CI checks are green with no validation.",
+    "CI checks pass with only mocked tests.",
+    "CI checks pass with insufficient coverage.",
+    "CI checks pass and no tests run for this path.",
+    "CI checks pass and no validation runs.",
+    "CI checks pass and do not run tests for the changed path.",
+    "CI checks pass and tests do not cover the changed path.",
+    "CI checks pass and the changed path is untested.",
+    "CI checks pass and a manual data migration is required before merge.",
   ];
-  for (const [index, riskLine] of riskLines.entries()) {
+  for (const actionablePassingRisk of actionablePassingRisks) {
     const comment = renderReviewCommentFromReport(
       `${reportFrontMatter({
         type: "pull_request",
-        number: String(74271 + index),
+        number: "74274",
         decision: "keep_open",
         close_reason: "none",
         work_candidate: "none",
-        pull_head_sha: `abc123def45${8 + index}`,
+        pull_head_sha: "abc123def461",
       })}
 
 ## Summary
@@ -9884,11 +10045,11 @@ Updates workflow handling.
 
 ## Best Possible Solution
 
-Merge after the workflow risk is addressed.
+Merge after the required-check risk is addressed.
 
 ## Risks / Open Questions
 
-${riskLine}
+${actionablePassingRisk}
 `,
       "none",
     );
@@ -9896,7 +10057,7 @@ ${riskLine}
     assert.match(comment, /\*\*Risk before merge\*\*/);
     assert.match(
       comment,
-      new RegExp(`- \\[P1\\] ${riskLine.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+      new RegExp(`- \\[P[01]\\] ${actionablePassingRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
     );
   }
 });

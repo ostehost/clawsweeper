@@ -7061,8 +7061,57 @@ function isActionablePriorityText(text: string): boolean {
 }
 
 function isRoutineCiOrReviewText(text: string): boolean {
-  return /\b(?:no automated repair|no clawsweeper repair|normal maintainer review|maintainer review and ci|ready for maintainer review|flaky ci|red ci|required checks are green|status checks are green|unrelated (?:ci|status checks?|required checks?)|(?:ci(?:\/status)?|status|required) checks? (?:are|were|is|was|remain|remains) (?:green|red|failing|pending|missing|flaky|unrelated))\b/i.test(
-    stripPriorityPrefix(text),
+  const body = stripPriorityPrefix(text);
+  const mentionsCheckState =
+    /\b(?:ci|status|required(?: status)?)(?:\/status)? checks?(?:(?:\s+(?:are|were|is|was|remain|remains))?\s+(?:green|passing|pass(?:es|ed|ing)?)|\s+(?:have|has)\s+passed|\s+to\s+pass)\b/i.test(
+      body,
+    );
+  const hasCheckStateContrast = /\b(?:although|but|despite|even though|even when|while)\b/i.test(
+    body,
+  );
+  const checkContrastRemainder = body
+    .replace(
+      /\b(?:ci|status|required(?: status)?)(?:\/status)? checks?(?:(?:\s+(?:are|were|is|was|remain|remains))?\s+(?:green|passing|pass(?:es|ed|ing)?)|\s+(?:have|has)\s+passed|\s+to\s+pass)?\b/gi,
+      "",
+    )
+    .replace(/\b(?:no|without) (?:any )?(?:test )?failures?\b/gi, "")
+    .replace(
+      /\b(?:maintainer review is still required|required approvals? (?:are )?complete)\b/gi,
+      "",
+    );
+  const hasSeparateContrastBlocker =
+    /\b(?:add|before merge|block(?:s|ed|ing)?|blocker|break(?:s|ing)?|broken|cover(?:s|ed|ing)?|coverage|crash(?:es|ed|ing)?|data loss|exposure|fail(?:s|ed|ing)?|fix|gap|implement|low|missing|must|need(?:s|ed)?|quality|required|risk|security|test-gap|unsafe|untested|validate|vulnerab(?:le|ility))\b/i.test(
+      checkContrastRemainder,
+    );
+  const isRoutineReviewOrApprovalGate =
+    !hasSeparateContrastBlocker &&
+    /\b(?:maintainer review is still required|required approvals? (?:are )?complete)\b/i.test(body);
+  if (
+    mentionsCheckState &&
+    (/\b(?:break(?:s|ing)?|broken|bypass(?:es|ed|ing)?|incorrect(?:ly)?|unsafe)\b/i.test(body) ||
+      /\b(?:disabled|did not run|do not run|not run(?:ning)?|skipp(?:ed|ing))\b/i.test(body) ||
+      /\bno\b.*\b(?:test(?:s|ing)?|validat(?:e|ed|es|ing|ion))\b.*\bruns?\b/i.test(body) ||
+      /\bwithout\b(?!\s+(?:any\s+)?(?:test\s+)?failures?\b)/i.test(body) ||
+      /\bwith (?:only )?(?:insufficient|limited|mock(?:ed)?|stub(?:bed)?|weak)\b.*\b(?:coverage|test(?:s|ing)?|validat(?:e|ed|es|ing|ion))\b/i.test(
+        body,
+      ) ||
+      /\bwith no\b.*\b(?:coverage|test(?:s|ing)?|validat(?:e|ed|es|ing|ion))\b/i.test(body) ||
+      /\bbecause\b.*\b(?:mock(?:ed|-only)?|stub(?:bed)?|test(?:s|ing)?|validat(?:e|ed|es|ing|ion))\b/i.test(
+        body,
+      ) ||
+      hasSeparateContrastBlocker ||
+      (hasCheckStateContrast &&
+        !isRoutineReviewOrApprovalGate &&
+        (!/\b(?:no|without) (?:any )?(?:test )?failures?\b/i.test(body) ||
+          hasSeparateContrastBlocker)))
+  ) {
+    return false;
+  }
+  if (mentionsCheckState && isRoutineReviewOrApprovalGate) {
+    return true;
+  }
+  return /\b(?:no automated repair|no clawsweeper repair|normal maintainer review|maintainer review and ci|ready for maintainer review|flaky ci|red ci|unrelated (?:ci|status checks?)|(?:ci|status|required(?: status)?)(?:\/status)? checks?(?:(?=\s*(?:and (?:maintainer review|required approvals?)|[.!?;,)]|$))| (?:(?:are|were|is|was|remain|remains) (?:green|passing|pass|red|failing|pending|missing|flaky|unrelated)|pass(?:es|ed)?|(?:have|has) passed|to pass)))\b/i.test(
+    body,
   );
 }
 
