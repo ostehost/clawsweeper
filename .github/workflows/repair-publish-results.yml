@@ -38,9 +38,11 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.repository.default_branch }}
           filter: blob:none
           fetch-depth: 0
           token: ${{ steps.app_token.outputs.token }}
+          persist-credentials: false
 
       - name: Create state token
         id: state-token
@@ -53,9 +55,50 @@ jobs:
         with:
           token: ${{ steps.state-token.outputs.token }}
 
-      - uses: ./.github/actions/setup-pnpm
+      - uses: actions/setup-node@v6
         with:
-          build-script: build:repair
+          node-version: "24"
+
+      - name: Enable pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          for attempt in 1 2 3; do
+            if corepack prepare "pnpm@10.33.2" --activate; then
+              exit 0
+            fi
+            sleep "$((attempt * 10))"
+          done
+          corepack prepare "pnpm@10.33.2" --activate
+
+      - name: Resolve pnpm store
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-10.33.2-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-10.33.2-
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if pnpm install --frozen-lockfile; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 10))"
+          done
+          pnpm run build:repair
 
       - name: Download worker artifacts
         id: download

@@ -3329,7 +3329,23 @@ function writeReport(report: LooseRecord, resultPath: string) {
     report.debug_artifacts = path.relative(repoRoot(), debugDir);
   }
   fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-  console.log(JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(reportLogSummary(report), null, 2));
+}
+
+function reportLogSummary(report: LooseRecord) {
+  return {
+    status: report.status ?? null,
+    reason: report.reason ?? null,
+    pr_url: report.pr_url ?? null,
+    branch: report.branch ?? null,
+    actions: (Array.isArray(report.actions) ? report.actions : []).map((action: JsonValue) => ({
+      action: action?.action ?? null,
+      status: action?.status ?? null,
+      reason: action?.reason ?? null,
+      target: action?.target ?? null,
+      pr_url: action?.pr_url ?? null,
+    })),
+  };
 }
 
 function appendIssueImplementationStatusComment(report: LooseRecord) {

@@ -10,7 +10,6 @@ const GH_TRANSIENT_PATTERNS = [
   /unexpected EOF/i,
   /connection reset by peer/i,
   /error connecting to api\.github\.com/i,
-  /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:500|502|503|504)\b/i,
   /bad gateway/i,
   /service unavailable/i,
   /gateway timeout/i,
@@ -27,6 +26,7 @@ const GH_TRANSIENT_PATTERNS = [
 export function ghRetryKind(error: unknown): GhRetryKind {
   const message = ghErrorText(error);
   if (GH_THROTTLE_PATTERNS.some((pattern) => pattern.test(message))) return "throttle";
+  if (hasGitHubStatus(message, [500, 502, 503, 504])) return "transient";
   if (GH_TRANSIENT_PATTERNS.some((pattern) => pattern.test(message))) return "transient";
   return "none";
 }
@@ -52,10 +52,7 @@ export function isGitHubNotFoundError(error: unknown): boolean {
 
 export function isGitHubRequiresAuthenticationError(error: unknown): boolean {
   const message = ghErrorText(error);
-  return (
-    /\b(?:HTTP|status(?: code)?)\s*:?\s*401\b/i.test(message) &&
-    /\brequires authentication\b/i.test(message)
-  );
+  return hasGitHubStatus(message, [401]) && /\brequires authentication\b/i.test(message);
 }
 
 export function ghRetryWaitMs(kind: GhRetryKind, attempt: number): number {
@@ -75,6 +72,23 @@ function ghErrorText(error: unknown): string {
     errorField(error, "stdout"),
     errorField(error, "stderr"),
   ].join("\n");
+}
+
+function hasGitHubStatus(message: string, statuses: readonly number[]): boolean {
+  const lower = message.toLowerCase();
+  return statuses.some((status) => {
+    const value = String(status);
+    return [
+      `http ${value}`,
+      `http: ${value}`,
+      `http:${value}`,
+      `status ${value}`,
+      `status: ${value}`,
+      `status code ${value}`,
+      `status code: ${value}`,
+      `status code:${value}`,
+    ].some((needle) => lower.includes(needle));
+  });
 }
 
 function errorField(error: unknown, field: "stdout" | "stderr"): string {
