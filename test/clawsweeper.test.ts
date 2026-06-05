@@ -77,8 +77,11 @@ import {
   protectedLabels,
   realBehaviorProofMediaLabelsForTest,
   realBehaviorProofSufficientLabelsForTest,
+  botProofCandidateRecordsForTest,
+  botProofEligibilityForTest,
   relatedGitHubIssueSearchQueryForTest,
   relatedTitleSearchTerms,
+  renderBotProofDecisionCommentForTest,
   renderProofNudgeCommentForTest,
   renderReviewStartStatusComment,
   reviewArtifactDestination,
@@ -14693,6 +14696,10 @@ function proofNudgeReport(overrides = {}) {
     proofSummary: "The PR needs after-fix proof from a real setup.",
     securityReviewStatus: "cleared",
     securityReviewSummary: "No security-sensitive review is needed for this proof nudge.",
+    mantisStatus: "not_recommended",
+    mantisScenario: "none",
+    mantisReason: "Mantis proof is not useful for this sample.",
+    mantisComment: "",
     ...overrides,
   };
   return `---
@@ -14726,6 +14733,16 @@ Summary: ${values.proofSummary}
 Status: ${values.securityReviewStatus}
 
 Summary: ${values.securityReviewSummary}
+
+## Mantis Recommendation
+
+Status: ${values.mantisStatus}
+
+Scenario: ${values.mantisScenario}
+
+Reason: ${values.mantisReason}
+
+Maintainer comment: ${values.mantisComment}
 `;
 }
 
@@ -14742,6 +14759,146 @@ function proofNudgeItem(overrides = {}) {
     ...overrides,
   });
 }
+
+test("bot proof candidate scan prioritizes ClawSweeper proof blockers", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    writeFileSync(
+      join(root, "41.md"),
+      proofNudgeReport({
+        number: 41,
+        author: "contributor",
+        reviewedAt: "2026-01-05T00:00:00Z",
+      }),
+    );
+    writeFileSync(
+      join(root, "42.md"),
+      proofNudgeReport({
+        author: "app/clawsweeper",
+        reviewedAt: "2026-01-01T00:00:00Z",
+      }),
+    );
+
+    assert.deepEqual(
+      botProofCandidateRecordsForTest(root).map((candidate) => candidate.number),
+      [42, 41],
+    );
+    assert.deepEqual(
+      botProofCandidateRecordsForTest(root, [41]).map((candidate) => candidate.number),
+      [41],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bot proof handling selects maintainer or Mantis proof path for ClawSweeper PRs", () => {
+  const baseOptions = {
+    item: proofNudgeItem({
+      author: "app/clawsweeper",
+      labels: ["triage: needs-real-behavior-proof", "status: 📣 needs proof", "stale"],
+    }),
+    headSha: "abc123def456",
+  };
+  const decision = botProofEligibilityForTest({
+    ...baseOptions,
+    markdown: proofNudgeReport({ author: "app/clawsweeper" }),
+  });
+  assert.equal(decision.eligible, true);
+  assert.equal(decision.action, "bot_proof_decision_planned");
+
+  const mantis = botProofEligibilityForTest({
+    ...baseOptions,
+    markdown: proofNudgeReport({
+      author: "app/clawsweeper",
+      mantisStatus: "recommended",
+      mantisScenario: "visual_task",
+      mantisReason: "A visual proof task would show the fixed Control UI behavior.",
+      mantisComment: "@openclaw-mantis capture Control UI proof for this PR",
+    }),
+  });
+  assert.equal(mantis.eligible, true);
+  assert.equal(mantis.action, "bot_proof_mantis_request_planned");
+
+  assert.equal(
+    botProofEligibilityForTest({
+      item: proofNudgeItem({
+        author: "clawsweeper[bot]",
+        labels: ["status: 📣 needs proof"],
+      }),
+      markdown: proofNudgeReport({ author: "app/clawsweeper" }),
+      headSha: "abc123def456",
+    }).action,
+    "bot_proof_decision_planned",
+  );
+});
+
+test("bot proof handling skips overrides, stale heads, drafts, and non-ClawSweeper PRs", () => {
+  const baseItem = proofNudgeItem({
+    author: "app/clawsweeper",
+    labels: ["triage: needs-real-behavior-proof"],
+  });
+  assert.equal(
+    botProofEligibilityForTest({
+      item: proofNudgeItem({ author: "contributor" }),
+      markdown: proofNudgeReport(),
+      headSha: "abc123def456",
+    }).action,
+    "skipped_not_bot_authored",
+  );
+  assert.equal(
+    botProofEligibilityForTest({
+      item: baseItem,
+      markdown: proofNudgeReport({ author: "app/clawsweeper" }),
+      headSha: "abc123def456",
+      draft: true,
+    }).action,
+    "skipped_draft",
+  );
+  for (const label of ["proof: override", "proof: supplied", "proof: sufficient"] as const) {
+    assert.equal(
+      botProofEligibilityForTest({
+        item: proofNudgeItem({
+          author: "app/clawsweeper",
+          labels: ["triage: needs-real-behavior-proof", label],
+        }),
+        markdown: proofNudgeReport({ author: "app/clawsweeper" }),
+        headSha: "abc123def456",
+      }).action,
+      "skipped_policy_exempt",
+    );
+  }
+  assert.equal(
+    botProofEligibilityForTest({
+      item: baseItem,
+      markdown: proofNudgeReport({ author: "app/clawsweeper", headSha: "oldhead" }),
+      headSha: "newhead",
+    }).action,
+    "skipped_stale_report_head",
+  );
+});
+
+test("bot proof status comment asks maintainers without contributor nudge copy", () => {
+  const markdown = proofNudgeReport({
+    author: "app/clawsweeper",
+    mantisStatus: "recommended",
+    mantisScenario: "visual_task",
+    mantisReason: "A visual proof task would show the fixed Control UI behavior.",
+    mantisComment: "@openclaw-mantis capture Control UI proof for this PR",
+  });
+  const comment = renderBotProofDecisionCommentForTest({
+    number: 42,
+    headSha: "abc123def456",
+    markdown,
+  });
+
+  assert.match(comment, /ClawSweeper-authored replacement PR is blocked on real behavior proof/);
+  assert.match(comment, /proof: override/);
+  assert.match(comment, /@openclaw-mantis capture Control UI proof/);
+  assert.match(comment, /<!-- clawsweeper-bot-proof-decision item="42" sha="abc123def456"/);
+  assert.doesNotMatch(comment, /thanks for the PR/);
+  assert.doesNotMatch(comment, /Once proof is added/);
+});
 
 test("proof nudge candidate scan defers proof-label checks to live PR state", () => {
   const root = mkdtempSync(tmpPrefix);
@@ -15367,6 +15524,11 @@ test("ClawSweeper PR status label scheme exposes workflow states", () => {
       { kind: "re_review_loop", name: "status: 🔁 re-review loop", color: "8250DF" },
       { kind: "actively_grinding", name: "status: 🛠️ actively grinding", color: "0969DA" },
       { kind: "needs_proof", name: "status: 📣 needs proof", color: "D93F0B" },
+      {
+        kind: "needs_maintainer_proof_decision",
+        name: "status: needs maintainer proof decision",
+        color: "D93F0B",
+      },
       { kind: "waiting_on_author", name: "status: ⏳ waiting on author", color: "FBCA04" },
       {
         kind: "ready_for_maintainer_look",

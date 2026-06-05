@@ -14,6 +14,7 @@
     "apply-artifacts": "node dist/clawsweeper.js apply-artifacts",
     "apply-decisions": "node dist/clawsweeper.js apply-decisions",
     "proof-nudges": "node dist/clawsweeper.js proof-nudges",
+    "bot-proof": "node dist/clawsweeper.js bot-proof",
     "audit": "node dist/clawsweeper.js audit",
     "reconcile": "node dist/clawsweeper.js reconcile",
     "status": "node dist/clawsweeper.js status",

@@ -29,6 +29,14 @@ on:
         description: "Optional comma-separated PR numbers to inspect first"
         required: false
         default: ""
+      bot_proof:
+        description: "Also inspect bot-owned PRs blocked on real behavior proof"
+        required: false
+        default: "false"
+      bot_proof_execute:
+        description: "Post bot-owned proof status comments and labels; false runs dry-run only"
+        required: false
+        default: "false"
   schedule:
     - cron: "0 10 * * *"
 
@@ -111,6 +119,8 @@ jobs:
           PROOF_NUDGES_LIMIT: ${{ github.event.inputs.limit || vars.CLAWSWEEPER_PROOF_NUDGES_LIMIT || '10' }}
           PROOF_NUDGES_MIN_AGE_DAYS: ${{ github.event.inputs.min_age_days || vars.CLAWSWEEPER_PROOF_NUDGES_MIN_AGE_DAYS || '5' }}
           PROOF_NUDGES_COOLDOWN_DAYS: ${{ github.event.inputs.cooldown_days || vars.CLAWSWEEPER_PROOF_NUDGES_COOLDOWN_DAYS || '7' }}
+          BOT_PROOF_ENABLED: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.bot_proof == 'true') || (github.event_name == 'schedule' && vars.CLAWSWEEPER_BOT_PROOF_SCHEDULED == '1') }}
+          BOT_PROOF_EXECUTE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.bot_proof_execute == 'true') || (github.event_name == 'schedule' && vars.CLAWSWEEPER_BOT_PROOF_EXECUTE == '1') }}
         run: |
           set -euo pipefail
           for numeric_input in PROOF_NUDGES_LIMIT PROOF_NUDGES_MIN_AGE_DAYS PROOF_NUDGES_COOLDOWN_DAYS; do
@@ -141,9 +151,24 @@ jobs:
             "${item_numbers_arg[@]}" \
             "${execute_arg[@]}"
 
+          if [ "$BOT_PROOF_ENABLED" = "true" ]; then
+            bot_proof_execute_arg=()
+            if [ "$BOT_PROOF_EXECUTE" = "true" ]; then
+              bot_proof_execute_arg=(--execute)
+            fi
+            pnpm run bot-proof -- \
+              --target-repo "$TARGET_REPO" \
+              --limit "$PROOF_NUDGES_LIMIT" \
+              --report-path bot-proof-report.json \
+              "${item_numbers_arg[@]}" \
+              "${bot_proof_execute_arg[@]}"
+          fi
+
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: proof-nudge-report
-          path: proof-nudge-report.json
+          name: proof-handling-reports
+          path: |
+            proof-nudge-report.json
+            bot-proof-report.json
           if-no-files-found: ignore
