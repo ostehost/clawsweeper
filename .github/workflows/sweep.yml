@@ -1317,11 +1317,31 @@ jobs:
           else
             pnpm run reconcile -- --target-repo "$TARGET_REPO" --skip-closed-at
           fi
-          pnpm run repair:publish-main -- \
-            --message "chore: update sweep records" \
-            --path "records/${target_slug}" \
-            --path "results/sweep-status/${target_slug}.json" \
+          publish_args=(
+            --message "chore: update sweep records"
+            --path "results/sweep-status/${target_slug}.json"
             --rebase-strategy theirs
+          )
+          if [ -n "$EXACT_ITEM" ]; then
+            item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
+            while IFS= read -r item_number; do
+              [ -n "$item_number" ] || continue
+              case "$item_number" in
+                *[!0-9]*)
+                  echo "Invalid artifact item number: $item_number" >&2
+                  exit 1
+                  ;;
+              esac
+              publish_args+=(
+                --path "records/${target_slug}/items/${item_number}.md"
+                --path "records/${target_slug}/closed/${item_number}.md"
+                --path "records/${target_slug}/plans/${item_number}.md"
+              )
+            done < <(tr ',' '\n' <<<"$item_numbers")
+          else
+            publish_args+=(--path "records/${target_slug}")
+          fi
+          pnpm run repair:publish-main -- "${publish_args[@]}"
 
       - name: Dispatch reproducible bug implementation candidates
         if: ${{ success() && needs.plan.outputs.target_repo == 'openclaw/openclaw' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS == '1' }}
@@ -1559,12 +1579,27 @@ jobs:
             --due-backlog "${{ needs.plan.outputs.due_backlog }}" \
             --oldest-unreviewed-at "${{ needs.plan.outputs.oldest_unreviewed_at }}" \
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
-          pnpm run repair:publish-main -- \
-            --message "chore: sync selected review comments" \
-            --path "records/${target_slug}" \
-            --path apply-report.json \
-            --path "results/sweep-status/${target_slug}.json" \
+          publish_args=(
+            --message "chore: sync selected review comments"
+            --path apply-report.json
+            --path "results/sweep-status/${target_slug}.json"
             --rebase-strategy theirs
+          )
+          while IFS= read -r item_number; do
+            [ -n "$item_number" ] || continue
+            case "$item_number" in
+              *[!0-9]*)
+                echo "Invalid artifact item number: $item_number" >&2
+                exit 1
+                ;;
+            esac
+            publish_args+=(
+              --path "records/${target_slug}/items/${item_number}.md"
+              --path "records/${target_slug}/closed/${item_number}.md"
+              --path "records/${target_slug}/plans/${item_number}.md"
+            )
+          done < <(tr ',' '\n' <<<"$item_numbers")
+          pnpm run repair:publish-main -- "${publish_args[@]}"
 
       - name: Apply selected safe close proposals
         if: ${{ success() && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}
@@ -1613,12 +1648,27 @@ jobs:
             --due-backlog "${{ needs.plan.outputs.due_backlog }}" \
             --oldest-unreviewed-at "${{ needs.plan.outputs.oldest_unreviewed_at }}" \
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
-          pnpm run repair:publish-main -- \
-            --message "chore: apply selected sweep decisions" \
-            --path "records/${target_slug}" \
-            --path apply-report.json \
-            --path "results/sweep-status/${target_slug}.json" \
+          publish_args=(
+            --message "chore: apply selected sweep decisions"
+            --path apply-report.json
+            --path "results/sweep-status/${target_slug}.json"
             --rebase-strategy theirs
+          )
+          while IFS= read -r item_number; do
+            [ -n "$item_number" ] || continue
+            case "$item_number" in
+              *[!0-9]*)
+                echo "Invalid artifact item number: $item_number" >&2
+                exit 1
+                ;;
+            esac
+            publish_args+=(
+              --path "records/${target_slug}/items/${item_number}.md"
+              --path "records/${target_slug}/closed/${item_number}.md"
+              --path "records/${target_slug}/plans/${item_number}.md"
+            )
+          done < <(tr ',' '\n' <<<"$item_numbers")
+          pnpm run repair:publish-main -- "${publish_args[@]}"
 
       - name: Continue sweep
         if: ${{ success() && needs.plan.outputs.planned_count == needs.plan.outputs.planned_capacity && github.event_name != 'repository_dispatch' && (github.event_name != 'workflow_dispatch' || (github.event.inputs.item_number == '' && github.event.inputs.item_numbers == '')) }}

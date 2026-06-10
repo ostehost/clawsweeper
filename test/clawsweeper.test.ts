@@ -16860,6 +16860,32 @@ test("setup-state defaults to non-partial checkout for auth-safe hydration", () 
   assert.match(action, /ref: state/);
 });
 
+test("exact review publishes cannot overwrite neighboring durable records", () => {
+  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const commitBlock = workflow.slice(
+    workflow.indexOf("- name: Commit review records"),
+    workflow.indexOf("- name: Dispatch reproducible bug implementation candidates"),
+  );
+  const syncBlock = workflow.slice(
+    workflow.indexOf("- name: Sync selected review comments"),
+    workflow.indexOf("- name: Apply selected safe close proposals"),
+  );
+  const applyBlock = workflow.slice(
+    workflow.indexOf("- name: Apply selected safe close proposals"),
+    workflow.indexOf("- name: Continue sweep"),
+  );
+
+  assert.match(commitBlock, /if \[ -n "\$EXACT_ITEM" \]; then/);
+  for (const block of [commitBlock, syncBlock, applyBlock]) {
+    assert.match(block, /artifact-item-numbers --artifact-dir artifacts/);
+    assert.match(block, /records\/\$\{target_slug\}\/items\/\$\{item_number\}\.md/);
+    assert.match(block, /records\/\$\{target_slug\}\/closed\/\$\{item_number\}\.md/);
+    assert.match(block, /records\/\$\{target_slug\}\/plans\/\$\{item_number\}\.md/);
+  }
+  assert.doesNotMatch(syncBlock, /--path "records\/\$\{target_slug\}"/);
+  assert.doesNotMatch(applyBlock, /--path "records\/\$\{target_slug\}"/);
+});
+
 test("github activity workflow coalesces noisy observer runs", () => {
   const workflow = readFileSync(".github/workflows/github-activity.yml", "utf8");
   const concurrencyBlock = workflow.slice(
