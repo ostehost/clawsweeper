@@ -99,10 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           payload_path="$RUNNER_TEMP/spam-comment-intake-dispatch.json"
-          if ! node <<'NODE' > "$payload_path"; then
-            echo "No spam comment intake candidate for this activity."
-            exit 0
-          fi
+          node <<'NODE' > "$payload_path"
           const fs = require("fs");
           const eventName = process.env.GITHUB_EVENT_NAME || "";
           const root = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
@@ -110,8 +107,8 @@ jobs:
           const activity = clientPayload.activity || clientPayload || {};
           const type = activity.type || clientPayload.event_name || (eventName === "repository_dispatch" ? "" : eventName);
           const action = activity.action || clientPayload.action || root.action || "";
-          if (!["issue_comment", "pull_request_review_comment"].includes(type)) process.exit(1);
-          if (!["created", "edited"].includes(action)) process.exit(1);
+          if (!["issue_comment", "pull_request_review_comment"].includes(type)) process.exit(0);
+          if (!["created", "edited"].includes(action)) process.exit(0);
           const repo =
             activity.target_repo ||
             activity.repo ||
@@ -133,6 +130,10 @@ jobs:
             },
           }));
           NODE
+          if [ ! -s "$payload_path" ]; then
+            echo "No spam comment intake candidate for this activity."
+            exit 0
+          fi
           gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
             --method POST \
             --input "$payload_path"

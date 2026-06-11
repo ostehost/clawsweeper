@@ -17098,6 +17098,16 @@ test("github activity workflow coalesces noisy observer runs", () => {
   assert.match(workflow, /clawsweeper_spam_comment_intake/);
   assert.match(workflow, /\["issue_comment", "pull_request_review_comment"\]/);
   assert.match(workflow, /\["created", "edited"\]/);
+  const dispatchStep = workflow.slice(
+    workflow.indexOf("- name: Dispatch spam comment intake candidates"),
+    workflow.indexOf("\n      - uses: actions/checkout@v6"),
+  );
+  const dispatchScript = dispatchStep
+    .slice(dispatchStep.indexOf("        run: |\n") + "        run: |\n".length)
+    .split("\n")
+    .map((line) => line.replace(/^ {10}/, ""))
+    .join("\n");
+  execFileSync("bash", ["-n"], { input: dispatchScript });
   assert.match(concurrencyBlock, /cancel-in-progress: true/);
   assert.doesNotMatch(
     concurrencyBlock,

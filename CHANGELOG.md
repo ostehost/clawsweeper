@@ -62,6 +62,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Fixed the GitHub activity bridge's spam-comment dispatch shell block so ordinary activity events continue into normal processing.
 - Prevented an older failed re-review command from starting another Codex review after the same requester submitted a newer re-review for the item.
 - Retried transient Codex review failures in fresh bounded sessions and redacted the internal model identifier from review failures and debug artifacts.
 - Kept sparse repair workflows building after the shared Codex transient helper moved outside the repair subtree.
