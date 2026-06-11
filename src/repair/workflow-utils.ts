@@ -334,20 +334,12 @@ function errorMessage(error: unknown): string {
 }
 
 function fetchActiveExactEventReviewRuns(repo: string, runId: string): ExactEventReviewRun[] {
-  const runs = parseExactEventReviewRuns(
-    ghJson([
+  const runs = exactEventReviewRunsFromGithubPages(
+    ghJson<JsonValue[]>([
       "api",
       githubPaginatedPath(`repos/${repo}/actions/runs?status=in_progress`),
       "--paginate",
       "--slurp",
-      "--jq",
-      [
-        "[.[]",
-        "| .workflow_runs[]",
-        '| select(.name == "ClawSweeper")',
-        '| select(.display_title | startswith("Review event item "))',
-        "| {id: (.id | tostring), createdAt: .created_at, displayTitle: .display_title}]",
-      ].join(" "),
     ]),
   );
   if (runs.some((run) => run.id === runId)) return runs;
@@ -360,25 +352,28 @@ function fetchCurrentExactEventReviewRun(
   repo: string,
   runId: string,
 ): ExactEventReviewRun | undefined {
-  const parsed = ghJson([
-    "api",
-    `repos/${repo}/actions/runs/${runId}`,
-    "--jq",
-    [
-      "{",
-      "id: (.id | tostring),",
-      "createdAt: .created_at,",
-      "displayTitle: .display_title,",
-      "name: .name,",
-      "status: .status",
-      "}",
-    ].join(" "),
-  ]);
-  if (!isJsonObject(parsed)) return undefined;
-  if (String(parsed.name ?? "") !== "ClawSweeper") return undefined;
-  if (String(parsed.status ?? "") !== "in_progress") return undefined;
-  if (!String(parsed.displayTitle ?? "").startsWith("Review event item ")) return undefined;
+  const parsed = ghJson(["api", `repos/${repo}/actions/runs/${runId}`]);
+  if (!isExactEventReviewRunRecord(parsed)) return undefined;
   return parseExactEventReviewRuns([parsed])[0];
+}
+
+export function exactEventReviewRunsFromGithubPages(value: unknown): ExactEventReviewRun[] {
+  if (!Array.isArray(value)) return [];
+  return parseExactEventReviewRuns(
+    value.flatMap((page): JsonValue[] => {
+      if (!isJsonObject(page) || !Array.isArray(page.workflow_runs)) return [];
+      return page.workflow_runs.filter(isExactEventReviewRunRecord);
+    }),
+  );
+}
+
+function isExactEventReviewRunRecord(value: unknown): value is LooseRecord {
+  if (!isJsonObject(value)) return false;
+  return (
+    String(value.event ?? "") === "repository_dispatch" &&
+    String(value.status ?? "") === "in_progress" &&
+    String(value.display_title ?? value.displayTitle ?? "").startsWith("Review event item ")
+  );
 }
 
 function parseExactEventReviewRuns(value: unknown): ExactEventReviewRun[] {
@@ -386,8 +381,8 @@ function parseExactEventReviewRuns(value: unknown): ExactEventReviewRun[] {
   return value.flatMap((entry): ExactEventReviewRun[] => {
     if (!isJsonObject(entry)) return [];
     const id = String(entry.id ?? "").trim();
-    const createdAt = String(entry.createdAt ?? "").trim();
-    const displayTitle = String(entry.displayTitle ?? "").trim();
+    const createdAt = String(entry.createdAt ?? entry.created_at ?? "").trim();
+    const displayTitle = String(entry.displayTitle ?? entry.display_title ?? "").trim();
     return id && createdAt && displayTitle ? [{ id, createdAt, displayTitle }] : [];
   });
 }

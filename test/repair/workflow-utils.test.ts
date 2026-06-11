@@ -13,6 +13,7 @@ import {
   countCommandActions,
   countRequeueRequired,
   exactEventReviewCapacityState,
+  exactEventReviewRunsFromGithubPages,
   mergeApplyReports,
   planOutputFields,
   plannedItemNumberCsv,
@@ -150,6 +151,60 @@ test("exact event capacity waits when the current run is absent", () => {
       limit: 1,
       rank: 2,
     },
+  );
+});
+
+test("exact event run parsing accepts raw GitHub Actions API fields", () => {
+  assert.deepEqual(
+    exactEventReviewRunsFromGithubPages([
+      {
+        workflow_runs: [
+          {
+            id: 27384499636,
+            name: "Review event item openclaw/openclaw#92225",
+            display_title: "Review event item openclaw/openclaw#92225",
+            event: "repository_dispatch",
+            status: "in_progress",
+            created_at: "2026-06-11T23:40:28Z",
+          },
+          {
+            id: 27384499637,
+            name: "Review event item openclaw/openclaw#92226",
+            display_title: "Review event item openclaw/openclaw#92226",
+            event: "repository_dispatch",
+            status: "completed",
+            created_at: "2026-06-11T23:40:29Z",
+          },
+          {
+            id: 27384499638,
+            name: "Review event item openclaw/openclaw#92227",
+            display_title: "Review event item openclaw/openclaw#92227",
+            event: "pull_request",
+            status: "in_progress",
+            created_at: "2026-06-11T23:40:30Z",
+          },
+        ],
+      },
+      {
+        workflow_runs: [
+          {
+            id: 27384499639,
+            name: "ClawSweeper",
+            display_title: "Audit state",
+            event: "repository_dispatch",
+            status: "in_progress",
+            created_at: "2026-06-11T23:40:31Z",
+          },
+        ],
+      },
+    ]),
+    [
+      {
+        id: "27384499636",
+        createdAt: "2026-06-11T23:40:28Z",
+        displayTitle: "Review event item openclaw/openclaw#92225",
+      },
+    ],
   );
 });
 
