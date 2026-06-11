@@ -234,7 +234,7 @@ export function readLedger(file: JsonValue) {
 
 export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
   const compact = entries
-    .filter((entry: JsonValue) => ["executed", "skipped"].includes(entry.status))
+    .filter((entry: JsonValue) => ["executed", "skipped", "waiting"].includes(entry.status))
     .filter((entry: JsonValue) => !isNoopSkip(entry))
     .map((entry: JsonValue) => {
       const actions = compactLedgerActions(entry.actions);

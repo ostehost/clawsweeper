@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MAX_LIVE_WORKERS,
+  activeRepairWorkflowRunForJobAfterDispatchRecheck,
   listActiveWorkflowRuns,
   normalizeWorkflowRun,
   readMaxLiveWorkers,
@@ -149,4 +150,53 @@ test("stale queued workflow runs do not consume repair capacity", () => {
     runs.map((run) => run.databaseId),
     [2, 3],
   );
+});
+
+test("active repair run recheck drops a worker that just completed", () => {
+  let calls = 0;
+  const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
+    repo: "openclaw/clawsweeper",
+    workflow: "repair-cluster-worker.yml",
+    jobPath: "jobs/openclaw/inbox/issue-openclaw-clawsweeper-225.md",
+    recheckMs: 1,
+    recheckActive: true,
+    env: { GH_TOKEN: "central-token" },
+    fetchWorkflowRuns: ({ env }) => {
+      calls += 1;
+      assert.equal(env.GH_TOKEN, "central-token");
+      return calls === 1
+        ? [
+            {
+              id: 27341186628,
+              status: "in_progress",
+              display_title: "repair cluster jobs/openclaw/inbox/issue-openclaw-clawsweeper-225.md",
+            },
+          ]
+        : [];
+    },
+  });
+
+  assert.equal(active, null);
+  assert.equal(calls, 2);
+});
+
+test("active repair run skips the delayed sample unless requested", () => {
+  let calls = 0;
+  const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
+    jobPath: "jobs/openclaw/inbox/cluster-001.md",
+    recheckMs: 1,
+    fetchWorkflowRuns: () => {
+      calls += 1;
+      return [
+        {
+          id: 1,
+          status: "in_progress",
+          display_title: "repair cluster jobs/openclaw/inbox/cluster-001.md",
+        },
+      ];
+    },
+  });
+
+  assert.equal(active.databaseId, 1);
+  assert.equal(calls, 1);
 });

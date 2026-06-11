@@ -116,6 +116,7 @@ test("workflow utilities count nested command actions by status", () => {
         {
           actions: [
             { action: "dispatch_repair", status: "waiting" },
+            { action: "dispatch_repair", status: "active" },
             { action: "dispatch_repair", status: "executed" },
           ],
         },
@@ -126,8 +127,9 @@ test("workflow utilities count nested command actions by status", () => {
     }),
   );
 
-  assert.equal(countCommandActions(report, "dispatch_repair"), 2);
+  assert.equal(countCommandActions(report, "dispatch_repair"), 3);
   assert.equal(countCommandActions(report, "dispatch_repair", "waiting"), 1);
+  assert.equal(countCommandActions(report, "dispatch_repair", "waiting,active"), 2);
   assert.equal(countCommandActions(report, "dispatch_clawsweeper", "waiting"), 1);
 });
 

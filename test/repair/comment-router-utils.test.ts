@@ -106,7 +106,7 @@ test("appendLedger keeps edited comment versions separate", () => {
   );
 });
 
-test("appendLedger leaves waiting commands retryable", () => {
+test("appendLedger records waiting commands without making them terminal", () => {
   const ledger = { updated_at: null, commands: [] };
 
   assert.equal(
@@ -122,10 +122,12 @@ test("appendLedger leaves waiting commands retryable", () => {
         repo: "openclaw/openclaw",
       },
     ]),
-    false,
+    true,
   );
 
-  assert.equal(ledger.commands.length, 0);
+  assert.equal(ledger.commands.length, 1);
+  assert.equal(ledger.commands[0].status, "waiting");
+  assert.equal(shouldSuppressProcessedCommentVersion(ledger.commands[0]), false);
 });
 
 test("appendLedger ignores no-op skipped command versions", () => {

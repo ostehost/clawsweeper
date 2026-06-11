@@ -223,13 +223,20 @@ export function countActions(reportPath: string, action: string): number {
 export function countCommandActions(reportPath: string, action: string, status = ""): number {
   const report = readJsonObject(reportPath);
   const commands: JsonValue[] = Array.isArray(report.commands) ? report.commands : [];
+  const statuses = new Set(
+    status
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
   return commands
     .flatMap((command: JsonValue): JsonValue[] =>
       isJsonObject(command) && Array.isArray(command.actions) ? command.actions : [],
     )
     .filter((entry: JsonValue): entry is LooseRecord => isJsonObject(entry))
     .filter((entry: LooseRecord) => entry.action === action)
-    .filter((entry: LooseRecord) => !status || entry.status === status).length;
+    .filter((entry: LooseRecord) => statuses.size === 0 || statuses.has(String(entry.status)))
+    .length;
 }
 
 export function countRequeueRequired(reportDir: string): number {

@@ -180,6 +180,10 @@ export function activeRepairWorkflowRunForJob({
   jobPath,
   automergeRunNamePrefix = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
   activeRunsByPrefix,
+  fetchWorkflowRuns,
+  nowMs,
+  staleQueuedMs,
+  env,
 }: LooseRecord = {}) {
   const job = String(jobPath ?? "");
   if (!job) return null;
@@ -192,6 +196,10 @@ export function activeRepairWorkflowRunForJob({
         repo,
         workflow,
         runNamePrefix: prefix,
+        fetchWorkflowRuns,
+        nowMs,
+        staleQueuedMs,
+        env,
       }),
     );
   }
@@ -202,6 +210,10 @@ export function activeRepairWorkflowRunForJob({
           repo,
           workflow,
           runNamePrefix: prefix,
+          fetchWorkflowRuns,
+          nowMs,
+          staleQueuedMs,
+          env,
         });
   return (
     activeRuns?.find((run: JsonValue) => String(run.displayTitle ?? "") === expectedTitle) ?? null
@@ -210,12 +222,12 @@ export function activeRepairWorkflowRunForJob({
 
 export function activeRepairWorkflowRunForJobAfterDispatchRecheck(options: LooseRecord = {}) {
   const activeRun = activeRepairWorkflowRunForJob(options);
-  if (activeRun) return activeRun;
+  if (activeRun && options.recheckActive !== true) return activeRun;
   const recheckMs = readNonNegativeInteger(
     options.recheckMs ?? process.env.CLAWSWEEPER_DISPATCH_RECHECK_MS ?? 5000,
     "repair dispatch recheck ms",
   );
-  if (recheckMs <= 0) return null;
+  if (recheckMs <= 0) return activeRun;
   sleepMs(recheckMs);
   const cache = options.activeRunsByPrefix;
   if (cache instanceof Map) cache.clear();

@@ -236,7 +236,7 @@ jobs:
           set -euo pipefail
           count="0"
           if [ -f results/comment-router-latest.json ]; then
-            count="$(pnpm run --silent workflow -- count-command-actions --report results/comment-router-latest.json --action dispatch_repair --status waiting)"
+            count="$(pnpm run --silent workflow -- count-command-actions --report results/comment-router-latest.json --action dispatch_repair --status waiting,active)"
           fi
           echo "count=$count" >> "$GITHUB_OUTPUT"
 

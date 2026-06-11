@@ -495,6 +495,14 @@ test("force reprocess bypasses existing command status guards", () => {
     existingCommandStatusBlocksReplay({ hasExistingResponse: true, forceReprocess: true }),
     false,
   );
+  assert.equal(
+    existingCommandStatusBlocksReplay({
+      hasExistingResponse: true,
+      forceReprocess: false,
+      retryPending: true,
+    }),
+    false,
+  );
 
   const existingEnabled = {
     hasModeLabel: true,

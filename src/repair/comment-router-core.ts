@@ -652,8 +652,9 @@ export function commandHasAction(command: LooseRecord, actionName: string): bool
 export function existingCommandStatusBlocksReplay({
   hasExistingResponse,
   forceReprocess,
+  retryPending,
 }: LooseRecord = {}) {
-  return Boolean(hasExistingResponse) && !forceReprocess;
+  return Boolean(hasExistingResponse) && !forceReprocess && !retryPending;
 }
 
 export function existingModeStatusBlocksReplay({

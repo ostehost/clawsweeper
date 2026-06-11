@@ -16804,6 +16804,17 @@ test("event re-review status explains superseded cancellations", () => {
   assert.match(block, /A newer re-review for this item started before this run finished/);
 });
 
+test("event repair retries wait for active worker capacity", () => {
+  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const block = workflow.slice(
+    workflow.indexOf("- name: Detect waiting event repair dispatches"),
+    workflow.indexOf("- name: Commit event comment router retry ledger"),
+  );
+
+  assert.match(block, /--status waiting,active/);
+  assert.match(block, /--wait-for-capacity/);
+});
+
 test("comment commands keep the router-to-sweep dispatch contract", () => {
   const routerWorkflow = readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
   const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");

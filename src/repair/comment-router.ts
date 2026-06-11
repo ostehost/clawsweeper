@@ -144,6 +144,14 @@ const processedCommentVersions = forceReprocess
         .map(commentVersionKey)
         .filter(Boolean),
     );
+const retryPendingCommentVersions = new Set(
+  (ledger.commands ?? [])
+    .filter((entry: JsonValue) => entry.status === "waiting")
+    .map(commentVersionKey)
+    .filter(Boolean),
+);
+// Pending replay is intentional: active-run checks prevent duplicate workers, and
+// marker-backed status replies are updated in place until dispatch can continue.
 const plannedAutoRepairHeads = new Set<string>();
 let repairLoopControlEntriesCache: LooseRecord[] | null = null;
 const collaboratorPermissionCache = new Map();
@@ -406,6 +414,9 @@ function classifyCommand(command: LooseRecord): JsonValue {
         target.head_sha,
       ),
       forceReprocess,
+      retryPending:
+        Boolean(command.comment_version_key) &&
+        retryPendingCommentVersions.has(command.comment_version_key),
     })
   ) {
     return {
@@ -2142,6 +2153,7 @@ function activeRepairRunForCommand(command: LooseRecord) {
     automergeRunNamePrefix,
     activeRunsByPrefix: activeRepairRunsByPrefix,
     env: dispatchTokenEnv(),
+    recheckActive: true,
   });
 }
 
