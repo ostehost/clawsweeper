@@ -62,6 +62,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Hydrated generated pull request review findings into automerge repair jobs instead of routing repairs through the original issue-only artifact.
 - Rechecked stale active worker state and durably retried pending repair dispatches instead of leaving review-fix loops waiting after a worker finishes.
 - Released automerge repair workers immediately when an exact-head ClawSweeper review requests another repair, allowing the router to dispatch the next Codex worker without waiting for the shepherd timeout.
 - Limited issue implementation intake and repair worker state hydration to required records, jobs, and results, avoiding unrelated generated state and proof assets.
