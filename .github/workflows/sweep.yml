@@ -246,6 +246,13 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
       - name: React to target item review start
         continue-on-error: true
         env:
@@ -274,9 +281,18 @@ jobs:
           }
           react "eyes"
 
+      - uses: actions/checkout@v6
+        with:
+          repository: openclaw/clawsweeper-state
+          ref: state
+          path: clawsweeper-provider-state
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 0
+          sparse-checkout: provider-leases
+
       - uses: ./.github/actions/setup-media-proof-tools
 
-      - name: Mark re-review command in progress
+      - name: Mark re-review waiting for Codex capacity
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -291,8 +307,8 @@ jobs:
             --item-number "$ITEM_NUMBER" \
             --marker "$COMMAND_STATUS_MARKER" \
             --status-comment-id "$STATUS_COMMENT_ID" \
-            --state "Review in progress" \
-            --detail "Targeted re-review run started; Codex is reviewing the item." \
+            --state "Waiting for Codex capacity" \
+            --detail "Targeted re-review run started and is waiting for a global Codex provider slot." \
             --run-url "$RUN_URL" \
             --wait-ms 120000
 
@@ -343,14 +359,60 @@ jobs:
           fi
           git -C "$checkout_dir" rev-parse --short HEAD
 
+      - name: Acquire Codex provider lease
+        id: provider-lease
+        env:
+          PROVIDER_LEASE_ID: exact-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.target.outputs.target_repo_name }}-${{ steps.target.outputs.item_number }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:provider-lease -- acquire \
+            --state-dir clawsweeper-provider-state \
+            --provider codex-internal-default \
+            --lease-id "$PROVIDER_LEASE_ID" \
+            --owner "${{ github.repository }}" \
+            --lane exact-review \
+            --item "${{ steps.target.outputs.target_repo }}#${{ steps.target.outputs.item_number }}" \
+            --run-id "${{ github.run_id }}" \
+            --capacity "${{ vars.CLAWSWEEPER_CODEX_PROVIDER_CAPACITY || '4' }}" \
+            --weight "${{ github.event.client_payload.provider_weight || '1' }}" \
+            --ttl-seconds "${{ vars.CLAWSWEEPER_CODEX_PROVIDER_LEASE_TTL_SECONDS || '900' }}" \
+            --wait-seconds "${{ vars.CLAWSWEEPER_CODEX_PROVIDER_WAIT_SECONDS || '1200' }}" \
+            --poll-seconds "${{ vars.CLAWSWEEPER_CODEX_PROVIDER_POLL_SECONDS || '15' }}"
+
+      - name: Mark re-review command in progress
+        if: ${{ steps.provider-lease.outputs.acquired == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          COMMAND_STATUS_MARKER: ${{ github.event.client_payload.command_status_marker || '' }}
+          STATUS_COMMENT_ID: ${{ github.event.client_payload.status_comment_id || '' }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          pnpm run repair:update-command-status -- \
+            --repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --marker "$COMMAND_STATUS_MARKER" \
+            --status-comment-id "$STATUS_COMMENT_ID" \
+            --state "Review in progress" \
+            --detail "Targeted re-review acquired a global Codex provider slot; Codex is reviewing the item." \
+            --run-url "$RUN_URL" \
+            --wait-ms 120000
+
       - name: Review exact event item
         id: review-exact-event-item
+        if: ${{ steps.provider-lease.outputs.acquired == 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.target-read-token.outputs.token || github.token }}
           ADDITIONAL_PROMPT: ${{ github.event.client_payload.additional_prompt || '' }}
           CLAWSWEEPER_RELATED_GITHUB_SEARCH: ${{ vars.CLAWSWEEPER_RELATED_GITHUB_SEARCH || '1' }}
+          PROVIDER_LEASE_ID: ${{ steps.provider-lease.outputs.lease_id }}
+          PROVIDER_LEASE_CAPACITY: ${{ vars.CLAWSWEEPER_CODEX_PROVIDER_CAPACITY || '4' }}
+          PROVIDER_LEASE_TTL_SECONDS: ${{ vars.CLAWSWEEPER_CODEX_PROVIDER_LEASE_TTL_SECONDS || '900' }}
+          PROVIDER_LEASE_RENEW_SECONDS: ${{ vars.CLAWSWEEPER_CODEX_PROVIDER_LEASE_RENEW_SECONDS || '' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -358,6 +420,50 @@ jobs:
           if [ -n "$ADDITIONAL_PROMPT" ]; then
             additional_prompt_arg=(--additional-prompt "$ADDITIONAL_PROMPT")
           fi
+
+          provider_lease_renew_seconds="$PROVIDER_LEASE_RENEW_SECONDS"
+          if [ -z "$provider_lease_renew_seconds" ]; then
+            provider_lease_renew_seconds=$(( PROVIDER_LEASE_TTL_SECONDS / 3 ))
+            if [ "$provider_lease_renew_seconds" -gt 60 ]; then
+              provider_lease_renew_seconds=60
+            fi
+          fi
+          if [ "$provider_lease_renew_seconds" -lt 5 ]; then
+            provider_lease_renew_seconds=5
+          fi
+          if [ "$provider_lease_renew_seconds" -ge "$PROVIDER_LEASE_TTL_SECONDS" ]; then
+            provider_lease_renew_seconds=$(( PROVIDER_LEASE_TTL_SECONDS / 2 ))
+            if [ "$provider_lease_renew_seconds" -lt 1 ]; then
+              provider_lease_renew_seconds=1
+            fi
+          fi
+
+          mkdir -p artifacts/event
+          provider_lease_renew_log="artifacts/event/provider-lease-renew.log"
+          (
+            while sleep "$provider_lease_renew_seconds"; do
+              date -u +"renewing provider lease at %Y-%m-%dT%H:%M:%SZ"
+              pnpm run repair:provider-lease -- renew \
+                --state-dir clawsweeper-provider-state \
+                --provider codex-internal-default \
+                --lease-id "$PROVIDER_LEASE_ID" \
+                --capacity "$PROVIDER_LEASE_CAPACITY" \
+                --ttl-seconds "$PROVIDER_LEASE_TTL_SECONDS"
+            done
+          ) > "$provider_lease_renew_log" 2>&1 &
+          provider_lease_renew_pid=$!
+
+          stop_provider_lease_renewal() {
+            if kill -0 "$provider_lease_renew_pid" 2>/dev/null; then
+              kill "$provider_lease_renew_pid" 2>/dev/null || true
+              wait "$provider_lease_renew_pid" 2>/dev/null || true
+            fi
+            if [ -s "$provider_lease_renew_log" ]; then
+              cat "$provider_lease_renew_log"
+            fi
+          }
+          trap stop_provider_lease_renewal EXIT
+
           timeout --kill-after=30s 12m pnpm run review -- \
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --target-dir "${{ steps.target.outputs.target_checkout_dir }}" \
@@ -372,14 +478,45 @@ jobs:
             --readonly-openclaw \
             --shard-index 0 \
             --shard-count 1 \
-            "${additional_prompt_arg[@]}"
+            "${additional_prompt_arg[@]}" &
+          review_pid=$!
 
-      - name: Create state token
-        id: state-token
-        uses: ./.github/actions/create-state-token
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          (
+            while kill -0 "$review_pid" 2>/dev/null; do
+              if ! kill -0 "$provider_lease_renew_pid" 2>/dev/null; then
+                echo "Provider lease renewal stopped before review completed." >&2
+                kill "$review_pid" 2>/dev/null || true
+                exit 1
+              fi
+              sleep 5
+            done
+          ) &
+          provider_lease_monitor_pid=$!
+
+          set +e
+          wait "$review_pid"
+          review_status=$?
+          kill "$provider_lease_monitor_pid" 2>/dev/null || true
+          wait "$provider_lease_monitor_pid" 2>/dev/null || true
+          set -e
+
+          if [ "$review_status" -eq 0 ] && ! kill -0 "$provider_lease_renew_pid" 2>/dev/null; then
+            echo "Provider lease renewal stopped before review completed." >&2
+            exit 1
+          fi
+          exit "$review_status"
+
+      - name: Release Codex provider lease
+        if: ${{ always() && steps.provider-lease.outputs.acquired == 'true' }}
+        env:
+          PROVIDER_LEASE_ID: ${{ steps.provider-lease.outputs.lease_id }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:provider-lease -- release \
+            --state-dir clawsweeper-provider-state \
+            --provider codex-internal-default \
+            --lease-id "$PROVIDER_LEASE_ID" \
+            --capacity "${{ vars.CLAWSWEEPER_CODEX_PROVIDER_CAPACITY || '4' }}"
 
       - uses: ./.github/actions/setup-state
         with:
@@ -388,6 +525,7 @@ jobs:
 
       - name: Publish event result and apply safe close
         id: publish-event-result
+        if: ${{ steps.provider-lease.outputs.acquired == 'true' }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           REPO_TOKEN: ${{ github.token }}
@@ -398,7 +536,7 @@ jobs:
         run: pnpm run repair:publish-event-result
 
       - name: Dispatch viable issue implementation
-        if: ${{ success() && steps.target-write-token.outputs.token != '' && steps.target.outputs.target_repo != 'openclaw/openclaw' && steps.target.outputs.target_repo != 'openclaw/clawhub' }}
+        if: ${{ success() && steps.provider-lease.outputs.acquired == 'true' && steps.target-write-token.outputs.token != '' && steps.target.outputs.target_repo != 'openclaw/openclaw' && steps.target.outputs.target_repo != 'openclaw/clawhub' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -436,6 +574,7 @@ jobs:
 
       - name: Route synced ClawSweeper verdict
         id: route-synced-verdict
+        if: ${{ steps.provider-lease.outputs.acquired == 'true' }}
         timeout-minutes: 4
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -466,13 +605,22 @@ jobs:
           COMMAND_STATUS_MARKER: ${{ github.event.client_payload.command_status_marker || '' }}
           STATUS_COMMENT_ID: ${{ github.event.client_payload.status_comment_id || '' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PROVIDER_LEASE_OUTCOME: ${{ steps.provider-lease.outcome }}
+          PROVIDER_LEASE_ACQUIRED: ${{ steps.provider-lease.outputs.acquired }}
+          PROVIDER_LEASE_REASON: ${{ steps.provider-lease.outputs.reason }}
           REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish-event-result.outcome }}
           ROUTE_OUTCOME: ${{ steps.route-synced-verdict.outcome }}
         run: |
           state="Failed"
           detail="The targeted re-review did not finish cleanly. Check the workflow run for details."
-          if [ "$REVIEW_OUTCOME" = "cancelled" ]; then
+          if [ "$PROVIDER_LEASE_OUTCOME" != "success" ]; then
+            state="Failed"
+            detail="The targeted re-review could not reserve global Codex provider capacity because the provider lease state update failed. Check the workflow run for details."
+          elif [ "$PROVIDER_LEASE_ACQUIRED" != "true" ]; then
+            state="Capacity timeout"
+            detail="The targeted re-review did not start because global Codex provider capacity stayed full until this workflow's wait deadline. Trigger a fresh re-review after capacity recovers. ${PROVIDER_LEASE_REASON}"
+          elif [ "$REVIEW_OUTCOME" = "cancelled" ]; then
             state="Superseded"
             detail="A newer re-review for this item started before this run finished, so GitHub cancelled this older run. Check the latest ClawSweeper run for the current result."
           fi
@@ -674,7 +822,7 @@ jobs:
 
   plan:
     name: Plan review candidates
-    if: ${{ (github.event_name != 'repository_dispatch' || github.event.action == 'clawsweeper_target_sweep') && !((github.event_name == 'workflow_dispatch' && (github.event.inputs.apply_existing == 'true' || github.event.inputs.audit_dashboard == 'true')) || (github.event_name == 'schedule' && ((github.event.schedule == '3 * * * *' || github.event.schedule == '18 * * * *' || github.event.schedule == '33 * * * *' || github.event.schedule == '48 * * * *' || github.event.schedule == '8,23,38,53 * * * *' || github.event.schedule == '6,21,36,51 * * * *') || (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *') || (github.event.schedule == '4/15 * * * *' || github.event.schedule == '41 * * * *' || github.event.schedule == '37 */6 * * *') || github.event.schedule == '13 8,20 * * *'))) && !(github.event_name == 'schedule' && (github.event.schedule == '2/5 * * * *' || github.event.schedule == '22 * * * *') && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') && !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
+    if: ${{ !contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') && (github.event_name != 'repository_dispatch' || github.event.action == 'clawsweeper_target_sweep') && !((github.event_name == 'workflow_dispatch' && (github.event.inputs.apply_existing == 'true' || github.event.inputs.audit_dashboard == 'true')) || (github.event_name == 'schedule' && ((github.event.schedule == '3 * * * *' || github.event.schedule == '18 * * * *' || github.event.schedule == '33 * * * *' || github.event.schedule == '48 * * * *' || github.event.schedule == '8,23,38,53 * * * *' || github.event.schedule == '6,21,36,51 * * * *') || (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *') || (github.event.schedule == '4/15 * * * *' || github.event.schedule == '41 * * * *' || github.event.schedule == '37 */6 * * *') || github.event.schedule == '13 8,20 * * *'))) && !(github.event_name == 'schedule' && (github.event.schedule == '2/5 * * * *' || github.event.schedule == '22 * * * *') && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') && !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -1798,9 +1946,414 @@ jobs:
             --path records/openclaw-openclaw \
             --rebase-strategy theirs
 
+  provider-lease-live-proof-holder:
+    name: Provider lease live proof holder
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Hold and renew provider lease
+        env:
+          PROOF_PROVIDER: codex-live-proof-${{ github.run_id }}
+          HOLDER_LEASE_ID: proof-holder-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          json_from_log() {
+            node -e '
+              const fs = require("fs");
+              const logPath = process.argv[1];
+              const text = fs.readFileSync(logPath, "utf8").trim();
+              for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
+                try {
+                  console.log(JSON.stringify(JSON.parse(text.slice(index)), null, 2));
+                  process.exit(0);
+                } catch {
+                  // Keep looking for the outer JSON object; provider-lease output can include git logs first.
+                }
+              }
+              console.error(`No trailing JSON object found in ${logPath}`);
+              process.exit(1);
+            ' "$1"
+          }
+          state_dir="${CLAWSWEEPER_STATE_DIR:?}"
+          echo "Provider: $PROOF_PROVIDER"
+          echo "Holder lease: $HOLDER_LEASE_ID"
+          pnpm run --silent repair:provider-lease -- acquire \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$HOLDER_LEASE_ID" \
+            --owner "$GITHUB_REPOSITORY" \
+            --lane live-proof-holder \
+            --item "$GITHUB_REPOSITORY#281" \
+            --run-id "$GITHUB_RUN_ID" \
+            --capacity 1 \
+            --weight 1 \
+            --ttl-seconds 30 \
+            --wait-seconds 0 \
+            --poll-seconds 2 2>&1 | tee acquire.log
+          acquire_json="$(json_from_log acquire.log)"
+          jq -e '.acquired == true and .activeWeight == 1 and .capacity == 1' <<<"$acquire_json"
+
+          for attempt in 1 2 3 4; do
+            sleep 10
+            echo "Renew attempt $attempt after original acquisition."
+            pnpm run --silent repair:provider-lease -- renew \
+              --state-dir "$state_dir" \
+              --provider "$PROOF_PROVIDER" \
+              --lease-id "$HOLDER_LEASE_ID" \
+              --capacity 1 \
+              --ttl-seconds 30 2>&1 | tee "renew-$attempt.log"
+            renew_json="$(json_from_log "renew-$attempt.log")"
+            jq -e '.renewed == true' <<<"$renew_json"
+          done
+
+          echo "Holder stayed active for more than the original 30s TTL; releasing now."
+          pnpm run --silent repair:provider-lease -- release \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$HOLDER_LEASE_ID" \
+            --capacity 1 2>&1 | tee release.log
+          release_json="$(json_from_log release.log)"
+          jq -e '.released == true' <<<"$release_json"
+          {
+            echo "### Provider lease live proof holder"
+            echo
+            echo "- Acquired lease: \`$HOLDER_LEASE_ID\`"
+            echo "- Renewed lease four times over more than the original 30s TTL"
+            echo "- Released lease cleanly"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provider-lease-live-proof-waiter:
+    name: Provider lease live proof concurrent waiter
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Verify concurrent capacity timeout
+        env:
+          PROOF_PROVIDER: codex-live-proof-${{ github.run_id }}
+          HOLDER_LEASE_ID: proof-holder-${{ github.run_id }}-${{ github.run_attempt }}
+          WAITER_LEASE_ID: proof-waiter-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          json_from_log() {
+            node -e '
+              const fs = require("fs");
+              const logPath = process.argv[1];
+              const text = fs.readFileSync(logPath, "utf8").trim();
+              for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
+                try {
+                  console.log(JSON.stringify(JSON.parse(text.slice(index)), null, 2));
+                  process.exit(0);
+                } catch {
+                  // Keep looking for the outer JSON object; provider-lease output can include git logs first.
+                }
+              }
+              console.error(`No trailing JSON object found in ${logPath}`);
+              process.exit(1);
+            ' "$1"
+          }
+          state_dir="${CLAWSWEEPER_STATE_DIR:?}"
+          lease_file="$state_dir/provider-leases/$PROOF_PROVIDER.json"
+          echo "Waiting for holder lease $HOLDER_LEASE_ID to appear in $lease_file."
+          saw_holder=false
+          for _ in $(seq 1 60); do
+            git -C "$state_dir" fetch --quiet origin state
+            git -C "$state_dir" reset --quiet --hard origin/state
+            if [ -f "$lease_file" ] && jq -e --arg id "$HOLDER_LEASE_ID" '.leases[]? | select(.id == $id)' "$lease_file" >/dev/null; then
+              saw_holder=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$saw_holder" != "true" ]; then
+            echo "Holder lease did not appear before timeout." >&2
+            exit 1
+          fi
+
+          echo "Holder is active in the real state repo; proving a concurrent waiter is blocked."
+          pnpm run --silent repair:provider-lease -- acquire \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$WAITER_LEASE_ID" \
+            --owner "$GITHUB_REPOSITORY" \
+            --lane live-proof-waiter \
+            --item "$GITHUB_REPOSITORY#281" \
+            --run-id "$GITHUB_RUN_ID" \
+            --capacity 1 \
+            --weight 1 \
+            --ttl-seconds 30 \
+            --wait-seconds 20 \
+            --poll-seconds 5 2>&1 | tee waiter-acquire.log
+          acquire_json="$(json_from_log waiter-acquire.log)"
+          jq -e '.acquired == false and .activeWeight == 1 and .capacity == 1 and (.reason | test("provider capacity full"))' <<<"$acquire_json"
+          {
+            echo "### Provider lease live proof waiter"
+            echo
+            echo "- Observed holder lease in the real state repo"
+            echo "- Concurrent acquire waited 20s and returned \`provider capacity full\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provider-lease-live-proof-release-check:
+    name: Provider lease live proof release check
+    needs:
+      - provider-lease-live-proof-holder
+      - provider-lease-live-proof-waiter
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Verify acquisition after release
+        env:
+          PROOF_PROVIDER: codex-live-proof-${{ github.run_id }}
+          RELEASE_CHECK_LEASE_ID: proof-release-check-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          json_from_log() {
+            node -e '
+              const fs = require("fs");
+              const logPath = process.argv[1];
+              const text = fs.readFileSync(logPath, "utf8").trim();
+              for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
+                try {
+                  console.log(JSON.stringify(JSON.parse(text.slice(index)), null, 2));
+                  process.exit(0);
+                } catch {
+                  // Keep looking for the outer JSON object; provider-lease output can include git logs first.
+                }
+              }
+              console.error(`No trailing JSON object found in ${logPath}`);
+              process.exit(1);
+            ' "$1"
+          }
+          state_dir="${CLAWSWEEPER_STATE_DIR:?}"
+          pnpm run --silent repair:provider-lease -- acquire \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$RELEASE_CHECK_LEASE_ID" \
+            --owner "$GITHUB_REPOSITORY" \
+            --lane live-proof-release-check \
+            --item "$GITHUB_REPOSITORY#281" \
+            --run-id "$GITHUB_RUN_ID" \
+            --capacity 1 \
+            --weight 1 \
+            --ttl-seconds 30 \
+            --wait-seconds 0 \
+            --poll-seconds 2 2>&1 | tee release-check-acquire.log
+          acquire_json="$(json_from_log release-check-acquire.log)"
+          jq -e '.acquired == true and .activeWeight == 1 and .capacity == 1' <<<"$acquire_json"
+          pnpm run --silent repair:provider-lease -- release \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$RELEASE_CHECK_LEASE_ID" \
+            --capacity 1 2>&1 | tee release-check-release.log
+          release_json="$(json_from_log release-check-release.log)"
+          jq -e '.released == true' <<<"$release_json"
+          {
+            echo "### Provider lease live proof release check"
+            echo
+            echo "- Acquired a new lease after the holder released"
+            echo "- Released the follow-up lease cleanly"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provider-lease-live-proof-ttl-recovery:
+    name: Provider lease live proof TTL recovery
+    needs:
+      - provider-lease-live-proof-release-check
+    if: ${{ github.event_name == 'workflow_dispatch' && contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Verify abandoned lease TTL recovery
+        env:
+          PROOF_PROVIDER: codex-live-proof-${{ github.run_id }}
+          ABANDONED_LEASE_ID: proof-abandoned-${{ github.run_id }}-${{ github.run_attempt }}
+          RECOVERED_LEASE_ID: proof-recovered-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          json_from_log() {
+            node -e '
+              const fs = require("fs");
+              const logPath = process.argv[1];
+              const text = fs.readFileSync(logPath, "utf8").trim();
+              for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
+                try {
+                  console.log(JSON.stringify(JSON.parse(text.slice(index)), null, 2));
+                  process.exit(0);
+                } catch {
+                  // Keep looking for the outer JSON object; provider-lease output can include git logs first.
+                }
+              }
+              console.error(`No trailing JSON object found in ${logPath}`);
+              process.exit(1);
+            ' "$1"
+          }
+          state_dir="${CLAWSWEEPER_STATE_DIR:?}"
+          pnpm run --silent repair:provider-lease -- acquire \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$ABANDONED_LEASE_ID" \
+            --owner "$GITHUB_REPOSITORY" \
+            --lane live-proof-abandoned \
+            --item "$GITHUB_REPOSITORY#281" \
+            --run-id "$GITHUB_RUN_ID" \
+            --capacity 1 \
+            --weight 1 \
+            --ttl-seconds 15 \
+            --wait-seconds 0 \
+            --poll-seconds 2 2>&1 | tee abandoned-acquire.log
+          abandoned_json="$(json_from_log abandoned-acquire.log)"
+          jq -e '.acquired == true and .activeWeight == 1 and .capacity == 1' <<<"$abandoned_json"
+
+          echo "Simulating cancellation by not releasing $ABANDONED_LEASE_ID; waiting for TTL recovery."
+          sleep 20
+
+          pnpm run --silent repair:provider-lease -- acquire \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$RECOVERED_LEASE_ID" \
+            --owner "$GITHUB_REPOSITORY" \
+            --lane live-proof-recovered \
+            --item "$GITHUB_REPOSITORY#281" \
+            --run-id "$GITHUB_RUN_ID" \
+            --capacity 1 \
+            --weight 1 \
+            --ttl-seconds 30 \
+            --wait-seconds 0 \
+            --poll-seconds 2 2>&1 | tee recovered-acquire.log
+          recovered_json="$(json_from_log recovered-acquire.log)"
+          jq -e '.acquired == true and .activeWeight == 1 and .capacity == 1' <<<"$recovered_json"
+
+          pnpm run --silent repair:provider-lease -- release \
+            --state-dir "$state_dir" \
+            --provider "$PROOF_PROVIDER" \
+            --lease-id "$RECOVERED_LEASE_ID" \
+            --capacity 1 2>&1 | tee recovered-release.log
+          release_json="$(json_from_log recovered-release.log)"
+          jq -e '.released == true' <<<"$release_json"
+
+          if (
+            set -euo pipefail
+            git -C "$state_dir" pull --rebase --autostash
+            rm -f "$state_dir/provider-leases/$PROOF_PROVIDER.json"
+            git -C "$state_dir" add -A -- provider-leases
+            if ! git -C "$state_dir" diff --cached --quiet; then
+              git -C "$state_dir" commit -m "chore: clean provider lease live proof $GITHUB_RUN_ID"
+              git -C "$state_dir" push
+            fi
+          ); then
+            echo "Cleaned proof provider state for $PROOF_PROVIDER."
+          else
+            echo "::warning::Proof provider cleanup failed; the isolated proof provider can be pruned by a later proof run."
+          fi
+
+          {
+            echo "### Provider lease live proof TTL recovery"
+            echo
+            echo "- Acquired an abandoned lease with 15s TTL and intentionally did not release it"
+            echo "- Waited past TTL and acquired a replacement lease, proving stale lease pruning"
+            echo "- Released the replacement lease and cleaned the proof provider file"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   audit-dashboard:
     name: Audit state
-    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.audit_dashboard == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *')) }}
+    if: ${{ !contains(github.event.inputs.additional_prompt || '', '[provider-lease-live-proof]') && ((github.event_name == 'workflow_dispatch' && github.event.inputs.audit_dashboard == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
