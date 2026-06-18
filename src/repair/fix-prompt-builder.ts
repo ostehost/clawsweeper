@@ -258,6 +258,13 @@ function renderValidationLoopGuidance({
 function renderChangelogRule(fixArtifact: LooseRecord) {
   const policyRule =
     "- target repository release-note policy wins over fix artifact credit notes: for openclaw/openclaw, do not edit CHANGELOG.md during normal repair work; preserve user-facing release-note context and contributor/source PR attribution in PR body/history/source links or commit messages instead; never add forbidden `Thanks @codex`, `Thanks @openclaw`, or `Thanks @steipete` changelog attribution;";
+  if (fixArtifact.repair_strategy === "repair_contributor_branch") {
+    return [
+      "- repair_contributor_branch never edits CHANGELOG.md or other release-owned changelog files, even if changelog_required is true;",
+      "- preserve release-note context and contributor credit in the existing PR body or commit history instead;",
+      policyRule,
+    ].join("\n");
+  }
   if (fixArtifact.changelog_required !== true) {
     return [
       "- changelog_required is false: do not edit CHANGELOG.md or other release-owned changelog files;",

@@ -13,7 +13,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
-- Prevented changelog-free repair artifacts from adding release-owned changelog entries, keeping contributor credit and release-note context in PR bodies or commit history instead.
+- Prevented contributor-branch repairs and changelog-free repair artifacts from adding release-owned changelog entries, keeping contributor credit and release-note context in PR bodies or commit history instead.
 - Added an explicit trusted ephemeral-runner fallback for repair planning when the host cannot start Codex's Linux read-only sandbox.
 - Prevented large exact-review bursts from dropping issues before review by retaining capacity-blocked items for 12 bounded retries by default.
 

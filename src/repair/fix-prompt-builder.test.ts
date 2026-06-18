@@ -54,9 +54,24 @@ test("fix prompt still asks Codex to preserve discovered release-note context", 
     likely_files: ["extensions/discord/src/message.ts"],
   });
 
-  assert.match(prompt, /changelog_required is false: do not edit CHANGELOG\.md/);
-  assert.match(prompt, /if you discover the target repository requires release-note context/);
+  assert.match(prompt, /repair_contributor_branch never edits CHANGELOG\.md/);
+  assert.match(prompt, /preserve release-note context/);
   assert.match(prompt, /preserve contributor credit in the PR body or commit history/);
+});
+
+test("contributor branch repairs never edit release-owned changelogs", () => {
+  const prompt = promptFor({
+    repair_strategy: "repair_contributor_branch",
+    pr_title: "feat(slides): add native tables",
+    summary: "Repair a generated contributor branch.",
+    source_prs: ["https://github.com/openclaw/gogcli/pull/834"],
+    changelog_required: true,
+    likely_files: ["CHANGELOG.md", "internal/cmd/slides_table.go"],
+  });
+
+  assert.match(prompt, /repair_contributor_branch never edits CHANGELOG\.md/);
+  assert.match(prompt, /even if changelog_required is true/);
+  assert.match(prompt, /existing PR body or commit history instead/);
 });
 
 test("fix prompt makes Codex own the validation loop", () => {
