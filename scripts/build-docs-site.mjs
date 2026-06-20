@@ -32,6 +32,7 @@ const sections = [
       "repair/internal-features.md",
     ],
   ],
+  ["Design", ["linear-integration.md"]],
 ];
 
 fs.rmSync(outDir, { recursive: true, force: true });
