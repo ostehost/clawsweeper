@@ -10,7 +10,11 @@ import {
   inferItemCategory,
   isStaleIssue,
   mapWorkspaceItem,
+  linearReviewSnapshotHash,
+  validateLinearReviewRecord,
+  assertLinearReviewRecord,
 } from "../dist/linear/record.js";
+import type { LinearReviewRecord } from "../dist/linear/record.js";
 import type { LinearIssue, LinearLabel, LinearTeam, WorkspaceItem } from "../dist/linear/types.js";
 
 // ---------------------------------------------------------------------------
@@ -285,4 +289,114 @@ test("mapWorkspaceItem: project=null → projectName is null", () => {
   assert.equal(record.state, "closed");
   assert.equal(record.triagePriority, "P3");
   assert.equal(record.itemCategory, "cleanup");
+});
+
+// ---------------------------------------------------------------------------
+// mapWorkspaceItem: Linear id + source identity (PAR-210 acceptance)
+// ---------------------------------------------------------------------------
+
+test("mapWorkspaceItem: preserves Linear id and derives source identity", () => {
+  const item = makeWorkspaceItem({
+    issue: makeIssue({ id: "issue-xyz", identifier: "ENG-99" }),
+  });
+
+  const record = mapWorkspaceItem(item);
+
+  assert.equal(record.id, "issue-xyz");
+  assert.equal(record.sourceId, "issue-xyz");
+  assert.equal(record.sourceProvider, "linear");
+  assert.equal(record.identifier, "ENG-99");
+  assert.equal(record.key, "ENG-99");
+  assert.equal(record.key, record.identifier);
+});
+
+test("mapWorkspaceItem: snapshotHash is a 64-char lowercase hex sha256", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  assert.match(record.snapshotHash, /^[0-9a-f]{64}$/);
+});
+
+// ---------------------------------------------------------------------------
+// snapshotHash determinism (no clock / no network)
+// ---------------------------------------------------------------------------
+
+test("snapshotHash: stable for equivalent input", () => {
+  const a = mapWorkspaceItem(makeWorkspaceItem());
+  const b = mapWorkspaceItem(makeWorkspaceItem());
+  assert.equal(a.snapshotHash, b.snapshotHash);
+});
+
+test("snapshotHash: independent of label order (canonicalized)", () => {
+  const a = mapWorkspaceItem(
+    makeWorkspaceItem({ issue: makeIssue({ labels: makeLabels("bug", "security") }) }),
+  );
+  const b = mapWorkspaceItem(
+    makeWorkspaceItem({ issue: makeIssue({ labels: makeLabels("security", "bug") }) }),
+  );
+  assert.equal(a.snapshotHash, b.snapshotHash);
+});
+
+test("snapshotHash: recomputing from the record is deterministic and matches the stamped hash", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  // Two recomputes are equal (no system clock / hidden state), and equal the stamped value.
+  assert.equal(linearReviewSnapshotHash(record), linearReviewSnapshotHash(record));
+  assert.equal(linearReviewSnapshotHash(record), record.snapshotHash);
+});
+
+test("snapshotHash: changes when the title changes", () => {
+  const base = mapWorkspaceItem(makeWorkspaceItem());
+  const changed = mapWorkspaceItem(
+    makeWorkspaceItem({ issue: makeIssue({ title: "A materially different title" }) }),
+  );
+  assert.notEqual(base.snapshotHash, changed.snapshotHash);
+});
+
+test("snapshotHash: changes when priority changes (P2 → P1)", () => {
+  const base = mapWorkspaceItem(makeWorkspaceItem()); // default priority 2 → P2
+  const changed = mapWorkspaceItem(makeWorkspaceItem({ issue: makeIssue({ priority: 1 }) }));
+  assert.notEqual(base.snapshotHash, changed.snapshotHash);
+});
+
+test("snapshotHash: changes when labels change", () => {
+  const base = mapWorkspaceItem(makeWorkspaceItem()); // default: no labels
+  const changed = mapWorkspaceItem(
+    makeWorkspaceItem({ issue: makeIssue({ labels: makeLabels("docs") }) }),
+  );
+  assert.notEqual(base.snapshotHash, changed.snapshotHash);
+});
+
+// ---------------------------------------------------------------------------
+// validateLinearReviewRecord / assertLinearReviewRecord
+// ---------------------------------------------------------------------------
+
+test("validateLinearReviewRecord: well-formed record yields no issues", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  assert.deepEqual(validateLinearReviewRecord(record), []);
+  assert.doesNotThrow(() => assertLinearReviewRecord(record));
+});
+
+test("validateLinearReviewRecord: missing required field (empty url) fails", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  const broken = { ...record, url: "" };
+
+  const issues = validateLinearReviewRecord(broken);
+  assert.ok(issues.some((i) => i.field === "url"));
+  assert.throws(() => assertLinearReviewRecord(broken), /url/);
+});
+
+test("validateLinearReviewRecord: missing required field (empty id) fails", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  const broken = { ...record, id: "" };
+
+  const issues = validateLinearReviewRecord(broken);
+  // Empty id is reported, and the sourceId === id consistency check also trips.
+  assert.ok(issues.some((i) => i.field === "id"));
+  assert.throws(() => assertLinearReviewRecord(broken), /id/);
+});
+
+test("validateLinearReviewRecord: invalid enum value fails", () => {
+  const record = mapWorkspaceItem(makeWorkspaceItem());
+  const broken = { ...record, triagePriority: "P9" } as unknown as LinearReviewRecord;
+
+  const issues = validateLinearReviewRecord(broken);
+  assert.ok(issues.some((i) => i.field === "triagePriority"));
 });
