@@ -110,8 +110,11 @@ Generic `openclaw/*` and `steipete/*` repositories:
 
 Manual `workflow_dispatch` can override `target_repo`, `item_number`,
 `item_numbers`, `batch_size`, `shard_count`, `hot_intake`, and apply inputs.
-Exact item dispatches use a dedicated concurrency group and exact planner
-matrix rather than the broad normal-review queue.
+OpenClaw on-demand and cron callers should use the thin dispatcher documented in
+[`openclaw-dispatch.md`](openclaw-dispatch.md), which maps operator-safe modes to
+this existing workflow entrypoint. Exact item dispatches use a dedicated
+concurrency group and exact planner matrix rather than the broad normal-review
+queue.
 
 Target fanout dispatches review batches through `repository_dispatch` so each
 selected repository can carry its inventory default branch without consuming
