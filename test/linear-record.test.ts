@@ -76,10 +76,7 @@ test("linearWorkspaceSlug: mixed-case key is fully lowercased", () => {
 // ---------------------------------------------------------------------------
 
 test("linearRecordPath: builds records/<slug>/items/<key>.md path", () => {
-  assert.equal(
-    linearRecordPath("linear-eng", "ENG-42"),
-    "records/linear-eng/items/ENG-42.md",
-  );
+  assert.equal(linearRecordPath("linear-eng", "ENG-42"), "records/linear-eng/items/ENG-42.md");
 });
 
 // ---------------------------------------------------------------------------

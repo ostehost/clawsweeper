@@ -49,19 +49,19 @@ export type ItemCategory =
   | "unclear";
 
 export interface LinearReviewRecord {
-  key: string;            // = issue.identifier, e.g. "PAR-123"
+  key: string; // = issue.identifier, e.g. "PAR-123"
   title: string;
   url: string;
-  workspaceSlug: string;  // "linear-" + team.key.toLowerCase()
-  recordPath: string;     // `records/<workspaceSlug>/items/<key>.md`
-  reviewMarker: string;   // `<!-- clawsweeper-review:<key> -->`
+  workspaceSlug: string; // "linear-" + team.key.toLowerCase()
+  recordPath: string; // `records/<workspaceSlug>/items/<key>.md`
+  reviewMarker: string; // `<!-- clawsweeper-review:<key> -->`
   state: TrackerItemState;
   triagePriority: TriagePriority;
   itemCategory: ItemCategory;
   teamKey: string;
   teamName: string;
   projectName: string | null;
-  labels: string[];       // label NAMES, from issue.labels[].name
+  labels: string[]; // label NAMES, from issue.labels[].name
   createdAt: string;
   updatedAt: string;
 }
@@ -88,11 +88,16 @@ export function linearReviewMarker(key: string): string {
  */
 export function mapLinearPriority(priority: number): TriagePriority {
   switch (priority) {
-    case 1: return "P1";
-    case 2: return "P2";
-    case 3: return "P3";
-    case 4: return "P3";
-    default: return "none";
+    case 1:
+      return "P1";
+    case 2:
+      return "P2";
+    case 3:
+      return "P3";
+    case 4:
+      return "P3";
+    default:
+      return "none";
   }
 }
 
@@ -107,15 +112,15 @@ export function mapLinearState(stateType: string | null): TrackerItemState {
 
 // Category precedence order — first substring match wins.
 const CATEGORY_RULES: Array<[ItemCategory, string]> = [
-  ["security",   "security"],
+  ["security", "security"],
   ["regression", "regression"],
-  ["bug",        "bug"],
-  ["docs",       "doc"],
-  ["skill",      "skill"],
-  ["cleanup",    "cleanup"],
-  ["support",    "support"],
-  ["admin",      "admin"],
-  ["feature",    "feature"],
+  ["bug", "bug"],
+  ["docs", "doc"],
+  ["skill", "skill"],
+  ["cleanup", "cleanup"],
+  ["support", "support"],
+  ["admin", "admin"],
+  ["feature", "feature"],
 ];
 
 /**
@@ -138,7 +143,11 @@ const DEFAULT_STALE_DAYS = 60;
  * Returns true if the issue's updatedAt is older than staleDays before nowIso.
  * nowIso must be provided by the caller — this function never reads the system clock.
  */
-export function isStaleIssue(issue: LinearIssue, nowIso: string, staleDays = DEFAULT_STALE_DAYS): boolean {
+export function isStaleIssue(
+  issue: LinearIssue,
+  nowIso: string,
+  staleDays = DEFAULT_STALE_DAYS,
+): boolean {
   const now = new Date(nowIso).getTime();
   const updated = new Date(issue.updatedAt).getTime();
   return now - updated > staleDays * MS_PER_DAY;
