@@ -24,3 +24,21 @@ export { createLinearTransport, resolveLinearToken } from "./client.js";
 export type { LinearTransport, LinearTransportOptions, ResolveTokenOptions } from "./client.js";
 
 export { LinearItemSource } from "./source.js";
+
+export type {
+  ItemCategory,
+  LinearReviewRecord,
+  TrackerItemState,
+  TriagePriority,
+} from "./record.js";
+
+export {
+  inferItemCategory,
+  isStaleIssue,
+  linearRecordPath,
+  linearReviewMarker,
+  linearWorkspaceSlug,
+  mapLinearPriority,
+  mapLinearState,
+  mapWorkspaceItem,
+} from "./record.js";
