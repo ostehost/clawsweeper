@@ -68,6 +68,11 @@ same-repository URLs and at most one evidence-backed canonical item; it does not
 dispatch repair, suppress jobs, mutate siblings, close, or merge. See
 [`docs/related-issue-discovery.md`](docs/related-issue-discovery.md).
 
+A design for extending ClawSweeper's weekly/on-demand review to Linear issues —
+preserving the same proposal-only, review-only-by-default doctrine — is documented
+in [`docs/linear-integration.md`](docs/linear-integration.md). It is a design for
+planned work and is not yet implemented.
+
 For open issues with complete, current kept-open reviews, ClawSweeper also
 projects selected structured review conclusions into advisory GitHub labels for
 maintainer filtering and project views. These labels expose states such as
