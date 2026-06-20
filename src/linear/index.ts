@@ -27,18 +27,24 @@ export { LinearItemSource } from "./source.js";
 
 export type {
   ItemCategory,
+  LinearRecordValidationIssue,
   LinearReviewRecord,
+  LinearSourceProvider,
   TrackerItemState,
   TriagePriority,
 } from "./record.js";
 
 export {
+  assertLinearReviewRecord,
   inferItemCategory,
   isStaleIssue,
+  LINEAR_SOURCE_PROVIDER,
   linearRecordPath,
   linearReviewMarker,
+  linearReviewSnapshotHash,
   linearWorkspaceSlug,
   mapLinearPriority,
   mapLinearState,
   mapWorkspaceItem,
+  validateLinearReviewRecord,
 } from "./record.js";

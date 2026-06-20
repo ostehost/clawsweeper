@@ -30,9 +30,15 @@
  *   Default stale threshold is 60 days. No system clock reads (deterministic).
  */
 
+import { createHash } from "node:crypto";
+
 import type { LinearIssue, LinearLabel, LinearTeam, WorkspaceItem } from "./types.js";
 
 export type TrackerItemState = "open" | "closed";
+
+/** Provider tag for source identity. Linear records are always "linear". */
+export const LINEAR_SOURCE_PROVIDER = "linear" as const;
+export type LinearSourceProvider = typeof LINEAR_SOURCE_PROVIDER;
 
 export type TriagePriority = "P0" | "P1" | "P2" | "P3" | "none";
 
@@ -49,9 +55,14 @@ export type ItemCategory =
   | "unclear";
 
 export interface LinearReviewRecord {
-  key: string; // = issue.identifier, e.g. "PAR-123"
+  id: string; // Linear issue id (UUID) — durable source identity, e.g. "a1b2…"
+  key: string; // = issue.identifier, e.g. "PAR-123" (the human-facing identifier)
+  identifier: string; // = issue.identifier; explicit per ClawSweeper taxonomy (mirrors `key`)
   title: string;
   url: string;
+  sourceProvider: LinearSourceProvider; // "linear" — provider half of the source identity
+  sourceId: string; // = id; provider-scoped durable id consumed by downstream records
+  snapshotHash: string; // sha256 over canonical source/record fields (deterministic, clock-free)
   workspaceSlug: string; // "linear-" + team.key.toLowerCase()
   recordPath: string; // `records/<workspaceSlug>/items/<key>.md`
   reviewMarker: string; // `<!-- clawsweeper-review:<key> -->`
@@ -64,6 +75,12 @@ export interface LinearReviewRecord {
   labels: string[]; // label NAMES, from issue.labels[].name
   createdAt: string;
   updatedAt: string;
+}
+
+/** A single field-level validation failure for a {@link LinearReviewRecord}. */
+export interface LinearRecordValidationIssue {
+  field: string;
+  message: string;
 }
 
 /** Returns the workspace slug: "linear-" + team.key lowercased. */
@@ -154,17 +171,160 @@ export function isStaleIssue(
 }
 
 /**
+ * Builds the canonical snapshot object that the record's content hash is derived from.
+ *
+ * Fields are enumerated explicitly (never via object-key iteration) and labels are
+ * sorted, so the snapshot is stable for equivalent input regardless of label order.
+ * Purely-derived fields (recordPath, reviewMarker — deterministic from `key`) and the
+ * hash itself are excluded. No system clock is read.
+ */
+function linearReviewSnapshot(
+  record: Omit<LinearReviewRecord, "snapshotHash">,
+): Record<string, unknown> {
+  return {
+    sourceProvider: record.sourceProvider,
+    sourceId: record.sourceId,
+    identifier: record.identifier,
+    url: record.url,
+    title: record.title,
+    state: record.state,
+    triagePriority: record.triagePriority,
+    itemCategory: record.itemCategory,
+    teamKey: record.teamKey,
+    teamName: record.teamName,
+    projectName: record.projectName,
+    workspaceSlug: record.workspaceSlug,
+    labels: [...record.labels].sort(),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
+/**
+ * Returns a deterministic sha256 snapshot hash for a record's canonical source fields.
+ * Stable for equivalent input (order-independent labels) and changes when any material
+ * source/classification field changes. Never reads the system clock or the network.
+ */
+export function linearReviewSnapshotHash(record: Omit<LinearReviewRecord, "snapshotHash">): string {
+  return createHash("sha256")
+    .update(JSON.stringify(linearReviewSnapshot(record)))
+    .digest("hex");
+}
+
+// Required non-empty string fields a record must carry before downstream consumers use it.
+const REQUIRED_STRING_FIELDS = [
+  "id",
+  "key",
+  "identifier",
+  "title",
+  "url",
+  "sourceProvider",
+  "sourceId",
+  "snapshotHash",
+  "workspaceSlug",
+  "recordPath",
+  "reviewMarker",
+  "teamKey",
+  "teamName",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+const VALID_STATES = new Set<TrackerItemState>(["open", "closed"]);
+const VALID_PRIORITIES = new Set<TriagePriority>(["P0", "P1", "P2", "P3", "none"]);
+const VALID_CATEGORIES = new Set<ItemCategory>([
+  "bug",
+  "regression",
+  "feature",
+  "skill",
+  "docs",
+  "cleanup",
+  "support",
+  "admin",
+  "security",
+  "unclear",
+]);
+
+/**
+ * Validates the required decision fields of a LinearReviewRecord. Pure and offline.
+ * Returns an empty array for a well-formed record, or one issue per failed field —
+ * downstream classifier/report steps should reject any record with a non-empty result.
+ */
+export function validateLinearReviewRecord(
+  record: LinearReviewRecord,
+): LinearRecordValidationIssue[] {
+  const issues: LinearRecordValidationIssue[] = [];
+  const view = record as unknown as Record<string, unknown>;
+
+  for (const field of REQUIRED_STRING_FIELDS) {
+    const value = view[field];
+    if (typeof value !== "string" || value.length === 0) {
+      issues.push({ field, message: `${field} must be a non-empty string` });
+    }
+  }
+
+  if (!VALID_STATES.has(record.state)) {
+    issues.push({
+      field: "state",
+      message: `state must be one of: ${[...VALID_STATES].join(", ")}`,
+    });
+  }
+  if (!VALID_PRIORITIES.has(record.triagePriority)) {
+    issues.push({
+      field: "triagePriority",
+      message: `triagePriority must be one of: ${[...VALID_PRIORITIES].join(", ")}`,
+    });
+  }
+  if (!VALID_CATEGORIES.has(record.itemCategory)) {
+    issues.push({
+      field: "itemCategory",
+      message: `itemCategory must be one of: ${[...VALID_CATEGORIES].join(", ")}`,
+    });
+  }
+  if (!Array.isArray(record.labels) || record.labels.some((l) => typeof l !== "string")) {
+    issues.push({ field: "labels", message: "labels must be an array of strings" });
+  }
+  if (record.sourceProvider !== LINEAR_SOURCE_PROVIDER) {
+    issues.push({ field: "sourceProvider", message: 'sourceProvider must be "linear"' });
+  }
+  if (record.identifier !== record.key) {
+    issues.push({ field: "identifier", message: "identifier must equal key" });
+  }
+  if (record.sourceId !== record.id) {
+    issues.push({ field: "sourceId", message: "sourceId must equal id" });
+  }
+
+  return issues;
+}
+
+/**
+ * Asserts a LinearReviewRecord is well-formed, throwing a precise error listing every
+ * failed field. Use this as the guard before a classifier or report consumes the record.
+ */
+export function assertLinearReviewRecord(record: LinearReviewRecord): void {
+  const issues = validateLinearReviewRecord(record);
+  if (issues.length > 0) {
+    const detail = issues.map((i) => `${i.field}: ${i.message}`).join("; ");
+    throw new Error(`Invalid LinearReviewRecord: ${detail}`);
+  }
+}
+
+/**
  * Maps a WorkspaceItem (team + project + issue) into a LinearReviewRecord.
- * Aggregates all mapping helpers above.
+ * Aggregates all mapping helpers above and stamps a deterministic snapshot hash.
  */
 export function mapWorkspaceItem(item: WorkspaceItem): LinearReviewRecord {
   const { team, project, issue } = item;
   const key = issue.identifier;
   const workspaceSlug = linearWorkspaceSlug(team);
-  return {
+  const base: Omit<LinearReviewRecord, "snapshotHash"> = {
+    id: issue.id,
     key,
+    identifier: issue.identifier,
     title: issue.title,
     url: issue.url,
+    sourceProvider: LINEAR_SOURCE_PROVIDER,
+    sourceId: issue.id,
     workspaceSlug,
     recordPath: linearRecordPath(workspaceSlug, key),
     reviewMarker: linearReviewMarker(key),
@@ -178,4 +338,5 @@ export function mapWorkspaceItem(item: WorkspaceItem): LinearReviewRecord {
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
   };
+  return { ...base, snapshotHash: linearReviewSnapshotHash(base) };
 }
