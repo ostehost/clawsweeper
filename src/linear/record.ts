@@ -2,12 +2,20 @@
  * Linear → ClawSweeper record mapping (deterministic, offline, pure functions).
  *
  * Priority mapping:
- *   Linear 0 (none) → "none"
- *   Linear 1 (urgent) → "P0"
- *   Linear 2 (high)   → "P1"
- *   Linear 3 (medium) → "P2"
+ *   Linear 0 (none)   → "none"
+ *   Linear 1 (urgent) → "P1"
+ *   Linear 2 (high)   → "P2"
+ *   Linear 3 (medium) → "P3"
  *   Linear 4 (low)    → "P3"
  *   Any other value   → "none"
+ *
+ *   P0 is intentionally never assigned here. ClawSweeper reserves P0 exclusively for
+ *   emergencies (data loss, security bypass, crash loop, unusable core runtime) requiring
+ *   concrete impact evidence that this deterministic mapping layer cannot establish from a
+ *   priority integer alone. Linear's "urgent" (1) maps to P1 ("urgent regression affecting
+ *   real users now"), which is the correct conservative match. Mapping urgent→P0 would
+ *   over-escalate and break ClawSweeper's evidence-required doctrine. P0 is never assigned
+ *   from the tracker priority field alone.
  *
  * State mapping:
  *   Linear stateType "completed" or "canceled" → "closed"
@@ -75,13 +83,14 @@ export function linearReviewMarker(key: string): string {
 
 /**
  * Maps a Linear priority integer to a TriagePriority.
- * 0 → none, 1 → P0, 2 → P1, 3 → P2, 4 → P3, else → none.
+ * 0 → none, 1 → P1, 2 → P2, 3 → P3, 4 → P3, else → none.
+ * P0 is never assigned here — see module doc comment for rationale.
  */
 export function mapLinearPriority(priority: number): TriagePriority {
   switch (priority) {
-    case 1: return "P0";
-    case 2: return "P1";
-    case 3: return "P2";
+    case 1: return "P1";
+    case 2: return "P2";
+    case 3: return "P3";
     case 4: return "P3";
     default: return "none";
   }
