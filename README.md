@@ -147,9 +147,11 @@ non-security, and still relevant on latest `main`.
 Repository-specific rules live in `src/repository-profiles.ts`, so OpenClaw,
 ClawHub, and ClawSweeper can share the same engine while keeping different apply
 limits. Both review and repair lanes support manual workflow dispatch, reruns,
-and backfills. `pnpm commit-reports -- --since 24h`, `--findings`,
-`--non-clean`, `--repo`, and `--author` query flat per-SHA commit storage
-without date buckets.
+and backfills. OpenClaw operators can use the thin GitHub Actions dispatcher in
+[`docs/openclaw-dispatch.md`](docs/openclaw-dispatch.md) for on-demand and cron
+calls without local generated state. `pnpm commit-reports -- --since 24h`,
+`--findings`, `--non-clean`, `--repo`, and `--author` query flat per-SHA commit
+storage without date buckets.
 
 ## Guardrails
 
