@@ -334,8 +334,8 @@ function activeRuns(options) {
   });
 }
 
-function workflowDisplayName(workflowNameOrFile) {
-  if (workflowNameOrFile === "sweep.yml") return "sweep";
+export function workflowDisplayName(workflowNameOrFile) {
+  if (workflowNameOrFile === "sweep.yml") return "ClawSweeper";
   return workflowNameOrFile;
 }
 
