@@ -71,7 +71,14 @@ test("OpenClaw dispatcher rejects exact-review without an item", () => {
 });
 
 test("OpenClaw dispatcher exposes status as a read-only gh run list", () => {
-  const options = parseArgs(["--mode", "status", "--run-limit", "7", "--active-max-age-minutes", "30"]);
+  const options = parseArgs([
+    "--mode",
+    "status",
+    "--run-limit",
+    "7",
+    "--active-max-age-minutes",
+    "30",
+  ]);
 
   assert.equal(options.activeMaxAgeMinutes, 30);
 
@@ -94,5 +101,8 @@ test("OpenClaw dispatcher shell-quotes receipt commands", () => {
     commandLine("gh", ["workflow", "run", "sweep.yml", "-f", "target_repo=openclaw/openclaw"]),
     "gh workflow run sweep.yml -f target_repo=openclaw/openclaw",
   );
-  assert.equal(commandLine("gh", ["run", "list", "--json", "databaseId,url"]), "gh run list --json databaseId,url");
+  assert.equal(
+    commandLine("gh", ["run", "list", "--json", "databaseId,url"]),
+    "gh run list --json databaseId,url",
+  );
 });
