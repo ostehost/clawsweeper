@@ -18,7 +18,7 @@ export const TEAMS_QUERY = `
 `;
 
 export const PROJECTS_QUERY = `
-  query ListProjects($teamId: ID!, $first: Int!, $after: String) {
+  query ListProjects($teamId: String!, $first: Int!, $after: String) {
     team(id: $teamId) {
       projects(first: $first, after: $after) {
         nodes {

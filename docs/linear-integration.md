@@ -206,4 +206,4 @@ Before any mutation scope is enabled, several questions need operator answers:
 ## Source Research
 
 The full source-of-truth research, verified key paths, and build sequence are in
-[`LINEAR-INTEGRATION-HANDOFF.md`](../LINEAR-INTEGRATION-HANDOFF.md).
+[`LINEAR-INTEGRATION-HANDOFF.md`](https://github.com/openclaw/clawsweeper/blob/main/LINEAR-INTEGRATION-HANDOFF.md).
