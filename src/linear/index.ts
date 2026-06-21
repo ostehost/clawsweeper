@@ -48,3 +48,12 @@ export {
   mapWorkspaceItem,
   validateLinearReviewRecord,
 } from "./record.js";
+
+export type {
+  ClassifierOptions,
+  CloseCandidateReason,
+  LinearClassification,
+  ReviewDisposition,
+} from "./classifier.js";
+
+export { classifyRecord, classifyRecords, proposesClose } from "./classifier.js";
