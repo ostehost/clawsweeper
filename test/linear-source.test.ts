@@ -121,6 +121,7 @@ test("listProjects: paginates under team.projects, sets teamId, maps state", asy
   assert.equal(p2?.state, null);
 
   assert.equal(calls[0]?.vars["teamId"], "team-abc");
+  assert.match(calls[0]?.query ?? "", /query ListProjects\(\$teamId: ID!/);
 });
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,7 @@ test("listIssues WITHOUT updatedAfter: vars have teamId but no updatedAfter key"
   const vars = calls[0]?.vars ?? {};
   assert.equal(vars["teamId"], "team-abc");
   assert.equal("updatedAfter" in vars, false);
+  assert.match(calls[0]?.query ?? "", /query ListIssues\(\$teamId: ID!, \$updatedAfter: DateComparator/);
 });
 
 // ---------------------------------------------------------------------------
