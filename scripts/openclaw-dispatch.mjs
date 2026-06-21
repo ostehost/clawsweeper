@@ -199,6 +199,8 @@ export function runListArgs(options, status = null) {
     "list",
     "--repo",
     options.dispatchRepo,
+    "--workflow",
+    options.workflow,
     "--limit",
     String(options.runLimit),
     "--json",

@@ -63,6 +63,7 @@ export const ISSUES_QUERY = `
           id
         }
         state {
+          id
           name
           type
         }

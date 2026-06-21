@@ -65,8 +65,11 @@ export interface LinearReviewRecord {
   snapshotHash: string; // sha256 over canonical source/record fields (deterministic, clock-free)
   workspaceSlug: string; // "linear-" + team.key.toLowerCase()
   recordPath: string; // `records/<workspaceSlug>/items/<key>.md`
-  reviewMarker: string; // `<!-- clawsweeper-review:<key> -->`
+  reviewMarker: string; // `<!-- clawsweeper-review:<sourceId> -->`
   state: TrackerItemState;
+  linearStateId: string | null;
+  linearStateName: string | null;
+  linearStateType: string | null;
   triagePriority: TriagePriority;
   itemCategory: ItemCategory;
   teamKey: string;
@@ -188,6 +191,9 @@ function linearReviewSnapshot(
     url: record.url,
     title: record.title,
     state: record.state,
+    linearStateId: record.linearStateId,
+    linearStateName: record.linearStateName,
+    linearStateType: record.linearStateType,
     triagePriority: record.triagePriority,
     itemCategory: record.itemCategory,
     teamKey: record.teamKey,
@@ -329,6 +335,9 @@ export function mapWorkspaceItem(item: WorkspaceItem): LinearReviewRecord {
     recordPath: linearRecordPath(workspaceSlug, key),
     reviewMarker: linearReviewMarker(issue.id),
     state: mapLinearState(issue.stateType),
+    linearStateId: issue.stateId,
+    linearStateName: issue.stateName,
+    linearStateType: issue.stateType,
     triagePriority: mapLinearPriority(issue.priority),
     itemCategory: inferItemCategory(issue.labels),
     teamKey: team.key,

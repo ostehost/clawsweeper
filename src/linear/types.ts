@@ -25,6 +25,7 @@ export interface LinearIssue {
   updatedAt: string;
   teamId: string;
   projectId: string | null;
+  stateId: string | null;
   stateName: string | null;
   stateType: string | null;
   priority: number;
