@@ -87,13 +87,12 @@ test("OpenClaw dispatcher exposes status as a read-only gh run list", () => {
     "list",
     "--repo",
     "openclaw/clawsweeper",
-    "--workflow",
-    "sweep.yml",
     "--limit",
     "7",
     "--json",
-    "databaseId,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+    "databaseId,workflowName,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
   ]);
+  assert.equal(runListArgs(options).includes("--workflow"), false);
 });
 
 test("OpenClaw dispatcher shell-quotes receipt commands", () => {

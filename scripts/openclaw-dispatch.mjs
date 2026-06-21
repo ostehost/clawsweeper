@@ -199,12 +199,10 @@ export function runListArgs(options, status = null) {
     "list",
     "--repo",
     options.dispatchRepo,
-    "--workflow",
-    options.workflow,
     "--limit",
     String(options.runLimit),
     "--json",
-    "databaseId,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+    "databaseId,workflowName,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
   ];
   if (status) args.push("--status", status);
   return args;
@@ -324,12 +322,21 @@ function activeRuns(options) {
     try {
       return JSON.parse(result.stdout || "[]").filter((run) => {
         const createdAt = Date.parse(run.createdAt || "");
-        return Number.isFinite(createdAt) && createdAt >= cutoff;
+        return (
+          run.workflowName === workflowDisplayName(options.workflow) &&
+          Number.isFinite(createdAt) &&
+          createdAt >= cutoff
+        );
       });
     } catch (error) {
       throw new Error(`could not parse gh run list output: ${error.message}`);
     }
   });
+}
+
+function workflowDisplayName(workflowNameOrFile) {
+  if (workflowNameOrFile === "sweep.yml") return "sweep";
+  return workflowNameOrFile;
 }
 
 function run(binary, args, { capture }) {

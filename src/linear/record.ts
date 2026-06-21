@@ -93,9 +93,9 @@ export function linearRecordPath(workspaceSlug: string, key: string): string {
   return `records/${workspaceSlug}/items/${key}.md`;
 }
 
-/** Returns the durable review-comment marker for a given issue key. */
-export function linearReviewMarker(key: string): string {
-  return `<!-- clawsweeper-review:${key} -->`;
+/** Returns the durable review-comment marker for a given Linear issue UUID. */
+export function linearReviewMarker(issueId: string): string {
+  return `<!-- clawsweeper-review:${issueId} -->`;
 }
 
 /**
@@ -327,7 +327,7 @@ export function mapWorkspaceItem(item: WorkspaceItem): LinearReviewRecord {
     sourceId: issue.id,
     workspaceSlug,
     recordPath: linearRecordPath(workspaceSlug, key),
-    reviewMarker: linearReviewMarker(key),
+    reviewMarker: linearReviewMarker(issue.id),
     state: mapLinearState(issue.stateType),
     triagePriority: mapLinearPriority(issue.priority),
     itemCategory: inferItemCategory(issue.labels),
