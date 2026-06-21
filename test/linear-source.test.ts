@@ -121,7 +121,7 @@ test("listProjects: paginates under team.projects, sets teamId, maps state", asy
   assert.equal(p2?.state, null);
 
   assert.equal(calls[0]?.vars["teamId"], "team-abc");
-  assert.match(calls[0]?.query ?? "", /query ListProjects\(\$teamId: ID!/);
+  assert.match(calls[0]?.query ?? "", /query ListProjects\(\$teamId: String!/);
 });
 
 // ---------------------------------------------------------------------------
