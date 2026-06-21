@@ -70,6 +70,15 @@ function extractErrorCode(errors: unknown[]): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+function networkErrorMessage(error: Error): string {
+  const cause = (error as { cause?: unknown }).cause;
+  if (typeof cause !== "object" || cause === null) return error.message;
+  const code = (cause as Record<string, unknown>)["code"];
+  return typeof code === "string" && code.length > 0
+    ? `${error.message}: ${code}`
+    : error.message;
+}
+
 // Build a LinearRequestError options object omitting undefined fields to satisfy
 // exactOptionalPropertyTypes — assigning `undefined` to an optional prop is forbidden.
 function makeErrOpts(
@@ -113,7 +122,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
         });
       } catch (networkError) {
         const err = networkError instanceof Error ? networkError : new Error(String(networkError));
-        const linearErr = new LinearRequestError(err.message);
+        const linearErr = new LinearRequestError(networkErrorMessage(err));
         if (attempt < maxRetries && shouldRetryLinear(linearErr)) {
           const kind = linearRetryKind(linearErr);
           await sleep(linearRetryWaitMs(kind, attempt, undefined, now()));
