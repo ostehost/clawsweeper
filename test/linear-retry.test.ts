@@ -236,6 +236,36 @@ test("createLinearTransport: retries once on 400 GraphQL errors RATELIMITED then
   assert.deepEqual(sleepDelays, [30_000]);
 });
 
+test("createLinearTransport: retries Node fetch failures with transient cause codes", async () => {
+  const sleepDelays: number[] = [];
+  let callCount = 0;
+  const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
+    callCount += 1;
+    if (callCount === 1) {
+      throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+    }
+    const body = JSON.stringify({ data: { ok: true } });
+    return new Response(body, { status: 200 });
+  };
+
+  const transport = createLinearTransport({
+    token: "fake-token",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: fakeFetch as typeof fetch,
+    sleep: (ms: number) => {
+      sleepDelays.push(ms);
+      return Promise.resolve();
+    },
+    now: () => 1_000_000,
+    maxRetries: 3,
+  });
+
+  const result = await transport("query { ok }", {});
+  assert.deepEqual(result, { ok: true });
+  assert.equal(callCount, 2);
+  assert.deepEqual(sleepDelays, [2_000]);
+});
+
 test("createLinearTransport: non-retryable error (validation) throws without retry", async () => {
   let callCount = 0;
   const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
