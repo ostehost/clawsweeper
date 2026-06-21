@@ -5,6 +5,7 @@ import {
   commandLine,
   parseArgs,
   runListArgs,
+  workflowDisplayName,
   workflowFields,
   workflowRunArgs,
 } from "../scripts/openclaw-dispatch.mjs";
@@ -93,6 +94,7 @@ test("OpenClaw dispatcher exposes status as a read-only gh run list", () => {
     "databaseId,workflowName,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
   ]);
   assert.equal(runListArgs(options).includes("--workflow"), false);
+  assert.equal(workflowDisplayName(options.workflow), "ClawSweeper");
 });
 
 test("OpenClaw dispatcher shell-quotes receipt commands", () => {
