@@ -87,8 +87,11 @@ test("linearRecordPath: builds records/<slug>/items/<key>.md path", () => {
 // linearReviewMarker
 // ---------------------------------------------------------------------------
 
-test("linearReviewMarker: wraps key in HTML comment marker", () => {
-  assert.equal(linearReviewMarker("PAR-99"), "<!-- clawsweeper-review:PAR-99 -->");
+test("linearReviewMarker: wraps durable Linear UUID in HTML comment marker", () => {
+  assert.equal(
+    linearReviewMarker("8f7c0a6a-8b76-44a5-9282-bb62c3d7c2a4"),
+    "<!-- clawsweeper-review:8f7c0a6a-8b76-44a5-9282-bb62c3d7c2a4 -->",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -260,7 +263,7 @@ test("mapWorkspaceItem: maps all fields correctly for a representative fixture",
   assert.equal(record.url, "https://linear.app/par/issue/PAR-123");
   assert.equal(record.workspaceSlug, "linear-par");
   assert.equal(record.recordPath, "records/linear-par/items/PAR-123.md");
-  assert.equal(record.reviewMarker, "<!-- clawsweeper-review:PAR-123 -->");
+  assert.equal(record.reviewMarker, "<!-- clawsweeper-review:issue-1 -->");
   assert.equal(record.state, "open");
   assert.equal(record.triagePriority, "P1");
   assert.equal(record.itemCategory, "regression"); // regression > bug
