@@ -158,11 +158,11 @@ test("linearRetryWaitMs: none → always 0", () => {
 // createLinearTransport retry behaviour (injected fetchImpl + sleep + now)
 // ---------------------------------------------------------------------------
 
-test("createLinearTransport: retries once on 400 RATELIMITED then succeeds", async () => {
+test("createLinearTransport: retries once on 400 top-level RATELIMITED then succeeds", async () => {
   const sleepDelays: number[] = [];
   let nowMs = 0;
 
-  // First call: 400 with RATELIMITED body
+  // First call: 400 with top-level RATELIMITED body
   // Second call: 200 with data
   let callCount = 0;
   const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
@@ -193,6 +193,47 @@ test("createLinearTransport: retries once on 400 RATELIMITED then succeeds", asy
   assert.equal(sleepDelays.length, 1);
   // Wait should be exponential throttle: 30000 * 2^0 = 30000
   assert.equal(sleepDelays[0], 30_000);
+});
+
+test("createLinearTransport: retries once on 400 GraphQL errors RATELIMITED then succeeds", async () => {
+  const sleepDelays: number[] = [];
+  let callCount = 0;
+  const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
+    callCount += 1;
+    if (callCount === 1) {
+      const body = JSON.stringify({
+        errors: [
+          {
+            message: "Rate limit exceeded",
+            extensions: { code: "RATELIMITED" },
+          },
+        ],
+      });
+      return new Response(body, {
+        status: 400,
+        headers: { "x-ratelimit-requests-reset": "1030" },
+      });
+    }
+    const body = JSON.stringify({ data: { ok: true } });
+    return new Response(body, { status: 200 });
+  };
+
+  const transport = createLinearTransport({
+    token: "fake-token",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: fakeFetch as typeof fetch,
+    sleep: (ms: number) => {
+      sleepDelays.push(ms);
+      return Promise.resolve();
+    },
+    now: () => 1_000_000,
+    maxRetries: 3,
+  });
+
+  const result = await transport("query { ok }", {});
+  assert.deepEqual(result, { ok: true });
+  assert.equal(callCount, 2);
+  assert.deepEqual(sleepDelays, [30_000]);
 });
 
 test("createLinearTransport: non-retryable error (validation) throws without retry", async () => {

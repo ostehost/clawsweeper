@@ -130,15 +130,19 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
         } catch {
           // best effort; keep empty body
         }
+        const errors = Array.isArray(body["errors"]) ? (body["errors"] as unknown[]) : [];
         const message =
-          typeof body["message"] === "string"
-            ? body["message"]
-            : `Linear API error: HTTP ${response.status}`;
+          errors.length > 0
+            ? joinErrors(errors)
+            : typeof body["message"] === "string"
+              ? body["message"]
+              : `Linear API error: HTTP ${response.status}`;
         const ext = body["extensions"];
-        const code =
+        const topLevelCode =
           typeof ext === "object" && ext !== null && "code" in ext
             ? String((ext as Record<string, unknown>)["code"])
             : undefined;
+        const code = extractErrorCode(errors) ?? topLevelCode;
         const resetAtMs = parseResetHeader(response.headers);
         const err = new LinearRequestError(message, makeErrOpts(response.status, code, resetAtMs));
         if (attempt < maxRetries && shouldRetryLinear(err)) {
