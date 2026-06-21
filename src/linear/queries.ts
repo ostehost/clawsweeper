@@ -18,7 +18,7 @@ export const TEAMS_QUERY = `
 `;
 
 export const PROJECTS_QUERY = `
-  query ListProjects($teamId: String!, $first: Int!, $after: String) {
+  query ListProjects($teamId: ID!, $first: Int!, $after: String) {
     team(id: $teamId) {
       projects(first: $first, after: $after) {
         nodes {
@@ -38,7 +38,7 @@ export const PROJECTS_QUERY = `
 // Issues are filtered by team and optionally by updatedAt, ordered by updatedAt
 // for efficient incremental sweeps (only process what changed since last run).
 export const ISSUES_QUERY = `
-  query ListIssues($teamId: String!, $updatedAfter: DateTimeFilter, $first: Int!, $after: String) {
+  query ListIssues($teamId: ID!, $updatedAfter: DateComparator, $first: Int!, $after: String) {
     issues(
       first: $first
       after: $after
