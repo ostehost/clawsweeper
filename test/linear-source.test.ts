@@ -146,7 +146,7 @@ test("listIssues WITHOUT updatedAfter: vars have teamId but no updatedAfter key"
                 priority: 2,
                 team: { id: "team-abc" },
                 project: { id: "proj-1" },
-                state: { name: "In Progress", type: "started" },
+                state: { id: "state-started", name: "In Progress", type: "started" },
                 labels: { nodes: [{ id: "lbl-1", name: "bug" }] },
               },
             ],
@@ -174,6 +174,7 @@ test("listIssues WITHOUT updatedAfter: vars have teamId but no updatedAfter key"
   assert.equal(issue.priority, 2);
   assert.equal(issue.teamId, "team-abc");
   assert.equal(issue.projectId, "proj-1");
+  assert.equal(issue.stateId, "state-started");
   assert.equal(issue.stateName, "In Progress");
   assert.equal(issue.stateType, "started");
   assert.deepEqual(issue.labels, [{ id: "lbl-1", name: "bug" }]);
@@ -253,6 +254,7 @@ test("listIssues: maps null project → projectId null, null state → nulls, em
   const issue = issues[0];
   assert.ok(issue !== undefined);
   assert.equal(issue.projectId, null);
+  assert.equal(issue.stateId, null);
   assert.equal(issue.stateName, null);
   assert.equal(issue.stateType, null);
   assert.deepEqual(issue.labels, []);
@@ -301,7 +303,7 @@ test("listWorkspaceItems: joins team, projects, issues; resolves project by id",
                 priority: 1,
                 team: { id: "team-1" },
                 project: { id: "proj-a" },
-                state: { name: "Todo", type: "unstarted" },
+                state: { id: "state-todo", name: "Todo", type: "unstarted" },
                 labels: { nodes: [] },
               },
               {

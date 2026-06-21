@@ -39,6 +39,7 @@ function makeIssue(overrides: Partial<LinearIssue> = {}): LinearIssue {
     updatedAt: "2024-06-01T00:00:00Z",
     teamId: "team-1",
     projectId: "proj-1",
+    stateId: "state-started",
     stateName: "In Progress",
     stateType: "started",
     priority: 2,
@@ -249,6 +250,7 @@ test("mapWorkspaceItem: maps all fields correctly for a representative fixture",
       title: "Fix memory leak",
       url: "https://linear.app/par/issue/PAR-123",
       priority: 1,
+      stateId: "state-started",
       stateType: "started",
       createdAt: "2024-03-01T00:00:00Z",
       updatedAt: "2024-03-15T00:00:00Z",
@@ -265,6 +267,9 @@ test("mapWorkspaceItem: maps all fields correctly for a representative fixture",
   assert.equal(record.recordPath, "records/linear-par/items/PAR-123.md");
   assert.equal(record.reviewMarker, "<!-- clawsweeper-review:issue-1 -->");
   assert.equal(record.state, "open");
+  assert.equal(record.linearStateId, "state-started");
+  assert.equal(record.linearStateName, "In Progress");
+  assert.equal(record.linearStateType, "started");
   assert.equal(record.triagePriority, "P1");
   assert.equal(record.itemCategory, "regression"); // regression > bug
   assert.equal(record.teamKey, "PAR");
@@ -280,6 +285,7 @@ test("mapWorkspaceItem: project=null → projectName is null", () => {
     project: null,
     issue: makeIssue({
       identifier: "ENG-7",
+      stateId: "state-completed",
       stateType: "completed",
       priority: 4,
       labels: makeLabels("cleanup"),
@@ -290,6 +296,8 @@ test("mapWorkspaceItem: project=null → projectName is null", () => {
 
   assert.equal(record.projectName, null);
   assert.equal(record.state, "closed");
+  assert.equal(record.linearStateId, "state-completed");
+  assert.equal(record.linearStateType, "completed");
   assert.equal(record.triagePriority, "P3");
   assert.equal(record.itemCategory, "cleanup");
 });
@@ -356,6 +364,21 @@ test("snapshotHash: changes when the title changes", () => {
 test("snapshotHash: changes when priority changes (P2 → P1)", () => {
   const base = mapWorkspaceItem(makeWorkspaceItem()); // default priority 2 → P2
   const changed = mapWorkspaceItem(makeWorkspaceItem({ issue: makeIssue({ priority: 1 }) }));
+  assert.notEqual(base.snapshotHash, changed.snapshotHash);
+});
+
+test("snapshotHash: changes when raw Linear workflow state changes", () => {
+  const base = mapWorkspaceItem(makeWorkspaceItem());
+  const changed = mapWorkspaceItem(
+    makeWorkspaceItem({
+      issue: makeIssue({
+        stateId: "state-todo",
+        stateName: "Todo",
+        stateType: "unstarted",
+      }),
+    }),
+  );
+  assert.equal(base.state, changed.state);
   assert.notEqual(base.snapshotHash, changed.snapshotHash);
 });
 

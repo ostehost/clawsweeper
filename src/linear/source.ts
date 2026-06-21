@@ -110,6 +110,7 @@ function mapIssue(raw: unknown): LinearIssue {
     priority: num(r["priority"]),
     teamId: str(team["id"]),
     projectId: project != null ? strOrNull(project["id"]) : null,
+    stateId: state != null ? strOrNull(state["id"]) : null,
     stateName: state != null ? strOrNull(state["name"]) : null,
     stateType: state != null ? strOrNull(state["type"]) : null,
     labels: mapLabels(r["labels"]),
