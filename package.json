@@ -23,6 +23,8 @@
     "openclaw:dispatch:dry-run": "node scripts/openclaw-dispatch.mjs --dry-run --json",
     "openclaw:audit": "node scripts/openclaw-dispatch.mjs --mode audit --target-repo openclaw/clawsweeper --skip-if-running",
     "openclaw:status": "node scripts/openclaw-dispatch.mjs --mode status --json",
+    "linear:triage": "node scripts/linear-triage.mjs",
+    "linear:triage:review": "node scripts/linear-triage.mjs --review-only --json",
     "commit-review": "node dist/commit-sweeper.js",
     "commit-reports": "node dist/commit-sweeper.js reports",
     "local-review": "node dist/commit-sweeper.js local-review",
