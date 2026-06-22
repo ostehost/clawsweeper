@@ -176,6 +176,19 @@ and `maxRunAgeMs`; runs end with a sentinel string such as `TRIAGE_OK` or
 `TRIAGE_ALERT_SENT`. Paths in the cron message use `/Users/ostemini/...` (the
 hub user path), not `/Users/ostehost/...`.
 
+The deterministic trigger-wiring and run-expectations contract is now implemented
+in `src/linear/trigger.ts`. `weeklyTriageCronSpec()` builds the OpenClaw cron spec
+(the Monday-09:00 `America/Chicago` schedule, the `main` agent with `exec,message`
+tools, a 600s timeout, and a message that routes to the committed review-only
+runner and ends with the `TRIAGE_OK` / `TRIAGE_ALERT_SENT` sentinels); it rejects
+a `/Users/ostehost/...` macbook-node path so the schedule never ships a path the
+hub user cannot run. `onDemandTriggerHandle(id)` builds the `openclaw cron run`
+handles for the same entry, the Linear-side equivalent of `repository_dispatch`.
+`triageRunExpectations()` produces the `deliveryStrict` / `semanticFailurePatterns`
+/ `maxRunAgeMs` contract, and `evaluateRunExpectations()` is a pure, clock-free
+verdict over a run outcome — sentinel recognition, failure-pattern matching, and
+freshness — so alerting stays deterministic.
+
 ## Open Decisions
 
 Before any mutation scope is enabled, several questions need operator answers:
