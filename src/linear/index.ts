@@ -57,3 +57,28 @@ export type {
 } from "./classifier.js";
 
 export { classifyRecord, classifyRecords, proposesClose } from "./classifier.js";
+
+export type {
+  CloseConfidence,
+  CloseDecision,
+  CloseEvidence,
+  CloseReason,
+  DriftFingerprint,
+  LabelChange,
+  MutationAuthorization,
+  MutationGates,
+  MutationKind,
+  MutationReceipt,
+  MutationRequest,
+} from "./authority.js";
+
+export {
+  authorizeMutation,
+  authorizeMutations,
+  buildMutationReceipt,
+  EVIDENCE_CLOSE_REASONS,
+  gateForKind,
+  mergeLabels,
+  resolveGates,
+  REVIEW_ONLY_GATES,
+} from "./authority.js";
