@@ -149,7 +149,12 @@ ClawHub, and ClawSweeper can share the same engine while keeping different apply
 limits. Both review and repair lanes support manual workflow dispatch, reruns,
 and backfills. OpenClaw operators can use the thin GitHub Actions dispatcher in
 [`docs/openclaw-dispatch.md`](docs/openclaw-dispatch.md) for on-demand and cron
-calls without local generated state. `pnpm commit-reports -- --since 24h`,
+calls without local generated state. The end-to-end handoff loop those
+dispatches feed — from a Linear backlog item to a committed change with a
+pending-review receipt, and the dedicated ClawSweeper identity it runs as — is
+documented in
+[`docs/orchestration-handoff-loop.md`](docs/orchestration-handoff-loop.md).
+`pnpm commit-reports -- --since 24h`,
 `--findings`, `--non-clean`, `--repo`, and `--author` query flat per-SHA commit
 storage without date buckets.
 
