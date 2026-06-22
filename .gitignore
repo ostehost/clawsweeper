@@ -8,9 +8,11 @@ artifacts/
 dashboard/.wrangler/
 .clawsweeper-repair/
 .claude/
+.vscode/
 tmp/
 apply-report.json
 repair-apply-report.json
+.oste-report.yaml
 jobs/
 records/
 results/
