@@ -74,9 +74,7 @@ function networkErrorMessage(error: Error): string {
   const cause = (error as { cause?: unknown }).cause;
   if (typeof cause !== "object" || cause === null) return error.message;
   const code = (cause as Record<string, unknown>)["code"];
-  return typeof code === "string" && code.length > 0
-    ? `${error.message}: ${code}`
-    : error.message;
+  return typeof code === "string" && code.length > 0 ? `${error.message}: ${code}` : error.message;
 }
 
 // Build a LinearRequestError options object omitting undefined fields to satisfy
