@@ -183,7 +183,10 @@ test("listIssues WITHOUT updatedAfter: vars have teamId but no updatedAfter key"
   const vars = calls[0]?.vars ?? {};
   assert.equal(vars["teamId"], "team-abc");
   assert.equal("updatedAfter" in vars, false);
-  assert.match(calls[0]?.query ?? "", /query ListIssues\(\$teamId: ID!, \$updatedAfter: DateComparator/);
+  assert.match(
+    calls[0]?.query ?? "",
+    /query ListIssues\(\$teamId: ID!, \$updatedAfter: DateComparator/,
+  );
 });
 
 // ---------------------------------------------------------------------------
