@@ -82,3 +82,20 @@ export {
   resolveGates,
   REVIEW_ONLY_GATES,
 } from "./authority.js";
+
+export type {
+  LinearComment,
+  ReviewCommentAction,
+  ReviewCommentPlan,
+  ReviewCommentUpsertInput,
+} from "./comment.js";
+
+export {
+  COMMENT_CREATE_MUTATION,
+  COMMENT_UPDATE_MUTATION,
+  findReviewComments,
+  hasReviewMarker,
+  planReviewCommentUpsert,
+  renderReviewCommentBody,
+  reviewCommentMutationRequest,
+} from "./comment.js";

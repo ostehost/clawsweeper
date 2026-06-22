@@ -118,6 +118,17 @@ explicitly forbids comments. A new gated capability must add
 the `<!-- clawsweeper-review:<n> -->` marker to preserve the single-durable-comment
 guarantee. This capability is independently gated and disabled by default.
 
+The marker-backed review-comment upsert planner is now implemented in
+`src/linear/comment.ts`. It produces a deterministic create/update/noop plan keyed
+by the durable marker from `linearReviewMarker()`, detects and surfaces stale
+duplicates, and computes a planHash that fingerprints only the write (not the
+reasons) so re-plans that yield identical output stay hash-stable. The plan bridges
+into the authority layer via `reviewCommentMutationRequest()`, which gates the
+comment-upsert MutationKind behind the "comment" gate (default closed). Inert
+GraphQL mutation strings (`COMMENT_CREATE_MUTATION`, `COMMENT_UPDATE_MUTATION`) are
+exported for downstream consumption by the short-lived-token apply script — they are
+never executed here.
+
 **4. Unattended apply authority and receipt contract.** The default for weekly
 runs is review-only: snapshot plus plan plus dry-run, no apply. Any real
 mutation — state change, label write, comment post — requires a pre-authorized
