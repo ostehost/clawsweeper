@@ -120,6 +120,28 @@ test("onDemandTriggerHandle throws on an empty id", () => {
   assert.throws(() => onDemandTriggerHandle("   "), /non-empty cron id/);
 });
 
+test("onDemandTriggerHandle accepts real OpenClaw cron id punctuation", () => {
+  const handle = onDemandTriggerHandle("linear-weekly_triage.v2:01");
+  assert.equal(handle.run, "openclaw cron run linear-weekly_triage.v2:01");
+});
+
+test("onDemandTriggerHandle rejects shell metacharacters and whitespace in the id", () => {
+  // Regression: a cron id is embedded into command strings, so an injection-shaped id
+  // must be rejected rather than interpolated.
+  for (const bad of [
+    "abc; rm -rf /",
+    "abc && curl evil",
+    "abc | tee x",
+    "abc`whoami`",
+    "abc$(id)",
+    "abc with space",
+    "abc\nnewline",
+    "$(touch pwned)",
+  ]) {
+    assert.throws(() => onDemandTriggerHandle(bad), /unsafe characters/, `expected reject: ${bad}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // triageRunExpectations — contract defaults and overrides
 // ---------------------------------------------------------------------------
@@ -183,6 +205,16 @@ test("detectSentinel ignores a sentinel merely quoted mid-body", () => {
   // The body quotes both sentinels but ends with neither — must not falsely match.
   const text = `End your reply with ${TRIAGE_OK_SENTINEL} or ${TRIAGE_ALERT_SENTINEL}, then summarize.`;
   assert.equal(detectSentinel(text, SENTINELS), "none");
+});
+
+test("detectSentinel rejects suffix-attached text on the final token", () => {
+  // Regression: the final token must equal the sentinel exactly — `NOT_TRIAGE_OK` and
+  // `TRIAGE_OK_LATER` only contain the sentinel as a substring and must not match.
+  assert.equal(detectSentinel("run done\nNOT_TRIAGE_OK", SENTINELS), "none");
+  assert.equal(detectSentinel("run done\nTRIAGE_OK_LATER", SENTINELS), "none");
+  assert.equal(detectSentinel("run done\nNOT_TRIAGE_ALERT_SENT", SENTINELS), "none");
+  // The bare sentinel as the final token still matches.
+  assert.equal(detectSentinel("run done TRIAGE_OK", SENTINELS), "ok");
 });
 
 // ---------------------------------------------------------------------------

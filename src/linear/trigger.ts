@@ -169,15 +169,27 @@ export function weeklyTriageCronSpec(options: CronTriggerOptions = {}): CronTrig
   };
 }
 
+// Conservative cron-id allowlist: letters, digits, and the punctuation real OpenClaw cron
+// ids use (underscore, hyphen, colon, dot). Anything else — whitespace or a shell
+// metacharacter — is rejected before the id is embedded in a command string.
+const SAFE_CRON_ID = /^[A-Za-z0-9_.:-]+$/;
+
 /**
  * Builds the shell handles for triggering and observing the same cron entry on demand.
  * `run` fires a run now; `runAndWait` blocks on the final sentinel; `list` discovers the
- * cron id. Throws if the cron id is empty.
+ * cron id. The cron id is embedded into command strings, so it is validated against a
+ * conservative allowlist first: throws if it is empty or contains any character outside
+ * `[A-Za-z0-9_.:-]` (whitespace or shell metacharacters).
  */
 export function onDemandTriggerHandle(cronId: string): OnDemandHandle {
   const id = cronId.trim();
   if (id.length === 0) {
     throw new Error("onDemandTriggerHandle requires a non-empty cron id");
+  }
+  if (!SAFE_CRON_ID.test(id)) {
+    throw new Error(
+      `onDemandTriggerHandle: cron id ${JSON.stringify(id)} contains unsafe characters — only letters, digits, "_", "-", ":", and "." are allowed`,
+    );
   }
   return {
     list: "openclaw cron list",
@@ -203,14 +215,16 @@ export function triageRunExpectations(overrides: Partial<RunExpectations> = {}):
 }
 
 /**
- * Detects which terminal sentinel a run ended with. A run is expected to *end with* the
- * sentinel, so detection uses the trailing token (after trimming) rather than a loose
- * substring match — this avoids a false positive when the body merely quotes a sentinel.
+ * Detects which terminal sentinel a run ended with. A run is expected to end with the
+ * sentinel as its own final whitespace-delimited token, so detection compares that last
+ * token exactly. Suffix-attached text like `NOT_TRIAGE_OK` is not a match, and a body that
+ * merely quotes a sentinel mid-text (ending on some other word) is not a match either.
  */
 export function detectSentinel(text: string, sentinels: RunSentinels): RunSentinel {
-  const trimmed = text.trimEnd();
-  if (trimmed.endsWith(sentinels.ok)) return "ok";
-  if (trimmed.endsWith(sentinels.alert)) return "alert";
+  const tokens = text.trim().split(/\s+/);
+  const last = tokens[tokens.length - 1] ?? "";
+  if (last === sentinels.ok) return "ok";
+  if (last === sentinels.alert) return "alert";
   return "none";
 }
 
