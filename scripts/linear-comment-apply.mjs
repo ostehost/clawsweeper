@@ -297,17 +297,81 @@ export async function applyPlan(plan, appCreds, deps = {}) {
   return { noop: true };
 }
 
+/**
+ * Composes the full live-write decision. A comment is posted only when ALL hold:
+ *   - mode is live (--apply + OPENCLAW_NOTIFY_LINEAR=1),
+ *   - the item is ELIGIBLE for review (disposition "review"/"stale-candidate") — ClawSweeper
+ *     never comments on closed, protected, or excluded issues; there is nothing to review,
+ *   - the mutation is authorized (gate open + matching fingerprints),
+ *   - the plan actually changes something (action !== "noop").
+ * Returns { write, reason }; reason explains any skip for the summary/receipt. Pure.
+ */
+export function resolveWriteDecision(result, mode) {
+  if (!mode.live) return { write: false, reason: mode.reason };
+  if (!result.classification.eligible) {
+    return {
+      write: false,
+      reason:
+        `skipped: ${result.record.identifier} is not eligible for review ` +
+        `(disposition "${result.classification.disposition}") — ClawSweeper does not comment ` +
+        `on closed, protected, or excluded issues`,
+    };
+  }
+  if (!result.authorization.allowed) {
+    return { write: false, reason: "authorization denied — see authorizationReasons" };
+  }
+  if (result.plan.action === "noop") {
+    return { write: false, reason: "noop: the durable comment already matches — nothing to write" };
+  }
+  return { write: true, reason: `live write authorized for ${result.record.identifier}` };
+}
+
+/**
+ * Reads the issue back after a live write and confirms the durable marker comment now
+ * reflects the plan (PAR-215 read-back: prove the mutation actually landed, not just that
+ * the API echoed success). Returns a secret-free confirmation summary.
+ */
+export async function readBackComment(source, identifier, plan) {
+  const hydrated = await source.fetchIssueByIdentifier(identifier);
+  const comments = hydrated?.comments ?? [];
+  const matches = comments.filter((c) => (c.body ?? "").includes(plan.marker));
+  // Confirm the EXACT comment we wrote, not "exactly one marker comment": the planner
+  // deliberately tolerates stale duplicate marker comments (cleaned up separately), so a
+  // successful update must still read back as confirmed when duplicates are present. For an
+  // update we pin the kept target by id; for a create we find the comment carrying the body.
+  const target =
+    plan.targetCommentId != null
+      ? comments.find((c) => c.id === plan.targetCommentId)
+      : matches.find((c) => (c.body ?? "") === plan.body);
+  const bodyMatches = (target?.body ?? null) === plan.body;
+  return {
+    confirmed: bodyMatches,
+    markerCommentCount: matches.length,
+    staleDuplicates: Math.max(0, matches.length - 1),
+    commentId: target?.id ?? (matches.length > 0 ? matches[0].id : null),
+    bodyMatches,
+  };
+}
+
 function summarize(result, mode) {
   return {
     identifier: result.record.identifier,
     disposition: result.classification.disposition,
+    eligible: result.classification.eligible,
     action: result.plan.action,
     targetCommentId: result.plan.targetCommentId,
     staleDuplicateIds: result.plan.staleDuplicateIds,
     authorized: result.authorization.allowed,
     authorizationReasons: result.authorization.reasons,
+    // Mode-independent: would a LIVE run actually write? (eligible + authorized + not noop)
+    // Lets a dry-run state exactly what a live run would do.
+    wouldWrite:
+      result.classification.eligible &&
+      result.authorization.allowed &&
+      result.plan.action !== "noop",
     planHash: result.plan.planHash,
     snapshotHash: result.record.snapshotHash,
+    receipt: result.receipt, // secret-free MutationReceipt (audit trail)
     live: mode.live,
     mode: mode.live ? "apply" : "dry-run",
     modeReason: mode.reason,
@@ -319,6 +383,7 @@ function printHuman(summary) {
   const out = [];
   out.push(`Identifier:   ${summary.identifier}`);
   out.push(`Disposition:  ${summary.disposition}`);
+  out.push(`Eligible:     ${summary.eligible}`);
   out.push(
     `Action:       ${summary.action}` +
       (summary.targetCommentId ? ` (-> ${summary.targetCommentId})` : ""),
@@ -327,7 +392,15 @@ function printHuman(summary) {
   if (!summary.authorized) {
     for (const r of summary.authorizationReasons) out.push(`  - ${r}`);
   }
+  out.push(`Would write:  ${summary.wouldWrite}`);
   out.push(`Mode:         ${summary.mode} — ${summary.modeReason}`);
+  if (summary.writeDecision) out.push(`Decision:     ${summary.writeDecision}`);
+  if (summary.readback) {
+    out.push(
+      `Read-back:    confirmed=${summary.readback.confirmed}` +
+        (summary.readback.commentId ? ` (${summary.readback.commentId})` : ""),
+    );
+  }
   out.push("");
   out.push("Planned comment body:");
   out.push("----------------------------------------");
@@ -364,9 +437,10 @@ async function main() {
   }
 
   let result;
+  let source;
   try {
     const transport = createLinearTransport({ token: readToken });
-    const source = new LinearItemSource(transport);
+    source = new LinearItemSource(transport);
     result = await buildItemPlan(source, options);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
@@ -375,14 +449,24 @@ async function main() {
   }
 
   const summary = summarize(result, mode);
+  const decision = resolveWriteDecision(result, mode);
+  summary.writeDecision = decision.reason;
 
-  // WRITE only when live AND authorized AND there is something to write.
-  if (mode.live && result.authorization.allowed && result.plan.action !== "noop") {
+  if (decision.write) {
     try {
       const appCreds = resolveAppCredentials({ account: options.keychainAccount });
       const applyResult = await applyPlan(result.plan, appCreds);
       summary.applied = true;
       summary.applyResult = applyResult;
+      // PAR-215 read-back: re-fetch and confirm the durable marker comment landed.
+      try {
+        summary.readback = await readBackComment(source, options.identifier, result.plan);
+      } catch (error) {
+        summary.readback = {
+          confirmed: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
@@ -390,9 +474,8 @@ async function main() {
     }
   } else {
     summary.applied = false;
-    if (mode.live && !result.authorization.allowed) {
-      summary.applyBlocked = "authorization denied — see authorizationReasons";
-    }
+    // Surface why a LIVE run skipped (ineligible / denied / noop); the dry-run reason is in writeDecision.
+    if (mode.live) summary.applyBlocked = decision.reason;
   }
 
   if (options.json) {

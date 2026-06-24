@@ -12,9 +12,11 @@ import {
 import {
   applyPlan,
   buildItemPlan,
+  readBackComment,
   renderReviewContent,
   resolveAppCredentials,
   resolveReadToken,
+  resolveWriteDecision,
   resolveWriteMode,
 } from "../scripts/linear-comment-apply.mjs";
 
@@ -351,6 +353,140 @@ test("resolveAppCredentials reads client id + secret from the injected keychain"
     runKeychain: (service: string) => (service.includes("client-id") ? "the-id" : "the-secret"),
   });
   assert.deepEqual(creds, { clientId: "the-id", clientSecret: "the-secret" });
+});
+
+// ---------------------------------------------------------------------------
+// resolveWriteDecision — eligibility-aware live-write gate. ClawSweeper never
+// comments on closed/protected/excluded; noop / denied / dry-run all skip.
+// ---------------------------------------------------------------------------
+
+function decisionResultStub(over: Record<string, unknown> = {}) {
+  return {
+    record: { identifier: (over.identifier as string) ?? "PAR-244" },
+    classification: {
+      eligible: (over.eligible as boolean) ?? true,
+      disposition: (over.disposition as string) ?? "review",
+    },
+    authorization: { allowed: (over.allowed as boolean) ?? true, reasons: [] },
+    plan: { action: (over.action as string) ?? "create" },
+  };
+}
+
+test("resolveWriteDecision: dry-run never writes", () => {
+  const d = resolveWriteDecision(decisionResultStub(), {
+    live: false,
+    reason: "dry-run (default)",
+  });
+  assert.equal(d.write, false);
+  assert.match(d.reason, /dry-run/);
+});
+
+test("resolveWriteDecision: live + ineligible (closed) is skipped, not written", () => {
+  const d = resolveWriteDecision(decisionResultStub({ eligible: false, disposition: "closed" }), {
+    live: true,
+    reason: "live",
+  });
+  assert.equal(d.write, false);
+  assert.match(d.reason, /not eligible/);
+  assert.match(d.reason, /closed/);
+});
+
+test("resolveWriteDecision: live + eligible + authorized + create writes", () => {
+  const d = resolveWriteDecision(decisionResultStub(), { live: true, reason: "live" });
+  assert.equal(d.write, true);
+});
+
+test("resolveWriteDecision: live + eligible but noop does not write", () => {
+  const d = resolveWriteDecision(decisionResultStub({ action: "noop" }), {
+    live: true,
+    reason: "live",
+  });
+  assert.equal(d.write, false);
+  assert.match(d.reason, /noop/);
+});
+
+test("resolveWriteDecision: live + eligible but unauthorized does not write", () => {
+  const d = resolveWriteDecision(decisionResultStub({ allowed: false }), {
+    live: true,
+    reason: "live",
+  });
+  assert.equal(d.write, false);
+  assert.match(d.reason, /denied/);
+});
+
+test("buildItemPlan marks a completed issue ineligible -> the write decision refuses even when live", async () => {
+  const node = hydratedIssueNode();
+  node.state = { id: "s", name: "Done", type: "completed" };
+  const { transport } = fakeTransport(node);
+  const result = await buildItemPlan(new LinearItemSource(transport), {
+    identifier: "PAR-244",
+    nowIso: "2026-06-22T00:00:00Z",
+  });
+  assert.equal(result.classification.eligible, false);
+  assert.equal(result.classification.disposition, "closed");
+  const d = resolveWriteDecision(result, { live: true, reason: "live" });
+  assert.equal(d.write, false);
+  assert.match(d.reason, /not eligible/);
+});
+
+// ---------------------------------------------------------------------------
+// readBackComment — PAR-215 read-back: confirm the durable marker comment landed
+// ---------------------------------------------------------------------------
+
+test("readBackComment confirms a single marker comment whose body matches the plan", async () => {
+  const plan = { marker: "<!-- m -->", body: "<!-- m -->\n\nhello" };
+  const source = {
+    fetchIssueByIdentifier: async () => ({ comments: [{ id: "c1", body: plan.body }] }),
+  };
+  const rb = await readBackComment(source, "PAR-244", plan);
+  assert.equal(rb.confirmed, true);
+  assert.equal(rb.commentId, "c1");
+  assert.equal(rb.markerCommentCount, 1);
+});
+
+test("readBackComment is not confirmed when the comment is missing or the body mismatches", async () => {
+  const plan = { marker: "<!-- m -->", body: "<!-- m -->\n\nhello" };
+  const missing = { fetchIssueByIdentifier: async () => ({ comments: [] }) };
+  assert.equal((await readBackComment(missing, "PAR-244", plan)).confirmed, false);
+  const mismatch = {
+    fetchIssueByIdentifier: async () => ({ comments: [{ id: "c1", body: "<!-- m -->\n\nOLD" }] }),
+  };
+  const rb = await readBackComment(mismatch, "PAR-244", plan);
+  assert.equal(rb.confirmed, false);
+  assert.equal(rb.bodyMatches, false);
+});
+
+test("readBackComment confirms an UPDATE by target id even with stale duplicate marker comments", async () => {
+  // The planner tolerates stale duplicates; a successful update must still read back confirmed.
+  const plan = { marker: "<!-- m -->", body: "<!-- m -->\n\nnew", targetCommentId: "keep" };
+  const source = {
+    fetchIssueByIdentifier: async () => ({
+      comments: [
+        { id: "stale", body: "<!-- m -->\n\nOLD-DUPLICATE" },
+        { id: "keep", body: plan.body },
+      ],
+    }),
+  };
+  const rb = await readBackComment(source, "PAR-244", plan);
+  assert.equal(rb.confirmed, true);
+  assert.equal(rb.commentId, "keep");
+  assert.equal(rb.markerCommentCount, 2);
+  assert.equal(rb.staleDuplicates, 1);
+});
+
+test("readBackComment confirms a CREATE by matching body even if a stale duplicate exists", async () => {
+  const plan = { marker: "<!-- m -->", body: "<!-- m -->\n\nfresh", targetCommentId: null };
+  const source = {
+    fetchIssueByIdentifier: async () => ({
+      comments: [
+        { id: "stale", body: "<!-- m -->\n\nOLD" },
+        { id: "new", body: plan.body },
+      ],
+    }),
+  };
+  const rb = await readBackComment(source, "PAR-244", plan);
+  assert.equal(rb.confirmed, true);
+  assert.equal(rb.commentId, "new");
 });
 
 // ---------------------------------------------------------------------------
