@@ -60,7 +60,7 @@ export interface LinearClassification {
   disposition: ReviewDisposition;
   reviewOnly: true; // invariant marker — this layer proposes only, never mutates
   eligible: boolean; // true iff disposition is "review" or "stale-candidate"
-  closeable: boolean; // false for "protected" and "closed"; true otherwise
+  closeable: boolean; // NOT "safe to close": only false for "protected"/"closed", true even for "excluded"/"review". Whether a close is *authorized* is decided by authority.ts (the evidence gate), never by this flag.
   staleCandidate: boolean; // true iff disposition === "stale-candidate"
   closeCandidateReason: CloseCandidateReason; // "stale_insufficient_info" iff stale-candidate, else "none"
   reasons: string[]; // ordered, human-readable rationale (non-empty)
