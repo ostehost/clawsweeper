@@ -18,11 +18,12 @@ is stale (`pnpm run build`; tsgo — scripts import `../dist/linear`).
 
 ```sh
 # DRY-RUN (default; read-only; writes nothing; mints no token):
-node scripts/linear-comment-apply.mjs --identifier PAR-XXX --json
+node scripts/linear-comment-apply.mjs --identifier PAR-XXX --json > par-xxx-clawsweeper-dry-run.json
 # alias: pnpm run linear:comment:dry-run -- --identifier PAR-XXX
 
 # LIVE (leaves a marker-backed comment as the ClawSweeper app identity):
-OPENCLAW_NOTIFY_LINEAR=1 node scripts/linear-comment-apply.mjs --identifier PAR-XXX --apply
+OPENCLAW_NOTIFY_LINEAR=1 node scripts/linear-comment-apply.mjs --identifier PAR-XXX --apply \
+  --dry-run-receipt ./par-xxx-clawsweeper-dry-run.json
 ```
 
 ## Always dry-run first
@@ -30,21 +31,32 @@ OPENCLAW_NOTIFY_LINEAR=1 node scripts/linear-comment-apply.mjs --identifier PAR-
 Read the dry-run JSON before any `--apply`:
 
 - `action` — `create` | `update` | `noop` (marker-backed upsert; idempotent).
-- `disposition` — if `closed`/skipped the body is a "state is closed — skipped"
-  note; confirm you actually want to post that (see Caveats).
-- `authorized` must be `true`; `body` is exactly what will be posted.
+- `disposition` — `closed`, protected, and excluded items are ineligible; the
+  live path skips them rather than posting a comment.
+- `planHash` + `snapshotHash` + `nowIso` — these are the approval fingerprints.
+  A dry-run without supplied approval hashes normally reports `authorized: false`;
+  that is expected. Review `body`, then pass the saved JSON with
+  `--dry-run-receipt` so apply reuses the same clock for stable stale-candidate
+  comments (or pass both hashes directly, with `--now` when needed).
+- `body` is exactly what will be posted if the live apply is eligible, approved,
+  and still matches the reviewed snapshot.
 
-## Live-write gate (ALL THREE required)
+## Live-write gate (ALL FOUR required)
 
-A comment is written only when every condition holds — otherwise it stays dry:
+A comment is written only when every condition holds — otherwise it stays dry or
+fails closed:
 
 1. `--apply` flag, AND
 2. env `OPENCLAW_NOTIFY_LINEAR=1`, AND
-3. `authorizeMutation().allowed === true` (`src/linear/authority.ts`:
-   snapshotHash == live, planHash == approved, comment gate open).
+3. an independently supplied approval (`--dry-run-receipt` from a reviewed
+   dry-run, or both `--approved-plan-hash` and `--approved-snapshot-hash`), AND
+4. `authorizeMutation().allowed === true` (`src/linear/authority.ts`:
+   approved snapshotHash == current live snapshot, current planHash == approved
+   planHash, comment gate open).
 
 A stray `--apply` without the env stays dry-run. No OAuth token is minted unless
-a live write actually fires.
+a live write actually fires. A live `--apply` for an eligible non-noop plan with
+missing/stale approval hashes fails nonzero.
 
 ## Pipeline
 
@@ -72,16 +84,17 @@ Comments author as the dedicated Linear app user **ClawSweeper** (OAuth
 ## Verify after a live write
 
 Query the issue's comments and confirm one carries the marker and
-`comment.user.name == "ClawSweeper"`. The script also prints the apply result.
+`comment.user.name == "ClawSweeper"`. The script also re-fetches comments after
+the mutation and fails nonzero unless the marker comment body exactly matches the
+approved plan.
 
 ## Caveats / safety
 
 - Production stays **review-only**: leave `OPENCLAW_NOTIFY_LINEAR` unset outside
   an explicit test. The weekly triage job runs `snapshot | triage --review-only`
   and never writes.
-- The current build still posts a comment on **closed/skipped** items — prefer
-  not writing to closed issues; gate on `disposition` from the dry-run before
-  `--apply`.
+- Closed, protected, excluded, and otherwise ineligible dispositions are skipped;
+  ClawSweeper only comments on eligible review/stale-candidate items.
 - Bulk writes need the separate mutation-authority gate + operator approval; this
   skill is the single-item path only.
 

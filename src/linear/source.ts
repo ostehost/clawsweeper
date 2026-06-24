@@ -116,6 +116,23 @@ function mapLabels(raw: unknown): LinearLabel[] {
   });
 }
 
+function mapComments(raw: unknown): Array<{ id: string; body: string }> {
+  const commentsConn = asRecord(raw);
+  const commentNodes = Array.isArray(commentsConn["nodes"]) ? commentsConn["nodes"] : [];
+  return commentNodes.map((n) => {
+    const cn = asRecord(n);
+    return { id: str(cn["id"]), body: str(cn["body"]) };
+  });
+}
+
+function commentPageInfo(raw: unknown): { hasNextPage: boolean; endCursor: string | null } {
+  return asConnection<unknown>(raw, "IssueByIdentifier.comments").pageInfo;
+}
+
+function hydratedIssueFingerprint(item: HydratedWorkspaceItem): string {
+  return JSON.stringify({ team: item.team, project: item.project, issue: item.issue });
+}
+
 function mapIssue(raw: unknown): LinearIssue {
   const r = asRecord(raw);
   const team = asRecord(r["team"]);
@@ -153,12 +170,7 @@ function mapHydratedItem(raw: unknown): HydratedWorkspaceItem {
 
   const project = r["project"] != null ? mapProject(r["project"], team.id) : null;
 
-  const commentsConn = asRecord(r["comments"]);
-  const commentNodes = Array.isArray(commentsConn["nodes"]) ? commentsConn["nodes"] : [];
-  const comments = commentNodes.map((n) => {
-    const cn = asRecord(n);
-    return { id: str(cn["id"]), body: str(cn["body"]) };
-  });
+  const comments = mapComments(r["comments"]);
 
   return { team, project, issue, comments };
 }
@@ -254,16 +266,48 @@ export class LinearItemSource {
    * Used by the single-item comment-apply path so plan + drift are computed against one
    * consistent read (no comment/snapshot drift).
    */
-  async fetchIssueByIdentifier(identifier: string): Promise<HydratedWorkspaceItem | null> {
+  async fetchIssueByIdentifier(
+    identifier: string,
+    commentPageSize = 100,
+  ): Promise<HydratedWorkspaceItem | null> {
     const { teamKey, number } = parseLinearIdentifier(identifier);
-    const data = await this.transport(ISSUE_BY_IDENTIFIER_QUERY, {
-      teamKey,
-      number,
-      first: 1,
-    });
-    const connection = asConnection<unknown>(asRecord(data)["issues"], "IssueByIdentifier");
-    const [node] = connection.nodes;
-    if (node === undefined) return null;
-    return mapHydratedItem(node);
+    let commentAfter: string | undefined;
+    let hydrated: HydratedWorkspaceItem | null = null;
+    let issueFingerprint: string | null = null;
+    const comments: Array<{ id: string; body: string }> = [];
+
+    while (true) {
+      const vars: Record<string, unknown> = {
+        teamKey,
+        number,
+        first: 1,
+        commentFirst: commentPageSize,
+      };
+      if (commentAfter != null) vars["commentAfter"] = commentAfter;
+
+      const data = await this.transport(ISSUE_BY_IDENTIFIER_QUERY, vars);
+      const connection = asConnection<unknown>(asRecord(data)["issues"], "IssueByIdentifier");
+      const [node] = connection.nodes;
+      if (node === undefined) return null;
+
+      const issue = asRecord(node);
+      comments.push(...mapComments(issue["comments"]));
+      const pageHydrated = mapHydratedItem(node);
+      const pageIssueFingerprint = hydratedIssueFingerprint(pageHydrated);
+      if (hydrated === null) {
+        hydrated = pageHydrated;
+        issueFingerprint = pageIssueFingerprint;
+      } else if (pageIssueFingerprint !== issueFingerprint) {
+        throw new Error(
+          `IssueByIdentifier ${identifier} changed while paginating comments — retry from a fresh snapshot`,
+        );
+      }
+
+      const pageInfo = commentPageInfo(issue["comments"]);
+      if (!pageInfo.hasNextPage || pageInfo.endCursor == null) break;
+      commentAfter = pageInfo.endCursor;
+    }
+
+    return hydrated === null ? null : { ...hydrated, comments };
   }
 }

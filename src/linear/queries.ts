@@ -86,7 +86,14 @@ export const ISSUES_QUERY = `
 // scoped to one team. Hydrates the issue's comments in the SAME read pass so a comment
 // upsert can be planned without snapshot/comment drift. Returns at most one node.
 export const ISSUE_BY_IDENTIFIER_QUERY = `
-  query IssueByIdentifier($teamKey: String!, $number: Float!, $first: Int!, $after: String) {
+  query IssueByIdentifier(
+    $teamKey: String!
+    $number: Float!
+    $first: Int!
+    $after: String
+    $commentFirst: Int!
+    $commentAfter: String
+  ) {
     issues(
       first: $first
       after: $after
@@ -124,10 +131,14 @@ export const ISSUE_BY_IDENTIFIER_QUERY = `
             name
           }
         }
-        comments {
+        comments(first: $commentFirst, after: $commentAfter) {
           nodes {
             id
             body
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
           }
         }
       }

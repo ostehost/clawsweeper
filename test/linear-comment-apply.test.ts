@@ -12,8 +12,10 @@ import {
 import {
   applyPlan,
   buildItemPlan,
+  assertReadBackConfirmed,
   readBackComment,
   renderReviewContent,
+  resolveApproval,
   resolveAppCredentials,
   resolveReadToken,
   resolveWriteDecision,
@@ -165,7 +167,10 @@ function hydratedIssueNode() {
     project: { id: "proj-1", name: "ClawSweeper", state: "started" },
     state: { id: "state-1", name: "Backlog", type: "backlog" },
     labels: { nodes: [{ id: "lbl-1", name: "bug" }] },
-    comments: { nodes: [] as Array<{ id: string; body: string }> },
+    comments: {
+      nodes: [] as Array<{ id: string; body: string }>,
+      pageInfo: { hasNextPage: false, endCursor: null as string | null },
+    },
   };
 }
 
@@ -193,6 +198,65 @@ test("fetchIssueByIdentifier returns a hydrated workspace item with comments", a
   assert.equal(calls.length, 1);
   assert.equal(calls[0].vars["teamKey"], "PAR");
   assert.equal(calls[0].vars["number"], 244);
+  assert.equal(calls[0].vars["commentFirst"], 100);
+});
+
+test("fetchIssueByIdentifier paginates issue comments so marker comments beyond page one are visible", async () => {
+  const first = hydratedIssueNode();
+  first.comments = {
+    nodes: [{ id: "c-old", body: "ordinary comment" }],
+    pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+  };
+  const second = hydratedIssueNode();
+  second.comments = {
+    nodes: [{ id: "c-marker", body: "<!-- clawsweeper-review:issue-uuid-244 -->\n\nold" }],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  };
+  const calls: Array<{ vars: Record<string, unknown> }> = [];
+  const pages = [first, second];
+  const transport = async (_query: string, vars: Record<string, unknown>): Promise<unknown> => {
+    calls.push({ vars });
+    const node = pages.shift();
+    return {
+      issues: { nodes: node ? [node] : [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+  };
+
+  const item = await new LinearItemSource(transport).fetchIssueByIdentifier("PAR-244");
+
+  assert.ok(item);
+  assert.deepEqual(
+    item.comments.map((c) => c.id),
+    ["c-old", "c-marker"],
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].vars["commentAfter"], "cursor-1");
+});
+
+test("fetchIssueByIdentifier fails closed when issue fields drift between comment pages", async () => {
+  const first = hydratedIssueNode();
+  first.comments = {
+    nodes: [{ id: "c-old", body: "ordinary comment" }],
+    pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+  };
+  const second = hydratedIssueNode();
+  second.title = "Changed while comments were paginating";
+  second.comments = {
+    nodes: [{ id: "c-marker", body: "<!-- clawsweeper-review:issue-uuid-244 -->\n\nold" }],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  };
+  const pages = [first, second];
+  const transport = async (): Promise<unknown> => ({
+    issues: {
+      nodes: pages.length > 0 ? [pages.shift()] : [],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  });
+
+  await assert.rejects(
+    () => new LinearItemSource(transport).fetchIssueByIdentifier("PAR-244"),
+    /changed while paginating comments/,
+  );
 });
 
 test("fetchIssueByIdentifier returns null when no issue matches", async () => {
@@ -225,7 +289,7 @@ test("resolveWriteMode goes live only with both --apply and OPENCLAW_NOTIFY_LINE
 // buildItemPlan — end-to-end single-item plan (real pipeline, fake transport)
 // ---------------------------------------------------------------------------
 
-test("buildItemPlan creates an authorized create plan when no marker comment exists", async () => {
+test("buildItemPlan does not authorize a create plan without an independently supplied approval", async () => {
   const { transport } = fakeTransport(hydratedIssueNode());
   const source = new LinearItemSource(transport);
   const result = await buildItemPlan(source, {
@@ -237,9 +301,102 @@ test("buildItemPlan creates an authorized create plan when no marker comment exi
   assert.equal(result.plan.targetCommentId, null);
   // body carries the durable marker keyed on the issue UUID.
   assert.ok(result.plan.body.includes("<!-- clawsweeper-review:issue-uuid-244 -->"));
-  // Authorized: comment gate opened, snapshot/plan hashes self-consistent within one read.
+  // Not authorized: a live apply needs an independently reviewed dry-run receipt/hash pair.
+  assert.equal(result.authorization.allowed, false);
+  assert.match(result.authorization.reasons.join("\n"), /plan hash mismatch/);
+});
+
+test("buildItemPlan authorizes only when approved plan and snapshot hashes match the current dry-run", async () => {
+  const probe = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-06-22T00:00:00Z",
+      staleDays: 60,
+    },
+  );
+  const result = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-06-22T00:00:00Z",
+      staleDays: 60,
+      approval: {
+        approvedPlanHash: probe.plan.planHash,
+        approvedSnapshotHash: probe.record.snapshotHash,
+        source: "direct-hashes",
+      },
+    },
+  );
+
   assert.equal(result.authorization.allowed, true);
   assert.equal(result.receipt.driftDetected, false);
+  assert.equal(result.receipt.approvedPlanHash, probe.plan.planHash);
+});
+
+test("buildItemPlan rejects an approval when the approved snapshot hash is stale", async () => {
+  const probe = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-06-22T00:00:00Z",
+    },
+  );
+  const result = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-06-22T00:00:00Z",
+      approval: {
+        approvedPlanHash: probe.plan.planHash,
+        approvedSnapshotHash: "0".repeat(64),
+        source: "direct-hashes",
+      },
+    },
+  );
+
+  assert.equal(result.authorization.allowed, false);
+  assert.match(result.authorization.reasons.join("\n"), /snapshot drift/);
+});
+
+test("buildItemPlan approval stays stable for stale candidates when the dry-run nowIso is reused", async () => {
+  const probe = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-08-22T00:00:00Z",
+    },
+  );
+  assert.equal(probe.classification.disposition, "stale-candidate");
+
+  const withSameClock = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: probe.nowIso,
+      approval: {
+        approvedPlanHash: probe.plan.planHash,
+        approvedSnapshotHash: probe.record.snapshotHash,
+        source: "dry-run-receipt",
+      },
+    },
+  );
+  assert.equal(withSameClock.authorization.allowed, true);
+
+  const withDifferentClock = await buildItemPlan(
+    new LinearItemSource(fakeTransport(hydratedIssueNode()).transport),
+    {
+      identifier: "PAR-244",
+      nowIso: "2026-08-23T00:00:00Z",
+      approval: {
+        approvedPlanHash: probe.plan.planHash,
+        approvedSnapshotHash: probe.record.snapshotHash,
+        source: "dry-run-receipt",
+      },
+    },
+  );
+  assert.equal(withDifferentClock.authorization.allowed, false);
+  assert.match(withDifferentClock.authorization.reasons.join("\n"), /plan hash mismatch/);
 });
 
 test("buildItemPlan yields a noop when an up-to-date marker comment already exists", async () => {
@@ -355,6 +512,50 @@ test("resolveAppCredentials reads client id + secret from the injected keychain"
   assert.deepEqual(creds, { clientId: "the-id", clientSecret: "the-secret" });
 });
 
+test("resolveApproval loads approved plan and snapshot hashes from a saved dry-run receipt", () => {
+  const planHash = "a".repeat(64);
+  const snapshotHash = "b".repeat(64);
+  const nowIso = "2026-06-22T00:00:00Z";
+  const approval = resolveApproval(
+    { identifier: "PAR-244", dryRunReceipt: "/fake/receipt.json" },
+    {
+      readFileSync: () =>
+        JSON.stringify({
+          identifier: "PAR-244",
+          planHash,
+          snapshotHash,
+          nowIso,
+          authorized: false,
+        }),
+    },
+  );
+  assert.deepEqual(approval, {
+    approvedPlanHash: planHash,
+    approvedSnapshotHash: snapshotHash,
+    nowIso,
+    source: "dry-run-receipt",
+  });
+});
+
+test("resolveApproval compares dry-run receipt identifiers after Linear-style normalization", () => {
+  const planHash = "a".repeat(64);
+  const snapshotHash = "b".repeat(64);
+  const approval = resolveApproval(
+    { identifier: "par-244", dryRunReceipt: "/fake/receipt.json" },
+    {
+      readFileSync: () => JSON.stringify({ identifier: "PAR-244", planHash, snapshotHash }),
+    },
+  );
+  assert.equal(approval?.approvedPlanHash, planHash);
+});
+
+test("resolveApproval requires direct approval to include both plan and snapshot hashes", () => {
+  assert.throws(
+    () => resolveApproval({ approvedPlanHash: "a".repeat(64), approvedSnapshotHash: "" }),
+    /requires both --approved-plan-hash and --approved-snapshot-hash/,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // resolveWriteDecision — eligibility-aware live-write gate. ClawSweeper never
 // comments on closed/protected/excluded; noop / denied / dry-run all skip.
@@ -454,6 +655,15 @@ test("readBackComment is not confirmed when the comment is missing or the body m
   const rb = await readBackComment(mismatch, "PAR-244", plan);
   assert.equal(rb.confirmed, false);
   assert.equal(rb.bodyMatches, false);
+});
+
+test("assertReadBackConfirmed fails live apply on missing, mismatched, or fetch-error read-back", () => {
+  assert.doesNotThrow(() => assertReadBackConfirmed({ confirmed: true }));
+  assert.throws(() => assertReadBackConfirmed({ confirmed: false }), /read-back failed/);
+  assert.throws(
+    () => assertReadBackConfirmed({ confirmed: false, error: "Linear fetch failed" }),
+    /Linear fetch failed/,
+  );
 });
 
 test("readBackComment confirms an UPDATE by target id even with stale duplicate marker comments", async () => {

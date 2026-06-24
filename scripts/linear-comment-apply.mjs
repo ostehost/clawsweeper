@@ -29,12 +29,14 @@
  *     OPENCLAW_NOTIFY_LINEAR=1. Either alone keeps the run dry. (Belt and suspenders so a
  *     stray flag in a cron command can never post.)
  *   - Even with both, the write only proceeds if authorizeMutation() returns allowed=true
- *     with the comment gate explicitly opened and matching snapshot/plan fingerprints.
+ *     with the comment gate explicitly opened and independently supplied matching
+ *     snapshot/plan fingerprints (--dry-run-receipt or direct approved hash flags).
  *
  * Secret hygiene: no token, client id, or client secret is ever logged.
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -47,6 +49,7 @@ import {
   LinearItemSource,
   mapWorkspaceItem,
   mintLinearAppToken,
+  parseLinearIdentifier,
   planReviewCommentUpsert,
   resolveGates,
   reviewCommentMutationRequest,
@@ -74,6 +77,9 @@ export function parseArgs(argv) {
     requiredLabels: [],
     exclusionLabels: [],
     protectedLabels: [],
+    approvedPlanHash: "",
+    approvedSnapshotHash: "",
+    dryRunReceipt: "",
     keychainAccount: DEFAULT_KEYCHAIN_ACCOUNT,
     help: false,
   };
@@ -111,6 +117,15 @@ export function parseArgs(argv) {
       case "--protected-label":
         options.protectedLabels.push(requireValue(argv, ++index, arg));
         break;
+      case "--approved-plan-hash":
+        options.approvedPlanHash = requireHashValue(argv, ++index, arg);
+        break;
+      case "--approved-snapshot-hash":
+        options.approvedSnapshotHash = requireHashValue(argv, ++index, arg);
+        break;
+      case "--dry-run-receipt":
+        options.dryRunReceipt = requireValue(argv, ++index, arg);
+        break;
       case "--keychain-account":
         options.keychainAccount = requireValue(argv, ++index, arg);
         break;
@@ -128,6 +143,101 @@ export function parseArgs(argv) {
   }
 
   return options;
+}
+
+function parseDryRunReceipt(raw, path) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `failed to parse --dry-run-receipt ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`--dry-run-receipt ${path} must contain a JSON object`);
+  }
+  return parsed;
+}
+
+function hashFromReceipt(receipt, key) {
+  const direct = receipt[key];
+  if (typeof direct === "string" && direct.trim() !== "") return direct.trim().toLowerCase();
+  const nested = receipt.receipt;
+  if (typeof nested === "object" && nested !== null) {
+    const value = nested[key];
+    if (typeof value === "string" && value.trim() !== "") return value.trim().toLowerCase();
+  }
+  return "";
+}
+
+function validateHash(hash, label) {
+  if (!/^[a-f0-9]{64}$/i.test(hash)) {
+    throw new Error(`${label} must be a 64-character sha256 hex hash`);
+  }
+}
+
+function canonicalIdentifier(identifier) {
+  const parsed = parseLinearIdentifier(identifier);
+  return `${parsed.teamKey}-${parsed.number}`;
+}
+
+export function resolveApproval(options, deps = {}) {
+  const readFile = deps.readFileSync ?? readFileSync;
+  const hasReceipt = (options.dryRunReceipt ?? "") !== "";
+  const hasDirect =
+    (options.approvedPlanHash ?? "") !== "" || (options.approvedSnapshotHash ?? "") !== "";
+
+  if (hasReceipt && hasDirect) {
+    throw new Error(
+      "use either --dry-run-receipt or direct --approved-plan-hash/--approved-snapshot-hash, not both",
+    );
+  }
+
+  if (hasReceipt) {
+    const receipt = parseDryRunReceipt(
+      readFile(options.dryRunReceipt, "utf8"),
+      options.dryRunReceipt,
+    );
+    if (
+      typeof receipt.identifier === "string" &&
+      typeof options.identifier === "string" &&
+      canonicalIdentifier(receipt.identifier) !== canonicalIdentifier(options.identifier)
+    ) {
+      throw new Error(
+        `--dry-run-receipt identifier ${receipt.identifier} does not match requested ${options.identifier}`,
+      );
+    }
+    const approvedPlanHash = hashFromReceipt(receipt, "planHash");
+    const approvedSnapshotHash = hashFromReceipt(receipt, "snapshotHash");
+    const nowIso = typeof receipt.nowIso === "string" ? receipt.nowIso.trim() : "";
+    if (approvedPlanHash === "" || approvedSnapshotHash === "") {
+      throw new Error("--dry-run-receipt must include planHash and snapshotHash");
+    }
+    validateHash(approvedPlanHash, "--dry-run-receipt planHash");
+    validateHash(approvedSnapshotHash, "--dry-run-receipt snapshotHash");
+    return {
+      approvedPlanHash,
+      approvedSnapshotHash,
+      ...(nowIso !== "" ? { nowIso } : {}),
+      source: "dry-run-receipt",
+    };
+  }
+
+  if (hasDirect) {
+    if ((options.approvedPlanHash ?? "") === "" || (options.approvedSnapshotHash ?? "") === "") {
+      throw new Error(
+        "live approval requires both --approved-plan-hash and --approved-snapshot-hash",
+      );
+    }
+    return {
+      approvedPlanHash: options.approvedPlanHash,
+      approvedSnapshotHash: options.approvedSnapshotHash,
+      source: "direct-hashes",
+    };
+  }
+
+  return null;
 }
 
 // Reads a generic password from the macOS Keychain without a shell. Returns "" on any miss.
@@ -252,17 +362,34 @@ export async function buildItemPlan(source, options) {
   const request = reviewCommentMutationRequest(plan, record.snapshotHash);
 
   // Open ONLY the comment gate. Live drift fingerprint: the same read pass produced both
-  // the snapshot and the comment list, so the live snapshot equals the plan snapshot, and
-  // the operator-approved plan hash is the freshly computed plan hash.
+  // the snapshot and the comment list. A live apply must still provide independently
+  // approved hashes (direct flags or a saved dry-run receipt); missing or stale approvals
+  // keep authorization denied. The approved snapshot is treated as the plan-time snapshot,
+  // while record.snapshotHash is the current live read-back fingerprint.
   const gates = resolveGates({ comment: true });
+  const approval = options.approval ?? null;
+  const authorizationRequest = {
+    ...request,
+    snapshotHash: approval?.approvedSnapshotHash ?? request.snapshotHash,
+  };
   const drift = {
     liveSnapshotHash: record.snapshotHash,
-    approvedPlanHash: plan.planHash,
+    approvedPlanHash: approval?.approvedPlanHash ?? "",
   };
-  const authorization = authorizeMutation(request, gates, drift);
-  const receipt = buildMutationReceipt(request, gates, drift);
+  const authorization = authorizeMutation(authorizationRequest, gates, drift);
+  const receipt = buildMutationReceipt(authorizationRequest, gates, drift);
 
-  return { record, classification, plan, request, authorization, receipt, hydrated };
+  return {
+    record,
+    classification,
+    plan,
+    request,
+    authorization,
+    receipt,
+    hydrated,
+    approval,
+    nowIso,
+  };
 }
 
 /** Applies the authorized plan with a freshly minted Bearer token. Never logs the token. */
@@ -353,6 +480,12 @@ export async function readBackComment(source, identifier, plan) {
   };
 }
 
+export function assertReadBackConfirmed(readback) {
+  if (readback?.confirmed === true) return;
+  const error = readback?.error ? `: ${readback.error}` : "";
+  throw new Error(`live apply read-back failed${error}`);
+}
+
 function summarize(result, mode) {
   return {
     identifier: result.record.identifier,
@@ -372,6 +505,8 @@ function summarize(result, mode) {
     planHash: result.plan.planHash,
     snapshotHash: result.record.snapshotHash,
     receipt: result.receipt, // secret-free MutationReceipt (audit trail)
+    approvalSource: result.approval?.source ?? null,
+    nowIso: result.nowIso,
     live: mode.live,
     mode: mode.live ? "apply" : "dry-run",
     modeReason: mode.reason,
@@ -438,10 +573,27 @@ async function main() {
 
   let result;
   let source;
+  let approval;
+  try {
+    approval = resolveApproval(options);
+    if (approval?.nowIso !== undefined) {
+      if (options.nowIso !== undefined && options.nowIso !== approval.nowIso) {
+        throw new Error(
+          `--now ${options.nowIso} does not match --dry-run-receipt nowIso ${approval.nowIso}`,
+        );
+      }
+      options.nowIso = approval.nowIso;
+    }
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+    return;
+  }
+
   try {
     const transport = createLinearTransport({ token: readToken });
     source = new LinearItemSource(transport);
-    result = await buildItemPlan(source, options);
+    result = await buildItemPlan(source, { ...options, approval });
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
@@ -456,16 +608,21 @@ async function main() {
     try {
       const appCreds = resolveAppCredentials({ account: options.keychainAccount });
       const applyResult = await applyPlan(result.plan, appCreds);
-      summary.applied = true;
+      summary.applyAttempted = true;
+      summary.applied = false;
       summary.applyResult = applyResult;
       // PAR-215 read-back: re-fetch and confirm the durable marker comment landed.
       try {
         summary.readback = await readBackComment(source, options.identifier, result.plan);
+        assertReadBackConfirmed(summary.readback);
+        summary.applied = true;
       } catch (error) {
         summary.readback = {
           confirmed: false,
           error: error instanceof Error ? error.message : String(error),
         };
+        console.error(summary.readback.error);
+        process.exitCode = 1;
       }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -476,13 +633,23 @@ async function main() {
     summary.applied = false;
     // Surface why a LIVE run skipped (ineligible / denied / noop); the dry-run reason is in writeDecision.
     if (mode.live) summary.applyBlocked = decision.reason;
+    if (
+      mode.live &&
+      result.classification.eligible &&
+      result.plan.action !== "noop" &&
+      !result.authorization.allowed
+    ) {
+      process.exitCode = 1;
+    }
   }
 
   if (options.json) {
     console.log(JSON.stringify(summary, null, 2));
   } else {
     console.log(printHuman(summary));
-    if (summary.applied) console.log("\nApplied: comment posted as ClawSweeper.");
+    if (summary.applied && summary.readback?.confirmed === true) {
+      console.log("\nApplied: comment posted as ClawSweeper and read-back confirmed.");
+    }
   }
 }
 
@@ -501,6 +668,12 @@ function positiveInt(value, flag) {
   return Number(value);
 }
 
+function requireHashValue(argv, index, flag) {
+  const value = requireValue(argv, index, flag).trim();
+  validateHash(value, flag);
+  return value.toLowerCase();
+}
+
 function usage() {
   return `Usage: node scripts/linear-comment-apply.mjs --identifier <KEY> [options]
 
@@ -516,6 +689,10 @@ Options:
   --json                     Emit a JSON summary instead of human-readable text
   --now <iso>                ISO 8601 timestamp to use as "now" (default: current time)
   --stale-days <n>           Staleness threshold in days (default: ${DEFAULT_STALE_DAYS})
+  --approved-plan-hash <h>   Operator-approved plan hash from a reviewed dry-run
+  --approved-snapshot-hash <h>
+                              Operator-approved snapshot hash from the same dry-run
+  --dry-run-receipt <path>   JSON dry-run receipt containing planHash + snapshotHash
   --required-label <label>   Require at least one of these labels (repeatable)
   --exclusion-label <label>  Skip items with this label (repeatable)
   --protected-label <label>  Mark items with this label as protected (repeatable)
@@ -532,7 +709,8 @@ Examples:
   node scripts/linear-comment-apply.mjs --identifier PAR-244 --json
 
   # Live write (posts the comment as ClawSweeper) — both gates required
-  ${NOTIFY_ENV}=1 node scripts/linear-comment-apply.mjs --identifier PAR-244 --apply`;
+  ${NOTIFY_ENV}=1 node scripts/linear-comment-apply.mjs --identifier PAR-244 --apply \
+    --dry-run-receipt ./par-244-clawsweeper-dry-run.json`;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
