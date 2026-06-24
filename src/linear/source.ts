@@ -1,6 +1,7 @@
 import type { LinearTransport } from "./client.js";
-import { ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
+import { ISSUE_BY_IDENTIFIER_QUERY, ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
 import type {
+  HydratedWorkspaceItem,
   LinearConnection,
   LinearIssue,
   LinearLabel,
@@ -10,6 +11,26 @@ import type {
   WorkspaceItem,
   WorkspaceSweepOptions,
 } from "./types.js";
+
+/** Parsed pieces of a Linear human identifier such as "PAR-244". */
+export interface ParsedIdentifier {
+  teamKey: string;
+  number: number;
+}
+
+/**
+ * Parses a Linear human identifier "TEAM-123" into its team key and issue number.
+ * Throws a clear error for anything that is not a `<KEY>-<number>` shape.
+ */
+export function parseLinearIdentifier(identifier: string): ParsedIdentifier {
+  const match = /^([A-Za-z][A-Za-z0-9]*)-(\d+)$/.exec(identifier.trim());
+  if (match === null || match[1] === undefined || match[2] === undefined) {
+    throw new Error(
+      `invalid Linear identifier "${identifier}" — expected a "<TEAM>-<number>" form like "PAR-244"`,
+    );
+  }
+  return { teamKey: match[1].toUpperCase(), number: Number(match[2]) };
+}
 
 // Narrowing helpers — Linear GraphQL data is untyped `unknown` from the transport.
 
@@ -117,6 +138,31 @@ function mapIssue(raw: unknown): LinearIssue {
   };
 }
 
+// Maps the hydrated issue node from ISSUE_BY_IDENTIFIER_QUERY into a WorkspaceItem plus
+// its current comments. Unlike mapIssue, this node carries full team and project fields.
+function mapHydratedItem(raw: unknown): HydratedWorkspaceItem {
+  const r = asRecord(raw);
+  const issue = mapIssue(raw);
+
+  const teamRaw = asRecord(r["team"]);
+  const team: LinearTeam = {
+    id: str(teamRaw["id"]),
+    key: str(teamRaw["key"]),
+    name: str(teamRaw["name"]),
+  };
+
+  const project = r["project"] != null ? mapProject(r["project"], team.id) : null;
+
+  const commentsConn = asRecord(r["comments"]);
+  const commentNodes = Array.isArray(commentsConn["nodes"]) ? commentsConn["nodes"] : [];
+  const comments = commentNodes.map((n) => {
+    const cn = asRecord(n);
+    return { id: str(cn["id"]), body: str(cn["body"]) };
+  });
+
+  return { team, project, issue, comments };
+}
+
 export class LinearItemSource {
   constructor(private transport: LinearTransport) {}
 
@@ -200,5 +246,24 @@ export class LinearItemSource {
     const results: WorkspaceItem[] = [];
     for await (const item of this.iterateWorkspaceItems(options)) results.push(item);
     return results;
+  }
+
+  /**
+   * Fetches exactly one issue by its human identifier (e.g. "PAR-244"), hydrated with the
+   * issue's current comments in the same read pass. Returns null when no issue matches.
+   * Used by the single-item comment-apply path so plan + drift are computed against one
+   * consistent read (no comment/snapshot drift).
+   */
+  async fetchIssueByIdentifier(identifier: string): Promise<HydratedWorkspaceItem | null> {
+    const { teamKey, number } = parseLinearIdentifier(identifier);
+    const data = await this.transport(ISSUE_BY_IDENTIFIER_QUERY, {
+      teamKey,
+      number,
+      first: 1,
+    });
+    const connection = asConnection<unknown>(asRecord(data)["issues"], "IssueByIdentifier");
+    const [node] = connection.nodes;
+    if (node === undefined) return null;
+    return mapHydratedItem(node);
   }
 }

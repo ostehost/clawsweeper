@@ -58,3 +58,12 @@ export interface WorkspaceItem {
   project: LinearProject | null;
   issue: LinearIssue;
 }
+
+/**
+ * A single workspace item hydrated with the issue's current comments — produced by the
+ * by-identifier fetch so a comment upsert can be planned against the live comment list
+ * in the same read pass (no separate comment fetch, no drift).
+ */
+export interface HydratedWorkspaceItem extends WorkspaceItem {
+  comments: Array<{ id: string; body: string }>;
+}

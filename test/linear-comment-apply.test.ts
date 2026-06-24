@@ -1,0 +1,364 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { createLinearTransport, mintLinearAppToken } from "../dist/linear/client.js";
+import { LinearItemSource, parseLinearIdentifier } from "../dist/linear/source.js";
+// Barrel-wiring checks: the new write-path symbols must be re-exported from the barrel.
+import {
+  createLinearTransport as createLinearTransportFromIndex,
+  mintLinearAppToken as mintLinearAppTokenFromIndex,
+  parseLinearIdentifier as parseLinearIdentifierFromIndex,
+} from "../dist/linear/index.js";
+import {
+  applyPlan,
+  buildItemPlan,
+  renderReviewContent,
+  resolveAppCredentials,
+  resolveReadToken,
+  resolveWriteMode,
+} from "../scripts/linear-comment-apply.mjs";
+
+// ---------------------------------------------------------------------------
+// Bearer-mode header construction (the seam in client.ts) — fake fetch, no network
+// ---------------------------------------------------------------------------
+
+// Captures the Authorization header sent on the first request, then returns ok data.
+function captureAuthFetch(captured: { header?: string }) {
+  return async (_url: string, init?: RequestInit): Promise<Response> => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    captured.header = headers["Authorization"];
+    return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+  };
+}
+
+test("createLinearTransport defaults to the RAW token header (read path unchanged)", async () => {
+  const captured: { header?: string } = {};
+  const transport = createLinearTransport({
+    token: "personal-key",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: captureAuthFetch(captured) as typeof fetch,
+  });
+  await transport("query { ok }", {});
+  assert.equal(captured.header, "personal-key");
+});
+
+test("createLinearTransport auth:'raw' explicitly sends the raw token", async () => {
+  const captured: { header?: string } = {};
+  const transport = createLinearTransport({
+    token: "personal-key",
+    auth: "raw",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: captureAuthFetch(captured) as typeof fetch,
+  });
+  await transport("query { ok }", {});
+  assert.equal(captured.header, "personal-key");
+});
+
+test("createLinearTransport auth:'bearer' sends 'Bearer <token>'", async () => {
+  const captured: { header?: string } = {};
+  const transport = createLinearTransport({
+    token: "oauth-access-token",
+    auth: "bearer",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: captureAuthFetch(captured) as typeof fetch,
+  });
+  await transport("mutation { commentCreate { success } }", {});
+  assert.equal(captured.header, "Bearer oauth-access-token");
+});
+
+// ---------------------------------------------------------------------------
+// mintLinearAppToken — urlencoded client_credentials POST, never leaks secrets
+// ---------------------------------------------------------------------------
+
+test("mintLinearAppToken POSTs urlencoded client_credentials and returns the access token", async () => {
+  let captured: { url?: string; contentType?: string; body?: string } = {};
+  const fakeFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+    captured = {
+      url,
+      contentType: ((init?.headers ?? {}) as Record<string, string>)["Content-Type"],
+      body: init?.body as string,
+    };
+    return new Response(
+      JSON.stringify({ access_token: "minted-abc", expires_in: 2591999, token_type: "Bearer" }),
+      { status: 200 },
+    );
+  };
+
+  const result = await mintLinearAppToken({
+    clientId: "cid",
+    clientSecret: "csecret",
+    endpoint: "https://fake.linear.app/oauth/token",
+    fetchImpl: fakeFetch as typeof fetch,
+  });
+
+  assert.equal(result.accessToken, "minted-abc");
+  assert.equal(result.expiresInSec, 2591999);
+  assert.equal(result.tokenType, "Bearer");
+  assert.equal(captured.url, "https://fake.linear.app/oauth/token");
+  assert.equal(captured.contentType, "application/x-www-form-urlencoded");
+  const params = new URLSearchParams(captured.body);
+  assert.equal(params.get("grant_type"), "client_credentials");
+  assert.equal(params.get("client_id"), "cid");
+  assert.equal(params.get("client_secret"), "csecret");
+  assert.equal(params.get("scope"), "read,write");
+});
+
+test("mintLinearAppToken throws a token-free error on HTTP failure", async () => {
+  const fakeFetch = async (): Promise<Response> =>
+    new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 });
+  await assert.rejects(
+    () =>
+      mintLinearAppToken({
+        clientId: "cid",
+        clientSecret: "supersecret",
+        fetchImpl: fakeFetch as typeof fetch,
+      }),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.match(message, /HTTP 401/);
+      assert.match(message, /invalid_client/);
+      // The secret must never appear in the error.
+      assert.ok(!message.includes("supersecret"));
+      return true;
+    },
+  );
+});
+
+test("mintLinearAppToken requires both clientId and clientSecret", async () => {
+  await assert.rejects(
+    () => mintLinearAppToken({ clientId: "", clientSecret: "x" }),
+    /requires both clientId and clientSecret/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// parseLinearIdentifier
+// ---------------------------------------------------------------------------
+
+test("parseLinearIdentifier splits TEAM-number", () => {
+  assert.deepEqual(parseLinearIdentifier("PAR-244"), { teamKey: "PAR", number: 244 });
+  assert.deepEqual(parseLinearIdentifier(" par-7 "), { teamKey: "PAR", number: 7 });
+});
+
+test("parseLinearIdentifier rejects malformed identifiers", () => {
+  assert.throws(() => parseLinearIdentifier("PAR"), /invalid Linear identifier/);
+  assert.throws(() => parseLinearIdentifier("244"), /invalid Linear identifier/);
+  assert.throws(() => parseLinearIdentifier(""), /invalid Linear identifier/);
+});
+
+// ---------------------------------------------------------------------------
+// LinearItemSource.fetchIssueByIdentifier — single-item fetch via fake transport
+// ---------------------------------------------------------------------------
+
+function hydratedIssueNode() {
+  return {
+    id: "issue-uuid-244",
+    identifier: "PAR-244",
+    title: "Example issue",
+    url: "https://linear.app/partnerai/issue/PAR-244",
+    createdAt: "2026-06-01T00:00:00Z",
+    updatedAt: "2026-06-20T00:00:00Z",
+    priority: 2,
+    team: { id: "team-1", key: "PAR", name: "PartnerAI" },
+    project: { id: "proj-1", name: "ClawSweeper", state: "started" },
+    state: { id: "state-1", name: "Backlog", type: "backlog" },
+    labels: { nodes: [{ id: "lbl-1", name: "bug" }] },
+    comments: { nodes: [] as Array<{ id: string; body: string }> },
+  };
+}
+
+function fakeTransport(node: ReturnType<typeof hydratedIssueNode> | null) {
+  const calls: Array<{ query: string; vars: Record<string, unknown> }> = [];
+  const transport = async (query: string, vars: Record<string, unknown>): Promise<unknown> => {
+    calls.push({ query, vars });
+    return {
+      issues: { nodes: node ? [node] : [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+  };
+  return { transport, calls };
+}
+
+test("fetchIssueByIdentifier returns a hydrated workspace item with comments", async () => {
+  const { transport, calls } = fakeTransport(hydratedIssueNode());
+  const source = new LinearItemSource(transport);
+  const item = await source.fetchIssueByIdentifier("PAR-244");
+  assert.ok(item);
+  assert.equal(item.issue.identifier, "PAR-244");
+  assert.equal(item.team.key, "PAR");
+  assert.equal(item.project?.name, "ClawSweeper");
+  assert.deepEqual(item.comments, []);
+  // The query is scoped by team key + number.
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].vars["teamKey"], "PAR");
+  assert.equal(calls[0].vars["number"], 244);
+});
+
+test("fetchIssueByIdentifier returns null when no issue matches", async () => {
+  const { transport } = fakeTransport(null);
+  const source = new LinearItemSource(transport);
+  assert.equal(await source.fetchIssueByIdentifier("PAR-999"), null);
+});
+
+// ---------------------------------------------------------------------------
+// resolveWriteMode — dry-run by default; live needs --apply AND OPENCLAW_NOTIFY_LINEAR
+// ---------------------------------------------------------------------------
+
+test("resolveWriteMode is dry-run without --apply", () => {
+  assert.equal(resolveWriteMode({ apply: false }, {}).live, false);
+});
+
+test("resolveWriteMode stays dry-run with --apply but no OPENCLAW_NOTIFY_LINEAR", () => {
+  const mode = resolveWriteMode({ apply: true }, {});
+  assert.equal(mode.live, false);
+  assert.match(mode.reason, /OPENCLAW_NOTIFY_LINEAR/);
+});
+
+test("resolveWriteMode goes live only with both --apply and OPENCLAW_NOTIFY_LINEAR=1", () => {
+  assert.equal(resolveWriteMode({ apply: true }, { OPENCLAW_NOTIFY_LINEAR: "1" }).live, true);
+  assert.equal(resolveWriteMode({ apply: true }, { OPENCLAW_NOTIFY_LINEAR: "true" }).live, true);
+  assert.equal(resolveWriteMode({ apply: true }, { OPENCLAW_NOTIFY_LINEAR: "0" }).live, false);
+});
+
+// ---------------------------------------------------------------------------
+// buildItemPlan — end-to-end single-item plan (real pipeline, fake transport)
+// ---------------------------------------------------------------------------
+
+test("buildItemPlan creates an authorized create plan when no marker comment exists", async () => {
+  const { transport } = fakeTransport(hydratedIssueNode());
+  const source = new LinearItemSource(transport);
+  const result = await buildItemPlan(source, {
+    identifier: "PAR-244",
+    nowIso: "2026-06-22T00:00:00Z",
+    staleDays: 60,
+  });
+  assert.equal(result.plan.action, "create");
+  assert.equal(result.plan.targetCommentId, null);
+  // body carries the durable marker keyed on the issue UUID.
+  assert.ok(result.plan.body.includes("<!-- clawsweeper-review:issue-uuid-244 -->"));
+  // Authorized: comment gate opened, snapshot/plan hashes self-consistent within one read.
+  assert.equal(result.authorization.allowed, true);
+  assert.equal(result.receipt.driftDetected, false);
+});
+
+test("buildItemPlan yields a noop when an up-to-date marker comment already exists", async () => {
+  // First render the body the planner would produce, then seed it as an existing comment.
+  const node = hydratedIssueNode();
+  const probe = fakeTransport(node);
+  const probeResult = await buildItemPlan(new LinearItemSource(probe.transport), {
+    identifier: "PAR-244",
+    nowIso: "2026-06-22T00:00:00Z",
+  });
+  node.comments.nodes = [{ id: "existing-comment-1", body: probeResult.plan.body }];
+
+  const { transport } = fakeTransport(node);
+  const result = await buildItemPlan(new LinearItemSource(transport), {
+    identifier: "PAR-244",
+    nowIso: "2026-06-22T00:00:00Z",
+  });
+  assert.equal(result.plan.action, "noop");
+  assert.equal(result.plan.targetCommentId, "existing-comment-1");
+});
+
+test("renderReviewContent is deterministic for the same record + classification", () => {
+  const record = {
+    identifier: "PAR-244",
+    triagePriority: "P2",
+    itemCategory: "bug",
+    state: "open",
+  };
+  const classification = { disposition: "review", reasons: ["eligible for review"] };
+  const a = renderReviewContent(record, classification);
+  const b = renderReviewContent(record, classification);
+  assert.equal(a, b);
+  assert.ok(a.includes("PAR-244"));
+});
+
+// ---------------------------------------------------------------------------
+// applyPlan — mints a Bearer token and runs the create/update mutation (fakes)
+// ---------------------------------------------------------------------------
+
+test("applyPlan mints a Bearer token and runs commentCreate with the planned body", async () => {
+  const seen: { authHeader?: string; mutation?: string; vars?: Record<string, unknown> } = {};
+  const fakeFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.includes("/oauth/token")) {
+      return new Response(
+        JSON.stringify({ access_token: "minted-xyz", expires_in: 100, token_type: "Bearer" }),
+        { status: 200 },
+      );
+    }
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    seen.authHeader = headers["Authorization"];
+    const parsed = JSON.parse(init?.body as string) as {
+      query: string;
+      variables: Record<string, unknown>;
+    };
+    seen.mutation = parsed.query;
+    seen.vars = parsed.variables;
+    return new Response(JSON.stringify({ data: { commentCreate: { success: true } } }), {
+      status: 200,
+    });
+  };
+
+  const plan = { action: "create", issueId: "issue-uuid-244", targetCommentId: null, body: "BODY" };
+  const out = await applyPlan(
+    plan,
+    { clientId: "cid", clientSecret: "csec" },
+    {
+      fetchImpl: fakeFetch as typeof fetch,
+      mintEndpoint: "https://fake.linear.app/oauth/token",
+      graphqlEndpoint: "https://fake.linear.app/graphql",
+    },
+  );
+
+  assert.equal(seen.authHeader, "Bearer minted-xyz");
+  assert.match(seen.mutation ?? "", /commentCreate/);
+  assert.deepEqual(seen.vars, { issueId: "issue-uuid-244", body: "BODY" });
+  assert.deepEqual(out, { commentCreate: { success: true } });
+});
+
+test("applyPlan does nothing (and mints no token) for a noop plan", async () => {
+  let touched = false;
+  const fakeFetch = async (): Promise<Response> => {
+    touched = true;
+    return new Response("{}", { status: 200 });
+  };
+  const out = await applyPlan(
+    { action: "noop", issueId: "x", targetCommentId: "c1", body: "B" },
+    { clientId: "cid", clientSecret: "csec" },
+    { fetchImpl: fakeFetch as typeof fetch, mintEndpoint: "https://fake/oauth/token" },
+  );
+  assert.deepEqual(out, { noop: true });
+  // A noop must NOT mint a write token or hit the network at all.
+  assert.equal(touched, false);
+});
+
+// ---------------------------------------------------------------------------
+// Keychain resolvers — env precedence / injected lookup (no real `security` call)
+// ---------------------------------------------------------------------------
+
+test("resolveReadToken prefers env and never calls the keychain when env is set", () => {
+  const token = resolveReadToken({
+    env: { LINEAR_API_KEY: "env-key" },
+    runKeychain: () => {
+      throw new Error("keychain must not be consulted when env token is present");
+    },
+  });
+  assert.equal(token, "env-key");
+});
+
+test("resolveAppCredentials reads client id + secret from the injected keychain", () => {
+  const creds = resolveAppCredentials({
+    runKeychain: (service: string) => (service.includes("client-id") ? "the-id" : "the-secret"),
+  });
+  assert.deepEqual(creds, { clientId: "the-id", clientSecret: "the-secret" });
+});
+
+// ---------------------------------------------------------------------------
+// Barrel wiring
+// ---------------------------------------------------------------------------
+
+test("write-path symbols are re-exported from the barrel", () => {
+  assert.equal(typeof createLinearTransportFromIndex, "function");
+  assert.equal(typeof mintLinearAppTokenFromIndex, "function");
+  assert.equal(typeof parseLinearIdentifierFromIndex, "function");
+});

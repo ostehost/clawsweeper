@@ -1,4 +1,5 @@
 export type {
+  HydratedWorkspaceItem,
   LinearConnection,
   LinearIssue,
   LinearLabel,
@@ -18,12 +19,19 @@ export {
 } from "./retry.js";
 export type { LinearRetryKind } from "./retry.js";
 
-export { ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
+export { ISSUE_BY_IDENTIFIER_QUERY, ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
 
-export { createLinearTransport, resolveLinearToken } from "./client.js";
-export type { LinearTransport, LinearTransportOptions, ResolveTokenOptions } from "./client.js";
+export { createLinearTransport, mintLinearAppToken, resolveLinearToken } from "./client.js";
+export type {
+  LinearTransport,
+  LinearTransportOptions,
+  MintAppTokenOptions,
+  MintedAppToken,
+  ResolveTokenOptions,
+} from "./client.js";
 
-export { LinearItemSource } from "./source.js";
+export { LinearItemSource, parseLinearIdentifier } from "./source.js";
+export type { ParsedIdentifier } from "./source.js";
 
 export type {
   ItemCategory,

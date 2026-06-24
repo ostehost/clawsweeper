@@ -81,3 +81,60 @@ export const ISSUES_QUERY = `
     }
   }
 `;
+
+// Fetch a single issue by its human identifier (team key + number, e.g. "PAR-244"),
+// scoped to one team. Hydrates the issue's comments in the SAME read pass so a comment
+// upsert can be planned without snapshot/comment drift. Returns at most one node.
+export const ISSUE_BY_IDENTIFIER_QUERY = `
+  query IssueByIdentifier($teamKey: String!, $number: Float!, $first: Int!, $after: String) {
+    issues(
+      first: $first
+      after: $after
+      filter: {
+        team: { key: { eq: $teamKey } }
+        number: { eq: $number }
+      }
+    ) {
+      nodes {
+        id
+        identifier
+        title
+        url
+        createdAt
+        updatedAt
+        priority
+        team {
+          id
+          key
+          name
+        }
+        project {
+          id
+          name
+          state
+        }
+        state {
+          id
+          name
+          type
+        }
+        labels {
+          nodes {
+            id
+            name
+          }
+        }
+        comments {
+          nodes {
+            id
+            body
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
