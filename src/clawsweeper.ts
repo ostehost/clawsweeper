@@ -1078,7 +1078,11 @@ const DEFAULT_REVIEW_CODEX_TIMEOUT_MS = 1_200_000;
 const DEFAULT_CODEX_FALLBACK_MIN_BUDGET_MS = 120_000;
 const REVIEW_POLICY_VERSION = "2026-06-15-policy-v22";
 const REVIEW_ITEM_PROMPT_PATH = join(ROOT, "prompts", "review-item.md");
-const CLAWSWEEPER_DECISION_SCHEMA_PATH = join(ROOT, "schema", "clawsweeper-decision.schema.json");
+export const CLAWSWEEPER_DECISION_SCHEMA_PATH = join(
+  ROOT,
+  "schema",
+  "clawsweeper-decision.schema.json",
+);
 const PR_CLOSE_COVERAGE_PROOF_PROMPT_PATH = join(ROOT, "prompts", "pr-close-coverage-proof.md");
 const PR_CLOSE_COVERAGE_PROOF_SCHEMA_PATH = join(
   ROOT,
@@ -6369,7 +6373,7 @@ function collectItemContext(
   return context;
 }
 
-function gitInfo(openclawDir: string): GitInfo {
+export function gitInfo(openclawDir: string): GitInfo {
   const targetBranch = reviewTargetBranch(openclawDir);
   run(
     "git",
@@ -7068,7 +7072,14 @@ export function runCodexForTest(options: Parameters<typeof runCodex>[0]): Decisi
   return runCodex(options);
 }
 
-function runCodex(options: {
+/**
+ * Promoted real export of the Codex review harness so the Linear analysis runner
+ * (scripts/linear-analyze.mjs) can drive the SAME read-only review pass the GitHub lane uses,
+ * with a Linear-shaped Item/ItemContext/GitInfo and its own prompt. Pass model:"internal" so
+ * codexModelArgs emits no --model and the harness config.toml (gpt-5.5) governs. The model
+ * runs read-only git inside the sandbox; the host re-verifies cited shas separately.
+ */
+export function runCodex(options: {
   item: Item;
   context: ItemContext;
   git: GitInfo;

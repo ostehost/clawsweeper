@@ -424,12 +424,19 @@ test("renderReviewContent is deterministic for the same record + classification"
     triagePriority: "P2",
     itemCategory: "bug",
     state: "open",
+    labels: [],
   };
-  const classification = { disposition: "review", reasons: ["eligible for review"] };
+  const classification = {
+    disposition: "review",
+    eligible: true,
+    staleCandidate: false,
+    reasons: ["eligible for review"],
+  };
   const a = renderReviewContent(record, classification);
   const b = renderReviewContent(record, classification);
   assert.equal(a, b);
   assert.ok(a.includes("PAR-244"));
+  assert.ok(a.includes("Suggested next step:")); // policy-driven next step is rendered
 });
 
 // ---------------------------------------------------------------------------

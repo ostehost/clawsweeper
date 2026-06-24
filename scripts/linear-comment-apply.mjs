@@ -46,11 +46,13 @@ import {
   COMMENT_CREATE_MUTATION,
   COMMENT_UPDATE_MUTATION,
   createLinearTransport,
+  evaluateReviewPolicy,
   LinearItemSource,
   mapWorkspaceItem,
   mintLinearAppToken,
   parseLinearIdentifier,
   planReviewCommentUpsert,
+  renderAnalyzerSections,
   resolveGates,
   reviewCommentMutationRequest,
 } from "../dist/linear/index.js";
@@ -290,8 +292,18 @@ export function resolveAppCredentials(options = {}) {
  * Renders the deterministic, offline review CONTENT (without the marker — the planner adds
  * it). The narrative is derived purely from the classification + record so re-runs that see
  * the same issue produce a byte-identical body (stable planHash for operator approval).
+ *
+ * Next-step rendering, exactly ONE source (no redundancy):
+ *   - With analysis: optional `review` ({ decision, closeLeaning }) appends the documented
+ *     analyzer sections (**Summary**, What I checked:, Reproducibility, **Next step**,
+ *     Remaining risk:) THROUGH the pure renderAnalyzerSections (analyzer.ts) — the analyzer's
+ *     issue-specific **Next step** is authoritative, so the generic policy line is NOT also
+ *     emitted. The body is gated on the CACHED deterministic Decision, so a re-plan of an
+ *     unchanged Decision yields a byte-identical body and comment.planHashFor noops.
+ *   - Without analysis (or empty analyzer output): the deterministic policy "Suggested next
+ *     step" line is emitted instead — the standard non-analysis review comment.
  */
-export function renderReviewContent(record, classification) {
+export function renderReviewContent(record, classification, review = null) {
   const lines = [];
   lines.push(`## ClawSweeper review — ${record.identifier}`);
   lines.push("");
@@ -304,6 +316,26 @@ export function renderReviewContent(record, classification) {
   for (const reason of classification.reasons) {
     lines.push(`- ${reason}`);
   }
+
+  // Exactly one next-step source. When a cached Decision is supplied, the analyzer's
+  // issue-specific sections (incl. **Next step**) are authoritative; otherwise fall back to
+  // the deterministic policy suggested-next-step. Both are pure/deterministic so planHash
+  // stays byte-stable on re-plan.
+  let renderedAnalyzerSections = false;
+  if (review && review.decision) {
+    const sections = renderAnalyzerSections(review.decision, review.closeLeaning);
+    if (sections.trim() !== "") {
+      lines.push("");
+      lines.push(sections);
+      renderedAnalyzerSections = true;
+    }
+  }
+  if (!renderedAnalyzerSections) {
+    const policy = evaluateReviewPolicy(classification, record);
+    lines.push("");
+    lines.push(`Suggested next step: ${policy.suggestedNextStep}`);
+  }
+
   lines.push("");
   lines.push(
     "_This is an automated, review-only triage note. ClawSweeper proposes; it never closes._",
@@ -399,21 +431,24 @@ export async function applyPlan(plan, appCreds, deps = {}) {
     return { noop: true };
   }
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const minted = await mintLinearAppToken({
-    clientId: appCreds.clientId,
-    clientSecret: appCreds.clientSecret,
-    scope: "read,write",
-    ...(deps.mintEndpoint ? { endpoint: deps.mintEndpoint } : {}),
-    fetchImpl,
-  });
-  const transport =
-    deps.transport ??
-    createLinearTransport({
+  // Reuse a caller-supplied transport when present (bulk runs mint ONE Bearer token and
+  // share it across items); only mint when we must build our own transport.
+  let transport = deps.transport;
+  if (transport === undefined) {
+    const minted = await mintLinearAppToken({
+      clientId: appCreds.clientId,
+      clientSecret: appCreds.clientSecret,
+      scope: "read,write",
+      ...(deps.mintEndpoint ? { endpoint: deps.mintEndpoint } : {}),
+      fetchImpl,
+    });
+    transport = createLinearTransport({
       token: minted.accessToken,
       auth: "bearer",
       ...(deps.graphqlEndpoint ? { endpoint: deps.graphqlEndpoint } : {}),
       ...(deps.fetchImpl ? { fetchImpl } : {}),
     });
+  }
 
   if (plan.action === "create") {
     return transport(COMMENT_CREATE_MUTATION, { issueId: plan.issueId, body: plan.body });

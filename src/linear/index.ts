@@ -19,7 +19,15 @@ export {
 } from "./retry.js";
 export type { LinearRetryKind } from "./retry.js";
 
-export { ISSUE_BY_IDENTIFIER_QUERY, ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
+export {
+  ISSUE_BY_IDENTIFIER_QUERY,
+  ISSUE_LABEL_CREATE_MUTATION,
+  ISSUE_LABELS_QUERY,
+  ISSUE_SET_LABELS_MUTATION,
+  ISSUES_QUERY,
+  PROJECTS_QUERY,
+  TEAMS_QUERY,
+} from "./queries.js";
 
 export { createLinearTransport, mintLinearAppToken, resolveLinearToken } from "./client.js";
 export type {
@@ -32,6 +40,24 @@ export type {
 
 export { LinearItemSource, parseLinearIdentifier } from "./source.js";
 export type { ParsedIdentifier } from "./source.js";
+
+export type {
+  ExtractOptions,
+  MatchedProject,
+  ScopeResolution,
+  ScopeSource,
+  ScopeSpec,
+} from "./scope.js";
+
+export {
+  canonicalizeIdentifiers,
+  chooseScope,
+  DEFAULT_ID_FIELDS,
+  DEFAULT_LIST_FIELDS,
+  extractIdentifiers,
+  matchIdentifier,
+  resolveScope,
+} from "./scope.js";
 
 export type {
   ItemCategory,
@@ -91,6 +117,25 @@ export {
   REVIEW_ONLY_GATES,
 } from "./authority.js";
 
+export type { PolicyDecision, PolicySignals, ReviewPolicyRule } from "./policy.js";
+
+export {
+  buildPolicySignals,
+  DEFAULT_REVIEW_POLICY,
+  evaluateReviewPolicy,
+  isProtectedActionLabel,
+  isReviewRoutingLabel,
+  LABEL_HUMAN_REVIEW,
+  LABEL_LINKED_PR_OPEN,
+  LABEL_NEEDS_INFO,
+  LABEL_NEEDS_MAINTAINER_REVIEW,
+  LABEL_NEEDS_PRODUCT_DECISION,
+  LABEL_NOT_REPRO_ON_MAIN,
+  nextReviewLabels,
+  PROTECTED_ACTION_LABELS,
+  REVIEW_ROUTING_LABELS,
+} from "./policy.js";
+
 export type {
   LinearComment,
   ReviewCommentAction,
@@ -118,6 +163,39 @@ export type {
   RunSentinels,
   RunVerdict,
 } from "./trigger.js";
+
+export type {
+  AnalyzerDecision,
+  AnalyzerEvidence,
+  AnalyzerFingerprintInput,
+  AnalyzerRecordFrontMatter,
+  CloseLeaning,
+  CloseLeaningInput,
+  ShaVerificationResult,
+  ShaVerifier,
+} from "./analyzer.js";
+
+export {
+  ANALYZER_INTERNAL_MODEL,
+  ANALYZER_VERSION,
+  analyzerFingerprint,
+  citedShas,
+  deriveCloseLeaning,
+  needsReanalysis,
+  renderAnalyzerSections,
+  serializeAnalyzerRecord,
+  verifyEvidenceShas,
+} from "./analyzer.js";
+
+export type {
+  FallbackOwnerRule,
+  RepoCatalog,
+  RepoCatalogEntry,
+  RepoInference,
+  RepoInferenceItem,
+} from "./repo-infer.js";
+
+export { buildRepoCatalog, inferTargetRepo, ownerRepoFromUrls } from "./repo-infer.js";
 
 export {
   DEFAULT_MAX_RUN_AGE_MS,
