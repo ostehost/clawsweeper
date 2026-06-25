@@ -34,6 +34,24 @@ export { LinearItemSource, parseLinearIdentifier } from "./source.js";
 export type { ParsedIdentifier } from "./source.js";
 
 export type {
+  ExtractOptions,
+  MatchedProject,
+  ScopeResolution,
+  ScopeSource,
+  ScopeSpec,
+} from "./scope.js";
+
+export {
+  canonicalizeIdentifiers,
+  chooseScope,
+  DEFAULT_ID_FIELDS,
+  DEFAULT_LIST_FIELDS,
+  extractIdentifiers,
+  matchIdentifier,
+  resolveScope,
+} from "./scope.js";
+
+export type {
   ItemCategory,
   LinearRecordValidationIssue,
   LinearReviewRecord,

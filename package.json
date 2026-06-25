@@ -103,7 +103,9 @@
     "crabbox:run": "crabbox run",
     "crabbox:stop": "crabbox stop",
     "crabbox:warmup": "crabbox warmup",
-    "repair:pr-intake": "node dist/repair/pr-repair-intake.js"
+    "repair:pr-intake": "node dist/repair/pr-repair-intake.js",
+    "linear:review-apply": "node scripts/linear-review-apply.mjs",
+    "linear:review-apply:dry-run": "node scripts/linear-review-apply.mjs --json"
   },
   "devDependencies": {
     "@types/node": "^25.9.2",
