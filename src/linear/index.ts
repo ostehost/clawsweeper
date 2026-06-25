@@ -164,6 +164,39 @@ export type {
   RunVerdict,
 } from "./trigger.js";
 
+export type {
+  AnalyzerDecision,
+  AnalyzerEvidence,
+  AnalyzerFingerprintInput,
+  AnalyzerRecordFrontMatter,
+  CloseLeaning,
+  CloseLeaningInput,
+  ShaVerificationResult,
+  ShaVerifier,
+} from "./analyzer.js";
+
+export {
+  ANALYZER_INTERNAL_MODEL,
+  ANALYZER_VERSION,
+  analyzerFingerprint,
+  citedShas,
+  deriveCloseLeaning,
+  needsReanalysis,
+  renderAnalyzerSections,
+  serializeAnalyzerRecord,
+  verifyEvidenceShas,
+} from "./analyzer.js";
+
+export type {
+  FallbackOwnerRule,
+  RepoCatalog,
+  RepoCatalogEntry,
+  RepoInference,
+  RepoInferenceItem,
+} from "./repo-infer.js";
+
+export { buildRepoCatalog, inferTargetRepo, ownerRepoFromUrls } from "./repo-infer.js";
+
 export {
   DEFAULT_MAX_RUN_AGE_MS,
   DEFAULT_SEMANTIC_FAILURE_PATTERNS,

@@ -28,6 +28,8 @@
     "linear:triage:review": "node scripts/linear-triage.mjs --review-only --json",
     "linear:review": "node scripts/linear-snapshot.mjs | node scripts/linear-triage.mjs --review-only --json",
     "linear:comment:dry-run": "node scripts/linear-comment-apply.mjs --json",
+    "linear:review-apply": "node scripts/linear-review-apply.mjs",
+    "linear:review-apply:dry-run": "node scripts/linear-review-apply.mjs --json",
     "commit-review": "node dist/commit-sweeper.js",
     "commit-reports": "node dist/commit-sweeper.js reports",
     "local-review": "node dist/commit-sweeper.js local-review",
@@ -103,9 +105,7 @@
     "crabbox:run": "crabbox run",
     "crabbox:stop": "crabbox stop",
     "crabbox:warmup": "crabbox warmup",
-    "repair:pr-intake": "node dist/repair/pr-repair-intake.js",
-    "linear:review-apply": "node scripts/linear-review-apply.mjs",
-    "linear:review-apply:dry-run": "node scripts/linear-review-apply.mjs --json"
+    "repair:pr-intake": "node dist/repair/pr-repair-intake.js"
   },
   "devDependencies": {
     "@types/node": "^25.9.2",
