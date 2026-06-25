@@ -91,6 +91,25 @@ export {
   REVIEW_ONLY_GATES,
 } from "./authority.js";
 
+export type { PolicyDecision, PolicySignals, ReviewPolicyRule } from "./policy.js";
+
+export {
+  buildPolicySignals,
+  DEFAULT_REVIEW_POLICY,
+  evaluateReviewPolicy,
+  isProtectedActionLabel,
+  isReviewRoutingLabel,
+  LABEL_HUMAN_REVIEW,
+  LABEL_LINKED_PR_OPEN,
+  LABEL_NEEDS_INFO,
+  LABEL_NEEDS_MAINTAINER_REVIEW,
+  LABEL_NEEDS_PRODUCT_DECISION,
+  LABEL_NOT_REPRO_ON_MAIN,
+  nextReviewLabels,
+  PROTECTED_ACTION_LABELS,
+  REVIEW_ROUTING_LABELS,
+} from "./policy.js";
+
 export type {
   LinearComment,
   ReviewCommentAction,

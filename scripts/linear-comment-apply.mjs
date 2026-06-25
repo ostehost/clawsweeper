@@ -46,6 +46,7 @@ import {
   COMMENT_CREATE_MUTATION,
   COMMENT_UPDATE_MUTATION,
   createLinearTransport,
+  evaluateReviewPolicy,
   LinearItemSource,
   mapWorkspaceItem,
   mintLinearAppToken,
@@ -304,6 +305,10 @@ export function renderReviewContent(record, classification) {
   for (const reason of classification.reasons) {
     lines.push(`- ${reason}`);
   }
+
+  const policy = evaluateReviewPolicy(classification, record);
+  lines.push("");
+  lines.push(`Suggested next step: ${policy.suggestedNextStep}`);
   lines.push("");
   lines.push(
     "_This is an automated, review-only triage note. ClawSweeper proposes; it never closes._",
