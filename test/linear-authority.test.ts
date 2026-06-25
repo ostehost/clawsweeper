@@ -220,14 +220,14 @@ test("label-add without a labelChange payload is denied", () => {
   assert.ok(auth.reasons.some((r) => r.includes("requires a labelChange")));
 });
 
-test("label-add with no additions is denied", () => {
+test("label-add with no additions or removals is denied", () => {
   const req = makeRequest({
     kind: "label-add",
     labelChange: { existing: ["bug"], additions: [], proposed: ["bug"] },
   });
   const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
   assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("no additions")));
+  assert.ok(auth.reasons.some((r) => r.includes("no additions or removals")));
 });
 
 test("label-add that would drop an existing label is denied (no silent removal)", () => {
@@ -252,7 +252,7 @@ test("label-add whose proposed set differs from the union is denied", () => {
   });
   const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
   assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("!= union")));
+  assert.ok(auth.reasons.some((r) => r.includes("!= existing minus removals plus additions")));
 });
 
 test("label-add union check is order-independent", () => {

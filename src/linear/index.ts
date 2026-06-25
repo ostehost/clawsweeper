@@ -19,7 +19,15 @@ export {
 } from "./retry.js";
 export type { LinearRetryKind } from "./retry.js";
 
-export { ISSUE_BY_IDENTIFIER_QUERY, ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
+export {
+  ISSUE_BY_IDENTIFIER_QUERY,
+  ISSUE_LABEL_CREATE_MUTATION,
+  ISSUE_LABELS_QUERY,
+  ISSUE_SET_LABELS_MUTATION,
+  ISSUES_QUERY,
+  PROJECTS_QUERY,
+  TEAMS_QUERY,
+} from "./queries.js";
 
 export { createLinearTransport, mintLinearAppToken, resolveLinearToken } from "./client.js";
 export type {

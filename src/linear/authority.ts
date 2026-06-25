@@ -136,11 +136,12 @@ export interface CloseEvidence {
   summary: string; // human-readable rationale; must be non-empty
 }
 
-/** Additive label write: the existing set, the additions, and the full proposed set. */
+/** Label write: the existing set, safe removals, additions, and the full proposed set. */
 export interface LabelChange {
   existing: string[]; // label names currently on the issue
+  removals?: string[]; // label names intentionally removed by a governed reconciler
   additions: string[]; // label names to add
-  proposed: string[]; // the full set that would be written (must equal the union)
+  proposed: string[]; // the full set that would be written (existing - removals + additions)
 }
 
 /** A single proposed mutation, carrying its own plan-time fingerprints. */
@@ -224,20 +225,34 @@ function checkLabelChange(change: LabelChange | undefined): string[] {
     return ["label-add requires a labelChange { existing, additions, proposed }"];
   }
   const blocks: string[] = [];
-  if (change.additions.length === 0) {
-    blocks.push("label-add has no additions — nothing to write");
+  const removals = change.removals ?? [];
+  if (change.additions.length === 0 && removals.length === 0) {
+    blocks.push("label write has no additions or removals — nothing to write");
   }
   const proposed = new Set(change.proposed);
+  const removalSet = new Set(removals);
   const dropped = change.existing.filter((l) => !proposed.has(l));
-  if (dropped.length > 0) {
+  const undeclaredDropped = dropped.filter((l) => !removalSet.has(l));
+  if (undeclaredDropped.length > 0) {
     blocks.push(
-      `label write would remove existing labels ${stableList(dropped)} — read-merge-write the union, never replace`,
+      `label write would remove existing labels ${stableList(undeclaredDropped)} without declaring safe removals`,
     );
   }
-  const expected = mergeLabels(change.existing, change.additions);
+  const notDropped = removals.filter((l) => proposed.has(l));
+  if (notDropped.length > 0) {
+    blocks.push(`label removals ${stableList(notDropped)} are still present in the proposed set`);
+  }
+  const missingRemovals = removals.filter((l) => !change.existing.includes(l));
+  if (missingRemovals.length > 0) {
+    blocks.push(`label removals ${stableList(missingRemovals)} were not present on the issue`);
+  }
+  const expected = mergeLabels(
+    change.existing.filter((l) => !removalSet.has(l)),
+    change.additions,
+  );
   if (!sameSet(change.proposed, expected)) {
     blocks.push(
-      `proposed labels ${stableList(change.proposed)} != union of existing and additions ${stableList(expected)}`,
+      `proposed labels ${stableList(change.proposed)} != existing minus removals plus additions ${stableList(expected)}`,
     );
   }
   return blocks;

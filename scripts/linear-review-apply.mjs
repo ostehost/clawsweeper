@@ -33,17 +33,26 @@
  * Secret hygiene: no token, client id, or client secret is ever logged.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  authorizeMutation,
+  buildMutationReceipt,
   chooseScope,
   createLinearTransport,
   evaluateReviewPolicy,
   extractIdentifiers,
+  isProtectedActionLabel,
+  ISSUE_LABEL_CREATE_MUTATION,
+  ISSUE_LABELS_QUERY,
+  ISSUE_SET_LABELS_MUTATION,
   LinearItemSource,
   matchIdentifier,
   mintLinearAppToken,
+  nextReviewLabels,
+  resolveGates,
   resolveScope,
 } from "../dist/linear/index.js";
 
@@ -71,6 +80,7 @@ export function parseArgs(argv) {
     project: "",
     team: "",
     apply: false,
+    applyLabels: false,
     json: false,
     approvals: "",
     limit: 0,
@@ -114,8 +124,12 @@ export function parseArgs(argv) {
       case "--apply":
         options.apply = true;
         break;
+      case "--apply-labels":
+        options.applyLabels = true;
+        break;
       case "--dry-run":
         options.apply = false;
+        options.applyLabels = false;
         break;
       case "--json":
         options.json = true;
@@ -261,6 +275,173 @@ async function mintWriteTransport(appCreds, deps = {}) {
 }
 
 /**
+ * Whether a LIVE label write is permitted. A label write needs BOTH the explicit
+ * --apply-labels flag AND the OPENCLAW_NOTIFY_LINEAR=1 environment opt-in (the same env opt-in
+ * the comment write reuses via resolveWriteMode). Either alone keeps the run dry. Returns
+ * { live, reason }. Pure.
+ */
+export function resolveLabelWriteMode(options, env = process.env) {
+  if (!options.applyLabels) {
+    return { live: false, reason: "label dry-run (default; pass --apply-labels to write labels)" };
+  }
+  const notify = (env[NOTIFY_ENV] ?? "").trim();
+  if (notify !== "1" && notify.toLowerCase() !== "true") {
+    return {
+      live: false,
+      reason: `--apply-labels given but ${NOTIFY_ENV} is not set to 1 — staying label dry-run`,
+    };
+  }
+  return { live: true, reason: `live label write authorized by --apply-labels + ${NOTIFY_ENV}` };
+}
+
+/**
+ * Computes the governed label change for one item from the policy decision. Pure and offline.
+ *   existing  — the issue's current label NAMES (record.labels)
+ *   removals  — stale engine-owned routing labels that nextReviewLabels removes
+ *   additions — proposed labels not already present (case-insensitive), denylist-asserted
+ *   proposed  — existing minus stale routing labels plus the wanted labels
+ *   noop      — true when there is nothing to add or remove
+ * Only engine-owned REVIEW_ROUTING_LABELS may be removed; action/proof/mantis/protected/project
+ * labels are preserved by nextReviewLabels. Protected action/proof/mantis/P0 labels are never
+ * added (the policy already denylist-filters proposedLabels — this asserts that invariant).
+ */
+export function planLabelChange(record, decision) {
+  const existing = [...(record.labels ?? [])];
+  const existingLower = new Map(existing.map((label) => [label.toLowerCase(), label]));
+  const wanted = [];
+  for (const label of decision.proposedLabels ?? []) {
+    if (isProtectedActionLabel(label)) {
+      throw new Error(`refusing to apply protected action label "${label}" — policy denylist`);
+    }
+    wanted.push(existingLower.get(label.toLowerCase()) ?? label);
+  }
+  const proposed = nextReviewLabels(existing, wanted);
+  const proposedLower = new Set(proposed.map((label) => label.toLowerCase()));
+  const additions = proposed.filter((label) => !existingLower.has(label.toLowerCase()));
+  const removals = existing.filter((label) => !proposedLower.has(label.toLowerCase()));
+  return {
+    existing,
+    removals,
+    additions,
+    proposed,
+    noop: additions.length === 0 && removals.length === 0,
+  };
+}
+
+/**
+ * Resolves wanted label NAMES to label ids, creating any that do not exist. Deterministic
+ * given its inputs + a stub createLabel. Lookup order per name (case-insensitive):
+ *   1. issueLabelsOnIssue — ids already attached to the issue (no extra read)
+ *   2. workspaceLabels    — every workspace label (paginated read result)
+ *   3. createLabel(name)  — mint a missing label (live only) and record it as created
+ * Returns { ids, createdNames }. The caller passes the PROPOSED set so ids cover existing ∪
+ * additions. Never logs secrets; createLabel is the only side-effecting input.
+ */
+export async function resolveLabelIds(wantedNames, opts) {
+  const onIssue = opts.issueLabelsOnIssue ?? [];
+  const workspace = opts.workspaceLabels ?? [];
+  const findIn = (list, name) =>
+    list.find((l) => (l.name ?? "").toLowerCase() === name.toLowerCase());
+  const ids = [];
+  const createdNames = [];
+  for (const name of wantedNames) {
+    const hit = findIn(onIssue, name) ?? findIn(workspace, name);
+    if (hit) {
+      ids.push(hit.id);
+      continue;
+    }
+    const created = await opts.createLabel(name);
+    ids.push(created.id);
+    createdNames.push(created.name ?? name);
+  }
+  return { ids, createdNames };
+}
+
+/** Reads EVERY workspace label (id + name) via the paginated ISSUE_LABELS_QUERY. */
+async function fetchWorkspaceLabels(transport) {
+  const all = [];
+  let after = null;
+  for (;;) {
+    const data = await transport(ISSUE_LABELS_QUERY, after ? { after } : {});
+    const page = data?.issueLabels;
+    for (const node of page?.nodes ?? []) all.push({ id: node.id, name: node.name });
+    if (!page?.pageInfo?.hasNextPage) break;
+    after = page.pageInfo.endCursor;
+  }
+  return all;
+}
+
+/** Canonical, deterministic plan hash for a label write: sorted proposed names + issue id. */
+function labelPlanHash(proposed, issueId) {
+  const canonical = JSON.stringify({ issueId, proposed: [...proposed].sort() });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Authorizes one additive label write through authority.authorizeMutation (kind "label-add",
+ * labelWrite gate opened). The plan is self-approved for an explicit --apply-labels run: the
+ * approved plan/snapshot hashes are recomputed from the same live record, so authorization
+ * checks the additive-union invariant (never drops a label) rather than an operator handshake.
+ * Returns { authorization, receipt, request, planHash }. Pure (no network).
+ */
+export function authorizeLabelChange(record, change) {
+  const planHash = labelPlanHash(change.proposed, record.id);
+  const request = {
+    kind: "label-add",
+    key: record.key,
+    snapshotHash: record.snapshotHash,
+    planHash,
+    labelChange: {
+      existing: change.existing,
+      removals: change.removals,
+      additions: change.additions,
+      proposed: change.proposed,
+    },
+  };
+  const gates = resolveGates({ labelWrite: true });
+  const drift = { liveSnapshotHash: record.snapshotHash, approvedPlanHash: planHash };
+  return {
+    authorization: authorizeMutation(request, gates, drift),
+    receipt: buildMutationReceipt(request, gates, drift),
+    request,
+    planHash,
+  };
+}
+
+/**
+ * Performs the gated live label write for one item. Resolves the PROPOSED set to ids
+ * (creating any missing label via the shared Bearer transport), then writes the union via
+ * ISSUE_SET_LABELS_MUTATION. Returns { labelAction, labelsApplied, labelsCreated }. The
+ * caller has already confirmed the gate is open, the change is not a noop, and authorization
+ * allowed. `issueLabelsOnIssue` is the issue's current { id, name } labels (from the hydrated
+ * read). Reuses the ONE minted Bearer transport — never mints its own.
+ */
+export async function applyLabelChange(record, change, transport, deps = {}) {
+  const fetchLabels = deps.fetchWorkspaceLabels ?? fetchWorkspaceLabels;
+  const workspaceLabels = await fetchLabels(transport);
+  const issueLabelsOnIssue = deps.issueLabelsOnIssue ?? [];
+  const created = [];
+  const createLabel = async (name) => {
+    const data = await transport(ISSUE_LABEL_CREATE_MUTATION, { name });
+    const label = data?.issueLabelCreate?.issueLabel;
+    if (!label?.id) throw new Error(`label create failed for "${name}"`);
+    created.push(label.name ?? name);
+    return { id: label.id, name: label.name ?? name };
+  };
+  const { ids } = await resolveLabelIds(change.proposed, {
+    issueLabelsOnIssue,
+    workspaceLabels,
+    createLabel,
+  });
+  await transport(ISSUE_SET_LABELS_MUTATION, { id: record.id, labelIds: ids });
+  return {
+    labelAction: created.length > 0 ? "create" : "add",
+    labelsApplied: change.additions,
+    labelsCreated: created,
+  };
+}
+
+/**
  * Per-item secret-free summary; planHash/snapshotHash/nowIso make it re-feedable as
  * approvals. Two distinct signals, deliberately not conflated:
  *   - `actionable` — intrinsic to the item: it is eligible for review AND the plan is not a
@@ -301,11 +482,13 @@ export function summarizeItem(result, decision) {
 export function aggregate(items, resolution, mode) {
   const byDisposition = {};
   const byRoutingLabel = {};
+  const byLabelAction = {};
   let eligible = 0;
   let actionable = 0;
   let authorized = 0;
   let wouldWrite = 0;
   let applied = 0;
+  let labelsApplied = 0;
   let errors = 0;
   for (const item of items) {
     if (item.error) {
@@ -315,11 +498,14 @@ export function aggregate(items, resolution, mode) {
     byDisposition[item.disposition] = (byDisposition[item.disposition] ?? 0) + 1;
     const routing = item.routingLabel ?? "(none)";
     byRoutingLabel[routing] = (byRoutingLabel[routing] ?? 0) + 1;
+    const labelAction = item.labelAction ?? "noop";
+    byLabelAction[labelAction] = (byLabelAction[labelAction] ?? 0) + 1;
     if (item.eligible) eligible += 1;
     if (item.actionable) actionable += 1;
     if (item.authorized) authorized += 1;
     if (item.wouldWrite) wouldWrite += 1;
     if (item.applied) applied += 1;
+    if (labelAction === "create" || labelAction === "add") labelsApplied += 1;
   }
   return {
     scope: {
@@ -337,9 +523,11 @@ export function aggregate(items, resolution, mode) {
       authorized,
       wouldWrite,
       applied,
+      labelsApplied,
       errors,
       byDisposition,
       byRoutingLabel,
+      byLabelAction,
     },
     items,
   };
@@ -406,6 +594,12 @@ function printHuman(report) {
   out.push(`Authorized:   ${report.counts.authorized}  (approved via --approvals)`);
   out.push(`Would write:  ${report.counts.wouldWrite}  (actionable AND authorized)`);
   if (report.mode === "apply") out.push(`Applied:      ${report.counts.applied}`);
+  out.push("");
+  out.push("Label actions:");
+  for (const [action, n] of Object.entries(report.counts.byLabelAction ?? {}).sort()) {
+    out.push(`  ${action.padEnd(10)} ${n}`);
+  }
+  out.push(`Labels applied: ${report.counts.labelsApplied ?? 0}  (create + add)`);
   if (report.counts.errors > 0) out.push(`Errors:       ${report.counts.errors}`);
   if (report.mode === "dry-run" && report.counts.actionable > 0 && report.counts.authorized === 0) {
     out.push("");
@@ -423,12 +617,78 @@ function printHuman(report) {
     }
     const mark = item.applied ? "✓" : item.actionable ? "→" : "·";
     const label = item.routingLabel ? ` label=${item.routingLabel}` : "";
+    const labelAct =
+      item.labelAction && item.labelAction !== "noop" ? ` labelAction=${item.labelAction}` : "";
     out.push(
-      `  ${mark} ${item.identifier.padEnd(10)} ${item.disposition.padEnd(16)} action=${item.action}${label}` +
+      `  ${mark} ${item.identifier.padEnd(10)} ${item.disposition.padEnd(16)} action=${item.action}${label}${labelAct}` +
         (item.applied ? " (applied)" : ""),
     );
   }
   return out.join("\n");
+}
+
+/**
+ * Plans (and, when fully gated, applies) the additive label change for one item. Always
+ * records the plan on the summary (labelAction/labelChange/labelAuthorized) so a dry-run
+ * shows exactly what a live run would do. A live label write requires ALL of:
+ *   - labelMode.live    (--apply-labels + OPENCLAW_NOTIFY_LINEAR=1)
+ *   - eligible          (never label closed / protected / excluded items)
+ *   - not a noop        (there is at least one additive label)
+ *   - authorization     (authority.authorizeMutation allowed — additive union, no drop)
+ * Additive only; never drops a label; protected action labels are denylist-asserted upstream.
+ */
+async function applyLabelStep(entry, summary, labelMode, ensureWriteTransport) {
+  const { record, classification } = entry.result;
+  const decision = evaluateReviewPolicy(classification, record);
+  const change = planLabelChange(record, decision);
+  const { authorization, receipt } = authorizeLabelChange(record, change);
+
+  summary.labelChange = {
+    existing: change.existing,
+    additions: change.additions,
+    removals: change.removals,
+    proposed: change.proposed,
+  };
+  summary.labelAuthorized = authorization.allowed;
+  summary.labelReceipt = receipt;
+
+  const eligible = classification.eligible;
+  const wouldWriteLabels = eligible && !change.noop && authorization.allowed;
+  summary.labelWouldWrite = wouldWriteLabels;
+
+  if (change.noop) {
+    summary.labelAction = "noop";
+    summary.labelsApplied = [];
+    summary.labelsCreated = [];
+    return;
+  }
+  if (!labelMode.live || !wouldWriteLabels) {
+    // Dry-run, ineligible, or unauthorized — record the plan, write nothing.
+    summary.labelAction = "noop";
+    summary.labelsApplied = [];
+    summary.labelsCreated = [];
+    summary.labelWriteSkipped = !labelMode.live
+      ? labelMode.reason
+      : !eligible
+        ? "skipped: item not eligible for review"
+        : "skipped: label-add not authorized";
+    return;
+  }
+
+  try {
+    const transport = await ensureWriteTransport();
+    const result = await applyLabelChange(record, change, transport, {
+      issueLabelsOnIssue: entry.result.hydrated.issue.labels ?? [],
+    });
+    summary.labelAction = result.labelAction;
+    summary.labelsApplied = result.labelsApplied;
+    summary.labelsCreated = result.labelsCreated;
+  } catch (error) {
+    summary.labelAction = "noop";
+    summary.labelsApplied = [];
+    summary.labelsCreated = [];
+    summary.labelApplyError = error instanceof Error ? error.message : String(error);
+  }
 }
 
 async function main() {
@@ -447,6 +707,7 @@ async function main() {
   }
 
   const mode = resolveWriteMode(options);
+  const labelMode = resolveLabelWriteMode(options);
 
   let source;
   let resolution;
@@ -490,7 +751,8 @@ async function main() {
     }
   });
 
-  // Phase 2: live writes, SERIALIZED + rate-limited, sharing ONE minted Bearer token.
+  // Phase 2: live writes, SERIALIZED + rate-limited, sharing ONE minted Bearer token across
+  // both the comment write and the label write (mint lazily, only when something will write).
   let writeTransport = null;
   let appCreds = null;
   const ensureWriteTransport = async () => {
@@ -533,7 +795,14 @@ async function main() {
       summary.applied = false;
     }
 
-    if (didWrite && options.rateMs > 0) await sleep(options.rateMs);
+    // Label write — independent of the comment write, same triple gate (--apply-labels +
+    // OPENCLAW_NOTIFY_LINEAR=1 + authority allowed) + eligible + not a noop. Additive only.
+    await applyLabelStep(entry, summary, labelMode, ensureWriteTransport);
+    if (summary.labelApplyError) process.exitCode = 1;
+
+    if (didWrite || summary.labelAction === "create" || summary.labelAction === "add") {
+      if (options.rateMs > 0) await sleep(options.rateMs);
+    }
     items.push(summary);
   }
 
@@ -593,6 +862,9 @@ Review options:
 
 Apply options (live write — review-only unless ALL hold):
   --apply                    Opt in to LIVE comment writes (also needs ${NOTIFY_ENV}=1)
+  --apply-labels             Opt in to LIVE additive label writes (also needs ${NOTIFY_ENV}=1);
+                             applies the policy's ONE proposed routing label, additive only
+                             (never drops a label), creating a missing clawsweeper:* label
   --approvals <path>         Per-item approved hashes from a reviewed dry-run (--json output)
   --rate-ms <n>              Delay between live writes in ms (default: 0)
   --json                     Emit the JSON run report (feedable as --approvals)

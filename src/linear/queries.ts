@@ -149,3 +149,58 @@ export const ISSUE_BY_IDENTIFIER_QUERY = `
     }
   }
 `;
+
+// --- Label read + write surface (additive label application) -----------------------------
+// These power the label-application path: a paginated workspace-label lookup (resolve a
+// routing-label NAME to its id), a create for a missing label, and an additive labelIds
+// write. All writes are gated in authority.ts; these are just the GraphQL strings.
+
+// Paginated list of every workspace label (id + name), for name→id resolution.
+export const ISSUE_LABELS_QUERY = `
+  query ($after: String) {
+    issueLabels(first: 250, after: $after) {
+      nodes {
+        id
+        name
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+// Creates a workspace label by name (used only to mint a missing clawsweeper:* routing label
+// on a live --apply-labels run). Returns the created label's id + name.
+export const ISSUE_LABEL_CREATE_MUTATION = `
+  mutation ($name: String!) {
+    issueLabelCreate(input: { name: $name }) {
+      success
+      issueLabel {
+        id
+        name
+      }
+    }
+  }
+`;
+
+// Additive label write. Linear's issueUpdate replaces the full labelIds array, so the caller
+// must send the union of existing ∪ additions (read-merge-write); authority.ts rejects any
+// write that would drop an existing label.
+export const ISSUE_SET_LABELS_MUTATION = `
+  mutation ($id: String!, $labelIds: [String!]!) {
+    issueUpdate(id: $id, input: { labelIds: $labelIds }) {
+      success
+      issue {
+        id
+        labels {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+`;
