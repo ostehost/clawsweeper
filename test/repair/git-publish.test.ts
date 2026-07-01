@@ -511,6 +511,8 @@ function run(command, args, cwd) {
 }
 
 function configureUser(cwd) {
+  run("git", ["config", "core.autocrlf", "false"], cwd);
+  run("git", ["config", "core.eol", "lf"], cwd);
   run("git", ["config", "user.name", "Tester"], cwd);
   run("git", ["config", "user.email", "tester@example.com"], cwd);
 }

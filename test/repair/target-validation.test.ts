@@ -19,6 +19,7 @@ import {
   resolveTargetRepoToolchain,
 } from "../../dist/repair/target-toolchain-config.js";
 import { parseAllowedValidationCommand } from "../../dist/repair/validation-command-utils.js";
+import { mockCommandBinEnv } from "../helpers.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
 
@@ -1042,16 +1043,15 @@ function gitBunPackageFixture(scripts) {
 function fakeBunFixture(cwd) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
   const logPath = path.join(cwd, "fake-bun.log");
-  const bunPath = path.join(binDir, "bun");
-  fs.writeFileSync(
-    bunPath,
+  writeNodeCommandShim(
+    binDir,
+    "bun",
     `#!/usr/bin/env node
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv[2] === "--version") console.log("1.3.10");
 `,
   );
-  fs.chmodSync(bunPath, 0o755);
   return { binDir, logPath };
 }
 
@@ -1059,9 +1059,9 @@ function envLoggingBunFixture(cwd) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-env-bin-"));
   const logPath = path.join(cwd, "fake-bun.log");
   const envLogPath = path.join(cwd, "fake-bun-env.log");
-  const bunPath = path.join(binDir, "bun");
-  fs.writeFileSync(
-    bunPath,
+  writeNodeCommandShim(
+    binDir,
+    "bun",
     `#!/usr/bin/env node
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
@@ -1069,7 +1069,6 @@ fs.appendFileSync(${JSON.stringify(envLogPath)}, JSON.stringify(process.env) + "
 if (process.argv[2] === "--version") console.log("1.3.10");
 `,
   );
-  fs.chmodSync(bunPath, 0o755);
   return { binDir, logPath, envLogPath };
 }
 
@@ -1079,14 +1078,44 @@ function restoreEnv(key, previous) {
 }
 
 function withPathPrefix(binDir, callback) {
-  const previousPath = process.env.PATH;
-  process.env.PATH = [binDir, previousPath].filter(Boolean).join(path.delimiter);
+  const pathKey = envPathKey();
+  const previousPath = process.env[pathKey];
+  const previousUpperPath = pathKey === "PATH" ? undefined : process.env.PATH;
+  const previousBunBin = process.env.BUN_BIN;
+  const previousBunBinArgs = process.env.BUN_BIN_ARGS;
+  if (pathKey !== "PATH") delete process.env.PATH;
+  process.env[pathKey] = [binDir, previousPath].filter(Boolean).join(path.delimiter);
+  Object.assign(process.env, mockCommandBinEnv("bun", path.join(binDir, "bun.js")));
   try {
     callback();
   } finally {
-    if (previousPath === undefined) delete process.env.PATH;
-    else process.env.PATH = previousPath;
+    if (previousPath === undefined) delete process.env[pathKey];
+    else process.env[pathKey] = previousPath;
+    restoreEnv("BUN_BIN", previousBunBin);
+    restoreEnv("BUN_BIN_ARGS", previousBunBinArgs);
+    if (pathKey !== "PATH") {
+      if (previousUpperPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousUpperPath;
+    }
   }
+}
+
+function envPathKey() {
+  return Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+}
+
+function writeNodeCommandShim(binDir, commandName, script) {
+  const scriptPath = path.join(binDir, `${commandName}.js`);
+  fs.writeFileSync(scriptPath, script);
+  fs.chmodSync(scriptPath, 0o755);
+  if (process.platform !== "win32") {
+    const shimPath = path.join(binDir, commandName);
+    fs.writeFileSync(shimPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`);
+    fs.chmodSync(shimPath, 0o755);
+    return;
+  }
+  const cmdPath = path.join(binDir, `${commandName}.cmd`);
+  fs.writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "%~dp0${commandName}.js" %*\r\n`);
 }
 
 function clawhubToolchain() {

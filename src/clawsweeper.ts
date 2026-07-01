@@ -50,7 +50,12 @@ import {
 } from "./github-retry.js";
 import { parseGhJson, parseGhJsonLines } from "./github-json.js";
 import { stableJson } from "./stable-json.js";
-import { isUserFacingCommandError, runText, UserFacingCommandError } from "./command.js";
+import {
+  isUserFacingCommandError,
+  resolveCommand,
+  runText,
+  UserFacingCommandError,
+} from "./command.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
 import {
   buildOpenClawPrSurfaceStats,
@@ -2022,23 +2027,14 @@ function gh(args: string[]): string {
   return run("gh", ["--repo", targetRepo(), ...args]);
 }
 
-function ghBinArgs(): string[] {
-  const value = process.env.GH_BIN_ARGS;
-  if (!value) return [];
-  const parsed = JSON.parse(value) as unknown;
-  if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === "string")) {
-    throw new Error("GH_BIN_ARGS must be a JSON string array");
-  }
-  return parsed;
-}
-
 function ghOnce(args: string[], timeoutMs: number): string {
-  const command = process.env.GH_BIN ?? "gh";
   const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
-  const result = spawnSync(command, [...ghBinArgs(), ...resolvedArgs], {
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  const command = resolveCommand("gh", resolvedArgs, env);
+  const result = spawnSync(command.command, command.args, {
     cwd: ROOT,
     encoding: "utf8",
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    env,
     maxBuffer: 8 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: timeoutMs,

@@ -4,18 +4,16 @@ import {
   type ChildProcess,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import {
+  resolveSpawnCommand,
+  windowsEnvironmentValue,
+  windowsSystemExecutable,
+  type CommandInvocation,
+} from "./command.js";
 
-export interface CodexSpawnInvocation {
-  command: string;
-  args: string[];
-  windowsVerbatimArguments?: boolean;
-}
-
-const windowsExecutablePattern = /\.(?:com|exe)$/i;
-const windowsBatchLauncherPattern = /\.(?:bat|cmd)$/i;
-const windowsMetaCharacterPattern = /([()\][%!^"`<>&|;, *?])/g;
+export type CodexSpawnInvocation = CommandInvocation;
 
 export function codexProcessCommand(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.CODEX_BIN?.trim();
@@ -34,26 +32,12 @@ export function codexSpawnInvocation(
   cwd = process.cwd(),
 ): CodexSpawnInvocation {
   const configuredCommand = codexProcessCommand(env);
-  const command =
-    platform === "win32" ? resolveWindowsCommand(configuredCommand, env, cwd) : configuredCommand;
-  if (platform === "win32" && nodeShebangScript(command)) {
-    return { command: process.execPath, args: [command, ...args] };
-  }
-  if (platform !== "win32" || windowsExecutablePattern.test(command)) {
-    return { command, args: [...args] };
-  }
-
-  const normalizedCommand = normalize(command);
-  const doubleEscapeMetaCharacters = windowsBatchLauncherPattern.test(normalizedCommand);
-  const shellCommand = [
-    escapeWindowsCommand(normalizedCommand),
-    ...args.map((arg) => escapeWindowsArgument(arg, doubleEscapeMetaCharacters)),
-  ].join(" ");
-  return {
-    command: windowsSystemExecutable("cmd.exe", env),
-    args: ["/d", "/s", "/c", `"${shellCommand}"`],
-    windowsVerbatimArguments: true,
-  };
+  return resolveSpawnCommand(configuredCommand, args, {
+    cwd,
+    env,
+    missingCommandMessage: `Unable to resolve Windows Codex command: ${configuredCommand}`,
+    platform,
+  });
 }
 
 export function terminateCodexProcessTree(
@@ -120,37 +104,6 @@ function signalPosixProcessGroup(child: ChildProcess, signal: NodeJS.Signals): v
   }
 }
 
-function resolveWindowsCommand(command: string, env: NodeJS.ProcessEnv, cwd: string): string {
-  if (isAbsolute(command) || /[\\/]/.test(command)) {
-    return resolve(cwd, command);
-  }
-  const extensions = (windowsEnvironmentValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .filter(Boolean)
-    .map((extension) => extension.toLowerCase());
-  const candidates = extensions.includes("")
-    ? [command]
-    : [command, ...extensions.map((extension) => `${command}${extension}`)];
-  for (const directory of (windowsEnvironmentValue(env, "PATH") || "")
-    .split(delimiter)
-    .filter(Boolean)) {
-    for (const candidate of candidates) {
-      const filePath = resolve(cwd, directory, candidate);
-      if (existsSync(filePath)) return filePath;
-    }
-  }
-  throw new Error(`Unable to resolve Windows Codex command: ${command}`);
-}
-
-function windowsSystemExecutable(name: string, env: NodeJS.ProcessEnv): string {
-  const systemRoot =
-    windowsEnvironmentValue(env, "SystemRoot") || windowsEnvironmentValue(env, "windir");
-  if (systemRoot) return join(systemRoot, "System32", name);
-  const comSpec = windowsEnvironmentValue(env, "ComSpec");
-  if (comSpec && isAbsolute(comSpec)) return join(dirname(comSpec), name);
-  throw new Error(`Unable to resolve Windows system executable: ${name}`);
-}
-
 function windowsCodexAppBinary(env: NodeJS.ProcessEnv): string | null {
   const localAppData =
     windowsEnvironmentValue(env, "LOCALAPPDATA") ||
@@ -160,36 +113,4 @@ function windowsCodexAppBinary(env: NodeJS.ProcessEnv): string | null {
   if (!localAppData) return null;
   const candidate = join(localAppData, "OpenAI", "Codex", "bin", "codex.exe");
   return existsSync(candidate) ? candidate : null;
-}
-
-function nodeShebangScript(filePath: string): boolean {
-  if (windowsExecutablePattern.test(filePath) || windowsBatchLauncherPattern.test(filePath)) {
-    return false;
-  }
-  try {
-    const firstLine = readFileSync(filePath, "utf8").split(/\r?\n/, 1)[0] ?? "";
-    return /^#!.*\bnode\b/i.test(firstLine);
-  } catch {
-    return false;
-  }
-}
-
-function windowsEnvironmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const entry = Object.entries(env).find(([key]) => key.toLowerCase() === name.toLowerCase());
-  return entry?.[1]?.trim() || undefined;
-}
-
-function escapeWindowsCommand(value: string): string {
-  return value.replace(windowsMetaCharacterPattern, "^$1");
-}
-
-function escapeWindowsArgument(value: string, doubleEscapeMetaCharacters: boolean): string {
-  let escaped = value.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
-  escaped = escaped.replace(/(?=(\\+?)?)\1$/, "$1$1");
-  escaped = `"${escaped}"`;
-  escaped = escaped.replace(windowsMetaCharacterPattern, "^$1");
-  if (doubleEscapeMetaCharacters) {
-    escaped = escaped.replace(windowsMetaCharacterPattern, "^$1");
-  }
-  return escaped;
 }

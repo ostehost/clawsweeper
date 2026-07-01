@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolveCommand } from "../command.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -288,11 +289,11 @@ function writeFileSyncWithDirs(filePath: string, content: string): void {
 }
 
 function runGh(args: readonly string[], env: NodeJS.ProcessEnv): string {
-  const command = process.env.GH_BIN ?? "gh";
-  const extraArgs = envArgs("GH_BIN_ARGS");
-  return execFileSync(command, [...extraArgs, ...args], {
+  const childEnv = { ...process.env, ...env, NO_COLOR: "1", CLICOLOR: "0" };
+  const command = resolveCommand("gh", args, childEnv);
+  return execFileSync(command.command, command.args, {
     encoding: "utf8",
-    env: { ...process.env, ...env, NO_COLOR: "1", CLICOLOR: "0" },
+    env: childEnv,
     maxBuffer: 32 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   }).trimEnd();
@@ -320,16 +321,6 @@ function dispatchEnv(): NodeJS.ProcessEnv {
   const token =
     process.env.CLAWSWEEPER_DISPATCH_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   return token ? { GH_TOKEN: token } : {};
-}
-
-function envArgs(name: string): string[] {
-  const value = process.env[name];
-  if (!value) return [];
-  const parsed = JSON.parse(value) as unknown;
-  if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === "string")) {
-    throw new Error(`${name} must be a JSON string array`);
-  }
-  return parsed;
 }
 
 function fanoutMode(value: string): FanoutMode {

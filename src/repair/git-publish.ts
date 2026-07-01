@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { clawsweeperGitUserEmail, clawsweeperGitUserName } from "./process-env.js";
 
@@ -210,7 +210,7 @@ function syncStatePublishPaths(paths: readonly string[], stateRoot: string): voi
   for (const path of uniqueNonEmpty(paths)) {
     const source = resolve(path);
     const destination = resolve(stateRoot, path);
-    if (!destination.startsWith(`${stateRoot}/`) && destination !== stateRoot) {
+    if (!isPathInsideOrEqual(stateRoot, destination)) {
       throw new Error(`Refusing to publish outside state root: ${path}`);
     }
     const preserved = preserveStateOnlyFiles({ path, source, destination });
@@ -241,7 +241,7 @@ function preserveStateOnlyFiles({
 
   const files: string[] = [];
   for (const file of listFiles(destination)) {
-    const rel = relative(destination, file);
+    const rel = toPosixPath(relative(destination, file));
     if (existsSync(resolve(source, rel))) continue;
     if (!shouldPreserveStateOnlyFile(path, rel, (candidate) => existsSync(resolve(candidate)))) {
       continue;
@@ -268,7 +268,18 @@ function shouldPreserveStateOnlyFile(
 }
 
 function joinedPublishPath(path: string, rel: string): string {
-  return [path.replace(/\/+$/, ""), rel.replace(/^\/+/, "")].filter(Boolean).join("/");
+  return [toPosixPath(path).replace(/\/+$/, ""), toPosixPath(rel).replace(/^\/+/, "")]
+    .filter(Boolean)
+    .join("/");
+}
+
+function isPathInsideOrEqual(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function toPosixPath(value: string): string {
+  return value.replace(/\\/g, "/");
 }
 
 function recordCounterpartPath(path: string): string | undefined {
@@ -294,7 +305,7 @@ function preserveStateOnlyCommitFiles({
   const files: string[] = [];
   const commitPathPrefix = path.replace(/\/+$/, "");
   for (const file of listFiles(source)) {
-    const rel = relative(source, file);
+    const rel = toPosixPath(relative(source, file));
     const commitPath = joinedPublishPath(commitPathPrefix, rel);
     if (commitHasPath(sourceCommit, commitPath)) continue;
     if (

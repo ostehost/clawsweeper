@@ -86,6 +86,8 @@ function fixtureRepo() {
   run("git", ["init", "--bare", "--initial-branch=main", remote]);
   fs.mkdirSync(work);
   run("git", ["init", "--initial-branch=main"], { cwd: work });
+  run("git", ["config", "core.autocrlf", "false"], { cwd: work });
+  run("git", ["config", "core.eol", "lf"], { cwd: work });
   run("git", ["config", "user.name", "ClawSweeper Test"], { cwd: work });
   run("git", ["config", "user.email", "clawsweeper-test@example.com"], { cwd: work });
   run("git", ["remote", "add", "origin", remote], { cwd: work });

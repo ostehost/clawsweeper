@@ -59,7 +59,7 @@ test("Codex process resolves command overrides and escaped Windows launchers", (
       root,
     );
     assert.match(invocation.command, /C:\\Windows[\\/]System32[\\/]cmd\.exe/);
-    assert.match(invocation.args[3] ?? "", /codex\.cmd/);
+    assert.match(invocation.args[3] ?? "", /codex\.cmd/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

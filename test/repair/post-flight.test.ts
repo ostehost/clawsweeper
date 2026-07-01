@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { mockGhBinEnv } from "../helpers.ts";
+
 const repoRoot = process.cwd();
 
 test("issue implementation post-flight waits for green PR checks without merging", () => {
@@ -142,7 +144,7 @@ test("issue implementation post-flight waits for green PR checks without merging
         ...process.env,
         CLAWSWEEPER_ALLOW_EXECUTE: "1",
         CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
     });
@@ -229,7 +231,7 @@ test("issue implementation post-flight waits for checks to be created", () => {
         CLAWSWEEPER_POST_FLIGHT_WAIT_MS: "10000",
         CLAWSWEEPER_POST_FLIGHT_POLL_MS: "1",
         FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
     });
@@ -320,7 +322,7 @@ test("merge post-flight waits when only ignored checks exist", () => {
         CLAWSWEEPER_POST_FLIGHT_POLL_MS: "1",
         FAKE_GH_MERGED_FILE: mergeFlagPath,
         FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
     });
@@ -396,7 +398,7 @@ test("post-flight keeps no-timestamp pending duplicate checks visible", () => {
         CLAWSWEEPER_POST_FLIGHT_WAIT_MS: "10000",
         CLAWSWEEPER_POST_FLIGHT_POLL_MS: "1",
         FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
     });

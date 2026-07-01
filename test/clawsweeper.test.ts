@@ -42,6 +42,7 @@ import {
   item,
   reportFrontMatter,
   reportWithSyncedReviewComment,
+  readText,
   runApplyDecisionsForTest,
   tmpPrefix,
   withMockGh,
@@ -927,7 +928,7 @@ test("runtime budget only trips after a positive elapsed limit", () => {
 });
 
 test("spam comment intake coalesces duplicate comment deliveries", () => {
-  const workflow = readFileSync(".github/workflows/spam-comment-intake.yml", "utf8");
+  const workflow = readText(".github/workflows/spam-comment-intake.yml");
 
   assert.match(workflow, /types: \[clawsweeper_spam_comment_intake\]/);
   assert.doesNotMatch(workflow, /types: \[github_activity\]/);
@@ -945,7 +946,7 @@ test("spam comment intake coalesces duplicate comment deliveries", () => {
 });
 
 test("spam scanner exact dispatches publish only per-comment audit records", () => {
-  const workflow = readFileSync(".github/workflows/spam-scanner.yml", "utf8");
+  const workflow = readText(".github/workflows/spam-scanner.yml");
 
   assert.match(workflow, /format\('spam-scanner-\{0\}-issue-comment-\{1\}'/);
   assert.match(workflow, /format\('spam-scanner-\{0\}-review-comment-\{1\}'/);
@@ -959,7 +960,7 @@ test("spam scanner exact dispatches publish only per-comment audit records", () 
 });
 
 test("issue implementation workflow lets job intent choose dispatch capacity", () => {
-  const workflow = readFileSync(".github/workflows/repair-issue-implementation-intake.yml", "utf8");
+  const workflow = readText(".github/workflows/repair-issue-implementation-intake.yml");
   const dispatchInputs = workflow.slice(
     workflow.indexOf("  workflow_dispatch:"),
     workflow.indexOf("\npermissions:"),
@@ -996,8 +997,8 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
 });
 
 test("repair workers hydrate only durable jobs from generated state", () => {
-  const workflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
-  const requeue = readFileSync("src/repair/requeue-job.ts", "utf8");
+  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
+  const requeue = readText("src/repair/requeue-job.ts");
 
   assert.match(workflow, /clawsweeper-repair-requeue-\{0\}-\{1\}.*clawsweeper-repair-\{0\}/);
   assert.match(workflow, /cancel-in-progress: false/);
@@ -1030,7 +1031,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
 });
 
 test("reviewed viable issues dispatch generated PRs and backfill durable open reports", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const eventDispatchStart = workflow.indexOf("- name: Dispatch viable issue implementation");
   const eventDispatch = workflow.slice(
     eventDispatchStart,
@@ -1054,7 +1055,7 @@ test("reviewed viable issues dispatch generated PRs and backfill durable open re
 });
 
 test("sweep workflow executes only durable queue leases without runner-side admission", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const legacyIntakeBlock = workflow.slice(
     workflow.indexOf("\n  legacy-event-queue-intake:"),
     workflow.indexOf("\n  event-review-apply:"),
@@ -1110,7 +1111,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
 });
 
 test("sweep workflow gives high-context Codex reviews twenty minutes by default", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(
     workflow,
@@ -1120,7 +1121,7 @@ test("sweep workflow gives high-context Codex reviews twenty minutes by default"
 });
 
 test("Codex workflows install pinned CLI releases and keep the model secret", () => {
-  const action = readFileSync(".github/actions/setup-codex/action.yml", "utf8");
+  const action = readText(".github/actions/setup-codex/action.yml");
   const workflows = [
     ".github/workflows/assist.yml",
     ".github/workflows/commit-review.yml",
@@ -1128,7 +1129,7 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
     ".github/workflows/repair-cluster-worker.yml",
     ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/sweep.yml",
-  ].map((file) => readFileSync(file, "utf8"));
+  ].map((file) => readText(file));
 
   assert.match(action, /codex-version:[\s\S]*default: "0\.139\.0"/);
   assert.match(action, /proxy-version:[\s\S]*default: "0\.139\.0"/);
@@ -1150,7 +1151,7 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
 });
 
 test("background review fanout keeps per-review transient recovery", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const reviewStart = workflow.indexOf("\n  review:");
   const publishStart = workflow.indexOf("\n  publish:", reviewStart);
   const reviewJob = workflow.slice(reviewStart, publishStart);
@@ -1167,21 +1168,18 @@ test("synchronous Codex review surfaces use the shared bounded runner", () => {
     "src/commit-sweeper.ts",
     "src/pr-close-coverage-proof.ts",
   ]) {
-    const source = readFileSync(file, "utf8");
+    const source = readText(file);
     assert.match(source, /runCodexProcess/);
     assert.doesNotMatch(source, /spawnSync\(\s*"codex"/);
   }
-  assert.match(
-    readFileSync("src/clawsweeper.ts", "utf8"),
-    /"--output-last-message",\s*outputPath,\s*"--json"/,
-  );
+  assert.match(readText("src/clawsweeper.ts"), /"--output-last-message",\s*outputPath,\s*"--json"/);
 });
 
 test("failed Codex workers use bounded automatic retry paths", () => {
-  const worker = readFileSync("src/repair/run-worker.ts", "utf8");
-  const outputCapture = readFileSync("src/codex-output-capture.ts", "utf8");
-  const executor = readFileSync("src/repair/execute-fix-artifact.ts", "utf8");
-  const selfHeal = readFileSync("src/repair/self-heal-failed-runs.ts", "utf8");
+  const worker = readText("src/repair/run-worker.ts");
+  const outputCapture = readText("src/codex-output-capture.ts");
+  const executor = readText("src/repair/execute-fix-artifact.ts");
+  const selfHeal = readText("src/repair/self-heal-failed-runs.ts");
 
   assert.match(worker, /appendCodexOutputCapture/);
   assert.match(worker, /openCodexOutputCapture\(codexTranscriptPath\)/);
@@ -1202,7 +1200,7 @@ test("failed Codex workers use bounded automatic retry paths", () => {
 });
 
 test("repair workers expose an explicit sandbox fallback for trusted ephemeral runners", () => {
-  const workflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
+  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
 
   assert.match(workflow, /planner_sandbox:/);
   assert.match(workflow, /default: read-only/);
@@ -1211,20 +1209,17 @@ test("repair workers expose an explicit sandbox fallback for trusted ephemeral r
 });
 
 test("repair workflows preserve existing dispatch while scheduled cluster intake stays gated", () => {
-  const cluster = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
-  const clusterIntake = readFileSync(".github/workflows/repair-cluster-intake.yml", "utf8");
-  const router = readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
-  const finalizer = readFileSync(".github/workflows/repair-finalize-open-prs.yml", "utf8");
-  const selfHeal = readFileSync(".github/workflows/repair-self-heal.yml", "utf8");
-  const sweep = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
-  const dispatchJobs = readFileSync("src/repair/dispatch-jobs.ts", "utf8");
-  const importGitcrawl = readFileSync("src/repair/import-gitcrawl-clusters.ts", "utf8");
-  const importLowSignal = readFileSync("src/repair/import-gitcrawl-low-signal-prs.ts", "utf8");
-  const issueImplementation = readFileSync(
-    ".github/workflows/repair-issue-implementation-intake.yml",
-    "utf8",
-  );
-  const commitFinding = readFileSync(".github/workflows/repair-commit-finding-intake.yml", "utf8");
+  const cluster = readText(".github/workflows/repair-cluster-worker.yml");
+  const clusterIntake = readText(".github/workflows/repair-cluster-intake.yml");
+  const router = readText(".github/workflows/repair-comment-router.yml");
+  const finalizer = readText(".github/workflows/repair-finalize-open-prs.yml");
+  const selfHeal = readText(".github/workflows/repair-self-heal.yml");
+  const sweep = readText(".github/workflows/sweep.yml");
+  const dispatchJobs = readText("src/repair/dispatch-jobs.ts");
+  const importGitcrawl = readText("src/repair/import-gitcrawl-clusters.ts");
+  const importLowSignal = readText("src/repair/import-gitcrawl-low-signal-prs.ts");
+  const issueImplementation = readText(".github/workflows/repair-issue-implementation-intake.yml");
+  const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
   const existingRepairWorkflows = [
     cluster,
     router,
@@ -1262,7 +1257,7 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
 });
 
 test("cluster intake publishes generated repair state through state repo", () => {
-  const workflow = readFileSync(".github/workflows/repair-cluster-intake.yml", "utf8");
+  const workflow = readText(".github/workflows/repair-cluster-intake.yml");
   const stateTokenIndex = workflow.indexOf("uses: ./.github/actions/create-state-token");
   const setupStateIndex = workflow.indexOf("uses: ./.github/actions/setup-state");
   const importIndex = workflow.indexOf("- name: Import one cluster from gitcrawl-store");
@@ -1280,7 +1275,7 @@ test("cluster intake publishes generated repair state through state repo", () =>
 });
 
 test("conflict self-heal publishes exact-head jobs before worker dispatch", () => {
-  const source = readFileSync("src/repair/conflict-self-heal.ts", "utf8");
+  const source = readText("src/repair/conflict-self-heal.ts");
   const writeIndex = source.indexOf("writeSelfHealJob(candidate);");
   const publishIndex = source.indexOf("publishSelfHealJobs();");
   const dispatchIndex = source.indexOf("dispatchRepair(candidate);");
@@ -1295,7 +1290,7 @@ test("conflict self-heal publishes exact-head jobs before worker dispatch", () =
 });
 
 test("review prompt asks for concise public review fields", () => {
-  const prompt = readFileSync("prompts/review-item.md", "utf8");
+  const prompt = readText("prompts/review-item.md");
 
   assert.match(prompt, /Keep these fields concise because they become the public review comment/);
   assert.match(prompt, /one short sentence for `changeSummary`, `workReason`, `bestSolution`/);
@@ -1306,7 +1301,7 @@ test("review prompt asks for concise public review fields", () => {
 });
 
 test("review prompt keeps automerge opt-in from becoming generic manual review", () => {
-  const prompt = readFileSync("prompts/review-item.md", "utf8");
+  const prompt = readText("prompts/review-item.md");
 
   assert.match(prompt, /explicitly opted into `clawsweeper:automerge`/);
   assert.match(prompt, /Do not choose `manual_review` solely because/);
@@ -1321,8 +1316,8 @@ test("review prompt keeps automerge opt-in from becoming generic manual review",
 });
 
 test("review prompts require reproduction and solution assessment details", () => {
-  const itemPrompt = readFileSync("prompts/review-item.md", "utf8");
-  const commitPrompt = readFileSync("prompts/review-commit.md", "utf8");
+  const itemPrompt = readText("prompts/review-item.md");
+  const commitPrompt = readText("prompts/review-commit.md");
 
   assert.match(itemPrompt, /Always fill `reproductionAssessment`/);
   assert.match(itemPrompt, /itemCategory: "bug"/);
@@ -1345,7 +1340,7 @@ test("review prompts require reproduction and solution assessment details", () =
 });
 
 test("commit review workflow settles and reviews from target main", () => {
-  const workflow = readFileSync(".github/workflows/commit-review.yml", "utf8");
+  const workflow = readText(".github/workflows/commit-review.yml");
 
   assert.doesNotMatch(workflow, /clawsweeper_commit_review/);
   assert.match(workflow, /workflow_dispatch:/);
@@ -1358,7 +1353,7 @@ test("commit review workflow settles and reviews from target main", () => {
 });
 
 test("sweep target write tokens can merge pull requests", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const targetWriteTokenBlocks = workflow
     .split("- name: Create target write token")
     .slice(1)
@@ -1372,7 +1367,7 @@ test("sweep target write tokens can merge pull requests", () => {
 });
 
 test("sweep review recovery uses explicit failed shard artifacts", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(
     workflow,
@@ -1395,7 +1390,7 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
 });
 
 test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const retryBlock = workflow.slice(
     workflow.indexOf("retry-failed-reviews:"),
     workflow.indexOf("\n\n  audit-dashboard:"),
@@ -1419,7 +1414,7 @@ test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", (
 });
 
 test("sweep dashboard status writes are scoped to the target repository", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const statusCalls = [...workflow.matchAll(new RegExp("pnpm run status -- \\\\", "g"))];
 
   assert.ok(statusCalls.length > 0);

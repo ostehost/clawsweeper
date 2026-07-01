@@ -1,27 +1,19 @@
 import assert from "node:assert/strict";
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
 import { makeTreeReadOnlyForTest, restoreTreeModesForTest } from "../dist/clawsweeper.js";
-import { tmpPrefix } from "./helpers.ts";
+import { readText, tmpPrefix } from "./helpers.ts";
 
 test("sweep keeps optional media tooling out of review startup", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.doesNotMatch(workflow, /setup-media-proof-tools/);
 });
 
 test("review workflow gives Codex a read-only inspection token", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const eventReviewJobStart = workflow.indexOf("\n  event-review-apply:");
   const planJobStart = workflow.indexOf("\n  plan:", eventReviewJobStart);
   const eventReviewJob = workflow.slice(eventReviewJobStart, planJobStart);
@@ -44,8 +36,8 @@ test("review workflow gives Codex a read-only inspection token", () => {
 });
 
 test("dashboard syncs Worker secrets with durable lifecycle storage", () => {
-  const workflow = readFileSync(".github/workflows/dashboard.yml", "utf8");
-  const config = readFileSync("dashboard/wrangler.toml", "utf8");
+  const workflow = readText(".github/workflows/dashboard.yml");
+  const config = readText("dashboard/wrangler.toml");
 
   assert.doesNotMatch(workflow, /storage\/kv\/namespaces/);
   assert.match(config, /\[\[durable_objects\.bindings\]\]/);
@@ -59,7 +51,7 @@ test("dashboard syncs Worker secrets with durable lifecycle storage", () => {
 });
 
 test("publish workflow installs Codex from the root checkout path", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const publishJobStart = workflow.indexOf("\n  publish:");
   const recoverJobStart = workflow.indexOf("\n  recover-review-failures:", publishJobStart);
   const publishJob = workflow.slice(publishJobStart, recoverJobStart);
@@ -78,7 +70,7 @@ test("publish workflow installs Codex from the root checkout path", () => {
 });
 
 test("apply workflow installs Codex only when proof-eligible apply work can run", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const applyJobStart = workflow.indexOf("\n  apply-existing:");
   assert.notEqual(applyJobStart, -1);
   const applyJob = workflow.slice(applyJobStart);
@@ -121,7 +113,7 @@ test("apply workflow installs Codex only when proof-eligible apply work can run"
 });
 
 test("apply workflow bounds checkpoints and requeues with a fresh token", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const inputBlock = workflow.slice(
     workflow.indexOf("  workflow_dispatch:\n    inputs:"),
     workflow.indexOf("\n  schedule:"),
@@ -160,7 +152,7 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
 });
 
 test("apply workflow syncs source checkout before state hydration", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const applyJobStart = workflow.indexOf("\n  apply-existing:");
   assert.notEqual(applyJobStart, -1);
   const applyJob = workflow.slice(applyJobStart);
@@ -179,7 +171,7 @@ test("apply workflow syncs source checkout before state hydration", () => {
 });
 
 test("sweep target tokens fall back when an org app installation is missing", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const stepBlocks = (name: string) =>
     workflow
       .split(`- name: ${name}`)
@@ -232,8 +224,8 @@ test("sweep target tokens fall back when an org app installation is missing", ()
 });
 
 test("proof nudge workflow is manual-first and scheduled behind repo vars", () => {
-  const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  const workflow = readFileSync(".github/workflows/proof-nudges.yml", "utf8");
+  const sweepWorkflow = readText(".github/workflows/sweep.yml");
+  const workflow = readText(".github/workflows/proof-nudges.yml");
   const job = workflow.slice(workflow.indexOf("  proof-nudges:"), workflow.length);
   const concurrency = workflow.slice(workflow.indexOf("concurrency:"), workflow.indexOf("\njobs:"));
 
@@ -297,47 +289,54 @@ test("proof nudge workflow publishes exact cursor files only for executed lanes"
   );
 });
 
-test("read-only checkout mode restores file modes and leaves git metadata writable", () => {
-  const root = mkdtempSync(tmpPrefix);
-  try {
-    const target = join(root, "target");
-    const nested = join(target, "src");
-    const gitDir = join(target, ".git");
-    mkdirSync(nested, { recursive: true });
-    mkdirSync(gitDir, { recursive: true });
-    const sourceFile = join(nested, "app.ts");
-    const executableFile = join(target, "tool.sh");
-    const gitConfig = join(gitDir, "config");
-    writeFileSync(sourceFile, "export const value = 1;\n");
-    writeFileSync(executableFile, "#!/bin/sh\n");
-    writeFileSync(gitConfig, "[core]\n");
-    chmodSync(target, 0o755);
-    chmodSync(nested, 0o750);
-    chmodSync(sourceFile, 0o640);
-    chmodSync(executableFile, 0o755);
-    chmodSync(gitDir, 0o700);
-    chmodSync(gitConfig, 0o600);
+test(
+  "read-only checkout mode restores file modes and leaves git metadata writable",
+  {
+    skip:
+      process.platform === "win32" ? "exact POSIX mode bits are not portable on Windows" : false,
+  },
+  () => {
+    const root = mkdtempSync(tmpPrefix);
+    try {
+      const target = join(root, "target");
+      const nested = join(target, "src");
+      const gitDir = join(target, ".git");
+      mkdirSync(nested, { recursive: true });
+      mkdirSync(gitDir, { recursive: true });
+      const sourceFile = join(nested, "app.ts");
+      const executableFile = join(target, "tool.sh");
+      const gitConfig = join(gitDir, "config");
+      writeFileSync(sourceFile, "export const value = 1;\n");
+      writeFileSync(executableFile, "#!/bin/sh\n");
+      writeFileSync(gitConfig, "[core]\n");
+      chmodSync(target, 0o755);
+      chmodSync(nested, 0o750);
+      chmodSync(sourceFile, 0o640);
+      chmodSync(executableFile, 0o755);
+      chmodSync(gitDir, 0o700);
+      chmodSync(gitConfig, 0o600);
 
-    const snapshots = makeTreeReadOnlyForTest(target);
-    assert.equal(statSync(target).mode & 0o777, 0o555);
-    assert.equal(statSync(nested).mode & 0o777, 0o555);
-    assert.equal(statSync(sourceFile).mode & 0o777, 0o444);
-    assert.equal(statSync(executableFile).mode & 0o777, 0o555);
-    assert.equal(statSync(gitDir).mode & 0o777, 0o700);
-    assert.equal(statSync(gitConfig).mode & 0o777, 0o600);
+      const snapshots = makeTreeReadOnlyForTest(target);
+      assert.equal(statSync(target).mode & 0o777, 0o555);
+      assert.equal(statSync(nested).mode & 0o777, 0o555);
+      assert.equal(statSync(sourceFile).mode & 0o777, 0o444);
+      assert.equal(statSync(executableFile).mode & 0o777, 0o555);
+      assert.equal(statSync(gitDir).mode & 0o777, 0o700);
+      assert.equal(statSync(gitConfig).mode & 0o777, 0o600);
 
-    restoreTreeModesForTest(snapshots);
-    assert.equal(statSync(target).mode & 0o777, 0o755);
-    assert.equal(statSync(nested).mode & 0o777, 0o750);
-    assert.equal(statSync(sourceFile).mode & 0o777, 0o640);
-    assert.equal(statSync(executableFile).mode & 0o777, 0o755);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      restoreTreeModesForTest(snapshots);
+      assert.equal(statSync(target).mode & 0o777, 0o755);
+      assert.equal(statSync(nested).mode & 0o777, 0o750);
+      assert.equal(statSync(sourceFile).mode & 0o777, 0o640);
+      assert.equal(statSync(executableFile).mode & 0o777, 0o755);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("event review completion removes ClawSweeper eyes reaction", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const block = workflow.slice(
     workflow.indexOf("- name: React to target item completion"),
     workflow.indexOf("\n\n  plan:"),
@@ -351,7 +350,7 @@ test("event review completion removes ClawSweeper eyes reaction", () => {
 });
 
 test("event re-review status lets the durable queue reconcile interruptions", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const block = workflow.slice(
     workflow.indexOf("- name: Mark re-review complete"),
     workflow.indexOf("- name: Commit event comment router ledger"),
@@ -365,7 +364,7 @@ test("event re-review status lets the durable queue reconcile interruptions", ()
 });
 
 test("event repair retries wait for active worker capacity", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const block = workflow.slice(
     workflow.indexOf("- name: Detect waiting event repair dispatches"),
     workflow.indexOf("- name: Commit event comment router retry ledger"),
@@ -376,9 +375,9 @@ test("event repair retries wait for active worker capacity", () => {
 });
 
 test("comment commands keep the router-to-sweep dispatch contract", () => {
-  const routerWorkflow = readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
-  const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  const routerSource = readFileSync("src/repair/comment-router.ts", "utf8");
+  const routerWorkflow = readText(".github/workflows/repair-comment-router.yml");
+  const sweepWorkflow = readText(".github/workflows/sweep.yml");
+  const routerSource = readText("src/repair/comment-router.ts");
 
   assert.match(routerWorkflow, /types:\s*\[clawsweeper_comment\]/);
   assert.match(routerWorkflow, /pnpm run repair:comment-router/);
@@ -402,7 +401,7 @@ test("comment commands keep the router-to-sweep dispatch contract", () => {
 });
 
 test("comment router prunes bare ack comments after updating shared automerge status", () => {
-  const routerSource = readFileSync("src/repair/comment-router.ts", "utf8");
+  const routerSource = readText("src/repair/comment-router.ts");
   const postComment = routerSource.slice(
     routerSource.indexOf("function postComment("),
     routerSource.indexOf("\nfunction findExistingCommandStatusComment"),
@@ -421,7 +420,7 @@ test("comment router prunes bare ack comments after updating shared automerge st
 });
 
 test("manual exact-item review dispatches avoid broad review concurrency", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(
     workflow,
@@ -434,7 +433,7 @@ test("manual exact-item review dispatches avoid broad review concurrency", () =>
 });
 
 test("sweep workflow publishes target-scoped state paths", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(workflow, /target_slug="\$TARGET_REPO"/);
   assert.match(workflow, /--path "records\/\$\{target_slug\}"/);
@@ -444,7 +443,7 @@ test("sweep workflow publishes target-scoped state paths", () => {
 });
 
 test("sweep workflow schedules cursor-based PR comment sync batches", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(workflow, /cron: "6,21,36,51 \* \* \* \*"/);
   assert.doesNotMatch(workflow, /apply_sync_open_pr_batch:/);
@@ -461,7 +460,7 @@ test("sweep workflow schedules cursor-based PR comment sync batches", () => {
 });
 
 test("sweep target checkouts retry without cached references", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const checkoutBlocks =
     workflow.match(/- name: Check out target repository[\s\S]*?rev-parse --short HEAD/g) ?? [];
 
@@ -478,7 +477,7 @@ test("sweep target checkouts retry without cached references", () => {
 });
 
 test("target sweep runs count as background review capacity", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const capacityBlock = workflow.slice(
     workflow.indexOf("active_sweep_background_workers()"),
     workflow.indexOf(
@@ -494,7 +493,7 @@ test("target sweep runs count as background review capacity", () => {
 });
 
 test("target hot sweep dispatches honor shard cap payload", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const modeBlock = workflow.slice(
     workflow.indexOf("- id: mode"),
     workflow.indexOf("\n      - id: select"),
@@ -509,7 +508,7 @@ test("target hot sweep dispatches honor shard cap payload", () => {
 });
 
 test("review git info follows checked-out target branch", () => {
-  const source = readFileSync("src/clawsweeper.ts", "utf8");
+  const source = readText("src/clawsweeper.ts");
 
   assert.match(source, /function reviewTargetBranch/);
   assert.match(source, /rev-parse", "--abbrev-ref", "HEAD"/);
@@ -517,7 +516,7 @@ test("review git info follows checked-out target branch", () => {
 });
 
 test("sweep workflow_dispatch input count stays under GitHub limit", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const inputBlock = workflow.slice(
     workflow.indexOf("  workflow_dispatch:\n    inputs:"),
     workflow.indexOf("\n  schedule:"),
@@ -528,7 +527,7 @@ test("sweep workflow_dispatch input count stays under GitHub limit", () => {
 });
 
 test("sweep review continuations stay workflow-dispatch compatible", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8").replace(/\r\n/g, "\n");
+  const workflow = readText(".github/workflows/sweep.yml");
   const continueBlock = workflow.slice(
     workflow.indexOf("- name: Continue sweep"),
     workflow.indexOf("\n\n  recover-review-failures:"),
@@ -545,7 +544,7 @@ test("sweep review continuations stay workflow-dispatch compatible", () => {
 });
 
 test("target sweep dispatches preserve disabled ClawHub guard", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const planHeader = workflow.slice(
     workflow.indexOf("\n  plan:"),
     workflow.indexOf("\n    runs-on:", workflow.indexOf("\n  plan:")),
@@ -559,7 +558,7 @@ test("target sweep dispatches preserve disabled ClawHub guard", () => {
 });
 
 test("sweep planning-started status publish is bounded", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const block = workflow.slice(
     workflow.indexOf("- name: Publish planning-started status"),
     workflow.indexOf("- id: mode"),
@@ -570,12 +569,12 @@ test("sweep planning-started status publish is bounded", () => {
 });
 
 test("review capacity probes use REST actions run listing", () => {
-  const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const sweepWorkflow = readText(".github/workflows/sweep.yml");
   const sweepBlock = sweepWorkflow.slice(
     sweepWorkflow.indexOf("- id: mode"),
     sweepWorkflow.indexOf("- id: select"),
   );
-  const commitWorkflow = readFileSync(".github/workflows/commit-review.yml", "utf8");
+  const commitWorkflow = readText(".github/workflows/commit-review.yml");
   const commitBlock = commitWorkflow.slice(
     commitWorkflow.indexOf("- name: Select commits"),
     commitWorkflow.indexOf('if [ "$ENABLED" = "false" ]'),
@@ -597,12 +596,12 @@ test("review capacity probes use REST actions run listing", () => {
 });
 
 test("background review capacity reserves expanding matrices and caps broad manual input", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const modeBlock = workflow.slice(
     workflow.indexOf("- id: mode"),
     workflow.indexOf("- id: select"),
   );
-  const commitWorkflow = readFileSync(".github/workflows/commit-review.yml", "utf8");
+  const commitWorkflow = readText(".github/workflows/commit-review.yml");
   const commitBlock = commitWorkflow.slice(
     commitWorkflow.indexOf("- name: Select commits"),
     commitWorkflow.indexOf('if [ "$ENABLED" = "false" ]'),
@@ -622,7 +621,7 @@ test("background review capacity reserves expanding matrices and caps broad manu
 });
 
 test("scheduled normal review keeps workers warm with multi-item shards", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const modeBlock = workflow.slice(
     workflow.indexOf("- id: mode"),
     workflow.indexOf("- id: select"),
@@ -635,7 +634,7 @@ test("scheduled normal review keeps workers warm with multi-item shards", () => 
 });
 
 test("sweep event reviews and target fanout avoid storm amplification", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const legacyIntakeBlock = workflow.slice(
     workflow.indexOf("legacy-event-queue-intake:"),
     workflow.indexOf("event-review-apply:"),
@@ -666,7 +665,7 @@ test("sweep event reviews and target fanout avoid storm amplification", () => {
 });
 
 test("setup-state defaults to an auth-safe shallow checkout", () => {
-  const action = readFileSync(".github/actions/setup-state/action.yml", "utf8");
+  const action = readText(".github/actions/setup-state/action.yml");
   const filterBlock = action.slice(action.indexOf("filter:"), action.indexOf("fetch-depth:"));
   const fetchDepthBlock = action.slice(action.indexOf("fetch-depth:"), action.indexOf("runs:"));
 
@@ -684,7 +683,7 @@ test("setup-state defaults to an auth-safe shallow checkout", () => {
 });
 
 test("sweep exact event reviews consume adaptive Codex timeout payload", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const resolveBlock = workflow.slice(
     workflow.indexOf("- name: Resolve event payload"),
     workflow.indexOf("- name: Create target read token"),
@@ -740,7 +739,7 @@ test("sweep exact event reviews consume adaptive Codex timeout payload", () => {
 });
 
 test("sweep exact event reviews preserve the configured fallback without an adaptive payload", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const resolveBlock = workflow.slice(
     workflow.indexOf("- name: Resolve event payload"),
     workflow.indexOf("- name: Create target read token"),
@@ -755,7 +754,7 @@ test("sweep exact event reviews preserve the configured fallback without an adap
 });
 
 test("github activity workflow scopes cancellation to matching item activity", () => {
-  const workflow = readFileSync(".github/workflows/github-activity.yml", "utf8");
+  const workflow = readText(".github/workflows/github-activity.yml");
   const concurrencyBlock = workflow.slice(
     workflow.indexOf("concurrency:"),
     workflow.indexOf("jobs:"),

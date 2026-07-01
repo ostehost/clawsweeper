@@ -787,11 +787,13 @@ test("Codex failure redaction reads the default home configuration", () => {
   writeFileSync(join(codexHome, "config.toml"), 'model = "default-secret-model"\n');
   const previous = {
     HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
     CODEX_HOME: process.env.CODEX_HOME,
     CLAWSWEEPER_INTERNAL_MODEL: process.env.CLAWSWEEPER_INTERNAL_MODEL,
   };
   try {
     process.env.HOME = root;
+    process.env.USERPROFILE = root;
     delete process.env.CODEX_HOME;
     delete process.env.CLAWSWEEPER_INTERNAL_MODEL;
     assert.equal(
