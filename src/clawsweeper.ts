@@ -98,6 +98,15 @@ import {
   type Args,
 } from "./clawsweeper-args.js";
 import { escapeRegExp, safeOutputTail, trimMiddle, truncateText } from "./clawsweeper-text.js";
+import {
+  appendReviewHistoryCycle,
+  neutralizeReviewControlMarkers,
+  parseReviewHistory,
+  renderReviewHistorySection,
+  reviewHistoryCycleFromCommentBody,
+  type ReviewHistoryCycle,
+  type ReviewHistoryLedger,
+} from "./review-history.js";
 
 export {
   codexEnv,
@@ -368,6 +377,7 @@ interface ReviewFinding {
   file: string;
   lineStart: number;
   lineEnd: number;
+  lateFinding?: boolean;
 }
 
 interface SecurityConcern {
@@ -471,6 +481,7 @@ interface ReviewCommentRenderOptions {
   prStatusKind?: PrStatusLabelKind | null;
   previousLabels?: readonly string[];
   hasOpenLinkedPullRequest?: boolean;
+  previousReviewCommentBody?: string;
 }
 
 interface Decision {
@@ -1813,6 +1824,7 @@ const REVIEW_FINDING_SCHEMA_KEYS = new Set([
   "file",
   "lineStart",
   "lineEnd",
+  "lateFinding",
 ]);
 const LIKELY_OWNER_SCHEMA_KEYS = new Set([
   "person",
@@ -2560,7 +2572,7 @@ function parseReviewFinding(value: unknown, path: string): ReviewFinding {
   const lineEnd = requireInteger(record.lineEnd, `${path}.lineEnd`);
   if (lineStart <= 0) throw new Error(`${path}.lineStart must be positive`);
   if (lineEnd < lineStart) throw new Error(`${path}.lineEnd must be >= lineStart`);
-  return {
+  const finding: ReviewFinding = {
     title: requireString(record.title, `${path}.title`),
     body: requireString(record.body, `${path}.body`),
     priority: requirePriority(record.priority, `${path}.priority`),
@@ -2569,6 +2581,10 @@ function parseReviewFinding(value: unknown, path: string): ReviewFinding {
     lineStart,
     lineEnd,
   };
+  if (record.lateFinding !== undefined) {
+    finding.lateFinding = requireBoolean(record.lateFinding, `${path}.lateFinding`);
+  }
+  return finding;
 }
 
 type DecisionNormalizationItem = Pick<Item, "repo" | "number" | "kind" | "authorAssociation">;
@@ -3419,6 +3435,8 @@ interface PreviousClawSweeperReview {
   rating: string;
   nextStep: string;
   findings: Array<{ priority: string; title: string }>;
+  earlierReviewCycles: ReviewHistoryCycle[];
+  completedReviewCycles: number;
   commentId: unknown;
   commentUrl: unknown;
   commentUpdatedAt: unknown;
@@ -3612,21 +3630,14 @@ function previousReviewProofStatus(body: string): string {
   return firstMergeReadinessLine(body, "Proof:");
 }
 
-function previousReviewFindings(body: string): Array<{ priority: string; title: string }> {
-  return body
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .flatMap((line) => {
-      if (!line.startsWith("- [P")) return [];
-      const close = line.indexOf("]");
-      if (close < 5) return [];
-      const priority = line.slice(3, close);
-      if (!/^P[0-3]$/.test(priority)) return [];
-      const rest = line.slice(close + 1).trim();
-      const dash = minNonNegative([rest.indexOf(" - "), rest.indexOf(" — ")]);
-      const title = (dash < 0 ? rest : rest.slice(0, dash)).trim();
-      return title ? [{ priority, title }] : [];
-    });
+function reviewHistoryFindings(
+  cycle: ReviewHistoryCycle | undefined,
+): Array<{ priority: string; title: string }> {
+  if (!cycle) return [];
+  return cycle.findings.flatMap((finding) => {
+    const match = finding.match(/^\[(P[0-3])\]\s+(.+)$/);
+    return match?.[1] && match[2] ? [{ priority: match[1], title: match[2] }] : [];
+  });
 }
 
 function extractLatestClawSweeperReview(
@@ -3641,11 +3652,18 @@ function extractLatestClawSweeperReview(
   const body = rawCommentBody(latest);
   const verdictMarker = htmlMarkerWithPrefix(body, "clawsweeper-verdict:");
   const actionMarker = htmlMarkerWithPrefix(body, "clawsweeper-action:");
-  const reviewedSha = markerAttribute(verdictMarker, "sha") ?? markerAttribute(actionMarker, "sha");
+  const history = parseReviewHistory(body);
+  const currentCycle = reviewHistoryCycleFromCommentBody(body);
+  const latestCompletedCycle = currentCycle ?? history.cycles.at(-1);
+  const earlierReviewCycles = currentCycle ? history.cycles : history.cycles.slice(0, -1);
   return {
     status: previousReviewStatus(body),
-    reviewedAt: previousReviewReviewedAt(body),
-    reviewedSha,
+    reviewedAt: previousReviewReviewedAt(body) ?? latestCompletedCycle?.reviewedAt ?? null,
+    reviewedSha:
+      markerAttribute(verdictMarker, "sha") ??
+      markerAttribute(actionMarker, "sha") ??
+      latestCompletedCycle?.sha ??
+      null,
     verdictMarker,
     actionMarker,
     summary: firstNonEmptyLine(markdownSection(body, "Summary")),
@@ -3654,7 +3672,9 @@ function extractLatestClawSweeperReview(
     nextStep:
       firstNonEmptyLine(markdownSection(body, "Next step before merge")) ||
       firstNonEmptyLine(markdownSection(body, "Next step")),
-    findings: previousReviewFindings(body),
+    findings: reviewHistoryFindings(latestCompletedCycle),
+    earlierReviewCycles,
+    completedReviewCycles: history.totalCompletedCycles + (currentCycle ? 1 : 0),
     commentId: comment.id,
     commentUrl: comment.html_url,
     commentUpdatedAt: comment.updated_at,
@@ -8549,6 +8569,9 @@ function reviewFindingDetailedLine(finding: ReviewFinding): string {
     reviewFindingSummaryLine(finding),
     `  ${sentence(finding.body)}`,
     `  Confidence: ${confidenceText(finding.confidenceScore)}`,
+    ...(finding.lateFinding
+      ? ["  Late finding: first raised on code an earlier review cycle already covered."]
+      : []),
   ].join("\n");
 }
 
@@ -9078,6 +9101,11 @@ function reportReviewFindings(markdown: string): ReviewFinding[] {
     const body = line.match(/^\s+- body: (.*)$/);
     if (body?.[1]) {
       current.body = body[1];
+      continue;
+    }
+    const late = line.match(/^\s+- late: (true|false)$/);
+    if (late?.[1]) {
+      current.lateFinding = late[1] === "true";
       continue;
     }
     const confidence = line.match(/^\s+- confidence: ([0-9.]+)$/);
@@ -14044,28 +14072,30 @@ function renderCloseComment(options: {
 }
 
 function renderCloseCommentFromReport(markdown: string, reason: CloseReason): string {
-  return sanitizePublicSelfReferences(
-    renderCloseComment({
-      reason,
-      summary: reviewSectionValue(markdown, "summary"),
-      bestSolution: reviewSectionValue(markdown, "bestSolution"),
-      reproductionAssessment: reviewSectionValue(markdown, "reproductionAssessment"),
-      solutionAssessment: reviewSectionValue(markdown, "solutionAssessment"),
-      agentsPolicyStatus: reportAgentsPolicyStatus(markdown),
-      evidence: reportEvidence(markdown),
-      likelyOwners: reportLikelyOwners(markdown),
-      fixedPullRequest: fixedPullRequestFromReport(markdown),
-      securityReview: reportSecurityReview(markdown),
-      rootCauseCluster: reportRootCauseCluster(markdown),
-      reviewLine: closeReviewLineFromReport(markdown),
-      currentItem: {
-        repo: markdownRepository(markdown),
-        number: Number(frontMatterValue(markdown, "number")),
-        kind: (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
-      },
-    }),
-    Number(frontMatterValue(markdown, "number")),
-    (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
+  return neutralizeReviewControlMarkers(
+    sanitizePublicSelfReferences(
+      renderCloseComment({
+        reason,
+        summary: reviewSectionValue(markdown, "summary"),
+        bestSolution: reviewSectionValue(markdown, "bestSolution"),
+        reproductionAssessment: reviewSectionValue(markdown, "reproductionAssessment"),
+        solutionAssessment: reviewSectionValue(markdown, "solutionAssessment"),
+        agentsPolicyStatus: reportAgentsPolicyStatus(markdown),
+        evidence: reportEvidence(markdown),
+        likelyOwners: reportLikelyOwners(markdown),
+        fixedPullRequest: fixedPullRequestFromReport(markdown),
+        securityReview: reportSecurityReview(markdown),
+        rootCauseCluster: reportRootCauseCluster(markdown),
+        reviewLine: closeReviewLineFromReport(markdown),
+        currentItem: {
+          repo: markdownRepository(markdown),
+          number: Number(frontMatterValue(markdown, "number")),
+          kind: (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
+        },
+      }),
+      Number(frontMatterValue(markdown, "number")),
+      (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
+    ),
   );
 }
 
@@ -14379,6 +14409,31 @@ function reviewFreshnessText(markdown: string): string {
   return timestamp ? ` _Reviewed ${timestamp}._` : "";
 }
 
+function reviewHistoryForRender(
+  markdown: string,
+  previousReviewCommentBody: string | undefined,
+): ReviewHistoryLedger {
+  if (frontMatterValue(markdown, "type") !== "pull_request") {
+    return { cycles: [], totalCompletedCycles: 0 };
+  }
+  const body = previousReviewCommentBody ?? "";
+  if (!body.trim()) return { cycles: [], totalCompletedCycles: 0 };
+  const history = parseReviewHistory(body);
+  const previousCycle = reviewHistoryCycleFromCommentBody(body);
+  if (!previousCycle) return history;
+  const reviewedAt = frontMatterValue(markdown, "reviewed_at");
+  if (reviewedAt && previousCycle.reviewedAt === reviewedAt) return history;
+  return appendReviewHistoryCycle(history, previousCycle);
+}
+
+function reviewHistoryForStaleComment(
+  previousReviewCommentBody: string | undefined,
+): ReviewHistoryLedger {
+  const body = previousReviewCommentBody ?? "";
+  const history = parseReviewHistory(body);
+  return appendReviewHistoryCycle(history, reviewHistoryCycleFromCommentBody(body));
+}
+
 function renderKeepOpenCommentFromReport(
   markdown: string,
   options: ReviewCommentRenderOptions = {},
@@ -14591,13 +14646,19 @@ function renderKeepOpenCommentFromReport(
   if (labelDetailsBlock) lines.push("", labelDetailsBlock);
   const evidenceDetailsBlock = collapsedDetailsBlock("Evidence reviewed", evidenceDetails);
   if (evidenceDetailsBlock) lines.push("", evidenceDetailsBlock);
+  const reviewHistoryBlock = renderReviewHistorySection(
+    reviewHistoryForRender(markdown, options.previousReviewCommentBody),
+  );
   if (isPullRequest && !reviewFailed) lines.push("", publicRankDetailsBlock());
   lines.push("", ...reviewWorkflowCallout());
-  return sanitizePublicSelfReferences(
-    lines.join("\n"),
-    Number(frontMatterValue(markdown, "number")),
-    (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
+  const publicBody = neutralizeReviewControlMarkers(
+    sanitizePublicSelfReferences(
+      lines.join("\n"),
+      Number(frontMatterValue(markdown, "number")),
+      (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
+    ),
   );
+  return reviewHistoryBlock ? `${publicBody.trimEnd()}\n\n${reviewHistoryBlock}\n` : publicBody;
 }
 
 export function renderReviewCommentFromReport(
@@ -14934,6 +14995,7 @@ function syncStalePullRequestReviewLabels(options: {
 function stalePullRequestReviewComment(options: {
   number: number;
   stale: StalePullRequestReviewHead;
+  previousReviewCommentBody?: string;
 }): string {
   const attrs = [
     `item=${markerAttributeValue(String(options.number))}`,
@@ -14941,6 +15003,9 @@ function stalePullRequestReviewComment(options: {
     `current_sha=${markerAttributeValue(options.stale.liveHeadSha)}`,
     "reason=stale_head",
   ].join(" ");
+  const history = renderReviewHistorySection(
+    reviewHistoryForStaleComment(options.previousReviewCommentBody),
+  );
   return [
     "Codex review: stale review; fresh review needed.",
     "",
@@ -14949,6 +15014,7 @@ function stalePullRequestReviewComment(options: {
     "",
     "**Next step**",
     "Run or wait for a fresh ClawSweeper review on the current PR head.",
+    ...(history ? ["", history] : []),
     "",
     `<!-- clawsweeper-review-status:stale ${attrs} -->`,
   ].join("\n");
@@ -15655,6 +15721,7 @@ function renderReviewFindingsReportSection(decision: Decision): string {
             finding,
           )}\``,
           `  - body: ${sentence(finding.body)}`,
+          ...(finding.lateFinding ? ["  - late: true"] : []),
           `  - confidence: ${confidenceText(finding.confidenceScore)}`,
         ].join("\n"),
       )
@@ -17387,9 +17454,22 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       renderOptions.hasOpenLinkedPullRequest =
         openClosingPullRequestApplyReason(currentClosingPullRequests) !== null;
     }
-    let reviewComment = stalePrReviewHead
-      ? stalePullRequestReviewComment({ number, stale: stalePrReviewHead })
-      : renderReviewCommentFromReport(markdown, closeReason ?? "none", renderOptions);
+    const renderCurrentReviewComment = (): string =>
+      stalePrReviewHead
+        ? stalePullRequestReviewComment({
+            number,
+            stale: stalePrReviewHead,
+            ...(renderOptions.previousReviewCommentBody
+              ? { previousReviewCommentBody: renderOptions.previousReviewCommentBody }
+              : {}),
+          })
+        : renderReviewCommentFromReport(markdown, closeReason ?? "none", renderOptions);
+    let reviewComment = renderCurrentReviewComment();
+    const existingReviewCommentBody = rawCommentBody(existingReviewComment);
+    if (existingReviewCommentBody.trim()) {
+      renderOptions.previousReviewCommentBody = existingReviewCommentBody;
+      reviewComment = renderCurrentReviewComment();
+    }
     let markedReviewComment = markedReviewCommentBody(number, reviewComment);
     let proofBlockedForCommentSync: PrCloseCoverageProofGateBlock | null = null;
     const protectedApplyReason = applyProtectedLabelReason(item.labels, closeReason);
@@ -17712,9 +17792,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         continue;
       }
     }
-    reviewComment = stalePrReviewHead
-      ? stalePullRequestReviewComment({ number, stale: stalePrReviewHead })
-      : renderReviewCommentFromReport(markdown, closeReason ?? "none", renderOptions);
+    reviewComment = renderCurrentReviewComment();
     markedReviewComment = markedReviewCommentBody(number, reviewComment);
     if (isCloseProposal && item.kind === "issue") {
       currentClosingPullRequests ??= closingPullRequestsForIssue(number);
