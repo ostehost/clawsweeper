@@ -33,6 +33,14 @@ test("triage routing groups classify impact labels without forcing one primary g
     triageRoutingGroupsForLabels(["impact:unknown"]).map((group) => group.id),
     ["unclassified"],
   );
+  assert.deepEqual(
+    triageRoutingGroupsForLabels(["impact:ux-release-blocker"]).map((group) => group.id),
+    ["user-experience"],
+  );
+  assert.deepEqual(
+    triageRoutingGroupsForLabels([{ name: "impact:ux-friction" }]).map((group) => group.id),
+    ["user-experience"],
+  );
   assert.equal(TRIAGE_ROUTING_GROUPS.at(-1)?.id, "unclassified");
 });
 

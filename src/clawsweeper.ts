@@ -131,6 +131,8 @@ type ImpactLabelName =
   | "impact:message-loss"
   | "impact:session-state"
   | "impact:auth-provider"
+  | "impact:ux-release-blocker"
+  | "impact:ux-friction"
   | "impact:other";
 type MergeRiskLabelName =
   | "merge-risk: 🚨 compatibility"
@@ -1328,6 +1330,17 @@ const IMPACT_LABELS = [
     color: "F9D65C",
     description:
       "This issue is about auth, provider routing, model choice, or SecretRef resolution.",
+  },
+  {
+    name: "impact:ux-release-blocker",
+    color: "B60205",
+    description: "A non-technical user is blocked without terminal, logs, config, or support.",
+  },
+  {
+    name: "impact:ux-friction",
+    color: "FBCA04",
+    description:
+      "User-facing flow adds avoidable confusion or support burden without fully blocking progress.",
   },
   {
     name: "impact:other",

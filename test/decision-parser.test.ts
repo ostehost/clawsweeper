@@ -268,6 +268,24 @@ test("decision parser enforces required schema-shaped evidence", () => {
     ).impactLabels,
     ["impact:other"],
   );
+  for (const [triagePriority, impactLabel, reason] of [
+    ["P0", "impact:ux-release-blocker", "Setup is blocked without an in-product recovery path."],
+    ["P1", "impact:ux-friction", "Setup is recoverable but creates avoidable support burden."],
+  ] as const) {
+    assert.deepEqual(
+      parseDecision(
+        closeDecision({
+          triagePriority,
+          impactLabels: [impactLabel],
+          labelJustifications: [
+            { label: triagePriority, reason: "The issue has user-facing setup impact." },
+            { label: impactLabel, reason },
+          ],
+        }),
+      ).impactLabels,
+      [impactLabel],
+    );
+  }
   assert.deepEqual(
     parseDecision(
       closeDecision({

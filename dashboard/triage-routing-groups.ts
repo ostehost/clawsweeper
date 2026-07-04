@@ -31,6 +31,11 @@ export const TRIAGE_ROUTING_GROUPS: TriageRoutingGroup[] = [
     labels: ["impact:security"],
   },
   {
+    id: "user-experience",
+    title: "User experience",
+    labels: ["impact:ux-release-blocker", "impact:ux-friction"],
+  },
+  {
     id: "other-impact",
     title: "Other impact",
     labels: ["impact:other"],
