@@ -51,6 +51,20 @@ import {
 import { parseGhJson, parseGhJsonLines } from "./github-json.js";
 import { stableJson } from "./stable-json.js";
 import {
+  appendFloorBackfillCandidates,
+  compareDueCandidates,
+  compareHotIntakeDueCandidates,
+  hasReviewPolicyMismatch,
+  nextReviewDueAtMs,
+  reviewedAtMs,
+  reviewPriority,
+  schedulerBucket,
+  selectDueCandidates,
+  shouldReviewItem,
+  shouldStopSaturatedPlanScan,
+  type SchedulerDueCandidate,
+} from "./scheduler-policy.js";
+import {
   isUserFacingCommandError,
   resolveCommand,
   runText,
@@ -102,7 +116,6 @@ export {
   isLockedConversationCommentError,
   shouldRetryGh,
 } from "./github-retry.js";
-
 type ItemKind = "issue" | "pull_request";
 type ApplyKind = ItemKind | "all";
 type DecisionKind = "close" | "keep_open";
@@ -806,22 +819,7 @@ const DEFAULT_PLAN_BATCH_SIZE = 3;
 const DEFAULT_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.normal_default;
 const MAX_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.hard_cap;
 
-type SchedulerBucket =
-  | "hot_issue"
-  | "hot_pull_request"
-  | "activity"
-  | "daily_pull_request"
-  | "recent_issue"
-  | "weekly_issue";
-
-interface DueCandidate {
-  item: Item;
-  review: ExistingReview | null;
-  priority: number;
-  reviewedAt: number;
-  nextDueAt: number;
-  bucket: SchedulerBucket;
-}
+type DueCandidate = SchedulerDueCandidate<Item, ExistingReview>;
 
 interface ApplyResult {
   repo?: string;
@@ -1084,7 +1082,6 @@ let activeRepositoryProfile = repositoryProfileFor(
 const FRESH_DAYS = 7;
 const HOT_REVIEW_DAYS = 7;
 const RECENT_ISSUE_DAYS = 30;
-const HOURLY_REVIEW_MS = 60 * 60 * 1000;
 const DEFAULT_BACKFILL_REVIEW_AGE_MINUTES = 360;
 const DAILY_REVIEW_DAYS = 1;
 const WEEKLY_REVIEW_DAYS = 7;
@@ -5289,126 +5286,6 @@ function isCurrentForCadence(options: {
   return options.now - reviewedAt < options.cadenceMs;
 }
 
-function reviewedAtMs(review: ExistingReview | null): number | null {
-  if (review?.reviewStatus !== "complete") return null;
-  if (!review.reviewedAt) return null;
-  const reviewedAt = Date.parse(review.reviewedAt);
-  return Number.isFinite(reviewedAt) ? reviewedAt : null;
-}
-
-function hasActivitySinceReview(item: Item, review: ExistingReview | null): boolean {
-  if (!review) return false;
-  const updatedAt = Date.parse(item.updatedAt);
-  const reviewedAt = reviewedAtMs(review);
-  const reviewCommentSyncedAt = timestampMs(review.reviewCommentSyncedAt);
-  const labelsSyncedAt = timestampMs(review.labelsSyncedAt);
-  const botOwnedSyncedAt = Math.max(
-    reviewCommentSyncedAt ?? -Infinity,
-    labelsSyncedAt ?? -Infinity,
-  );
-  if (review.itemUpdatedAt) {
-    if (item.updatedAt === review.itemUpdatedAt) return false;
-    if (Number.isFinite(updatedAt) && reviewedAt !== null && updatedAt <= reviewedAt) return false;
-    if (
-      Number.isFinite(updatedAt) &&
-      Number.isFinite(botOwnedSyncedAt) &&
-      updatedAt <= botOwnedSyncedAt
-    ) {
-      return false;
-    }
-    return true;
-  }
-  if (
-    Number.isFinite(updatedAt) &&
-    Number.isFinite(botOwnedSyncedAt) &&
-    updatedAt <= botOwnedSyncedAt
-  ) {
-    return false;
-  }
-  return reviewedAt !== null && Number.isFinite(updatedAt) && updatedAt > reviewedAt;
-}
-
-function isCreatedWithinDays(
-  item: Pick<Item, "createdAt">,
-  days: number,
-  now = Date.now(),
-): boolean {
-  const createdAt = Date.parse(item.createdAt);
-  return Number.isFinite(createdAt) && now - createdAt < days * DAY_MS;
-}
-
-function reviewCadenceMs(item: Item, review: ExistingReview | null, now = Date.now()): number {
-  if (hasActivitySinceReview(item, review)) return HOURLY_REVIEW_MS;
-  if (isCreatedWithinDays(item, HOT_REVIEW_DAYS, now)) return DAILY_REVIEW_DAYS * DAY_MS;
-  if (item.kind === "pull_request") return DAILY_REVIEW_DAYS * DAY_MS;
-  const createdAt = Date.parse(item.createdAt);
-  if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) {
-    return DAILY_REVIEW_DAYS * DAY_MS;
-  }
-  return WEEKLY_REVIEW_DAYS * DAY_MS;
-}
-
-function hasReviewPolicyMismatch(review: ExistingReview | null, reviewPolicy?: string): boolean {
-  return Boolean(review && reviewPolicy && review.reviewPolicy !== reviewPolicy);
-}
-
-export function shouldReviewItem(
-  item: Item,
-  review: ExistingReview | null,
-  now = Date.now(),
-  reviewPolicy?: string,
-): boolean {
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return true;
-  const reviewedAt = reviewedAtMs(review);
-  if (reviewedAt === null) return true;
-  return now - reviewedAt >= reviewCadenceMs(item, review, now);
-}
-
-export function reviewPriority(
-  item: Item,
-  review: ExistingReview | null,
-  now = Date.now(),
-  reviewPolicy?: string,
-): number {
-  if (isCreatedWithinDays(item, HOT_REVIEW_DAYS, now) && item.kind === "issue") return 0;
-  if (isCreatedWithinDays(item, HOT_REVIEW_DAYS, now)) return 1;
-  if (hasActivitySinceReview(item, review)) return 2;
-  if (item.kind === "pull_request") return 3;
-  const createdAt = Date.parse(item.createdAt);
-  if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) return 4;
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return 5;
-  return 6;
-}
-
-function schedulerBucket(
-  item: Item,
-  review: ExistingReview | null,
-  now = Date.now(),
-): SchedulerBucket {
-  if (isCreatedWithinDays(item, HOT_REVIEW_DAYS, now)) {
-    return item.kind === "issue" ? "hot_issue" : "hot_pull_request";
-  }
-  if (hasActivitySinceReview(item, review)) return "activity";
-  if (item.kind === "pull_request") return "daily_pull_request";
-  const createdAt = Date.parse(item.createdAt);
-  if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) {
-    return "recent_issue";
-  }
-  return "weekly_issue";
-}
-
-function nextReviewDueAtMs(
-  item: Item,
-  review: ExistingReview | null,
-  now = Date.now(),
-  reviewPolicy?: string,
-): number {
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return 0;
-  const reviewedAt = reviewedAtMs(review);
-  if (reviewedAt === null) return 0;
-  return reviewedAt + reviewCadenceMs(item, review, now);
-}
-
 function dueCandidate(
   item: Item,
   itemsDir: string,
@@ -5450,196 +5327,6 @@ function reviewBackfillCandidate(
     nextDueAt: nextReviewDueAtMs(item, review, now, reviewPolicy),
     bucket: schedulerBucket(item, review, now),
   };
-}
-
-function compareDueCandidates(left: DueCandidate, right: DueCandidate): number {
-  return (
-    left.priority - right.priority ||
-    left.nextDueAt - right.nextDueAt ||
-    left.reviewedAt - right.reviewedAt ||
-    left.item.number - right.item.number
-  );
-}
-
-function compareBackfillCandidates(left: DueCandidate, right: DueCandidate): number {
-  return (
-    left.nextDueAt - right.nextDueAt ||
-    left.reviewedAt - right.reviewedAt ||
-    left.priority - right.priority ||
-    left.item.number - right.item.number
-  );
-}
-
-function weeklyReviewDeadlineMs(candidate: DueCandidate): number {
-  if (candidate.reviewedAt > 0) {
-    return candidate.reviewedAt + WEEKLY_REVIEW_DAYS * DAY_MS;
-  }
-  const createdAt = Date.parse(candidate.item.createdAt);
-  return Number.isFinite(createdAt) ? createdAt + WEEKLY_REVIEW_DAYS * DAY_MS : 0;
-}
-
-const SCHEDULER_BUCKET_WEIGHTS: ReadonlyArray<readonly [SchedulerBucket, number]> = [
-  ["hot_issue", 4],
-  ["hot_pull_request", 2],
-  ["activity", 2],
-  ["daily_pull_request", 3],
-  ["recent_issue", 2],
-  ["weekly_issue", 1],
-];
-
-function selectDueCandidates(
-  due: DueCandidate[],
-  limit: number,
-  compare: (left: DueCandidate, right: DueCandidate) => number = compareDueCandidates,
-  now = Date.now(),
-): DueCandidate[] {
-  const capacity = Math.max(0, limit);
-  if (capacity === 0) return [];
-  const buckets = new Map<SchedulerBucket, DueCandidate[]>();
-  for (const [bucket] of SCHEDULER_BUCKET_WEIGHTS) buckets.set(bucket, []);
-  for (const candidate of due) buckets.get(candidate.bucket)?.push(candidate);
-  for (const candidates of buckets.values()) candidates.sort(compare);
-
-  const selected: DueCandidate[] = [];
-  const selectedKeys = new Set<string>();
-  const take = (candidate: DueCandidate | undefined): void => {
-    if (!candidate || selected.length >= capacity) return;
-    const key = existingReviewKey(candidate.item.repo, candidate.item.number);
-    if (selectedKeys.has(key)) return;
-    selectedKeys.add(key);
-    selected.push(candidate);
-  };
-
-  // Weekly freshness is the outer SLO. Catch up breached items before applying
-  // the normal weighted mix for hourly and daily work.
-  const weeklyOverdue = due
-    .filter((candidate) => weeklyReviewDeadlineMs(candidate) <= now)
-    .sort(
-      (left, right) =>
-        weeklyReviewDeadlineMs(left) - weeklyReviewDeadlineMs(right) || compare(left, right),
-    );
-  for (const candidate of weeklyOverdue) take(candidate);
-  for (const [bucket, candidates] of buckets) {
-    buckets.set(
-      bucket,
-      candidates.filter(
-        (candidate) =>
-          !selectedKeys.has(existingReviewKey(candidate.item.repo, candidate.item.number)),
-      ),
-    );
-  }
-
-  while (selected.length < capacity) {
-    const before = selected.length;
-    for (const [bucket, weight] of SCHEDULER_BUCKET_WEIGHTS) {
-      const candidates = buckets.get(bucket);
-      if (!candidates?.length) continue;
-      for (let i = 0; i < weight && candidates.length && selected.length < capacity; i += 1) {
-        take(candidates.shift());
-      }
-    }
-    if (selected.length === before) break;
-  }
-
-  return selected;
-}
-
-function appendFloorBackfillCandidates(
-  selected: DueCandidate[],
-  backfill: DueCandidate[],
-  options: { activeFloor: number; capacity: number },
-): DueCandidate[] {
-  const activeFloor = Math.max(0, Math.floor(options.activeFloor));
-  const capacity = Math.max(0, Math.floor(options.capacity));
-  const target = Math.min(activeFloor, capacity);
-  if (selected.length >= target) return selected;
-  const selectedKeys = new Set(
-    selected.map((candidate) => existingReviewKey(candidate.item.repo, candidate.item.number)),
-  );
-  const filled = [...selected];
-  for (const candidate of [...backfill].sort(compareBackfillCandidates)) {
-    if (filled.length >= target) break;
-    const key = existingReviewKey(candidate.item.repo, candidate.item.number);
-    if (selectedKeys.has(key)) continue;
-    selectedKeys.add(key);
-    filled.push(candidate);
-  }
-  return filled;
-}
-
-export function selectDueCandidateNumbersForTest(
-  due: Array<{
-    item: Item;
-    bucket: SchedulerBucket;
-    priority?: number;
-    reviewedAt?: number;
-    nextDueAt?: number;
-  }>,
-  limit: number,
-  now = Date.now(),
-): number[] {
-  return selectDueCandidates(
-    due.map((candidate) => ({
-      item: candidate.item,
-      review: null,
-      priority: candidate.priority ?? reviewPriority(candidate.item, null),
-      reviewedAt: candidate.reviewedAt ?? 0,
-      nextDueAt: candidate.nextDueAt ?? 0,
-      bucket: candidate.bucket,
-    })),
-    limit,
-    compareDueCandidates,
-    now,
-  ).map((candidate) => candidate.item.number);
-}
-
-export function appendFloorBackfillCandidateNumbersForTest(
-  selected: Array<{
-    item: Item;
-    bucket: SchedulerBucket;
-    priority?: number;
-    reviewedAt?: number;
-    nextDueAt?: number;
-  }>,
-  backfill: Array<{
-    item: Item;
-    bucket: SchedulerBucket;
-    priority?: number;
-    reviewedAt?: number;
-    nextDueAt?: number;
-  }>,
-  activeFloor: number,
-  capacity: number,
-): number[] {
-  const normalize = (candidate: (typeof selected)[number]): DueCandidate => ({
-    item: candidate.item,
-    review: null,
-    priority: candidate.priority ?? reviewPriority(candidate.item, null),
-    reviewedAt: candidate.reviewedAt ?? 0,
-    nextDueAt: candidate.nextDueAt ?? 0,
-    bucket: candidate.bucket,
-  });
-  return appendFloorBackfillCandidates(selected.map(normalize), backfill.map(normalize), {
-    activeFloor,
-    capacity,
-  }).map((candidate) => candidate.item.number);
-}
-
-function compareHotIntakeDueCandidates(left: DueCandidate, right: DueCandidate): number {
-  return (
-    left.priority - right.priority ||
-    hotIntakeRecencyMs(right.item) - hotIntakeRecencyMs(left.item) ||
-    right.item.number - left.item.number
-  );
-}
-
-export function hotIntakeRecencyMs(item: Pick<Item, "createdAt" | "updatedAt">): number {
-  const updatedAt = Date.parse(item.updatedAt);
-  const createdAt = Date.parse(item.createdAt);
-  return Math.max(
-    Number.isFinite(updatedAt) ? updatedAt : 0,
-    Number.isFinite(createdAt) ? createdAt : 0,
-  );
 }
 
 function fetchOpenItemPage(
@@ -6134,13 +5821,6 @@ function oldestUnreviewedAt(candidates: readonly DueCandidate[]): string | undef
     oldest = candidate.item.createdAt;
   }
   return oldest;
-}
-
-export function shouldStopSaturatedPlanScan(options: {
-  dueCount: number;
-  capacity: number;
-}): boolean {
-  return options.capacity > 0 && options.dueCount >= options.capacity;
 }
 
 function planCapacityReason(options: {

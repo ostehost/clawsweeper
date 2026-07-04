@@ -2,14 +2,39 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  appendFloorBackfillCandidateNumbersForTest,
+  appendFloorBackfillCandidates,
   hotIntakeRecencyMs,
   reviewPriority,
-  selectDueCandidateNumbersForTest,
+  selectDueCandidates,
   shouldReviewItem,
   shouldStopSaturatedPlanScan,
-} from "../dist/clawsweeper.js";
+} from "../dist/scheduler-policy.js";
 import { item } from "./helpers.ts";
+
+function schedulerCandidate(candidate) {
+  return {
+    item: candidate.item,
+    review: null,
+    priority: candidate.priority ?? reviewPriority(candidate.item, null),
+    reviewedAt: candidate.reviewedAt ?? 0,
+    nextDueAt: candidate.nextDueAt ?? 0,
+    bucket: candidate.bucket,
+  };
+}
+
+function selectedNumbers(due, limit, now) {
+  return selectDueCandidates(due.map(schedulerCandidate), limit, undefined, now).map(
+    (candidate) => candidate.item.number,
+  );
+}
+
+function backfilledNumbers(selected, backfill, activeFloor, capacity) {
+  return appendFloorBackfillCandidates(
+    selected.map(schedulerCandidate),
+    backfill.map(schedulerCandidate),
+    { activeFloor, capacity },
+  ).map((candidate) => candidate.item.number);
+}
 
 test("review policy changes force fresh complete reports back into planning", () => {
   const reviewedAt = new Date().toISOString();
@@ -330,7 +355,7 @@ test("normal scheduler reserves throughput for PR and older buckets", () => {
     },
   );
 
-  assert.deepEqual(selectDueCandidateNumbersForTest(due, 8, now), [1, 2, 3, 4, 101, 201, 301, 5]);
+  assert.deepEqual(selectedNumbers(due, 8, now), [1, 2, 3, 4, 101, 201, 301, 5]);
 });
 
 test("normal scheduler prioritizes items already breaching weekly freshness", () => {
@@ -368,7 +393,7 @@ test("normal scheduler prioritizes items already breaching weekly freshness", ()
     },
   ];
 
-  assert.deepEqual(selectDueCandidateNumbersForTest(due, 3, now), [3, 2, 1]);
+  assert.deepEqual(selectedNumbers(due, 3, now), [3, 2, 1]);
 });
 
 test("weekly freshness preselection still fills remaining scheduler capacity", () => {
@@ -406,7 +431,7 @@ test("weekly freshness preselection still fills remaining scheduler capacity", (
     },
   );
 
-  assert.deepEqual(selectDueCandidateNumbersForTest(due, 7, now), [1, 2, 3, 4, 5, 7, 6]);
+  assert.deepEqual(selectedNumbers(due, 7, now), [1, 2, 3, 4, 5, 7, 6]);
 });
 
 test("normal scheduler can fill active floor from stale current reviews", () => {
@@ -442,11 +467,8 @@ test("normal scheduler can fill active floor from stale current reviews", () => 
     },
   ];
 
-  assert.deepEqual(
-    appendFloorBackfillCandidateNumbersForTest(selected, backfill, 3, 10),
-    [1, 10, 11],
-  );
-  assert.deepEqual(appendFloorBackfillCandidateNumbersForTest(selected, backfill, 3, 2), [1, 10]);
+  assert.deepEqual(backfilledNumbers(selected, backfill, 3, 10), [1, 10, 11]);
+  assert.deepEqual(backfilledNumbers(selected, backfill, 3, 2), [1, 10]);
 });
 
 test("normal scheduler can stop scanning once planned capacity is saturated", () => {
