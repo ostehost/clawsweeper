@@ -38,18 +38,14 @@ test("no-op automerge repair updates outcome and re-enters router before exit", 
   assert.ok(noPlannedBranch, "expected no planned fix actions branch");
   assert.match(noPlannedBranch, /report\.reason = "no planned fix actions";/);
 
-  const continuationIndex = noPlannedBranch.indexOf(
-    "appendAutomergeRepairOutcomeComment(report, resultPath);",
-  );
   const writeReportIndex = noPlannedBranch.indexOf("writeReport(report, resultPath);");
   const exitIndex = noPlannedBranch.indexOf("process.exit(0);");
 
-  assert.notEqual(continuationIndex, -1);
   assert.notEqual(writeReportIndex, -1);
   assert.notEqual(exitIndex, -1);
   assert.ok(
-    continuationIndex < writeReportIndex && writeReportIndex < exitIndex,
-    "no-op repair must update automerge continuation before writing the terminal report and exiting",
+    writeReportIndex < exitIndex,
+    "no-op repair must durably write the terminal report before exiting",
   );
 });
 
@@ -234,4 +230,51 @@ test("final repair contract compares the repaired tree with the latest base", ()
   assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseRef\}\.\.HEAD`/);
   assert.match(helper, /enforceRepairContract\(\{ fixArtifact, changedFiles \}\)/);
   assert.doesNotMatch(helper, /--porcelain=v1|phase|checkpoint/);
+});
+
+test("contributor repair review loop stays on one pinned target base", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const validation = readText(path.join(process.cwd(), "src/repair/target-validation.ts"));
+  const promptBuilder = readText(path.join(process.cwd(), "src/repair/fix-prompt-builder.ts"));
+
+  assert.match(
+    source,
+    /const targetBaseSha = run\("git", \["rev-parse", `origin\/\$\{baseBranch\}`\]/,
+  );
+  assert.match(source, /validateAndReviewLoop\(\{[\s\S]*targetBaseSha/);
+  assert.match(source, /pinnedBaseRef: targetBaseSha/);
+  assert.match(source, /runDiffCheck\(\{ targetDir, baseRef: targetBaseSha \}\)/);
+  assert.match(source, /pinned target base \$\{targetBaseSha\}/);
+  assert.match(validation, /pinnedBaseRef\?: string/);
+  assert.match(validation, /if \(!options\.pinnedBaseRef\) \{[\s\S]*ensureMergeBaseAvailable/);
+  assert.match(promptBuilder, /Pinned target base SHA: \$\{targetBaseSha\}/);
+});
+
+test("final synchronized tree is reviewed and reports persist before publication", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+
+  assert.match(source, /reviewAfterFinalBaseSync\(\{/);
+  assert.match(source, /validateAndReviewSynchronizedTree\(\{/);
+  assert.match(source, /attempt: "final-sync"/);
+  assert.match(source, /finalizeExecutionReport\(\{/);
+});
+
+test("repair workflow renews target credentials before deferred outcome publication", () => {
+  const workflow = readText(
+    path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
+  );
+  const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
+  const renewIndex = workflow.indexOf("- name: Renew target write token for post-flight");
+  const publishIndex = workflow.indexOf("- name: Publish deferred fix outcome");
+  const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
+
+  assert.ok(
+    executeIndex < renewIndex && renewIndex < publishIndex && publishIndex < postFlightIndex,
+  );
+  assert.match(workflow.slice(executeIndex, renewIndex), /--latest --defer-publication/);
+  assert.match(
+    workflow.slice(publishIndex, postFlightIndex),
+    /GH_TOKEN: \${{ steps\.target_post_flight_token\.outputs\.token }}/,
+  );
+  assert.match(workflow.slice(publishIndex, postFlightIndex), /--latest --publish-report-only/);
 });

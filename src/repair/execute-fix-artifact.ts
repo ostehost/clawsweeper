@@ -88,6 +88,7 @@ import {
 } from "./fix-prompt-builder.js";
 import { canTreatRebaseAsCompleteRepair } from "./fix-edit-policy.js";
 import { applyMechanicalChangelogFix } from "./mechanical-changelog.js";
+import { finalizeExecutionReport, reviewAfterFinalBaseSync } from "./execution-finalization.js";
 import { tryResolveMechanicalRebaseConflicts } from "./mechanical-rebase-conflicts.js";
 import { compactGeneratedBranchHistory } from "./compact-generated-branch.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
@@ -157,6 +158,8 @@ const jobPath = args._[0];
 const resultPathArg = args._[1];
 const latest = Boolean(args.latest);
 const dryRun = Boolean(args["dry-run"] || process.env.CLAWSWEEPER_FIX_DRY_RUN === "1");
+const deferPublication = Boolean(args["defer-publication"]);
+const publishReportOnly = Boolean(args["publish-report-only"]);
 const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const executionModelArgs = codexModelArgs(model);
 const { codexTimeoutMs, fixStepTimeoutMs, lateWorkerReserveMs } = repairTimeoutBudgetFromEnv(
@@ -424,6 +427,11 @@ const report: LooseRecord = {
   actions: [],
 };
 
+if (publishReportOnly) {
+  publishPersistedReport(resultPath);
+  process.exit(0);
+}
+
 logProgress("starting fix execution", {
   repo: result.repo,
   cluster_id: result.cluster_id,
@@ -441,7 +449,6 @@ updateAutomergeProgressStatus({
 if (plannedFixActions.length === 0) {
   report.status = "skipped";
   report.reason = "no planned fix actions";
-  appendAutomergeRepairOutcomeComment(report, resultPath);
   writeReport(report, resultPath);
   process.exit(0);
 }
@@ -2050,6 +2057,9 @@ function editValidatePrepareMerge({
     if (producedChanges) logProgress("applied mechanical changelog fix");
   }
   const repositoryContext = buildRepositoryContext({ fixArtifact, targetDir });
+  const targetBaseSha = run("git", ["rev-parse", `origin/${baseBranch}`], {
+    cwd: targetDir,
+  }).trim();
   const shouldRunCodexEdit = !producedChanges || reconcileWithBase;
   const repairDeltaBaseHead =
     rebaseResult?.status === "conflicts" ? sourceHead : currentHead(targetDir);
@@ -2073,6 +2083,7 @@ function editValidatePrepareMerge({
             : rebaseResult,
         maxEditAttempts,
         validationCommands: validationPreflight.resolved_commands ?? [],
+        targetBaseSha,
         isAutomergeRepair: isAutomergeRepairJob(),
       });
       const summaryPath = path.join(workRoot, `${mode}-codex-summary-${attempt}.md`);
@@ -2226,30 +2237,72 @@ function editValidatePrepareMerge({
     pushIntermediateCheckpoint?.();
   }
 
-  let codexReview = null;
-  const maxFinalBaseSyncAttempts = Math.max(
-    1,
-    Number(process.env.CLAWSWEEPER_FINAL_BASE_SYNC_ATTEMPTS ?? 1),
-  );
-  for (let attempt = 1; attempt <= maxFinalBaseSyncAttempts; attempt += 1) {
-    logProgress("starting validation/review loop", { mode, attempt });
-    updateAutomergeProgressStatus({
-      id: `validation-review-${mode}-${attempt}`,
-      label: `validation and review ${attempt}`,
-      status: "running",
-      details: mode,
-      headSha: currentHead(targetDir),
-    });
-    codexReview = validateAndReviewLoop({
-      fixArtifact,
-      targetDir,
-      mode,
-      baseBranch,
-      sourceHead: repairDeltaBaseHead,
-      onReviewFix: (reviewAttempt: JsonValue) => {
+  logProgress("starting validation/review loop", { mode, attempt: 1 });
+  updateAutomergeProgressStatus({
+    id: `validation-review-${mode}-1`,
+    label: "validation and review 1",
+    status: "running",
+    details: mode,
+    headSha: currentHead(targetDir),
+  });
+  let codexReview = validateAndReviewLoop({
+    fixArtifact,
+    targetDir,
+    mode,
+    baseBranch,
+    targetBaseSha,
+    sourceHead: repairDeltaBaseHead,
+    onReviewFix: (reviewAttempt: JsonValue) => {
+      const checkpoint = commitCheckpointIfNeeded({
+        targetDir,
+        message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+        trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
+      });
+      if (checkpoint) {
+        checkpointCommits.push(checkpoint);
+        pushIntermediateCheckpoint?.();
+      }
+    },
+  });
+  const sync = reconcileLatestBaseBeforePush({
+    fixArtifact,
+    targetDir,
+    branch,
+    mode,
+    baseBranch,
+    contributorCredits,
+    attempt: 1,
+    repositoryContext,
+    sourceHead,
+  });
+  logProgress("final base sync result", { mode, attempt: 1, status: sync.status });
+  updateAutomergeProgressStatus({
+    id: `validation-review-${mode}-1`,
+    label: "validation and review 1",
+    status: "complete",
+    details: sync.status,
+    headSha: currentHead(targetDir),
+  });
+  if (sync.status !== "already-current") {
+    const synchronizedBaseSha = run("git", ["rev-parse", `origin/${baseBranch}`], {
+      cwd: targetDir,
+    }).trim();
+    codexReview = reviewAfterFinalBaseSync({
+      syncChanged: true,
+      currentReview: codexReview,
+      reviewSynchronizedTree: () =>
+        validateAndReviewSynchronizedTree({
+          fixArtifact,
+          targetDir,
+          mode,
+          baseBranch,
+          targetBaseSha: synchronizedBaseSha,
+          sourceHead: repairDeltaBaseHead,
+        }),
+      checkpointSynchronizedTree: () => {
         const checkpoint = commitCheckpointIfNeeded({
           targetDir,
-          message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+          message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (1)`,
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
         if (checkpoint) {
@@ -2258,45 +2311,14 @@ function editValidatePrepareMerge({
         }
       },
     });
-    const sync = reconcileLatestBaseBeforePush({
-      fixArtifact,
-      targetDir,
-      branch,
-      mode,
-      baseBranch,
-      contributorCredits,
-      attempt,
-      repositoryContext,
-      sourceHead,
-    });
-    logProgress("final base sync result", { mode, attempt, status: sync.status });
-    updateAutomergeProgressStatus({
-      id: `validation-review-${mode}-${attempt}`,
-      label: `validation and review ${attempt}`,
-      status: sync.status === "already-current" ? "complete" : "base moved",
-      details: sync.status,
-      headSha: currentHead(targetDir),
-    });
-    if (sync.status === "already-current") break;
-    const checkpoint = commitCheckpointIfNeeded({
-      targetDir,
-      message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (${attempt})`,
-      trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
-    });
-    if (checkpoint) {
-      checkpointCommits.push(checkpoint);
-      pushIntermediateCheckpoint?.();
-    }
-    if (attempt === maxFinalBaseSyncAttempts) {
-      codexReview.final_base_sync = {
-        status: "accepted_after_final_sync",
-        reason:
-          "origin/main moved during final validation; pushed the branch after the last successful final-base sync and left review/CI/automerge to gate the exact head",
-        attempts: maxFinalBaseSyncAttempts,
-        sync,
-      };
-      break;
-    }
+    codexReview.final_base_sync = {
+      status: "accepted_after_final_sync",
+      reason:
+        "origin/main moved after pinned-base validation; the deterministically synchronized tree passed one bounded validation and Codex review before push",
+      attempts: 1,
+      sync,
+      target_base_sha: synchronizedBaseSha,
+    };
   }
   const finalCheckpoint = commitCheckpointIfNeeded({
     targetDir,
@@ -2705,15 +2727,20 @@ function validateAndReviewLoop({
   targetDir,
   mode,
   baseBranch = DEFAULT_BASE_BRANCH,
+  targetBaseSha,
   onReviewFix = null,
   sourceHead = null,
 }: LooseRecord) {
   let lastReview = null;
   let validationCommands: LooseRecord[] = [];
   for (let attempt = 1; attempt <= maxReviewAttempts; attempt += 1) {
+    const validationOptions = {
+      ...currentTargetValidationOptions(),
+      pinnedBaseRef: targetBaseSha,
+    };
     const validationPlan = repairDeltaValidationPlan(
       { fixArtifact, targetDir, sourceHead },
-      currentTargetValidationOptions(),
+      validationOptions,
     );
     try {
       validationCommands = runAllowedValidationCommands(
@@ -2722,7 +2749,7 @@ function validateAndReviewLoop({
         validationPlan.options,
         baseBranch,
       );
-      runDiffCheck({ targetDir, baseBranch });
+      runDiffCheck({ targetDir, baseRef: targetBaseSha });
       if (canSkipInternalCodexReviewForRepairDelta(validationPlan)) {
         return {
           status: "passed_repair_delta_validation",
@@ -2756,6 +2783,7 @@ function validateAndReviewLoop({
           attempt,
           validationPlan,
           validationCommands,
+          targetBaseSha,
         });
         onReviewFix?.(`validation-${attempt}`);
         continue;
@@ -2769,6 +2797,7 @@ function validateAndReviewLoop({
         mode,
         attempt,
         baseBranch,
+        targetBaseSha,
         validationCommands,
         validationPlan,
       });
@@ -2796,11 +2825,12 @@ function validateAndReviewLoop({
         mode,
         review: lastReview,
         attempt: `${attempt}-final`,
+        targetBaseSha,
       });
       onReviewFix?.(`${attempt}-final`);
       const finalValidationPlan = repairDeltaValidationPlan(
         { fixArtifact, targetDir, sourceHead },
-        currentTargetValidationOptions(),
+        validationOptions,
       );
       validationCommands = runAllowedValidationCommands(
         finalValidationPlan.commands,
@@ -2808,7 +2838,7 @@ function validateAndReviewLoop({
         finalValidationPlan.options,
         baseBranch,
       );
-      runDiffCheck({ targetDir, baseBranch });
+      runDiffCheck({ targetDir, baseRef: targetBaseSha });
       return {
         status: "passed_after_final_review_fix",
         summary:
@@ -2827,11 +2857,60 @@ function validateAndReviewLoop({
         },
       };
     }
-    runCodexReviewFix({ fixArtifact, targetDir, mode, review: lastReview, attempt });
+    runCodexReviewFix({
+      fixArtifact,
+      targetDir,
+      mode,
+      review: lastReview,
+      attempt,
+      targetBaseSha,
+    });
     onReviewFix?.(attempt);
   }
   const summary = codexReviewFailureSummary(lastReview);
   throw new Error(`Codex /review did not pass after ${maxReviewAttempts} attempt(s): ${summary}`);
+}
+
+function validateAndReviewSynchronizedTree({
+  fixArtifact,
+  targetDir,
+  mode,
+  baseBranch,
+  targetBaseSha,
+  sourceHead,
+}: LooseRecord) {
+  const validationOptions = {
+    ...currentTargetValidationOptions(),
+    pinnedBaseRef: targetBaseSha,
+  };
+  const validationPlan = repairDeltaValidationPlan(
+    { fixArtifact, targetDir, sourceHead },
+    validationOptions,
+  );
+  const validationCommands = runAllowedValidationCommands(
+    validationPlan.commands,
+    targetDir,
+    validationPlan.options,
+    baseBranch,
+  );
+  runDiffCheck({ targetDir, baseRef: targetBaseSha });
+  const review = runCodexReview({
+    fixArtifact,
+    targetDir,
+    mode,
+    attempt: "final-sync",
+    baseBranch,
+    targetBaseSha,
+    validationCommands,
+    validationPlan,
+  });
+  review.validation_commands_run = validationCommands;
+  if (!isCleanCodexReview(review)) {
+    throw new Error(
+      `Codex /review did not pass after final base synchronization: ${codexReviewFailureSummary(review)}`,
+    );
+  }
+  return review;
 }
 
 function codexReviewFailureSummary(review: LooseRecord | null): string {
@@ -2855,9 +2934,9 @@ function isRetryableCodexReviewError(error: JsonValue) {
   );
 }
 
-function runDiffCheck({ targetDir, baseBranch }: LooseRecord) {
-  ensureMergeBaseAvailable({ targetDir, baseBranch });
-  run("git", ["diff", "--check", `origin/${baseBranch}...HEAD`], { cwd: targetDir });
+function runDiffCheck({ targetDir, baseRef }: LooseRecord) {
+  run("git", ["merge-base", baseRef, "HEAD"], { cwd: targetDir });
+  run("git", ["diff", "--check", `${baseRef}...HEAD`], { cwd: targetDir });
   run("git", ["diff", "--check"], { cwd: targetDir });
 }
 
@@ -2867,6 +2946,7 @@ function runCodexReview({
   mode,
   attempt,
   baseBranch = DEFAULT_BASE_BRANCH,
+  targetBaseSha,
   validationCommands = [],
   validationPlan = null,
 }: LooseRecord) {
@@ -2875,7 +2955,7 @@ function runCodexReview({
   const prompt = [
     "/review",
     "",
-    `Review the current ClawSweeper Repair fix branch diff against origin/${baseBranch} before it can be merged.`,
+    `Review the current ClawSweeper Repair fix branch diff against pinned target base ${targetBaseSha} (${baseBranch}) before it can be merged.`,
     "",
     "Required checks:",
     "- security-sensitive issues are resolved or absent;",
@@ -2993,11 +3073,19 @@ function isCodexReview(value: JsonValue) {
   );
 }
 
-function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: LooseRecord) {
+function runCodexReviewFix({
+  fixArtifact,
+  targetDir,
+  mode,
+  review,
+  attempt,
+  targetBaseSha,
+}: LooseRecord) {
   const prompt = [
     "Address every actionable finding from Codex /review.",
     "",
     "Rules:",
+    `- keep all inspection and validation anchored to pinned target base ${targetBaseSha};`,
     "- keep the patch narrow;",
     "- keep shell output bounded; inspect targeted files and avoid broad repo-wide dumps;",
     "- do not commit, push, open PRs, close PRs, or call gh;",
@@ -3059,6 +3147,7 @@ function runCodexValidationFix({
   attempt,
   validationPlan,
   validationCommands = [],
+  targetBaseSha,
 }: LooseRecord) {
   const validationError = compactText(String(error?.message ?? error), 8000);
   const changedFiles = run("git", ["diff", "--name-only"], { cwd: targetDir })
@@ -3069,6 +3158,7 @@ function runCodexValidationFix({
     "Fix the current repair patch so the changed-surface validation gate passes.",
     "",
     "Rules:",
+    `- keep all inspection and validation anchored to pinned target base ${targetBaseSha};`,
     "- keep the patch narrow;",
     "- fix only issues introduced by the current repair branch or required to make its changed gate pass;",
     "- keep shell output bounded; inspect targeted files and avoid broad repo-wide dumps;",
@@ -3491,18 +3581,45 @@ function findLatestResultPath() {
 }
 
 function writeReport(report: LooseRecord, resultPath: string) {
-  appendIssueImplementationStatusComment(report);
-  appendAutomergeRepairOutcomeComment(report, resultPath);
-  const reportPath =
-    typeof args.report === "string"
-      ? path.resolve(args.report)
-      : path.join(path.dirname(resultPath), "fix-execution-report.json");
+  const reportPath = fixExecutionReportPath(resultPath);
   const debugDir = copyFixDebugArtifacts(path.dirname(reportPath));
   if (debugDir) {
     report.debug_artifacts = path.relative(repoRoot(), debugDir);
   }
-  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  finalizeExecutionReport({
+    deferPublication,
+    reportPath,
+    serialize: () => `${JSON.stringify(report, null, 2)}\n`,
+    publish: () => publishReportOutcome(report, resultPath),
+  });
   console.log("Wrote fix execution report.");
+}
+
+function publishPersistedReport(resultPath: string) {
+  const reportPath = fixExecutionReportPath(resultPath);
+  if (!fs.existsSync(reportPath)) {
+    console.warn(`No deferred fix execution report exists at ${reportPath}; skipping publication.`);
+    return;
+  }
+  const persistedReport = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  finalizeExecutionReport({
+    deferPublication: false,
+    reportPath,
+    serialize: () => `${JSON.stringify(persistedReport, null, 2)}\n`,
+    publish: () => publishReportOutcome(persistedReport, resultPath),
+  });
+  console.log("Published deferred fix execution outcome.");
+}
+
+function publishReportOutcome(report: LooseRecord, resultPath: string) {
+  appendIssueImplementationStatusComment(report);
+  appendAutomergeRepairOutcomeComment(report, resultPath);
+}
+
+function fixExecutionReportPath(resultPath: string) {
+  return typeof args.report === "string"
+    ? path.resolve(args.report)
+    : path.join(path.dirname(resultPath), "fix-execution-report.json");
 }
 
 function appendIssueImplementationStatusComment(report: LooseRecord) {
