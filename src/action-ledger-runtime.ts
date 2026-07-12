@@ -433,12 +433,13 @@ export async function flushWorkflowActionEvents(
 
 function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
   return (
-    (event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+    workflowActionEventIsUncertainMutationStart(event) ||
+    ((event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
       event.event_type === ACTION_EVENT_TYPES.reviewItem ||
       event.event_type === ACTION_EVENT_TYPES.reviewRetry ||
       event.event_type === ACTION_EVENT_TYPES.applyBatch ||
       event.event_type === ACTION_EVENT_TYPES.applyAction) &&
-    event.action.status === ACTION_EVENT_STATUSES.started
+      event.action.status === ACTION_EVENT_STATUSES.started)
   );
 }
 

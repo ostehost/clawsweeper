@@ -121,7 +121,8 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   const preparedPushIndex = preparedReplacement.indexOf(
     "pushRecoverableBranch({ targetDir, branch });",
   );
-  const preparedCreateIndex = preparedReplacement.indexOf('"pr",\n        "create"');
+  const preparedCreateMatch = /"pr",\s+"create"/.exec(preparedReplacement);
+  const preparedCreateIndex = preparedCreateMatch?.index ?? -1;
   assert.notEqual(preparedSkipIndex, -1);
   assert.notEqual(preparedPushIndex, -1);
   assert.notEqual(preparedCreateIndex, -1);

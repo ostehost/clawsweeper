@@ -13,6 +13,7 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
+import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
 
 type EventSeverity = "info" | "warning" | "error";
 type EventStatus = "sent" | "planned" | "failed" | "skipped";
@@ -340,6 +341,9 @@ export async function runClawSweeperEventNotifier(
   const collected = collectClawSweeperEvents({ applyRows, runRecord, ledger, runId });
   const config = resolveOpenClawHookConfig(env);
   if (!config) {
+    for (const event of collected.events) {
+      recordNotificationPhase(eventNotificationLedgerInput(event), "skipped", "not_configured");
+    }
     const summary = summaryRow(
       "skipped",
       collected.considered,
@@ -357,20 +361,23 @@ export async function runClawSweeperEventNotifier(
   let nextLedger = ledger;
   for (const event of collected.events) {
     if (dryRun) {
+      recordNotificationPhase(eventNotificationLedgerInput(event), "planned", "dry_run");
       reportActions.push(reportRow(event, "planned", "dry run"));
       continue;
     }
     try {
-      const result = await postOpenClawAgentHook({
-        config,
-        fetcher,
-        post: {
-          name: eventName(event),
-          message: renderClawSweeperEventMessage(event),
-          idempotencyKey: event.idempotencyKey,
-          deliver: true,
-        },
-      });
+      const result = await deliverNotification(eventNotificationLedgerInput(event), () =>
+        postOpenClawAgentHook({
+          config,
+          fetcher,
+          post: {
+            name: eventName(event),
+            message: renderClawSweeperEventMessage(event),
+            idempotencyKey: event.idempotencyKey,
+            deliver: true,
+          },
+        }),
+      );
       let dashboardStatus = "status dashboard not configured";
       let dashboardDelivered = true;
       if (dashboardConfig) {
@@ -434,6 +441,15 @@ export async function runClawSweeperEventNotifier(
   };
   log(JSON.stringify(summary, null, 2));
   return summary;
+}
+
+function eventNotificationLedgerInput(event: ClawSweeperEvent) {
+  const number = Number(String(event.target ?? "").replace(/^#/, ""));
+  return {
+    repository: event.repo,
+    key: event.key,
+    ...(Number.isInteger(number) && number > 0 ? { number } : {}),
+  };
 }
 
 function resolveDashboardIngestConfig(env: NodeJS.ProcessEnv): DashboardIngestConfig | null {

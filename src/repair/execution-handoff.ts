@@ -28,6 +28,11 @@ import {
   writeJson,
 } from "./prepared-publication.js";
 import { replacementLabelsToCopy } from "./replacement-labels.js";
+import {
+  recordRepairWorkflowEvent,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 import { hasDeterministicSecuritySignal } from "./security-signals.js";
 import {
   isPassedStagedProofBundle,
@@ -798,6 +803,8 @@ export function publishValidatedExecution({
   const mutations: LooseRecord[] = priorCheckpoint
     ? sourceClosureCheckpointMutations(publication, priorCheckpoint, intent)
     : [];
+  const lifecycle = publicationRepairLifecycle(intent, publication);
+  recordPublicationWorkflowEventSafely(lifecycle, "started");
   try {
     run("gh", ["auth", "setup-git"], { cwd: checkout });
     const targetPrNumber =
@@ -825,8 +832,13 @@ export function publishValidatedExecution({
       mutations,
     });
     writeJson(outputPath, receipt);
+    recordPublicationWorkflowEventSafely(lifecycle, "completed");
     return receipt;
+  } catch (error) {
+    recordPublicationWorkflowEventSafely(lifecycle, "failed", error);
+    throw error;
   } finally {
+    recordPublicationWorkflowEventSafely(lifecycle, "finalized");
     fs.rmSync(path.dirname(checkout), { recursive: true, force: true });
   }
 }
@@ -2194,7 +2206,19 @@ function publishPreparedRef({
       publication,
       checkpointedClosures,
       targetNumbers: [targetPrNumber],
-      mutation: () => run("git", pushArgs, { cwd: checkout }),
+      mutation: () =>
+        runPublicationSideEffect({
+          intent,
+          publication,
+          kind: "branch_push",
+          identity: {
+            repo: intent.target_repo,
+            ref: targetRef,
+            expectedSha,
+            preparedSha: publication.prepared_head_sha,
+          },
+          operation: () => run("git", pushArgs, { cwd: checkout }),
+        }),
     });
   }
   if (remoteRefSha(checkout, targetRef) !== publication.prepared_head_sha) {
@@ -2387,8 +2411,21 @@ function publishExactPullComment({
     checkpointedClosures,
     targetNumbers: [...targetNumbers, number],
     mutation: () =>
-      run("gh", ["pr", "comment", String(number), "--repo", intent.target_repo, "--body", body], {
-        cwd: checkout,
+      runPublicationSideEffect({
+        intent,
+        publication,
+        kind: "pull_request_comment",
+        identity: {
+          repo: intent.target_repo,
+          number,
+          bodySha256: digestJson(body),
+        },
+        operation: () =>
+          run(
+            "gh",
+            ["pr", "comment", String(number), "--repo", intent.target_repo, "--body", body],
+            { cwd: checkout },
+          ),
       }),
   });
 }
@@ -2424,19 +2461,30 @@ function publishRequiredPullLabels({
         intent,
         verifyLabels: false,
         mutation: () =>
-          run(
-            "gh",
-            [
-              "issue",
-              "edit",
-              String(targetPrNumber),
-              "--repo",
-              intent.target_repo,
-              "--add-label",
-              missing.join(","),
-            ],
-            { cwd: checkout },
-          ),
+          runPublicationSideEffect({
+            intent,
+            publication,
+            kind: "pull_request_labels",
+            identity: {
+              repo: intent.target_repo,
+              number: targetPrNumber,
+              labels: [...missing].sort(),
+            },
+            operation: () =>
+              run(
+                "gh",
+                [
+                  "issue",
+                  "edit",
+                  String(targetPrNumber),
+                  "--repo",
+                  intent.target_repo,
+                  "--add-label",
+                  missing.join(","),
+                ],
+                { cwd: checkout },
+              ),
+          }),
       }),
   });
 }
@@ -2575,8 +2623,15 @@ function publishReplacementRepair({
             readStateEvents: () => readSourcePullStateEvents(intent.target_repo, liveTargetPr),
             expectedCloseActor: expectedMutationActor,
             mutation: () =>
-              run("gh", ["pr", "reopen", String(liveTargetPr), "--repo", intent.target_repo], {
-                cwd: checkout,
+              runPublicationSideEffect({
+                intent,
+                publication,
+                kind: "pull_request_reopen",
+                identity: { repo: intent.target_repo, number: liveTargetPr },
+                operation: () =>
+                  run("gh", ["pr", "reopen", String(liveTargetPr), "--repo", intent.target_repo], {
+                    cwd: checkout,
+                  }),
               }),
           }),
       });
@@ -2607,13 +2662,18 @@ function publishReplacementRepair({
               readSourcePullStateEvents(intent.target_repo, expectedTargetPrNumber),
             expectedCloseActor: expectedMutationActor,
             mutation: () =>
-              run(
-                "gh",
-                ["pr", "reopen", String(expectedTargetPrNumber), "--repo", intent.target_repo],
-                {
-                  cwd: checkout,
-                },
-              ),
+              runPublicationSideEffect({
+                intent,
+                publication,
+                kind: "pull_request_reopen",
+                identity: { repo: intent.target_repo, number: expectedTargetPrNumber },
+                operation: () =>
+                  run(
+                    "gh",
+                    ["pr", "reopen", String(expectedTargetPrNumber), "--repo", intent.target_repo],
+                    { cwd: checkout },
+                  ),
+              }),
           }),
       });
       mutations.push({
@@ -2632,24 +2692,37 @@ function publishReplacementRepair({
       checkpointedClosures,
       targetNumbers: [],
       mutation: () =>
-        run(
-          "gh",
-          [
-            "pr",
-            "create",
-            "--repo",
-            intent.target_repo,
-            "--base",
-            intent.target_base_ref,
-            "--head",
-            intent.output_branch,
-            "--title",
-            publication.pr_title ?? "",
-            "--body-file",
-            bodyPath,
-          ],
-          { cwd: checkout },
-        ),
+        runPublicationSideEffect({
+          intent,
+          publication,
+          kind: "pull_request_create",
+          identity: {
+            repo: intent.target_repo,
+            base: intent.target_base_ref,
+            head: intent.output_branch,
+            title: publication.pr_title ?? "",
+            bodySha256: publication.pr_body ? digestJson(publication.pr_body) : null,
+          },
+          operation: () =>
+            run(
+              "gh",
+              [
+                "pr",
+                "create",
+                "--repo",
+                intent.target_repo,
+                "--base",
+                intent.target_base_ref,
+                "--head",
+                intent.output_branch,
+                "--title",
+                publication.pr_title ?? "",
+                "--body-file",
+                bodyPath,
+              ],
+              { cwd: checkout },
+            ),
+        }),
     }).trim();
     const parsed = parsePullRequestUrl(created);
     if (!parsed || parsed.repo !== intent.target_repo) {
@@ -2920,8 +2993,15 @@ function ensurePublishedReplacementAvailable({
           readStateEvents: () => readSourcePullStateEvents(intent.target_repo, targetPrNumber),
           expectedCloseActor,
           mutation: () =>
-            run("gh", ["pr", "reopen", String(targetPrNumber), "--repo", intent.target_repo], {
-              cwd,
+            runPublicationSideEffect({
+              intent,
+              publication,
+              kind: "pull_request_reopen",
+              identity: { repo: intent.target_repo, number: targetPrNumber },
+              operation: () =>
+                run("gh", ["pr", "reopen", String(targetPrNumber), "--repo", intent.target_repo], {
+                  cwd,
+                }),
             }),
         }),
     });
@@ -3116,8 +3196,20 @@ function closeSupersededReplacementSources({
           throw new Error("source reopen compensation lost trusted close identity");
         }
         try {
-          run("gh", ["pr", "reopen", String(revision.number), "--repo", intent.target_repo], {
-            cwd,
+          runPublicationSideEffect({
+            intent,
+            publication,
+            kind: "source_pull_request_reopen_compensation",
+            identity: {
+              repo: intent.target_repo,
+              number: revision.number,
+              source: revision.url,
+              expectedHeadSha: revision.expected_head_sha,
+            },
+            operation: () =>
+              run("gh", ["pr", "reopen", String(revision.number), "--repo", intent.target_repo], {
+                cwd,
+              }),
           });
         } catch (error) {
           throw new SourceCloseCompensationFailure(
@@ -3364,8 +3456,22 @@ function closeSupersededReplacementSources({
               targetPrNumber,
             }),
           closeSource: () => {
-            run("gh", ["pr", "close", String(action.source.number), "--repo", intent.target_repo], {
-              cwd,
+            runPublicationSideEffect({
+              intent,
+              publication,
+              kind: "source_pull_request_close",
+              identity: {
+                repo: intent.target_repo,
+                number: action.source.number,
+                source: action.revision.url,
+                expectedHeadSha: action.revision.expected_head_sha,
+              },
+              operation: () =>
+                run(
+                  "gh",
+                  ["pr", "close", String(action.source.number), "--repo", intent.target_repo],
+                  { cwd },
+                ),
             });
           },
           readRecovery: () => {
@@ -3420,11 +3526,23 @@ function closeSupersededReplacementSources({
                 if (recovery.status !== "closed") {
                   throw new Error("source close compensation lost trusted close identity");
                 }
-                run(
-                  "gh",
-                  ["pr", "reopen", String(action.source.number), "--repo", intent.target_repo],
-                  { cwd },
-                );
+                runPublicationSideEffect({
+                  intent,
+                  publication,
+                  kind: "source_pull_request_reopen_compensation",
+                  identity: {
+                    repo: intent.target_repo,
+                    number: action.source.number,
+                    source: action.revision.url,
+                    expectedHeadSha: action.revision.expected_head_sha,
+                  },
+                  operation: () =>
+                    run(
+                      "gh",
+                      ["pr", "reopen", String(action.source.number), "--repo", intent.target_repo],
+                      { cwd },
+                    ),
+                });
               },
             }),
           readCompensatedRecovery: () => {
@@ -3800,6 +3918,64 @@ function repairActionIdentity(result: LooseRecord): string {
     mutating_actions: mutatingActions,
     canonical_pr: result.canonical_pr ?? null,
     reviewed_sha: result.reviewed_sha ?? null,
+  });
+}
+
+function publicationRepairLifecycle(
+  intent: ExecutionIntent,
+  publication: PreparedPublication,
+): RepairLifecycleInput {
+  return {
+    repository: intent.target_repo,
+    workKey: `publication:${publication.identity_sha256}`,
+    ...(intent.source.number ? { number: intent.source.number } : {}),
+    sourceRevision: publication.prepared_head_sha,
+    subjectKind: intent.source.kind === "issue" ? "issue" : "pull_request",
+  };
+}
+
+function recordPublicationWorkflowEventSafely(
+  lifecycle: RepairLifecycleInput,
+  phase: "started" | "completed" | "failed" | "finalized",
+  error?: unknown,
+) {
+  try {
+    recordRepairWorkflowEvent(lifecycle, {
+      component: "execution_handoff",
+      phase,
+      ...(error === undefined ? {} : { error }),
+    });
+  } catch (receiptError) {
+    console.error(
+      `[action-ledger] failed to record execution handoff workflow ${phase}: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
+}
+
+function runPublicationSideEffect<T>({
+  intent,
+  publication,
+  kind,
+  identity,
+  operation,
+}: {
+  intent: ExecutionIntent;
+  publication: PreparedPublication;
+  kind: string;
+  identity: unknown;
+  operation: () => T;
+}): T {
+  return runRepairMutation(publicationRepairLifecycle(intent, publication), {
+    kind,
+    identity: {
+      actionIdentitySha256: intent.action_identity_sha256,
+      preparedPublicationSha256: publication.identity_sha256,
+      request: identity,
+    },
+    component: "execution_handoff",
+    operation,
   });
 }
 

@@ -32,7 +32,7 @@ test("repair sessions, statuses, and result publication flush immutable receipts
       update.indexOf("if (metadata.remoteEnabled === true)"),
   );
 
-  const statusMutation = status.indexOf("mutateComment();");
+  const statusMutation = status.indexOf("mutateCommentWithReceipt();");
   const statusReceipt = status.indexOf("type: ACTION_EVENT_TYPES.statusLifecycle", statusMutation);
   assert.ok(statusMutation >= 0);
   assert.ok(statusReceipt > statusMutation);
@@ -64,6 +64,10 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   const mutate = workflow.slice(
     workflow.indexOf("\n  mutate:"),
     workflow.indexOf("\n  publish-repair-action-ledger:"),
+  );
+  const execute = workflow.slice(
+    workflow.indexOf("\n  execute:"),
+    workflow.indexOf("\n  validate:"),
   );
   const publisher = workflow.slice(workflow.indexOf("\n  publish-repair-action-ledger:"));
   const clusterRegistration = cluster.slice(
@@ -109,8 +113,14 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   );
   assert.match(mutate, /CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS:/);
   assert.doesNotMatch(mutate, /create-state-token|setup-state/);
+  assert.match(execute, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(execute, /CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS:/);
+  assert.match(execute, /Resolve planning action ledger context/);
+  assert.match(execute, /Finalize execution repair action ledger/);
+  assert.match(execute, /clawsweeper-repair-action-ledger-execute-/);
 
   assert.match(publisher, /name: Publish immutable repair action ledger/);
+  assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
   assert.match(publisher, /create-state-token/);
   assert.match(publisher, /name: Resolve repair action ledger shards/);
   assert.match(publisher, /has_artifacts=0/);
@@ -123,11 +133,85 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     /continue-on-error: true[\s\S]*Download repair action ledger shards/,
   );
   assert.match(publisher, /repair:action-ledger -- publish/);
+  assert.match(publisher, /clawsweeper-repair-action-ledger-execute-/);
   assert.match(
     publisher,
     /Repair action ledger artifacts were selected but no paths were imported\." >&2\s+exit 1/,
   );
   assert.match(publisher, /--message "chore: append repair action ledger"/);
+});
+
+test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
+  const ledger = readText("src/repair/repair-action-ledger.ts");
+  const handoff = readText("src/repair/execution-handoff.ts");
+  const executor = readText("src/repair/execute-fix-artifact.ts");
+  const github = readText("src/repair/execute-fix-github.ts");
+  const postFlight = readText("src/repair/post-flight.ts");
+
+  assert.match(ledger, /ACTION_EVENT_TYPES\.repairMutation/);
+  assert.match(ledger, /requestAttempt/);
+  assert.match(ledger, /mutation_outcome_unknown/);
+  assert.match(ledger, /repairMutationState/);
+  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "started"\)/);
+  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "failed", error\)/);
+  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "finalized"\)/);
+  for (const boundary of [
+    "branch_push",
+    "pull_request_create",
+    "pull_request_reopen",
+    "pull_request_comment",
+    "pull_request_labels",
+    "source_pull_request_close",
+    "source_pull_request_reopen_compensation",
+  ]) {
+    assert.match(handoff, new RegExp(`kind: "${boundary}"`));
+  }
+  assert.match(executor, /recordRepairCodexLifecycle\("started", "repair_review"/);
+  assert.match(executor, /publishRepairCodexArtifacts\("repair_review"/);
+  assert.match(executor, /recordRepairCodexLifecycle\("started", "repair_review_fix"/);
+  assert.match(executor, /repair_execution_report/);
+  for (const boundary of [
+    "branch_push",
+    "pull_request_create",
+    "pull_request_reopen",
+    "pull_request_comment",
+    "pull_request_label_add",
+    "pull_request_label_remove",
+    "source_pull_request_comment",
+    "source_pull_request_close",
+    "issue_comment_create",
+    "issue_comment_update",
+    "automerge_router_dispatch",
+    "automerge_review_dispatch",
+  ]) {
+    assert.match(executor, new RegExp(`"${boundary}"`));
+  }
+  assert.match(github, /"review_thread_resolve"/);
+  assert.match(executor, /mutationBoundary: runDirectRepairMutation/);
+  assert.match(postFlight, /post_flight_merge/);
+  assert.match(postFlight, /closeout_comment/);
+  assert.match(postFlight, /source_pull_request_closeout/);
+  assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("started"\)/);
+  assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("failed", error\)/);
+  assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("finalized"\)/);
+});
+
+test("commit review and notification workflows publish their operation receipts", () => {
+  const commit = readText(".github/workflows/commit-review.yml");
+  const activity = readText(".github/workflows/github-activity.yml");
+  const maintainer = readText(".github/workflows/maintainer-report-discord.yml");
+
+  assert.match(commit, /setup-action-ledger/);
+  assert.match(commit, /Finalize commit review action ledger/);
+  assert.match(commit, /action-ledger-commit-review-/);
+  assert.match(commit, /codex-logs-commit-review-/);
+  assert.match(commit, /Publish immutable commit review action ledger/);
+  assert.match(commit, /append commit review action ledger/);
+  for (const workflow of [activity, maintainer]) {
+    assert.match(workflow, /setup-action-ledger/);
+    assert.match(workflow, /repair:action-ledger -- finalize/);
+    assert.match(workflow, /repair:action-ledger -- publish/);
+  }
 });
 
 test("issue implementation intake finalizes and publishes source-bound status receipts", () => {
@@ -171,7 +255,7 @@ test("result and finalizer workflows publish their repair operation receipts", (
 test("the shared action ledger finalizer is operation-family agnostic", () => {
   const source = readText("src/repair/action-ledger-cli.ts");
 
-  assert.match(source, /flushWorkflowActionEvents\(repairActionLedgerRoot\(\)\)/);
-  assert.doesNotMatch(source, /flushWorkflowActionEvents\(repoRoot\(\)\)/);
+  assert.match(source, /flushRepairActionEvents\(\)/);
+  assert.doesNotMatch(source, /flushWorkflowActionEvents/);
   assert.doesNotMatch(source, /flushCommandActionEvents/);
 });

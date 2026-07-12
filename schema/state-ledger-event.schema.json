@@ -492,6 +492,7 @@
         "repair.queue",
         "repair.blocked",
         "repair.failed",
+        "repair.mutation",
         "apply.action",
         "apply.batch",
         "apply.publish",

@@ -10,6 +10,11 @@ import {
   type ChildProcess,
   type SpawnSyncOptionsWithStringEncoding,
 } from "node:child_process";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "../action-ledger.js";
 import { assertAllowedOwner, parseArgs, parseJob, repoRoot, validateJob } from "./lib.js";
 import {
   automergeRepairOutcomeComment,
@@ -75,6 +80,13 @@ import {
   COMMIT_FINDING_LABEL_COLOR,
   COMMIT_FINDING_LABEL_DESCRIPTION,
 } from "./constants.js";
+import {
+  recordRepairArtifactPublication,
+  recordRepairLifecycleEvent,
+  recordRepairWorkflowEvent,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const AUTOMERGE_LABEL = "clawsweeper:automerge";
 const AUTOFIX_LABEL = "clawsweeper:autofix";
@@ -307,6 +319,13 @@ if (result.cluster_id !== job.frontmatter.cluster_id) {
 if (result.mode !== job.frontmatter.mode) {
   throw new Error(`result mode ${result.mode} does not match job mode ${job.frontmatter.mode}`);
 }
+recordRepairWorkflowEventSafely("started");
+process.on("uncaughtExceptionMonitor", (error) => {
+  recordRepairWorkflowEventSafely("failed", error);
+});
+process.on("exit", () => {
+  recordRepairWorkflowEventSafely("finalized");
+});
 const executionIntent = preparePublication
   ? verifyExecutionIntentIdentity(
       JSON.parse(
@@ -371,6 +390,47 @@ function runGitNetwork(args: string[], cwd: string = targetDir) {
     cwd,
     timeoutMs: currentNetworkCommandTimeoutMs(),
   });
+}
+
+function directRepairLifecycle(number: number | null): RepairLifecycleInput {
+  return {
+    repository: String(result.repo),
+    workKey: `execute-fix:${result.repo}:${result.cluster_id ?? result.reviewed_sha ?? "unknown"}`,
+    clusterId: String(result.cluster_id ?? "") || null,
+    ...(number && number > 0 ? { number } : {}),
+    sourceRevision: String(
+      result.reviewed_sha ?? result.head_sha ?? job.frontmatter.expected_head_sha ?? "",
+    ),
+    subjectKind: number && number > 0 ? "pull_request" : "workflow",
+  };
+}
+
+function runDirectRepairMutation<T>(kind: string, identity: unknown, operation: () => T): T {
+  return runRepairMutation(directRepairLifecycle(null), {
+    kind,
+    identity,
+    component: "execute_fix",
+    operation,
+  });
+}
+
+function recordRepairWorkflowEventSafely(
+  phase: "started" | "completed" | "failed" | "finalized",
+  error?: unknown,
+) {
+  try {
+    recordRepairWorkflowEvent(directRepairLifecycle(null), {
+      component: "execute_fix",
+      phase,
+      ...(error === undefined ? {} : { error }),
+    });
+  } catch (receiptError) {
+    console.error(
+      `[action-ledger] failed to record execute-fix workflow ${phase}: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
 }
 
 function currentCodexTimeoutMs(preserveLateWorkerBudget = false) {
@@ -1108,7 +1168,20 @@ function pushRepairBranchAndUpdateStatus({
   if (liveHeadBlock) return liveHeadBlock;
   const pushArgs = repairBranchPushArgs({ pull, rewritten: branchUpdate.rewritten });
   try {
-    runGitNetwork(pushArgs, targetDir);
+    runDirectRepairMutation(
+      "branch_push",
+      {
+        repo: result.repo,
+        number: sourcePr.number,
+        sourcePrUrl: sourcePr.url,
+        headRepo: pull.head.repo.full_name,
+        headRef: pull.head.ref,
+        expectedHeadSha: livePull.head?.sha ?? null,
+        preparedHeadSha: prep.commit,
+        rewritten: branchUpdate.rewritten,
+      },
+      () => runGitNetwork(pushArgs, targetDir),
+    );
   } catch (error) {
     const blockedReason = repairBranchPushBlockedReason(error);
     if (blockedReason && !sameRepoBranch) {
@@ -1142,6 +1215,7 @@ function pushRepairBranchAndUpdateStatus({
     number: sourcePr.number,
     targetDir,
     resolveThreads: resolveReviewThreads,
+    mutationBoundary: runDirectRepairMutation,
   });
   const statusCommentUpdated = updateAutomergeStatusCommentForBranchRepair({
     target: sourcePr.number,
@@ -1159,14 +1233,19 @@ function pushRepairBranchAndUpdateStatus({
         reviewedSha: prep.commit,
       }),
     });
-    run(
-      "gh",
-      ["pr", "comment", String(sourcePr.number), "--repo", result.repo, "--body", comment],
-      {
-        cwd: targetDir,
-        env: ghEnv(),
-        timeoutMs: currentNetworkCommandTimeoutMs(),
-      },
+    runDirectRepairMutation(
+      "pull_request_comment",
+      { repo: result.repo, number: sourcePr.number, comment },
+      () =>
+        run(
+          "gh",
+          ["pr", "comment", String(sourcePr.number), "--repo", result.repo, "--body", comment],
+          {
+            cwd: targetDir,
+            env: ghEnv(),
+            timeoutMs: currentNetworkCommandTimeoutMs(),
+          },
+        ),
     );
   }
   const shepherd = waitForAutomergeAfterBranchRepair({
@@ -1405,23 +1484,28 @@ function openReplacementPrFromPreparedRepairCheckout({
   fs.writeFileSync(bodyPath, body);
   const prUrl =
     findOpenPullRequestForBranch(branch, targetDir) ||
-    run(
-      "gh",
-      [
-        "pr",
-        "create",
-        "--repo",
-        result.repo,
-        "--base",
-        baseBranch,
-        "--head",
-        branch,
-        "--title",
-        fixArtifact.pr_title,
-        "--body-file",
-        bodyPath,
-      ],
-      { cwd: targetDir, env: ghEnv(), timeoutMs: currentNetworkCommandTimeoutMs() },
+    runDirectRepairMutation(
+      "pull_request_create",
+      { repo: result.repo, baseBranch, branch, title: fixArtifact.pr_title, body },
+      () =>
+        run(
+          "gh",
+          [
+            "pr",
+            "create",
+            "--repo",
+            result.repo,
+            "--base",
+            baseBranch,
+            "--head",
+            branch,
+            "--title",
+            fixArtifact.pr_title,
+            "--body-file",
+            bodyPath,
+          ],
+          { cwd: targetDir, env: ghEnv(), timeoutMs: currentNetworkCommandTimeoutMs() },
+        ),
     ).trim();
   const prNumber = pullRequestNumberFromUrl(prUrl);
   if (prNumber) ensurePullRequestOpen({ number: prNumber, targetDir });
@@ -1433,6 +1517,7 @@ function openReplacementPrFromPreparedRepairCheckout({
         number: prNumber,
         targetDir,
         resolveThreads: resolveReviewThreads,
+        mutationBoundary: runDirectRepairMutation,
       })
     : { status: "blocked", reason: "replacement PR URL did not include a PR number" };
 
@@ -1827,23 +1912,28 @@ function executeReplacementBranch({
   fs.writeFileSync(bodyPath, body);
   const prUrl =
     findOpenPullRequestForBranch(branch, targetDir) ||
-    run(
-      "gh",
-      [
-        "pr",
-        "create",
-        "--repo",
-        result.repo,
-        "--base",
-        baseBranch,
-        "--head",
-        branch,
-        "--title",
-        fixArtifact.pr_title,
-        "--body-file",
-        bodyPath,
-      ],
-      { cwd: targetDir, env: ghEnv(), timeoutMs: currentNetworkCommandTimeoutMs() },
+    runDirectRepairMutation(
+      "pull_request_create",
+      { repo: result.repo, baseBranch, branch, title: fixArtifact.pr_title, body },
+      () =>
+        run(
+          "gh",
+          [
+            "pr",
+            "create",
+            "--repo",
+            result.repo,
+            "--base",
+            baseBranch,
+            "--head",
+            branch,
+            "--title",
+            fixArtifact.pr_title,
+            "--body-file",
+            bodyPath,
+          ],
+          { cwd: targetDir, env: ghEnv(), timeoutMs: currentNetworkCommandTimeoutMs() },
+        ),
     ).trim();
   const prNumber = pullRequestNumberFromUrl(prUrl);
   if (prNumber) ensurePullRequestOpen({ number: prNumber, targetDir });
@@ -1855,6 +1945,7 @@ function executeReplacementBranch({
         number: prNumber,
         targetDir,
         resolveThreads: resolveReviewThreads,
+        mutationBoundary: runDirectRepairMutation,
       })
     : { status: "blocked", reason: "replacement PR URL did not include a PR number" };
 
@@ -2047,26 +2138,35 @@ function ensureLabel(
   targetDir: string,
 ) {
   try {
-    run(
-      "gh",
-      ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
-      {
-        cwd: targetDir,
-        env: ghEnv(),
-        timeoutMs: currentNetworkCommandTimeoutMs(),
-      },
-    );
+    runRepairMutation(directRepairLifecycle(null), {
+      kind: "repository_label_create",
+      identity: { repo, name, color, description },
+      component: "execute_fix",
+      knownNoMutation: (error) => /already exists/i.test(String(error)),
+      operation: () =>
+        run(
+          "gh",
+          ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
+          {
+            cwd: targetDir,
+            env: ghEnv(),
+            timeoutMs: currentNetworkCommandTimeoutMs(),
+          },
+        ),
+    });
   } catch (error) {
     if (!/already exists/i.test(String(error?.message ?? error))) throw error;
   }
 }
 
 function addLabel(repo: string, number: JsonValue, name: string, targetDir: string) {
-  run("gh", ["issue", "edit", String(number), "--repo", repo, "--add-label", name], {
-    cwd: targetDir,
-    env: ghEnv(),
-    timeoutMs: currentNetworkCommandTimeoutMs(),
-  });
+  runDirectRepairMutation("pull_request_label_add", { repo, number, name }, () =>
+    run("gh", ["issue", "edit", String(number), "--repo", repo, "--add-label", name], {
+      cwd: targetDir,
+      env: ghEnv(),
+      timeoutMs: currentNetworkCommandTimeoutMs(),
+    }),
+  );
 }
 
 function removeLabelIfPresent(repo: string, number: JsonValue, name: string, targetDir: string) {
@@ -2075,11 +2175,13 @@ function removeLabelIfPresent(repo: string, number: JsonValue, name: string, tar
     (label: JsonValue) => String(label?.name ?? label).toLowerCase() === name.toLowerCase(),
   );
   if (!present) return;
-  run("gh", ["issue", "edit", String(number), "--repo", repo, "--remove-label", name], {
-    cwd: targetDir,
-    env: ghEnv(),
-    timeoutMs: currentNetworkCommandTimeoutMs(),
-  });
+  runDirectRepairMutation("pull_request_label_remove", { repo, number, name }, () =>
+    run("gh", ["issue", "edit", String(number), "--repo", repo, "--remove-label", name], {
+      cwd: targetDir,
+      env: ghEnv(),
+      timeoutMs: currentNetworkCommandTimeoutMs(),
+    }),
+  );
 }
 
 function linkReplacementSourcePr({
@@ -2110,11 +2212,20 @@ function linkReplacementSourcePr({
     provenance,
     contributorCredits,
   });
-  run("gh", ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment], {
-    cwd: targetDir,
-    env: ghEnv(),
-    timeoutMs: currentNetworkCommandTimeoutMs(),
-  });
+  runDirectRepairMutation(
+    "source_pull_request_comment",
+    { repo: result.repo, number: parsed.number, comment },
+    () =>
+      run(
+        "gh",
+        ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment],
+        {
+          cwd: targetDir,
+          env: ghEnv(),
+          timeoutMs: currentNetworkCommandTimeoutMs(),
+        },
+      ),
+  );
   return { ...base, status: "executed", reason: "linked replacement PR without closing source PR" };
 }
 
@@ -2146,18 +2257,32 @@ function closeSupersededSourcePr({
     provenance,
     contributorCredits,
   });
-  run("gh", ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment], {
-    cwd: targetDir,
-    env: ghEnv(),
-    timeoutMs: currentNetworkCommandTimeoutMs(),
-  });
+  runDirectRepairMutation(
+    "source_pull_request_comment",
+    { repo: result.repo, number: parsed.number, comment },
+    () =>
+      run(
+        "gh",
+        ["pr", "comment", String(parsed.number), "--repo", result.repo, "--body", comment],
+        {
+          cwd: targetDir,
+          env: ghEnv(),
+          timeoutMs: currentNetworkCommandTimeoutMs(),
+        },
+      ),
+  );
 
   try {
-    run("gh", ["pr", "close", String(parsed.number), "--repo", result.repo], {
-      cwd: targetDir,
-      env: ghEnv(),
-      timeoutMs: currentNetworkCommandTimeoutMs(),
-    });
+    runDirectRepairMutation(
+      "source_pull_request_close",
+      { repo: result.repo, number: parsed.number, replacementPrUrl },
+      () =>
+        run("gh", ["pr", "close", String(parsed.number), "--repo", result.repo], {
+          cwd: targetDir,
+          env: ghEnv(),
+          timeoutMs: currentNetworkCommandTimeoutMs(),
+        }),
+    );
     return {
       ...base,
       status: "executed",
@@ -2180,11 +2305,13 @@ function ensurePullRequestOpen({ number, targetDir }: LooseRecord) {
     throw new Error(`replacement PR #${number} is already merged`);
   }
   if (view.state === "CLOSED") {
-    run("gh", ["pr", "reopen", String(number), "--repo", result.repo], {
-      cwd: targetDir,
-      env: ghEnv(),
-      timeoutMs: currentNetworkCommandTimeoutMs(),
-    });
+    runDirectRepairMutation("pull_request_reopen", { repo: result.repo, number }, () =>
+      run("gh", ["pr", "reopen", String(number), "--repo", result.repo], {
+        cwd: targetDir,
+        env: ghEnv(),
+        timeoutMs: currentNetworkCommandTimeoutMs(),
+      }),
+    );
   }
 }
 
@@ -3345,55 +3472,73 @@ function runCodexReview({
     "```",
   ].join("\n");
   const reviewTimeoutMs = currentCodexTimeoutMs();
-  const child = spawnCodexSyncWithHeartbeat(
-    `Codex /review ${mode} attempt ${attempt}`,
-    [
-      "exec",
-      "--cd",
-      targetDir,
-      ...executionModelArgs,
-      "--sandbox",
-      codexReviewSandbox,
-      ...codexReviewSandboxConfigArgs(),
-      ...codexConfigArgs(),
-      "--output-schema",
-      schemaPath,
-      "--output-last-message",
-      outputPath,
-      "--json",
-      "-",
-    ],
-    {
-      cwd: targetDir,
-      input: prompt,
-      encoding: "utf8",
-      env: codexEnv(),
-      timeout: reviewTimeoutMs,
-      stdoutPath: path.join(workRoot, `${mode}-codex-review-${attempt}.jsonl`),
-      stderrPath: path.join(workRoot, `${mode}-codex-review-${attempt}.stderr.log`),
-    },
-  );
-  if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex /review timed out after ${reviewTimeoutMs}ms`);
-  if (child.error) throw new Error(child.error.message || String(child.error));
-  if (child.status !== 0) throw new Error(child.stderr || child.stdout || "Codex /review failed");
-  if (!fs.existsSync(outputPath)) {
-    const fallbackReview = extractCodexReviewFromJsonl(child.stdout);
-    if (fallbackReview) {
-      fs.writeFileSync(outputPath, `${JSON.stringify(fallbackReview, null, 2)}\n`);
-      return fallbackReview;
-    }
-    const stdout = compactText(child.stdout, 800);
-    const stderr = compactText(child.stderr, 800);
-    throw new Error(
-      `Codex /review failed: structured output was not written to ${path.basename(outputPath)}; stdout=${stdout || "empty"}; stderr=${stderr || "empty"}`,
-    );
-  }
+  const stdoutPath = path.join(workRoot, `${mode}-codex-review-${attempt}.jsonl`);
+  const stderrPath = path.join(workRoot, `${mode}-codex-review-${attempt}.stderr.log`);
+  recordRepairCodexLifecycle("started", "repair_review", mode, attempt);
   try {
-    return JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const child = spawnCodexSyncWithHeartbeat(
+      `Codex /review ${mode} attempt ${attempt}`,
+      [
+        "exec",
+        "--cd",
+        targetDir,
+        ...executionModelArgs,
+        "--sandbox",
+        codexReviewSandbox,
+        ...codexReviewSandboxConfigArgs(),
+        ...codexConfigArgs(),
+        "--output-schema",
+        schemaPath,
+        "--output-last-message",
+        outputPath,
+        "--json",
+        "-",
+      ],
+      {
+        cwd: targetDir,
+        input: prompt,
+        encoding: "utf8",
+        env: codexEnv(),
+        timeout: reviewTimeoutMs,
+        stdoutPath,
+        stderrPath,
+      },
+    );
+    publishRepairCodexArtifacts("repair_review", {
+      jsonl: stdoutPath,
+      stderr: stderrPath,
+    });
+    if ((child.error as JsonValue)?.code === "ETIMEDOUT")
+      throw new Error(`Codex /review timed out after ${reviewTimeoutMs}ms`);
+    if (child.error) throw new Error(child.error.message || String(child.error));
+    if (child.status !== 0) throw new Error(child.stderr || child.stdout || "Codex /review failed");
+    if (!fs.existsSync(outputPath)) {
+      const fallbackReview = extractCodexReviewFromJsonl(child.stdout);
+      if (fallbackReview) {
+        fs.writeFileSync(outputPath, `${JSON.stringify(fallbackReview, null, 2)}\n`);
+        publishRepairCodexArtifacts("repair_review", { report: outputPath });
+        recordRepairCodexLifecycle("completed", "repair_review", mode, attempt);
+        return fallbackReview;
+      }
+      const stdout = compactText(child.stdout, 800);
+      const stderr = compactText(child.stderr, 800);
+      throw new Error(
+        `Codex /review failed: structured output was not written to ${path.basename(outputPath)}; stdout=${stdout || "empty"}; stderr=${stderr || "empty"}`,
+      );
+    }
+    const review = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    publishRepairCodexArtifacts("repair_review", { report: outputPath });
+    recordRepairCodexLifecycle("completed", "repair_review", mode, attempt);
+    return review;
   } catch (error) {
+    publishRepairCodexArtifacts("repair_review", {
+      jsonl: stdoutPath,
+      stderr: stderrPath,
+      report: outputPath,
+    });
+    recordRepairCodexLifecycle("failed", "repair_review", mode, attempt, error);
     throw new Error(
-      `Codex /review failed: invalid structured output in ${path.basename(outputPath)}: ${error.message}`,
+      `Codex /review failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -3467,37 +3612,113 @@ function runCodexReviewFix({
     "```",
   ].join("\n");
   const reviewFixTimeoutMs = currentCodexTimeoutMs();
-  const child = spawnCodexSyncWithHeartbeat(
-    `Codex review-fix worker ${mode} attempt ${attempt}`,
-    [
-      "exec",
-      "--cd",
-      targetDir,
-      ...executionModelArgs,
-      "--sandbox",
-      codexWriteSandbox,
-      ...codexWriteSandboxConfigArgs(),
-      ...codexConfigArgs(),
-      "--output-last-message",
-      path.join(workRoot, `${mode}-codex-review-fix-${attempt}.md`),
-      "--json",
-      "-",
-    ],
-    {
-      cwd: targetDir,
-      input: prompt,
-      encoding: "utf8",
-      env: codexEnv(),
-      timeout: reviewFixTimeoutMs,
-      stdoutPath: path.join(workRoot, `${mode}-codex-review-fix-${attempt}.jsonl`),
-      stderrPath: path.join(workRoot, `${mode}-codex-review-fix-${attempt}.stderr.log`),
+  const reportPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.md`);
+  const stdoutPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.jsonl`);
+  const stderrPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.stderr.log`);
+  recordRepairCodexLifecycle("started", "repair_review_fix", mode, attempt);
+  try {
+    const child = spawnCodexSyncWithHeartbeat(
+      `Codex review-fix worker ${mode} attempt ${attempt}`,
+      [
+        "exec",
+        "--cd",
+        targetDir,
+        ...executionModelArgs,
+        "--sandbox",
+        codexWriteSandbox,
+        ...codexWriteSandboxConfigArgs(),
+        ...codexConfigArgs(),
+        "--output-last-message",
+        reportPath,
+        "--json",
+        "-",
+      ],
+      {
+        cwd: targetDir,
+        input: prompt,
+        encoding: "utf8",
+        env: codexEnv(),
+        timeout: reviewFixTimeoutMs,
+        stdoutPath,
+        stderrPath,
+      },
+    );
+    publishRepairCodexArtifacts("repair_review_fix", {
+      jsonl: stdoutPath,
+      stderr: stderrPath,
+      report: reportPath,
+    });
+    if ((child.error as JsonValue)?.code === "ETIMEDOUT")
+      throw new Error(`Codex review-fix worker timed out after ${reviewFixTimeoutMs}ms`);
+    if (child.error) throw new Error(child.error.message || String(child.error));
+    if (child.status !== 0)
+      throw new Error(child.stderr || child.stdout || "Codex review-fix worker failed");
+    recordRepairCodexLifecycle("completed", "repair_review_fix", mode, attempt);
+  } catch (error) {
+    publishRepairCodexArtifacts("repair_review_fix", {
+      jsonl: stdoutPath,
+      stderr: stderrPath,
+      report: reportPath,
+    });
+    recordRepairCodexLifecycle("failed", "repair_review_fix", mode, attempt, error);
+    throw error;
+  }
+}
+
+function recordRepairCodexLifecycle(
+  phase: "started" | "completed" | "failed",
+  reviewMode: string,
+  mode: JsonValue,
+  attempt: JsonValue,
+  error?: unknown,
+) {
+  recordRepairLifecycleEvent(directRepairLifecycle(null), {
+    type:
+      phase === "started"
+        ? ACTION_EVENT_TYPES.reviewStarted
+        : phase === "completed"
+          ? ACTION_EVENT_TYPES.reviewCompleted
+          : ACTION_EVENT_TYPES.reviewFailed,
+    status:
+      phase === "started"
+        ? ACTION_EVENT_STATUSES.started
+        : phase === "completed"
+          ? ACTION_EVENT_STATUSES.completed
+          : ACTION_EVENT_STATUSES.failed,
+    reasonCode:
+      phase === "started"
+        ? ACTION_EVENT_REASON_CODES.selected
+        : phase === "completed"
+          ? ACTION_EVENT_REASON_CODES.completed
+          : ACTION_EVENT_REASON_CODES.exception,
+    mutation: false,
+    component: "execute_fix_codex",
+    state: phase,
+    reviewMode,
+    eventIdentity: {
+      mode: String(mode),
+      attempt: Number(attempt),
+      ...(error === undefined
+        ? {}
+        : { errorKind: error instanceof Error ? error.name : typeof error }),
     },
-  );
-  if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex review-fix worker timed out after ${reviewFixTimeoutMs}ms`);
-  if (child.error) throw new Error(child.error.message || String(child.error));
-  if (child.status !== 0)
-    throw new Error(child.stderr || child.stdout || "Codex review-fix worker failed");
+  });
+}
+
+function publishRepairCodexArtifacts(
+  reviewMode: string,
+  paths: { jsonl?: string; stderr?: string; report?: string },
+) {
+  for (const [kind, artifactPath] of Object.entries(paths)) {
+    if (!artifactPath) continue;
+    recordRepairArtifactPublication(directRepairLifecycle(null), {
+      path: artifactPath,
+      kind: `${reviewMode}_${kind}`,
+      component: "execute_fix_codex",
+      ...(kind === "report" ? { type: ACTION_EVENT_TYPES.reviewPublished } : {}),
+      reviewMode,
+    });
+  }
 }
 
 function runCodexValidationFix({
@@ -3984,7 +4205,11 @@ function pushRecoverableBranch({ targetDir, branch }: LooseRecord) {
   const args = remoteSha
     ? ["push", `--force-with-lease=${targetRef}:${remoteSha}`, "origin", `HEAD:${targetRef}`]
     : ["push", "origin", `HEAD:${targetRef}`];
-  runGitNetwork(args, targetDir);
+  runDirectRepairMutation(
+    "branch_push",
+    { repo: result.repo, branch, remoteSha, targetRef, head: currentHead(targetDir) },
+    () => runGitNetwork(args, targetDir),
+  );
   if (fetchRemoteRecoverableBranch({ targetDir, branch, required: false })) return;
   throw new Error(`git push reported success, but refs/heads/${branch} was not visible on origin`);
 }
@@ -4092,6 +4317,14 @@ function writeReport(report: LooseRecord, resultPath: string) {
     serialize: () => `${JSON.stringify(report, null, 2)}\n`,
     publish: () => publishReportOutcome(report, resultPath),
   });
+  recordRepairArtifactPublication(directRepairLifecycle(null), {
+    path: reportPath,
+    kind: "repair_execution_report",
+    component: "execute_fix",
+    type: ACTION_EVENT_TYPES.reviewPublished,
+    reviewMode: "repair_execution",
+  });
+  recordRepairWorkflowEventSafely("completed");
   console.log("Wrote fix execution report.");
 }
 
@@ -4099,6 +4332,7 @@ function publishPersistedReport(resultPath: string) {
   const reportPath = fixExecutionReportPath(resultPath);
   if (!fs.existsSync(reportPath)) {
     console.warn(`No deferred fix execution report exists at ${reportPath}; skipping publication.`);
+    recordRepairWorkflowEventSafely("completed");
     return;
   }
   const persistedReport = JSON.parse(fs.readFileSync(reportPath, "utf8"));
@@ -4108,6 +4342,14 @@ function publishPersistedReport(resultPath: string) {
     serialize: () => `${JSON.stringify(persistedReport, null, 2)}\n`,
     publish: () => publishReportOutcome(persistedReport, resultPath),
   });
+  recordRepairArtifactPublication(directRepairLifecycle(null), {
+    path: reportPath,
+    kind: "repair_execution_report",
+    component: "execute_fix",
+    type: ACTION_EVENT_TYPES.reviewPublished,
+    reviewMode: "repair_execution",
+  });
+  recordRepairWorkflowEventSafely("completed");
   console.log("Published deferred fix execution outcome.");
 }
 
@@ -4552,14 +4794,27 @@ function dispatchAutomergeCommentRouter({
     },
   });
   try {
-    run(
-      "gh",
-      ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", payloadPath],
+    runDirectRepairMutation(
+      "automerge_router_dispatch",
       {
-        cwd: repoRoot(),
-        env: ghEnv(),
-        timeoutMs: currentNetworkCommandTimeoutMs(),
+        reviewRepo,
+        targetRepo: result.repo,
+        target,
+        commentId,
+        maxComments,
+        forceReprocess,
+        reason,
       },
+      () =>
+        run(
+          "gh",
+          ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", payloadPath],
+          {
+            cwd: repoRoot(),
+            env: ghEnv(),
+            timeoutMs: currentNetworkCommandTimeoutMs(),
+          },
+        ),
     );
     return { status: "executed", repo: reviewRepo, dispatched_at: dispatchedAt };
   } catch (error) {
@@ -4604,14 +4859,26 @@ function dispatchAutomergeReviewAfterBranchRepair({ target, commit }: LooseRecor
     },
   });
   try {
-    run(
-      "gh",
-      ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", payloadPath],
+    runDirectRepairMutation(
+      "automerge_review_dispatch",
       {
-        cwd: repoRoot(),
-        env: ghEnv(),
-        timeoutMs: currentNetworkCommandTimeoutMs(),
+        reviewRepo,
+        targetRepo: result.repo,
+        target,
+        commit,
+        codexTimeoutMs: reviewBudget?.codexTimeoutMs ?? null,
+        mediaProofTimeoutMs: reviewBudget?.mediaProofTimeoutMs ?? null,
       },
+      () =>
+        run(
+          "gh",
+          ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", payloadPath],
+          {
+            cwd: repoRoot(),
+            env: ghEnv(),
+            timeoutMs: currentNetworkCommandTimeoutMs(),
+          },
+        ),
     );
     return { status: "executed", repo: reviewRepo, dispatched_at: dispatchedAt };
   } catch (error) {
@@ -4783,21 +5050,23 @@ function preserveStatusMarkers(existingBody: JsonValue, nextBody: string) {
 
 function patchIssueComment(id: JsonValue, body: string) {
   const payloadPath = writePayload(`automerge-outcome-${id}`, { body });
-  run(
-    "gh",
-    [
-      "api",
-      `repos/${result.repo}/issues/comments/${id}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payloadPath,
-    ],
-    {
-      cwd: repoRoot(),
-      env: ghEnv(),
-      timeoutMs: currentNetworkCommandTimeoutMs(),
-    },
+  runDirectRepairMutation("issue_comment_update", { repo: result.repo, id, body }, () =>
+    run(
+      "gh",
+      [
+        "api",
+        `repos/${result.repo}/issues/comments/${id}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payloadPath,
+      ],
+      {
+        cwd: repoRoot(),
+        env: ghEnv(),
+        timeoutMs: currentNetworkCommandTimeoutMs(),
+      },
+    ),
   );
 }
 
@@ -4819,20 +5088,22 @@ function listOrNone(items: LooseRecord[]) {
 
 function postIssueComment(number: JsonValue, body: string) {
   const payloadPath = writePayload(`automerge-outcome-${number}`, { body });
-  run(
-    "gh",
-    [
-      "api",
-      `repos/${result.repo}/issues/${number}/comments`,
-      "--method",
-      "POST",
-      "--input",
-      payloadPath,
-    ],
-    {
-      cwd: repoRoot(),
-      env: ghEnv(),
-    },
+  runDirectRepairMutation("issue_comment_create", { repo: result.repo, number, body }, () =>
+    run(
+      "gh",
+      [
+        "api",
+        `repos/${result.repo}/issues/${number}/comments`,
+        "--method",
+        "POST",
+        "--input",
+        payloadPath,
+      ],
+      {
+        cwd: repoRoot(),
+        env: ghEnv(),
+      },
+    ),
   );
 }
 

@@ -360,6 +360,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
     strategy:
       fail-fast: false
@@ -399,7 +400,12 @@ jobs:
           worktree-path: clawsweeper
           fetch-depth: 1
 
+      - uses: ./clawsweeper/.github/actions/setup-action-ledger
+        with:
+          worktree-path: clawsweeper
+
       - uses: ./clawsweeper/.github/actions/setup-pnpm
+        id: review-setup-pnpm
         with:
           working-directory: clawsweeper
           build-script: build
@@ -485,6 +491,30 @@ jobs:
             --report-relative-path "$relative_path" \
             --report-repo "${{ github.repository }}"
 
+      - name: Finalize commit review action ledger
+        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Upload commit review action ledger
+        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
+          path: clawsweeper/.clawsweeper-repair/action-ledger-state/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload commit review Codex logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-logs-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
+          path: commit-work/**
+          if-no-files-found: warn
+          retention-days: 30
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -515,9 +545,19 @@ jobs:
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: publish-setup-pnpm
         with:
           build-script: build:all
+
+      - uses: actions/download-artifact@v8
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        with:
+          pattern: action-ledger-commit-review-*
+          path: .clawsweeper-repair/action-ledger-download
+          merge-multiple: true
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
@@ -597,6 +637,52 @@ jobs:
               --report-relative-path "$relative_path" \
               --report-repo "${{ github.repository }}"
           done
+
+      - name: Finalize commit publication action ledger
+        if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish immutable commit review action ledger
+        if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          mkdir -p .artifacts
+          if [ ! -d .clawsweeper-repair/action-ledger-download/ledger ] &&
+             [ ! -d .clawsweeper-repair/action-ledger-state/ledger ]; then
+            echo "No commit review action event shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/commit-review-action-ledger-paths.txt"
+          : > "$event_paths_file"
+          for source_root in \
+            .clawsweeper-repair/action-ledger-download \
+            .clawsweeper-repair/action-ledger-state
+          do
+            if [ ! -d "$source_root/ledger" ]; then
+              continue
+            fi
+            pnpm run --silent repair:action-ledger -- publish \
+              --source-root "$source_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" |
+              jq -r '.paths[]?' >> "$event_paths_file"
+          done
+          sort -u -o "$event_paths_file" "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Commit review action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append commit review action ledger" \
+            "${action_ledger_args[@]}"
 
       - name: Continue commit review range
         if: ${{ success() && needs.plan.outputs.has_more == 'true' }}

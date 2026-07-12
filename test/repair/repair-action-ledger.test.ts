@@ -15,6 +15,7 @@ import {
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
   repairSourceRevision,
+  runRepairMutation,
 } from "../../dist/repair/repair-action-ledger.js";
 
 test("repair receipts preserve operation and mutation identity across workflow retries", async () => {
@@ -60,6 +61,130 @@ test("repair receipts preserve operation and mutation identity across workflow r
       if (!(key in previous)) delete process.env[key];
     }
     Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair mutation receipts keep stable business identity and distinct request attempts", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mutation-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      assert.equal(
+        runRepairMutation(lifecycle, {
+          kind: "branch_push",
+          identity: { repo: "openclaw/openclaw", ref: "refs/heads/fix", sha: "a".repeat(40) },
+          operation: () => "ok",
+        }),
+        "ok",
+      );
+    }
+    await flushRepairActionEvents();
+
+    const mutations = readEvents(outputRoot).filter(
+      (event) => event.event_type === ACTION_EVENT_TYPES.repairMutation,
+    );
+    assert.deepEqual(
+      mutations.map((event) => event.action.status),
+      ["started", "executed", "started", "executed"],
+    );
+    assert.equal(new Set(mutations.map((event) => event.idempotency_key_sha256)).size, 1);
+    assert.equal(new Set(mutations.map((event) => event.event_id)).size, 4);
+    assert.deepEqual(
+      mutations.map((event) => event.phase_seq),
+      [1, 2, 3, 4],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair mutation uncertainty survives later workflow failure", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-unknown-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+
+  try {
+    assert.throws(
+      () =>
+        runRepairMutation(lifecycle, {
+          kind: "pull_request_create",
+          identity: { repo: "openclaw/openclaw", branch: "fix" },
+          operation: () => {
+            throw new Error("connection reset after request");
+          },
+        }),
+      /connection reset/,
+    );
+    recordRepairLifecycleFailureSafely(lifecycle, {
+      component: "repair_worker",
+      error: new Error("later verification failed"),
+    });
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    const outcome = events.find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+        event.attributes?.completion_reason === "mutation_outcome_unknown",
+    );
+    const failure = events.find((event) => event.event_type === ACTION_EVENT_TYPES.repairFailed);
+    assert.equal(outcome?.action.mutation, true);
+    assert.equal(outcome?.action.retryable, true);
+    assert.equal(failure?.action.mutation, true);
+    assert.equal(failure?.action.retryable, true);
+    assert.equal(failure?.attributes?.completion_reason, "mutation_outcome_unknown");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair finalization turns interrupted request boundaries into unknown outcomes", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-interrupted-ledger-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+
+  try {
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairMutation,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      mutation: false,
+      retryable: true,
+      component: "repair_worker",
+      state: "mutation_attempted",
+      completionReason: "mutation_attempted",
+      eventIdentity: { kind: "branch_push", requestAttempt: 1, outcome: "attempted" },
+      idempotencyIdentity: { mutation: "branch_push", request: "stable" },
+    });
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.equal(events.length, 2);
+    assert.equal(events[1]?.event_type, ACTION_EVENT_TYPES.repairMutation);
+    assert.equal(events[1]?.action.status, ACTION_EVENT_STATUSES.failed);
+    assert.equal(events[1]?.action.mutation, true);
+    assert.equal(events[1]?.attributes?.completion_reason, "mutation_outcome_unknown");
+    assert.equal(events[1]?.phase_seq, events[0]!.phase_seq + 1);
+    assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+    assert.equal(events[1]?.idempotency_key_sha256, events[0]?.idempotency_key_sha256);
+  } finally {
+    restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
   }
 });
@@ -362,6 +487,18 @@ test("repair action ledger CLI finalizes the configured ledger root", () => {
         state: "queued",
       },
     );
+    recordRepairLifecycleEvent(repairLifecycle(), {
+      type: ACTION_EVENT_TYPES.repairMutation,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      mutation: false,
+      retryable: true,
+      component: "repair_worker",
+      state: "mutation_attempted",
+      completionReason: "mutation_attempted",
+      eventIdentity: { kind: "branch_push", requestAttempt: 1, outcome: "attempted" },
+      idempotencyIdentity: { mutation: "branch_push", request: "cli-stable" },
+    });
     const result = JSON.parse(
       execFileSync(
         process.execPath,
@@ -370,7 +507,9 @@ test("repair action ledger CLI finalizes the configured ledger root", () => {
       ),
     );
     assert.equal(result.paths.length, 1);
-    assert.equal(readEvents(outputRoot).length, 1);
+    const events = readEvents(outputRoot);
+    assert.equal(events.length, 3);
+    assert.equal(events.at(-1)?.attributes?.completion_reason, "mutation_outcome_unknown");
   } finally {
     for (const key of Object.keys(process.env)) {
       if (!(key in previous)) delete process.env[key];
@@ -381,13 +520,7 @@ test("repair action ledger CLI finalizes the configured ledger root", () => {
 });
 
 function recordRepairAttempt() {
-  const lifecycle = {
-    repository: "openclaw/openclaw",
-    workKey: "openclaw/openclaw:repair-pr-42",
-    clusterId: "repair-pr-42",
-    number: 42,
-    sourceRevision: "source-head-42",
-  };
+  const lifecycle = repairLifecycle();
   recordRepairLifecycleEvent(lifecycle, {
     type: ACTION_EVENT_TYPES.repairQueue,
     status: ACTION_EVENT_STATUSES.queued,
@@ -416,6 +549,23 @@ function recordRepairAttempt() {
     state: "executed",
     idempotencySlot: "publish_branch:repair-pr-42",
   });
+}
+
+function repairLifecycle() {
+  return {
+    repository: "openclaw/openclaw",
+    workKey: "openclaw/openclaw:repair-pr-42",
+    clusterId: "repair-pr-42",
+    number: 42,
+    sourceRevision: "source-head-42",
+  };
+}
+
+function restoreEnv(previous: NodeJS.ProcessEnv) {
+  for (const key of Object.keys(process.env)) {
+    if (!(key in previous)) delete process.env[key];
+  }
+  Object.assign(process.env, previous);
 }
 
 function workflowEnv(root: string, outputRoot: string) {

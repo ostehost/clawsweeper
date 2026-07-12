@@ -266,7 +266,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
       /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
     ),
   ];
-  assert.equal(downloadBlocks.length, 16);
+  assert.equal(downloadBlocks.length, 17);
   const collectorDownload = downloadBlocks.find((block) =>
     block[1]!.includes("steps.repair-action-ledger-artifacts.outputs.artifact_ids"),
   );
@@ -277,7 +277,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
   const exactArtifactDownloads = downloadBlocks.filter(
     (block) => block !== collectorDownload && block[1]!.includes("artifact-ids:"),
   );
-  assert.equal(exactArtifactDownloads.length, 15);
+  assert.equal(exactArtifactDownloads.length, 16);
   for (const block of exactArtifactDownloads) {
     assert.match(block[1]!, /artifact-ids: \$\{\{ steps\.[^.]+\.outputs\.artifact_id \}\}/);
     assert.match(block[1]!, /github-token: \$\{\{ github\.token \}\}/);

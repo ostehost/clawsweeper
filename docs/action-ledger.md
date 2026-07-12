@@ -126,6 +126,20 @@ confidential-identifier checks as every other durable machine-text field.
   so a changed failed-review record cannot reuse an earlier dispatch receipt.
   Operators must reconcile the workflow run before another launch; automatic
   retry never duplicates an outcome-unknown dispatch.
+- Repair publication uses the same request boundary for branch pushes, PR
+  create/reopen, comments, labels, review-thread resolution, continuation
+  dispatch, source close/reopen compensation, closeout, and post-flight merge.
+  Business idempotency binds the sealed publication and request digest; a
+  request-attempt ordinal keeps repeated wire attempts distinct. Accepted or
+  unknown mutation state survives later verification, reporting, and workflow
+  failures. Finalization converts an interrupted open request into an immutable
+  `mutation_outcome_unknown` child instead of claiming that no write occurred.
+- Repair `/review`, review-fix, and commit-review Codex runs record lifecycle
+  events plus SHA-256 evidence for JSONL, stderr, and report artifacts.
+  Commit-check publication and notification delivery also use request-boundary
+  receipts. Their workflow shards are finalized and imported into the state
+  repository; GitHub artifact upload is retention, not the durable audit
+  boundary.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix

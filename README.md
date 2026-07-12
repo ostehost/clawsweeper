@@ -123,6 +123,13 @@ every sealed source and existing replacement target for live pause labels
 before each mutation, and restore the required replacement labels. Non-merge
 repair lanes complete only when the live PR still points at that published
 commit.
+Every repair write is recorded at the request boundary with stable business
+idempotency and a distinct wire-attempt identity. Branch, PR, comment, label,
+review-thread, continuation-dispatch, source-close compensation, and merge
+outcomes remain accepted or unknown even when a later verification step fails.
+Repair and commit-review Codex logs and reports are digest-bound in the
+immutable action ledger, as are commit-check publication and notification
+delivery.
 
 Operators can create repair-only jobs for one author's blocked pull requests in
 one repository with `pnpm repair:pr-intake -- --repo owner/name --author login`,

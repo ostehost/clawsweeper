@@ -74,6 +74,7 @@ export const ACTION_EVENT_TYPES = {
   repairQueue: "repair.queue",
   repairBlocked: "repair.blocked",
   repairFailed: "repair.failed",
+  repairMutation: "repair.mutation",
   applyAction: "apply.action",
   applyBatch: "apply.batch",
   applyPublish: "apply.publish",
@@ -143,6 +144,7 @@ export const ACTION_EVENT_FAMILIES = {
     ACTION_EVENT_TYPES.repairQueue,
     ACTION_EVENT_TYPES.repairBlocked,
     ACTION_EVENT_TYPES.repairFailed,
+    ACTION_EVENT_TYPES.repairMutation,
   ],
   apply: [
     ACTION_EVENT_TYPES.applyPlanned,
@@ -213,6 +215,7 @@ export const ACTION_EVENT_PHASE_TYPES = {
   repairQueue: ACTION_EVENT_TYPES.repairQueue,
   repairBlocked: ACTION_EVENT_TYPES.repairBlocked,
   repairFailed: ACTION_EVENT_TYPES.repairFailed,
+  repairMutation: ACTION_EVENT_TYPES.repairMutation,
   applyAction: ACTION_EVENT_TYPES.applyAction,
   applyBatch: ACTION_EVENT_TYPES.applyBatch,
   applyPublish: ACTION_EVENT_TYPES.applyPublish,

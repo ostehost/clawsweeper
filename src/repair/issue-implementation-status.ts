@@ -23,6 +23,7 @@ import {
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
   repairSourceRevision,
+  runRepairMutation,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -170,6 +171,19 @@ async function main() {
     ]);
     commentId = Number(created.id ?? 0);
   };
+  const mutateCommentWithReceipt = () =>
+    runRepairMutation(issueStatusLifecycle(options), {
+      kind: existing ? "issue_status_comment_update" : "issue_status_comment_create",
+      identity: {
+        repo,
+        itemNumber,
+        commentId: commentId || null,
+        state,
+        body,
+      },
+      component: "issue_implementation_status",
+      operation: mutateComment,
+    });
   if (isTerminalMutationState(state)) {
     const root = requiredArg(args, "handoff-root");
     const validationReceiptPath = requiredArg(args, "validation-receipt");
@@ -198,7 +212,7 @@ async function main() {
           if (receipt.target_pr_url !== prUrl) {
             throw new Error("terminal status pull request differs from the publication receipt");
           }
-          mutateComment();
+          mutateCommentWithReceipt();
         },
       });
     } else {
@@ -217,12 +231,12 @@ async function main() {
         expectedValidationReceiptSha256,
         mutation: ({ intent }) => {
           assertSealedSource(intent);
-          mutateComment();
+          mutateCommentWithReceipt();
         },
       });
     }
   } else {
-    mutateComment();
+    mutateCommentWithReceipt();
   }
   recordRepairLifecycleEvent(issueStatusLifecycle(options), {
     type: ACTION_EVENT_TYPES.statusLifecycle,

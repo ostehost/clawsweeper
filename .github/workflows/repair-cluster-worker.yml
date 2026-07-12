@@ -756,6 +756,7 @@ jobs:
       CLAWSWEEPER_GIT_USER_EMAIL: ${{ vars.CLAWSWEEPER_GIT_USER_EMAIL || '274271284+clawsweeper[bot]@users.noreply.github.com' }}
       CLAWSWEEPER_STEERABLE_CODEX: ${{ vars.CLAWSWEEPER_STEERABLE_CODEX || '0' }}
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: ${{ github.workspace }}/.clawsweeper-repair/action-ledger-context
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
       - name: Record producer attempt
@@ -767,9 +768,34 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: execute-setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Resolve planning action ledger context
+        id: execute_planning_action_ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-action-ledger-cluster \
+            --expected-artifact-id "${{ needs.cluster.outputs.action_ledger_artifact_id }}" \
+            --expected-artifact-digest "${{ needs.cluster.outputs.action_ledger_artifact_digest }}"
+
+      - name: Download planning action ledger context
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.execute_planning_action_ledger.outputs.artifact_id }}
+          path: .clawsweeper-repair/action-ledger-context
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       - name: Resolve immutable execution handoff producer
         id: authorized_artifact
@@ -945,6 +971,20 @@ jobs:
             ${{ steps.codex_session.outputs.codex_home }}/sessions
             ${{ steps.codex_session.outputs.codex_home }}/clawsweeper-thread-state.json
           key: ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}-execute
+
+      - name: Finalize execution repair action ledger
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Upload execution repair action ledger
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/action-ledger-state/**
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 90
 
   validate:
     name: Replay repair proof without credentials
@@ -1813,6 +1853,7 @@ jobs:
     name: Publish immutable repair action ledger
     needs:
       - cluster
+      - execute
       - mutate
     if: ${{ always() && needs.cluster.result != 'skipped' }}
     runs-on: ubuntu-latest
@@ -1861,6 +1902,7 @@ jobs:
             fi
             case "$artifact_name" in
               "clawsweeper-repair-action-ledger-cluster-${GITHUB_RUN_ID}-"* | \
+              "clawsweeper-repair-action-ledger-execute-${GITHUB_RUN_ID}-"* | \
               "clawsweeper-repair-action-ledger-mutate-${GITHUB_RUN_ID}-"*) ;;
               *) continue ;;
             esac

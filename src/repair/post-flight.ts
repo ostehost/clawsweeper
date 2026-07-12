@@ -39,6 +39,11 @@ import {
   verifyPublishedPullContext,
 } from "./execution-handoff.js";
 import {
+  recordRepairWorkflowEvent,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
+import {
   issueImplementationPublishedHeadBlock,
   postFlightOutcomeExitCode,
   publicationOnlyPostFlightAction,
@@ -118,6 +123,13 @@ if (result.cluster_id !== job.frontmatter.cluster_id) {
 if (!["execute", "autonomous"].includes(result.mode)) {
   throw new Error(`refusing post-flight: result mode is ${result.mode}`);
 }
+recordPostFlightWorkflowEventSafely("started");
+process.on("uncaughtExceptionMonitor", (error) => {
+  recordPostFlightWorkflowEventSafely("failed", error);
+});
+process.on("exit", () => {
+  recordPostFlightWorkflowEventSafely("finalized");
+});
 
 const fixReport = readSiblingJson(resultPath, "fix-execution-report.json");
 const report: LooseRecord = {
@@ -348,7 +360,16 @@ function finalizeFixPr(action: LooseRecord) {
         policyReadJson: rulesetPolicyReader(),
       });
       if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
-      ghWithRetry(mergeArgs);
+      runPostFlightMutation(
+        "post_flight_merge",
+        {
+          repo: result.repo,
+          number: parsed.number,
+          headSha: pull.head?.sha ?? null,
+          method: "squash",
+        },
+        () => ghWithRetry(mergeArgs),
+      );
       return { policyBlock: "" };
     });
     if (mergeAttempt.policyBlock) {
@@ -610,43 +631,77 @@ function finalizePostMergeCloseout({
   if (beforeLabelSecurityBlock) {
     return { ...base, status: "blocked", reason: beforeLabelSecurityBlock };
   }
-  ghBestEffort([
-    "issue",
-    "edit",
-    String(target),
-    "--repo",
-    result.repo,
-    "--add-label",
-    "clawsweeper",
-  ]);
+  runRepairMutation(postFlightLifecycle(target), {
+    kind: "closeout_label",
+    identity: { repo: result.repo, number: target, label: "clawsweeper" },
+    component: "post_flight",
+    operation: () =>
+      ghBestEffort([
+        "issue",
+        "edit",
+        String(target),
+        "--repo",
+        result.repo,
+        "--add-label",
+        "clawsweeper",
+      ]),
+    outcome: () => "unknown",
+  });
   const beforeCommentSecurityBlock = freshLiveSecurityBlockReason(target);
   if (beforeCommentSecurityBlock) {
     return { ...base, status: "blocked", reason: beforeCommentSecurityBlock };
   }
-  ghWithRetry([
-    "issue",
-    "comment",
-    String(target),
-    "--repo",
-    result.repo,
-    "--body",
-    postMergeCloseoutComment({
-      actionName,
+  runPostFlightMutation(
+    "closeout_comment",
+    {
+      repo: result.repo,
+      number: target,
       fixUrl,
-      provenance: externalMessageProvenance({
-        reviewedSha:
-          finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
-      }),
-    }),
-  ]);
+      mergeCommitSha: finalized.merge_commit_sha ?? null,
+    },
+    () =>
+      ghWithRetry([
+        "issue",
+        "comment",
+        String(target),
+        "--repo",
+        result.repo,
+        "--body",
+        postMergeCloseoutComment({
+          actionName,
+          fixUrl,
+          provenance: externalMessageProvenance({
+            reviewedSha:
+              finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
+          }),
+        }),
+      ]),
+  );
   const beforeCloseSecurityBlock = freshLiveSecurityBlockReason(target);
   if (beforeCloseSecurityBlock) {
     return { ...base, status: "blocked", reason: beforeCloseSecurityBlock };
   }
   if (live.pull_request) {
-    ghWithRetry(["pr", "close", String(target), "--repo", result.repo]);
+    runPostFlightMutation(
+      "source_pull_request_closeout",
+      { repo: result.repo, number: target, fixUrl },
+      () => ghWithRetry(["pr", "close", String(target), "--repo", result.repo]),
+    );
   } else {
-    ghWithRetry(["issue", "close", String(target), "--repo", result.repo, "--reason", "completed"]);
+    runPostFlightMutation(
+      "source_issue_closeout",
+      { repo: result.repo, number: target, fixUrl, reason: "completed" },
+      () =>
+        ghWithRetry([
+          "issue",
+          "close",
+          String(target),
+          "--repo",
+          result.repo,
+          "--reason",
+          "completed",
+        ]),
+    );
   }
   const after = fetchIssue(result.repo, target);
   return {
@@ -689,18 +744,78 @@ function hasLabel(labels: LooseRecord[], wanted: string) {
 
 function labelForClawSweeperReview(repo: string, number: JsonValue) {
   ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
-  ghBestEffort(["issue", "edit", String(number), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]);
+  runRepairMutation(postFlightLifecycle(Number(number)), {
+    kind: "pull_request_label",
+    identity: { repo, number: Number(number), label: CLAWSWEEPER_LABEL },
+    component: "post_flight",
+    operation: () =>
+      ghBestEffort([
+        "issue",
+        "edit",
+        String(number),
+        "--repo",
+        repo,
+        "--add-label",
+        CLAWSWEEPER_LABEL,
+      ]),
+    outcome: () => "unknown",
+  });
 }
 
 function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
   try {
-    ghWithRetry(
-      ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
-      2,
-    );
+    runRepairMutation(postFlightLifecycle(null), {
+      kind: "repository_label_create",
+      identity: { repo, name, color, description },
+      component: "post_flight",
+      operation: () =>
+        ghWithRetry(
+          ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
+          2,
+        ),
+      knownNoMutation: (error) => /already exists/i.test(ghErrorText(error)),
+    });
   } catch (error) {
     if (!/already exists/i.test(ghErrorText(error))) return;
   }
+}
+
+function postFlightLifecycle(number: number | null): RepairLifecycleInput {
+  return {
+    repository: result.repo,
+    workKey: `post-flight:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
+    ...(number && number > 0 ? { number } : {}),
+    sourceRevision: result.reviewed_sha ?? result.head_sha ?? null,
+    subjectKind: number && number > 0 ? "pull_request" : "workflow",
+  };
+}
+
+function recordPostFlightWorkflowEventSafely(
+  phase: "started" | "completed" | "failed" | "finalized",
+  error?: unknown,
+) {
+  try {
+    recordRepairWorkflowEvent(postFlightLifecycle(null), {
+      component: "post_flight",
+      phase,
+      ...(error === undefined ? {} : { error }),
+    });
+  } catch (receiptError) {
+    console.error(
+      `[action-ledger] failed to record post-flight workflow ${phase}: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
+}
+
+function runPostFlightMutation<T>(kind: string, identity: unknown, operation: () => T): T {
+  return runRepairMutation(postFlightLifecycle(null), {
+    kind,
+    identity,
+    component: "post_flight",
+    operation,
+  });
 }
 
 function hasLiveSecuritySignal(number: JsonValue, labels: LooseRecord[]) {
@@ -1079,6 +1194,7 @@ function writeReport(report: LooseRecord, resultPath: string) {
       `report_outcome=${summary.outcome}\nreport_detail=${summary.detail}\n`,
     );
   }
+  recordPostFlightWorkflowEventSafely("completed");
   console.log(JSON.stringify(finalReport, null, 2));
   return summary;
 }

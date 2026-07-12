@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -28,6 +29,18 @@ import {
   DEFAULT_TARGET_REPO,
   repositoryProfileFor,
 } from "./repository-profiles.js";
+import {
+  recordCommitArtifact,
+  recordCommitLifecycleEvent,
+  recordCommitWorkflowEvent,
+  runCommitMutation,
+  type CommitLifecycleInput,
+} from "./commit-action-ledger.js";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "./action-ledger.js";
 
 export { isReviewableCommitPath } from "./commit-classifier.js";
 
@@ -64,6 +77,13 @@ function assertSha(value: string, label = "sha"): string {
   const sha = value.trim();
   if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`Invalid ${label}: ${value}`);
   return sha.toLowerCase();
+}
+
+function commitLifecycle(repository: string, sha: string): CommitLifecycleInput {
+  return {
+    repository,
+    sha,
+  };
 }
 
 function repoSlug(targetRepo: string): string {
@@ -300,9 +320,12 @@ function runCodex(options: {
   additionalPrompt: string;
   extraCodexConfig?: readonly string[];
 }): string {
+  const lifecycle = commitLifecycle(options.targetRepo, options.sha);
   ensureDir(options.workDir);
   const promptPath = join(options.workDir, `${options.sha}.prompt.md`);
   const outputPath = join(options.workDir, `${options.sha}.md`);
+  const stdoutPath = join(options.workDir, `${options.sha}.jsonl`);
+  const stderrPath = join(options.workDir, `${options.sha}.stderr.log`);
   writeFileSync(
     promptPath,
     promptForCommit({
@@ -321,6 +344,16 @@ function runCodex(options: {
     'approval_policy="never"',
     ...(options.extraCodexConfig ?? []),
   ];
+  recordCommitLifecycleEvent(lifecycle, {
+    type: ACTION_EVENT_TYPES.reviewStarted,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    mutation: false,
+    component: "commit_review",
+    state: "started",
+    reviewMode: "commit_review",
+    eventIdentity: { sha: options.sha },
+  });
   if (options.serviceTier) codexConfig.splice(1, 0, `service_tier="${options.serviceTier}"`);
   const result = runCodexProcess({
     args: [
@@ -340,6 +373,18 @@ function runCodex(options: {
     input: readFileSync(promptPath, "utf8"),
     timeoutMs: options.timeoutMs,
   });
+  writeFileSync(stdoutPath, result.stdout ?? "", "utf8");
+  writeFileSync(stderrPath, result.stderr ?? "", "utf8");
+  recordCommitArtifact(lifecycle, {
+    path: stdoutPath,
+    kind: "commit_review_jsonl",
+    logKind: "jsonl",
+  });
+  recordCommitArtifact(lifecycle, {
+    path: stderrPath,
+    kind: "commit_review_stderr",
+    logKind: "stderr",
+  });
   if (result.error || result.status !== 0 || !existsSync(outputPath)) {
     const timeout = codexProcessErrorCode(result.error) === "ETIMEDOUT";
     const detail =
@@ -348,6 +393,19 @@ function runCodex(options: {
         : `exit ${result.status ?? "unknown"}\n${
             safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."
           }`;
+    recordCommitLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.reviewFailed,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: timeout ? ACTION_EVENT_REASON_CODES.timeout : ACTION_EVENT_REASON_CODES.exception,
+      mutation: false,
+      component: "commit_review",
+      state: "failed",
+      reviewMode: "commit_review",
+      eventIdentity: {
+        sha: options.sha,
+        errorKind: result.error instanceof Error ? result.error.name : "nonzero_exit",
+      },
+    });
     return failureReport({
       targetRepo: options.targetRepo,
       sha: options.sha,
@@ -357,6 +415,21 @@ function runCodex(options: {
       timeout,
     });
   }
+  recordCommitArtifact(lifecycle, {
+    path: outputPath,
+    kind: "commit_review_raw_report",
+    type: ACTION_EVENT_TYPES.reviewPublished,
+  });
+  recordCommitLifecycleEvent(lifecycle, {
+    type: ACTION_EVENT_TYPES.reviewCompleted,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    mutation: false,
+    component: "commit_review",
+    state: "completed",
+    reviewMode: "commit_review",
+    eventIdentity: { sha: options.sha },
+  });
   return stripMarkdownFence(readFileSync(outputPath, "utf8"));
 }
 
@@ -366,38 +439,53 @@ function reviewCommand(args: Args): void {
     argString(args, "target_dir", repositoryProfileFor(targetRepo).checkoutDir),
   );
   const sha = assertSha(argString(args, "commit_sha", ""));
-  const metadata = commitMetadata(targetDir, targetRepo, sha);
-  const baseSha = assertSha(argString(args, "base_sha", metadata.parents[0] ?? ""), "base sha");
-  const reportDir = resolve(argString(args, "report_dir", "records"));
-  const artifactMode = argBool(args, "artifact_mode");
-  const outputPath = artifactMode
-    ? join(reportDir, artifactReportRelativePath(targetRepo, sha))
-    : resolve(commitReportRelativePath(targetRepo, sha));
-  const additionalPrompt = argString(
-    args,
-    "additional_prompt",
-    process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
-  );
-  const markdown = ensureCommitReportTimestamps(
-    runCodex({
-      targetDir,
-      targetRepo,
-      sha,
-      baseSha,
+  const lifecycle = commitLifecycle(targetRepo, sha);
+  recordCommitWorkflowEvent(lifecycle, "started");
+  try {
+    const metadata = commitMetadata(targetDir, targetRepo, sha);
+    const baseSha = assertSha(argString(args, "base_sha", metadata.parents[0] ?? ""), "base sha");
+    const reportDir = resolve(argString(args, "report_dir", "records"));
+    const artifactMode = argBool(args, "artifact_mode");
+    const outputPath = artifactMode
+      ? join(reportDir, artifactReportRelativePath(targetRepo, sha))
+      : resolve(commitReportRelativePath(targetRepo, sha));
+    const additionalPrompt = argString(
+      args,
+      "additional_prompt",
+      process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
+    );
+    const markdown = ensureCommitReportTimestamps(
+      runCodex({
+        targetDir,
+        targetRepo,
+        sha,
+        baseSha,
+        metadata,
+        model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
+        reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
+        sandboxMode: argString(args, "codex_sandbox", "danger-full-access"),
+        serviceTier: argString(args, "codex_service_tier", DEFAULT_SERVICE_TIER),
+        timeoutMs: argNumber(args, "codex_timeout_ms", 1_800_000),
+        workDir: resolve(argString(args, "work_dir", join(reportDir, ".codex"))),
+        additionalPrompt,
+      }),
       metadata,
-      model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
-      reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
-      sandboxMode: argString(args, "codex_sandbox", "danger-full-access"),
-      serviceTier: argString(args, "codex_service_tier", DEFAULT_SERVICE_TIER),
-      timeoutMs: argNumber(args, "codex_timeout_ms", 1_800_000),
-      workDir: resolve(argString(args, "work_dir", join(reportDir, ".codex"))),
-      additionalPrompt,
-    }),
-    metadata,
-  );
-  ensureDir(dirname(outputPath));
-  writeFileSync(outputPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
-  console.log(outputPath);
+    );
+    ensureDir(dirname(outputPath));
+    writeFileSync(outputPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
+    recordCommitArtifact(lifecycle, {
+      path: outputPath,
+      kind: "commit_review_report",
+      type: ACTION_EVENT_TYPES.reviewPublished,
+    });
+    recordCommitWorkflowEvent(lifecycle, "completed");
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+    console.log(outputPath);
+  } catch (error) {
+    recordCommitWorkflowEvent(lifecycle, "failed", error);
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+    throw error;
+  }
 }
 
 // GitHub credential env vars scrubbed before the offline local-review engine runs.
@@ -592,14 +680,36 @@ function publishCheckCommand(args: Args): void {
   const sha = assertSha(argString(args, "commit_sha", frontMatter.sha ?? ""));
   const reportRelativePath =
     argString(args, "report_relative_path", "") || commitReportRelativePath(targetRepo, sha);
-  publishCheckFromReport({
-    targetRepo,
-    reportRepo,
-    reportPath,
-    reportRelativePath,
-    sha,
-    checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
-  });
+  const lifecycle = commitLifecycle(targetRepo, sha);
+  recordCommitWorkflowEvent(lifecycle, "started");
+  try {
+    runCommitMutation(lifecycle, {
+      kind: "commit_check_publication",
+      identity: {
+        targetRepo,
+        reportRepo,
+        reportRelativePath,
+        sha,
+        checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
+        reportSha256: createHash("sha256").update(markdown).digest("hex"),
+      },
+      operation: () =>
+        publishCheckFromReport({
+          targetRepo,
+          reportRepo,
+          reportPath,
+          reportRelativePath,
+          sha,
+          checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
+        }),
+    });
+    recordCommitWorkflowEvent(lifecycle, "completed");
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+  } catch (error) {
+    recordCommitWorkflowEvent(lifecycle, "failed", error);
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+    throw error;
+  }
 }
 
 function collectMarkdownFiles(dir: string): string[] {

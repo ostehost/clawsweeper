@@ -13,6 +13,7 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
+import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
 
 export type MaintainerReportPointer = {
   date: string;
@@ -139,7 +140,12 @@ export async function runMaintainerReportNotifier(
   const report = await fetchJson(fetcher, pointer.dataUrl, accessHeaders);
   const message = renderMaintainerReportMessage({ report, reportUrl: pointer.reportUrl });
   const config = resolveOpenClawHookConfig(env);
+  const notificationLedgerInput = {
+    repository: env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper",
+    key: `maintainer-report:${pointer.date}`,
+  };
   if (!config) {
+    recordNotificationPhase(notificationLedgerInput, "skipped", "not_configured");
     if (args["write-report"]) {
       writeJsonFile(reportPath, reportPayload({ now, dryRun, deliver, pointer, message }));
     }
@@ -162,21 +168,25 @@ export async function runMaintainerReportNotifier(
   let reason: string | null = null;
   if (!dryRun) {
     try {
-      const result = await postOpenClawAgentHook({
-        config,
-        fetcher,
-        post: {
-          name: `Maintainer report ${pointer.date}`,
-          message,
-          idempotencyKey: `maintainer-report:${pointer.date}`,
-          deliver,
-        },
-      });
+      const result = await deliverNotification(notificationLedgerInput, () =>
+        postOpenClawAgentHook({
+          config,
+          fetcher,
+          post: {
+            name: `Maintainer report ${pointer.date}`,
+            message,
+            idempotencyKey: `maintainer-report:${pointer.date}`,
+            deliver,
+          },
+        }),
+      );
       hookRunId = result.runId;
     } catch (error) {
       failed = 1;
       reason = errorText(error);
     }
+  } else {
+    recordNotificationPhase(notificationLedgerInput, "planned", "dry_run");
   }
 
   if (args["write-report"]) {

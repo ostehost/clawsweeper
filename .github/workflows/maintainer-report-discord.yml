@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -57,7 +58,21 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - name: Create notification ledger state token
+        id: notification-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.notification-state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -75,3 +90,36 @@ jobs:
           CLAWSWEEPER_MAINTAINER_REPORT_STRICT: "1"
           CLAWSWEEPER_MAINTAINER_REPORT_DELIVER: "1"
         run: pnpm run repair:notify-maintainer-report -- --write-report
+
+      - name: Finalize maintainer notification action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish immutable maintainer notification action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source_root=".clawsweeper-repair/action-ledger-state"
+          if [ ! -d "$source_root/ledger" ]; then
+            exit 0
+          fi
+          paths_file=".artifacts/maintainer-notification-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$paths_file"
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$paths_file"
+          if [ "${#action_ledger_args[@]}" -gt 0 ]; then
+            pnpm run repair:publish-main -- \
+              --message "chore: append maintainer notification action ledger" \
+              "${action_ledger_args[@]}"
+          fi

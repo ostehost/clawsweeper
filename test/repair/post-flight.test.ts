@@ -534,9 +534,9 @@ test("post-flight rechecks live security immediately before privileged mutations
   assert.ok(
     [...closeout.matchAll(/SecurityBlock = (?:freshL|l)iveSecurityBlockReason/g)].length >= 3,
   );
-  assert.ok(
-    closeout.indexOf("beforeCommentSecurityBlock") < closeout.indexOf('"issue",\n    "comment"'),
-  );
+  const commentMutationIndex = /"issue",\s+"comment"/.exec(closeout)?.index ?? -1;
+  assert.notEqual(commentMutationIndex, -1);
+  assert.ok(closeout.indexOf("beforeCommentSecurityBlock") < commentMutationIndex);
   assert.ok(closeout.indexOf("beforeCloseSecurityBlock") < closeout.indexOf('["pr", "close"'));
 });
 

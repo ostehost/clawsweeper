@@ -100,6 +100,13 @@ checkpoint, and status-only commits are intentionally omitted.
   CrabFleet service token. Credential-isolated worker jobs upload finalized
   shards for one state-authorized collector, while existing state-authorized
   publishers import their own shards directly.
+- Added exact repair request-boundary receipts for branch, pull request,
+  comment, label, review-thread, continuation-dispatch, source-close
+  compensation, closeout, and merge mutations, preserving accepted and unknown
+  outcomes through later failures. Added digest-bound repair and commit-review
+  Codex log/report lifecycles, request-bound commit-check and notification
+  delivery receipts, generic workflow attempt/finalization events, and
+  immutable workflow publication of the resulting shards.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.
