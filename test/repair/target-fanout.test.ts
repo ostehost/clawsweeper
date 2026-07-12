@@ -6,11 +6,13 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  defaultLimit,
   filterEligibleRepositories,
   selectRepositories,
   type InventoryConfig,
   type ListedRepository,
 } from "../../dist/repair/target-fanout.js";
+import { mockGhBinEnv } from "../helpers.ts";
 
 const config: InventoryConfig = {
   owners: ["openclaw", "steipete"],
@@ -20,6 +22,12 @@ const config: InventoryConfig = {
   includeForks: false,
   requireIssues: true,
 };
+
+test("target fanout defaults match the scheduled cursor batch sizes", () => {
+  assert.equal(defaultLimit("hot-intake"), "10");
+  assert.equal(defaultLimit("normal-review"), "6");
+  assert.equal(defaultLimit("audit"), "12");
+});
 
 test("target fanout filters eligible repositories conservatively", () => {
   const repositories: ListedRepository[] = [
@@ -80,7 +88,7 @@ process.exit(2);
       env: {
         ...process.env,
         GITHUB_ACTIONS: "true",
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         GH_TOKEN: "workflow-token",
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
@@ -146,7 +154,7 @@ process.exit(2);
       env: {
         ...process.env,
         GITHUB_ACTIONS: "true",
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
         CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: "__public__",
@@ -242,7 +250,7 @@ process.exit(2);
       encoding: "utf8",
       env: {
         ...process.env,
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         GH_TOKEN: "workflow-token",
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
@@ -321,7 +329,7 @@ process.exit(2);
       encoding: "utf8",
       env: {
         ...process.env,
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
       },
     },

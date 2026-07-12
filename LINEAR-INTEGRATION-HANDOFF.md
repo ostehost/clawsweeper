@@ -1,7 +1,12 @@
 # Handoff — ClawSweeper × Linear: weekly / on-demand issue triage & review
 
 **Prepared:** 2026-06-18 · **For:** the main OpenClaw agent (hub, user `ostemini`)
-**Status:** research complete, scaffolding done, ready to implement. **No code changed yet.**
+**Status:** historical design handoff. The operator-run sidecar is now implemented
+under `src/linear/` and `scripts/linear-*.mjs`; native `TrackerProvider` integration
+remains unbuilt.
+
+The remainder is preserved as the original research record, not as current setup
+instructions.
 
 ---
 
@@ -18,9 +23,11 @@ A 4-agent research round produced the design below. The findings are grounded in
 - ✅ **Cloned the ClawSweeper source** (was NOT on this machine; it was the single biggest research blocker):
   `~/projects/clawsweeper` ← `github.com/openclaw/clawsweeper` (PUBLIC, branch `main`, `@openclaw/clawsweeper`, TS/pnpm).
   Its own description already states the target behavior: *"scans all issues and PRs and suggest what we can close, and why. It runs every PR / Issue once a week."*
-- ✅ This handoff lives at `~/projects/clawsweeper/LINEAR-INTEGRATION-HANDOFF.md` (untracked; clean working tree, deliberately **not** placed in `~/projects/config` which is mid-branch with unrelated uncommitted edits + subject to the node dirty-tree sweep).
+- ✅ At the time of writing, this handoff lived at
+  `~/projects/clawsweeper/LINEAR-INTEGRATION-HANDOFF.md` as an untracked research artifact.
 
-**You still need to do:** create a feature branch before any edits — `git -C ~/projects/clawsweeper checkout -b feat/linear-provider`. Commit early/often (see §7 dirty-tree warning).
+The original implementation plan began by creating a feature branch; that work has
+since landed in this fork.
 
 ---
 
@@ -28,7 +35,7 @@ A 4-agent research round produced the design below. The findings are grounded in
 
 | Aspect | Reality (file paths are real) |
 |---|---|
-| **Core** | `src/clawsweeper.ts` — a single ~19,500-line monolith. Entrypoints: `node dist/clawsweeper.js review\|plan\|status` (pnpm scripts `review`/`plan`/`status`); commit lane `dist/commit-sweeper.js`. |
+| **Core** | `src/clawsweeper.ts` — a large monolith. Entrypoints: `node dist/clawsweeper.js review\|plan\|status` (pnpm scripts `review`/`plan`/`status`); commit lane `dist/commit-sweeper.js`. |
 | **GitHub I/O** | **No provider/tracker abstraction exists** (`grep -rE 'interface (Tracker\|Provider\|IssueSource\|Forge)' src` → empty). All reads/writes shell out to the **`gh` CLI inline**. `src/github-json.ts` (31 lines) only *parses* `gh` JSON; `src/github-retry.ts` (99 lines) wraps retry/backoff. Repair-lane GitHub writes live in `src/repair/*-github.ts`. |
 | **Lanes** | Event-driven via GitHub `repository_dispatch` + scheduled scans. README:19/48 — *"reviews open issues and pull requests on a schedule and on exact GitHub events; scheduled runs scan open issues and PRs, while target repos forward exact issue/PR events with `repository_dispatch` for low-latency."* Dispatcher (in `openclaw/openclaw`): `.github/workflows/clawsweeper-dispatch.yml`. |
 | **Decision contract** | `schema/clawsweeper-decision.schema.json` — per-item decision record. Audit records: `records/<repo>/items/<n>.md`, `records/<repo>/closed/<n>.md`, `records/<repo>/commits/<sha>.md`. |

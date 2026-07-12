@@ -66,6 +66,46 @@ test("comment webhook ignores ClawSweeper proof-nudge comments", () => {
   assert.deepEqual(result, { accepted: false, reason: "proof nudge comment" });
 });
 
+test("comment webhook ignores command-bearing assist and visual publications before ack or dispatch", async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests += 1;
+    throw new Error("generated publications must not reach GitHub");
+  };
+
+  try {
+    for (const body of [
+      "@clawsweeper automerge\n<!-- clawsweeper-assist:stable-request -->",
+      "/autoclose\n<!-- clawsweeper-visual -->",
+    ]) {
+      const result = await handleGitHubWebhook({
+        event: "issue_comment",
+        payload: {
+          action: "created",
+          repository: { full_name: "openclaw/openclaw", default_branch: "main" },
+          issue: { number: 86422 },
+          installation: { id: 123 },
+          comment: {
+            id: 456,
+            body,
+            author_association: "MEMBER",
+            user: { login: "clawsweeper[bot]" },
+          },
+        },
+      });
+
+      assert.deepEqual(result, {
+        statusCode: 202,
+        body: { accepted: false, reason: "assist publication comment" },
+      });
+    }
+    assert.equal(requests, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("comment webhook rejects inline ClawSweeper mentions before visible ack", () => {
   const result = classifyIssueCommentWebhook({
     event: "issue_comment",
@@ -216,6 +256,8 @@ test("comment webhook still accepts post-close re-review commands for router res
     commentId: 456,
     installationId: 123,
     sourceAction: "created",
+    commentUpdatedAt: "2026-05-19T05:03:00Z",
+    commentBodySha256: crypto.createHash("sha256").update("@clawsweeper re-review").digest("hex"),
   });
 });
 
@@ -530,7 +572,53 @@ test("webhook rejects private and denied target repositories", () => {
   assert.deepEqual(deniedResult, { accepted: false, reason: "repository not eligible" });
 });
 
-test("webhook rejects all label mutations from exact-review intake", () => {
+test("webhook requeues unlocked and close-guard removal events", () => {
+  const closeGuardLabels = [
+    "security",
+    "beta-blocker",
+    "release-blocker",
+    "maintainer",
+    "clawsweeper:human-review",
+    "clawsweeper:manual-only",
+    "clawsweeper:automerge",
+    "clawsweeper:autofix",
+  ];
+  const cases = [
+    { event: "issues", action: "unlocked" },
+    { event: "pull_request", action: "unlocked" },
+    ...closeGuardLabels.flatMap((name) => [
+      { event: "issues", action: "unlabeled", label: { name } },
+      { event: "pull_request", action: "unlabeled", label: { name } },
+    ]),
+  ];
+  for (const [index, { event, action, label }] of cases.entries()) {
+    const itemNumber = 76990 + index;
+    const result = classifyItemWebhook({
+      event,
+      payload: {
+        action,
+        repository: {
+          full_name: "openclaw/gogcli",
+          private: false,
+          archived: false,
+          fork: false,
+          has_issues: true,
+        },
+        ...(event === "issues"
+          ? { issue: { number: itemNumber } }
+          : { pull_request: { number: itemNumber } }),
+        ...(label ? { label } : {}),
+        installation: { id: 123 },
+      },
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.sourceAction, action);
+    assert.equal(result.supersedesInProgress, true);
+  }
+});
+
+test("webhook rejects label additions and unrelated removals from exact-review intake", () => {
   for (const [event, payload] of [
     [
       "pull_request",
@@ -560,6 +648,7 @@ test("webhook rejects all label mutations from exact-review intake", () => {
           has_issues: true,
         },
         issue: { number: 597 },
+        label: { name: "clawsweeper:queueable-fix" },
         installation: { id: 123 },
         sender: { login: "steipete" },
       },
@@ -590,7 +679,9 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
     [];
   let nextCommentId = 9001;
   let fastAckPosts = 0;
+  let reactions = 0;
   let dispatches = 0;
+  const dispatchBodies: Array<Record<string, unknown>> = [];
   process.env.CLAWSWEEPER_APP_ID = "12345";
   delete process.env.CLAWSWEEPER_APP_CLIENT_ID;
   process.env.CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS = "0,0,0";
@@ -627,10 +718,12 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
       return jsonResponse(comment);
     }
     if (path === "/repos/openclaw/openclaw/issues/comments/456/reactions" && method === "POST") {
+      reactions += 1;
       return jsonResponse({ id: 1 });
     }
     if (path === "/repos/openclaw/clawsweeper/dispatches" && method === "POST") {
       dispatches += 1;
+      dispatchBodies.push(JSON.parse(String(init?.body ?? "{}")));
       return jsonResponse({});
     }
     if (path.startsWith("/repos/openclaw/openclaw/issues/comments/") && method === "DELETE") {
@@ -651,6 +744,7 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
       comment: {
         id: 456,
         body: "@clawsweeper re-review",
+        updated_at: "2026-07-12T20:00:00Z",
         author_association: "MEMBER",
         user: { login: "user" },
       },
@@ -663,7 +757,31 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
     assert.deepEqual(left, { statusCode: 202, body: { ok: true, status_comment_id: 9001 } });
     assert.deepEqual(right, { statusCode: 202, body: { ok: true, status_comment_id: 9001 } });
     assert.equal(fastAckPosts, 1);
+    assert.equal(reactions, 2);
     assert.equal(dispatches, 2);
+    assert.deepEqual(
+      dispatchBodies.map((body) => body.client_payload),
+      Array.from({ length: 2 }, () => ({
+        target_repo: "openclaw/openclaw",
+        target_branch: "main",
+        item_number: 71898,
+        comment_id: 456,
+        status_comment_id: 9001,
+        source_event: "issue_comment",
+        source_action: "created",
+        comment_event_auth: "github_webhook_v1",
+        comment_updated_at: "2026-07-12T20:00:00Z",
+        comment_body_sha256: crypto
+          .createHash("sha256")
+          .update("@clawsweeper re-review")
+          .digest("hex"),
+      })),
+    );
+    assert.ok(
+      dispatchBodies.every(
+        (body) => Object.keys(body.client_payload as Record<string, unknown>).length <= 10,
+      ),
+    );
     assert.equal(comments.length, 1);
     assert.match(comments[0]?.body ?? "", /clawsweeper-command-ack:456/);
     await new Promise((resolve) => setTimeout(resolve, 0));

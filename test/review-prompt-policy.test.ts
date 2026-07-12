@@ -129,6 +129,18 @@ test("review prompt treats plugin API changes as compatibility-sensitive P1 repa
   );
 });
 
+test("review prompt makes ClawHub closes a self-serve handoff", () => {
+  const prompt = readFileSync("prompts/review-item.md", "utf8");
+
+  assert.match(prompt, /For `clawhub` closes/);
+  assert.match(prompt, /self-serve handoff/);
+  assert.match(prompt, /skill, plugin, provider, channel, bundle, or MCP integration/);
+  assert.match(prompt, /metadata, entrypoint, permissions, secrets\/config/);
+  assert.match(prompt, /should not open a ClawHub issue/);
+  assert.match(prompt, /open a ClawHub PR/);
+  assert.match(prompt, /publish the package on the contributor's behalf/);
+});
+
 test("review prompt requires upgrade and preference overwrite checks", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
 
@@ -303,6 +315,13 @@ test("decision schema keeps draft and protected workflow state out of PR rank", 
   );
 });
 
+test("review finding schema requires every structured-output property", () => {
+  const schema = JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8"));
+  const finding = schema.properties.reviewFindings.items;
+
+  assert.deepEqual([...finding.required].sort(), Object.keys(finding.properties).sort());
+});
+
 test("review prompt and schema describe positive-only feature showcase labels", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
   const schema = JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8"));
@@ -317,6 +336,28 @@ test("review prompt and schema describe positive-only feature showcase labels", 
   assert.deepEqual(featureShowcase.properties.status.enum, ["showcase", "none"]);
 });
 
+test("review prompt uses token-light maturity shortlist helper", () => {
+  const prompt = readFileSync("prompts/review-item.md", "utf8");
+  const runtimePrompt = reviewPromptForTest(
+    item({ kind: "issue" }),
+    { issue: {}, comments: [], timeline: [] },
+    { mainSha: "abc123", latestRelease: null },
+    "",
+    { proofScratchDir: "/tmp/proof" },
+  );
+
+  assert.match(prompt, /maturity-stable-shortlist\.mjs/);
+  assert.match(prompt, /compare the issue against the M4\+ shortlist/);
+  assert.match(
+    runtimePrompt,
+    /node "\$CLAWSWEEPER_PROOF_SCRATCH_DIR\/maturity-stable-shortlist\.mjs"/,
+  );
+  assert.match(
+    runtimePrompt,
+    /read the full scorecard or taxonomy only if the shortlist is ambiguous/,
+  );
+});
+
 test("review prompt classifies Telegram visible proof candidates", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
 
@@ -326,7 +367,18 @@ test("review prompt classifies Telegram visible proof candidates", () => {
   assert.match(prompt, /mantis: telegram-visible-proof/);
   assert.match(prompt, /mantisRecommendation/);
   assert.match(prompt, /@openclaw-mantis/);
-  assert.match(prompt, /ambiguous Mantis account mention/);
+  assert.match(prompt, /ambiguous Mantis\s+account mention/);
+  assert.match(prompt, /Telegram,\s+Discord,\s+or web UI chat behavior/);
+  assert.match(prompt, /web_ui_chat_proof/);
+  assert.match(prompt, /WinUI/);
+  assert.match(prompt, /browser\/Playwright proof/);
+  assert.match(prompt, /Mantis is proof-only/);
+  assert.match(prompt, /Never\s+recommend Mantis to edit code, fix CI/);
+  assert.match(prompt, /ClawSweeper's repair, apply, and\s+automerge lanes/);
+  assert.match(prompt, /explicit proof action/);
+  assert.match(prompt, /ambiguous requests\s+without proof intent fail closed/);
+  assert.doesNotMatch(prompt, /`visual_task`: generic visible browser\/desktop proof/);
+  assert.doesNotMatch(prompt, /`slack_desktop_smoke`/);
 });
 
 test("pull request review comments suggest copy-paste Mantis proof comments", () => {
@@ -388,6 +440,137 @@ Reason: Maintainers should review the proof before merge.
   assert.match(comment, /```text\n@openclaw-mantis telegram desktop proof:/);
 });
 
+test("pull request review comments keep Discord and web UI chat Mantis suggestions", () => {
+  const discordComment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83140",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "abc123def456",
+    })}
+
+## Summary
+
+Keep this Discord PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: discord_status_reactions
+
+Reason: This changes visible Discord status reactions.
+
+Maintainer comment: @openclaw-mantis discord status reactions proof: verify queued and done reactions update around the worker run.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+  assert.match(discordComment, /\*\*Mantis proof suggestion\*\*/);
+  assert.match(discordComment, /@openclaw-mantis discord status reactions proof:/);
+
+  const webUiChatComment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83141",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "def456abc123",
+    })}
+
+## Summary
+
+Keep this web UI chat PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: web_ui_chat_proof
+
+Reason: This changes a visible web UI chat transcript interaction.
+
+Maintainer comment: @openclaw-mantis web UI chat proof: verify the assistant reply streams into the active chat transcript.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+  assert.match(webUiChatComment, /\*\*Mantis proof suggestion\*\*/);
+  assert.match(webUiChatComment, /@openclaw-mantis web UI chat proof:/);
+});
+
+test("pull request review comments scope unsupported Mantis visual suggestions", () => {
+  const comment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83142",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "123abc456def",
+    })}
+
+## Summary
+
+Keep this WinUI PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: visual_task
+
+Reason: A short visible WinUI proof would materially help because this changes a Sessions page filter toggle.
+
+Maintainer comment: @openclaw-mantis visual task: verify the Sessions page hides clean completed sessions by default.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+
+  assert.doesNotMatch(comment, /\*\*Mantis proof suggestion\*\*/);
+  assert.doesNotMatch(comment, /@openclaw-mantis visual task/);
+  assert.match(comment, /\*\*Proof path suggestion\*\*/);
+  assert.match(comment, /Mantis is currently scoped to Telegram, Discord, and web UI chat proof/);
+  assert.match(comment, /browser or Playwright proof/);
+});
+
 test("pull request review comments suppress unsafe Mantis recommendations", () => {
   const comment = renderReviewCommentFromReport(
     `${reportFrontMatter({
@@ -429,7 +612,206 @@ Reason: Maintainers should review the proof before merge.
   );
 
   assert.doesNotMatch(comment, /\*\*Mantis proof suggestion\*\*/);
+  assert.doesNotMatch(comment, /\*\*Proof path suggestion\*\*/);
   assert.doesNotMatch(comment, /@openclaw-mantis/);
+});
+
+test("pull request review comments keep Mantis proof-only and route mutations to ClawSweeper", () => {
+  const mutationComment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83143",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "abc456def789",
+    })}
+
+## Summary
+
+Keep this Telegram PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: telegram_desktop_proof
+
+Reason: The Telegram behavior still needs live proof and a branch repair.
+
+Maintainer comment: @openclaw-mantis fix this PR and push the repaired branch.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+
+  assert.doesNotMatch(mutationComment, /\*\*Mantis proof suggestion\*\*/);
+  assert.doesNotMatch(mutationComment, /@openclaw-mantis fix this PR/);
+  assert.match(mutationComment, /\*\*Proof path suggestion\*\*/);
+  assert.match(mutationComment, /Mantis is proof-only/);
+  assert.match(mutationComment, /ClawSweeper's repair, apply, or automerge lanes/);
+
+  const proofComment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83144",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "def789abc456",
+    })}
+
+## Summary
+
+Keep this Telegram PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: telegram_desktop_proof
+
+Reason: Native Telegram proof would show the corrected visible behavior.
+
+Maintainer comment: @openclaw-mantis telegram desktop proof: verify the fix in Telegram Desktop and capture redacted logs.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+
+  assert.match(proofComment, /\*\*Mantis proof suggestion\*\*/);
+  assert.match(proofComment, /verify the fix in Telegram Desktop/);
+  assert.doesNotMatch(proofComment, /\*\*Proof path suggestion\*\*/);
+});
+
+test("pull request review comments reject GitHub metadata mutations without blocking chat interaction proof", () => {
+  for (const maintainerComment of [
+    "@openclaw-mantis change labels on this PR",
+    "@openclaw-mantis add a comment to this PR",
+    "@openclaw-mantis reproduce the Telegram issue, push the repaired branch",
+    "@openclaw-mantis close this item",
+    "@openclaw-mantis comment on this PR",
+    "@openclaw-mantis make this code change",
+    "@openclaw-mantis please can you push the repaired branch",
+    "@openclaw-mantis please use gh to merge this PR",
+    "@openclaw-mantis can you use GitHub to close this item",
+    "@openclaw-mantis fix it",
+    "@openclaw-mantis repair this",
+    "@openclaw-mantis verify the Telegram fix and merge",
+    "@openclaw-mantis capture logs and approve",
+    "@openclaw-mantis discord proof: capture logs and approve if correct",
+    "@openclaw-mantis telegram proof: verify the fix and merge when done",
+    "@openclaw-mantis verify the Telegram fix and rerun CI",
+    "@openclaw-mantis capture logs and retry the failed workflow",
+  ]) {
+    const comment = renderReviewCommentFromReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "83145",
+        decision: "keep_open",
+        close_reason: "none",
+        work_candidate: "none",
+        pull_head_sha: "456def789abc",
+      })}
+
+## Summary
+
+Keep this Discord PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: discord_thread_attachment
+
+Reason: This changes a visible Discord interaction.
+
+Maintainer comment: ${maintainerComment}
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+      "none",
+    );
+    assert.doesNotMatch(comment, /\*\*Mantis proof suggestion\*\*/);
+    assert.doesNotMatch(
+      comment,
+      new RegExp(maintainerComment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    );
+    assert.match(comment, /Mantis is proof-only/);
+  }
+
+  const interactionProof = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "83146",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "none",
+      pull_head_sha: "789abc456def",
+    })}
+
+## Summary
+
+Keep this Discord PR open for maintainer review.
+
+## Mantis Recommendation
+
+Status: recommended
+
+Scenario: discord_thread_attachment
+
+Reason: This changes visible Discord message behavior.
+
+Maintainer comment: @openclaw-mantis discord proof: edit a Discord message and verify the attachment remains in the thread.
+
+## Work Candidate
+
+Candidate: none
+
+Confidence: low
+
+Priority: low
+
+Status: none
+
+Reason: Maintainers should review the proof before merge.
+	`,
+    "none",
+  );
+  assert.match(interactionProof, /\*\*Mantis proof suggestion\*\*/);
+  assert.match(interactionProof, /edit a Discord message/);
 });
 
 test("ClawSweeper proof judgement controls the sufficient proof label", () => {

@@ -31,15 +31,16 @@ The mental model:
 
 ## Worker Budget
 
-| Name | Current | Meaning |
-| --- | ---: | --- |
-| `workers.max` | 128 | Maximum global Codex worker budget used to derive lane limits. |
-| `workers.reserve_for_interactive` | 32 | Worker slots background lanes leave open for exact/manual/urgent work. |
-| `workers.expansion_reserve` | 32 | Extra slots background lanes leave open for independently planned matrix expansion. |
-| `workers.minimum_background` | 16 | Target floor for background progress when enough global capacity is available. |
-| `lanes.exact_review.max_concurrent` | 32 | Maximum concurrent exact-item review workflow runs admitted to Codex. |
-| `lanes.assist.max` | 10 | Maximum concurrent lightweight assist jobs. |
-| `lanes.repair.cluster_max_live_runs` | 2 | Default live repair workflow cap for imported gitcrawl cluster dispatches. |
+| Name                                       | Current | Meaning                                                                               |
+| ------------------------------------------ | ------: | ------------------------------------------------------------------------------------- |
+| `workers.max`                              |     128 | Maximum global Codex worker budget used to derive lane limits.                        |
+| `workers.reserve_for_interactive`          |      16 | Worker slots background lanes leave open for exact/manual/urgent work.                |
+| `workers.expansion_reserve`                |       8 | Extra slots background lanes leave open for independently planned matrix expansion.   |
+| `workers.minimum_background`               |      16 | Target floor for background progress when enough global capacity is available.        |
+| `lanes.exact_review.max_concurrent`        |      28 | Maximum concurrent exact-item review workflow runs admitted to Codex.                 |
+| `lanes.exact_review.target_max_concurrent` |      24 | Maximum concurrent exact-item review workflow runs one target repository may consume. |
+| `lanes.assist.max`                         |      10 | Maximum concurrent lightweight assist jobs.                                           |
+| `lanes.repair.cluster_max_live_runs`       |       2 | Default live repair workflow cap for imported gitcrawl cluster dispatches.            |
 
 ## Derived Limits
 
@@ -50,23 +51,24 @@ commit review can use 6 commits per page, existing repair lanes dispatch 51
 live workers by default, and imported cluster repair dispatches two live workers
 by default.
 
-| Name | Current | Meaning |
-| --- | ---: | --- |
-| `exact_review.concurrent_max` | 32 | Exact-item review admission cap, clamped to `workers.max`. |
-| `assist.default` | 10 | Maintainer assist job cap. |
-| `review_shards.normal_default` | 89 | Quiet-system normal review shard ceiling. |
-| `review_shards.normal_active_floor` | 38 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
-| `review_shards.hot_intake_default` | 44 | Quiet-system broad hot-intake review shard ceiling. |
-| `review_shards.exact_item_default` | 1 | Exact-item hot-intake shard count. |
-| `review_shards.hard_cap` | 128 | Maximum accepted review shard count. |
-| `commit_review.page_size_default` | 6 | Commits selected per commit-review page. |
-| `commit_review.page_size_hard_cap` | 128 | Maximum commit-review page size. |
-| `repair_live_runs.default` | 51 | Default live repair workflow run cap for manual dispatch/requeue/self-heal. |
-| `repair_live_runs.hard_cap` | 128 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
-| `repair_live_runs.automerge_default` | 51 | Live repair run cap for automerge comment-router dispatches. |
-| `repair_live_runs.issue_implementation_default` | 51 | Live repair run cap for issue-to-PR implementation intake. |
-| `repair_live_runs.cluster_default` | 2 | Live repair run cap for imported gitcrawl cluster dispatches. |
-| `issue_implementation.dispatches_per_sweep_default` | 5 | Maximum implementation intake jobs queued from one review publish run. |
+| Name                                                | Current | Meaning                                                                               |
+| --------------------------------------------------- | ------: | ------------------------------------------------------------------------------------- |
+| `exact_review.concurrent_max`                       |      28 | Exact-item review admission cap, clamped to `workers.max`.                            |
+| `exact_review.target_concurrent_max`                |      24 | Exact-item per-target admission cap, clamped to global exact-review capacity.         |
+| `assist.default`                                    |      10 | Maintainer assist job cap.                                                            |
+| `review_shards.normal_default`                      |      89 | Quiet-system normal review shard ceiling.                                             |
+| `review_shards.normal_active_floor`                 |      38 | Minimum active normal review shards to keep queued for `openclaw/openclaw`.           |
+| `review_shards.hot_intake_default`                  |      44 | Quiet-system broad hot-intake review shard ceiling.                                   |
+| `review_shards.exact_item_default`                  |       1 | Exact-item hot-intake shard count.                                                    |
+| `review_shards.hard_cap`                            |     128 | Maximum accepted review shard count.                                                  |
+| `commit_review.page_size_default`                   |       6 | Commits selected per commit-review page.                                              |
+| `commit_review.page_size_hard_cap`                  |     128 | Maximum commit-review page size.                                                      |
+| `repair_live_runs.default`                          |      51 | Default live repair workflow run cap for manual dispatch/requeue/self-heal.           |
+| `repair_live_runs.hard_cap`                         |     128 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
+| `repair_live_runs.automerge_default`                |      51 | Live repair run cap for automerge comment-router dispatches.                          |
+| `repair_live_runs.issue_implementation_default`     |      51 | Live repair run cap for issue-to-PR implementation intake.                            |
+| `repair_live_runs.cluster_default`                  |       2 | Live repair run cap for imported gitcrawl cluster dispatches.                         |
+| `issue_implementation.dispatches_per_sweep_default` |       5 | Maximum implementation intake jobs queued from one review publish run.                |
 
 Formula summary:
 
@@ -99,11 +101,12 @@ The scheduler does this for background lanes:
 6. cap the result at the lane's derived quiet-system ceiling
 7. return at least 1 so an enabled lane can still make slow progress
 
-Background sweeps that are still planning or expanding their matrix reserve
-their quiet lane size. That avoids a race where a second background planner sees
-the first run before its shard jobs exist and over-allocates the shared Codex
-budget. Broad manual review `shard_count` inputs are also capped by the current
-lane allowance; exact-item runs still use the exact-item lane.
+Background planner jobs serialize per target repository. A sweep that is still
+planning, queued, or expanding its matrix reserves its quiet lane size. Once
+its shard jobs exist and all finish, its publish phase counts as zero workers,
+allowing the next planner to refill the available capacity. Broad manual review
+`shard_count` inputs are also capped by the current lane allowance; exact-item
+runs still use the exact-item lane.
 
 Priority lanes do not subtract the interactive reserve. They cap themselves at
 their derived lane ceiling and at the remaining global budget after other active
@@ -114,23 +117,37 @@ Exact-item webhooks are admitted by the dashboard Worker's durable
 deliveries by repository and item number, so a new webhook updates the latest
 desired review rather than consuming another runner. Only
 `EXACT_REVIEW_QUEUE_MAX_CONCURRENT` leased items may dispatch an exact-review
-workflow at once; the default is 32.
+workflow at once; the default is 28. `EXACT_REVIEW_TARGET_MAX_CONCURRENT` bounds
+how many of those slots one target repository may consume; production sets it
+to 24 so other target repositories retain four global slots during an OpenClaw
+backlog drain.
 
-Each dispatched workflow claims its opaque lease before checkout. Duplicate
+Each dispatched workflow claims its opaque lease before checkout. Protocol v2
+binds claim and completion to the item key, lease revision, run attempt, claim
+generation, and an immutable decision snapshot. During the rolling-upgrade
+window, dispatches nest the strict tuple under `queue_claim`, also carry the immutable v1 snapshot, and the Worker accepts
+lease-id-only finalization only for claims recorded as protocol v1. Duplicate
 dispatches and stale workflows cannot claim the same lease, and a completion
-releases the lease or immediately schedules the newest revision. If a workflow
-never claims or completes, the Durable Object reclaims the expired lease. This
-keeps capacity waiting and retry state out of GitHub Actions runners.
+immediately schedules a known newer revision. Failed and cancelled executors
+requeue their item with bounded retry backoff. Successful finalizer reports stay
+leased until a signed terminal-run reconciliation backstop confirms that exact
+GitHub attempt completed successfully; this backstop can also recover terminal
+failed or cancelled runs before lease expiry.
+Run-attempt binding and a per-claim generation check keep delayed terminal
+decisions from releasing a later rerun; queued and in-progress runs are never
+released. If a workflow never claims or completes, the Durable Object reclaims
+the expired lease. This keeps capacity waiting and retry state out of GitHub
+Actions runners.
 
 Examples with the current config:
 
-- Quiet system: manual normal review can request 89 shards; scheduled normal
-  review gets 64 after reserving 32 slots for exact/manual/urgent work and 32
-  slots for in-flight matrix expansion.
-- 4 active repair workers and 68 active background workers: normal review gets
-  1 because `128 - 32 interactive reserve - 32 expansion reserve - 4 priority
-  - 68 background = -8`, and enabled background lanes keep one slow-progress worker.
-- 88 active priority workers: commit review gets 1, so commit review yields but
+- Quiet system: scheduled and manual normal review can request 89 shards, with
+  104 background slots available after reserving 16 for interactive work and 8
+  for matrix expansion.
+- 4 active repair workers and 96 active background workers: normal review gets
+  4 because `128 - 16 interactive reserve - 8 expansion reserve - 4 priority
+  - 96 background = 4`.
+- 105 active priority workers: commit review gets 1, so commit review yields but
   does not fully stall.
 
 Use these commands to inspect the effective values from a checkout:
@@ -143,8 +160,8 @@ pnpm run --silent workflow -- worker-limit commit_review --active-critical 88
 ```
 
 Change `workers.max` first when tuning review-side rate-limit pressure. For
-example, setting `workers.max` to `90` automatically makes normal review `63`,
-hot intake `31`, and commit review `4`. Existing repair lanes keep their
+example, setting `workers.max` to `40` automatically makes normal review `28`,
+hot intake `14`, and commit review `2`. Existing repair lanes keep their
 40% derived caps, while imported cluster repair remains separately bounded until
 `lanes.repair.cluster_max_live_runs` is raised.
 

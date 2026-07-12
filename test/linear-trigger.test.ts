@@ -6,9 +6,10 @@ import {
   DEFAULT_SEMANTIC_FAILURE_PATTERNS,
   detectSentinel,
   evaluateRunExpectations,
-  HUB_OPENCLAW_ROOT,
+  HUB_CLAWSWEEPER_ROOT,
   HUB_USER,
   onDemandTriggerHandle,
+  SNAPSHOT_SCRIPT_REL,
   TRIAGE_ALERT_SENTINEL,
   TRIAGE_OK_SENTINEL,
   TRIAGE_SCRIPT_REL,
@@ -60,6 +61,9 @@ test("weeklyTriageCronSpec returns the Monday-09:00 America/Chicago default", ()
 
 test("weeklyTriageCronSpec message routes to the review-only runner and ends with sentinels", () => {
   const spec = weeklyTriageCronSpec();
+  const snapshot = `${HUB_CLAWSWEEPER_ROOT}/${SNAPSHOT_SCRIPT_REL}`;
+  const triage = `${HUB_CLAWSWEEPER_ROOT}/${TRIAGE_SCRIPT_REL}`;
+  assert.ok(spec.message.includes(`node ${snapshot} | node ${triage}`));
   assert.ok(spec.message.includes("--review-only --json"));
   assert.ok(spec.message.includes(TRIAGE_OK_SENTINEL));
   assert.ok(spec.message.includes(TRIAGE_ALERT_SENTINEL));
@@ -70,7 +74,8 @@ test("weeklyTriageCronSpec message routes to the review-only runner and ends wit
 
 test("weeklyTriageCronSpec defaults to the committed hub-side runner path", () => {
   const spec = weeklyTriageCronSpec();
-  assert.ok(spec.message.includes(`${HUB_OPENCLAW_ROOT}/${TRIAGE_SCRIPT_REL}`));
+  assert.ok(spec.message.includes(`${HUB_CLAWSWEEPER_ROOT}/${SNAPSHOT_SCRIPT_REL}`));
+  assert.ok(spec.message.includes(`${HUB_CLAWSWEEPER_ROOT}/${TRIAGE_SCRIPT_REL}`));
   assert.ok(spec.message.includes(`/Users/${HUB_USER}/`));
 });
 
@@ -80,23 +85,36 @@ test("weeklyTriageCronSpec accepts overrides", () => {
     cron: "30 8 * * 2",
     tz: "UTC",
     timeoutSeconds: 900,
-    scriptPath: "/Users/ostemini/projects/config/openclaw/scripts/other.mjs",
+    projectRoot: "/Users/ostemini/projects/clawsweeper-alt",
   });
   assert.equal(spec.name, "Custom triage");
   assert.equal(spec.cron, "30 8 * * 2");
   assert.equal(spec.tz, "UTC");
   assert.equal(spec.timeoutSeconds, 900);
-  assert.ok(spec.message.includes("/scripts/other.mjs"));
+  assert.ok(spec.message.includes("/projects/clawsweeper-alt/scripts/linear-snapshot.mjs"));
+  assert.ok(spec.message.includes("/projects/clawsweeper-alt/scripts/linear-triage.mjs"));
 });
 
 test("weeklyTriageCronSpec rejects the macbook node path", () => {
   assert.throws(
     () =>
       weeklyTriageCronSpec({
-        scriptPath: "/Users/ostehost/projects/config/openclaw/scripts/linear-triage.mjs",
+        projectRoot: "/Users/ostehost/projects/clawsweeper",
       }),
     /hub user path/,
   );
+});
+
+test("weeklyTriageCronSpec rejects paths outside the hub projects root and unsafe shell text", () => {
+  for (const projectRoot of [
+    "/tmp/clawsweeper",
+    "/Users/another/projects/clawsweeper",
+    "/Users/ostemini/projects/../config",
+    "/Users/ostemini/projects/clawsweeper;touch-pwned",
+    "/Users/ostemini/projects/claw sweeper",
+  ]) {
+    assert.throws(() => weeklyTriageCronSpec({ projectRoot }), /safe hub user path/);
+  }
 });
 
 // ---------------------------------------------------------------------------

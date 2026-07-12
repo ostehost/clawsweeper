@@ -32,6 +32,7 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
@@ -60,6 +61,8 @@ const CLOSE_CLASSIFICATIONS = new Set([
 ]);
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
+// A covering PR may need a base update, but actual merge actions remain CLEAN-only.
+const VIABLE_COVERING_PR_MERGE_STATES = new Set(["CLEAN", "BEHIND"]);
 const PR_CLOSE_COVERAGE_PROOF_COMMENT_LIMIT = 50;
 const GITHUB_MAX_PAGE_SIZE = 100;
 const CLAWSWEEPER_COMMAND_ONLY_PATTERN = /^@clawsweeper\s+(?:re-review|re-run|review)\s*$/i;
@@ -646,6 +649,22 @@ function applyMergeAction({
     };
   }
 
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: String(view.baseRefName ?? pullRequest.base?.ref ?? ""),
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: strictBaseBindingBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      merge_method: "squash",
+    };
+  }
+
   const mergeMessage = buildRepairSquashMergeMessage({
     target,
     title: view.title ?? pullRequest.title,
@@ -668,6 +687,22 @@ function applyMergeAction({
   ];
   if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
   try {
+    const finalView = fetchPullRequestView(result.repo, target);
+    const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+      repo: result.repo,
+      baseBranch: String(finalView.baseRefName ?? ""),
+      policyReadJson: rulesetPolicyReader(),
+    });
+    if (finalStrictBaseBindingBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: finalStrictBaseBindingBlock,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        merge_method: "squash",
+      };
+    }
     ghWithRetry(mergeArgs);
   } catch (error) {
     if (isLockedConversationCommentError(error)) {
@@ -692,6 +727,15 @@ function applyMergeAction({
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
   };
+}
+
+function rulesetPolicyReader() {
+  const token = process.env.CLAWSWEEPER_RULESET_GH_TOKEN?.trim();
+  if (!token) return undefined;
+  return (ghArgs: string[]) =>
+    ghJson(ghArgs, {
+      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+    });
 }
 
 function validateClosePolicy({ job, actionName }: LooseRecord) {
@@ -1094,7 +1138,11 @@ function validatePrCloseCoverageCoveringSafety({
   if (covering.mergedAt) return "";
   const pullRequest = fetchPullRequest(result.repo, coveringRef);
   const view = fetchPullRequestView(result.repo, coveringRef);
-  const mergeBlock = validateMergeablePullRequest({ pullRequest, view });
+  const mergeBlock = validateMergeablePullRequest({
+    pullRequest,
+    view,
+    allowedMergeStates: VIABLE_COVERING_PR_MERGE_STATES,
+  });
   if (mergeBlock) return formatCoveringPullRequestBlock(coveringRef, mergeBlock);
   if (resultHasPlannedCloseForTarget(result, coveringRef)) {
     return `linked canonical PR #${coveringRef} is itself proposed for close`;
@@ -1262,9 +1310,21 @@ function fetchPrCloseCoverageProofCommentWindow(
 ): { comments: JsonValue[]; total: number } {
   const apiPath = `repos/${repo}/issues/${number}/comments`;
   const total = nonNegativeIntegerFromUnknown(commentsCount);
-  if (total === null || total <= limit) {
-    const comments = ghPaged(apiPath);
-    return { comments, total: total ?? comments.length };
+  if (total === null) {
+    return fetchPrCloseCoverageProofCommentWindowWithoutCount(apiPath, limit);
+  }
+  if (total === 0 || limit <= 0) {
+    return { comments: [], total };
+  }
+  if (total <= limit) {
+    return {
+      comments: fetchPrCloseCoverageProofCommentPage(
+        apiPath,
+        Math.min(total, GITHUB_MAX_PAGE_SIZE),
+        1,
+      ),
+      total,
+    };
   }
 
   if (total <= GITHUB_MAX_PAGE_SIZE) {
@@ -1279,6 +1339,46 @@ function fetchPrCloseCoverageProofCommentWindow(
   const first = fetchPrCloseCoverageProofCommentPage(apiPath, keepStart, 1);
   const last = fetchLastPrCloseCoverageProofComments(apiPath, total, keepEnd);
   return { comments: [...first, ...last], total };
+}
+
+function fetchPrCloseCoverageProofCommentWindowWithoutCount(
+  apiPath: string,
+  limit: number,
+): { comments: JsonValue[]; total: number } {
+  const boundedLimit = Math.max(0, Math.floor(limit));
+  if (boundedLimit <= 0) return { comments: [], total: 0 };
+  const first = fetchPrCloseCoverageProofCommentPageWithHeaders(apiPath, GITHUB_MAX_PAGE_SIZE, 1);
+  const lastPage =
+    first.lastPageNumber ?? (first.comments.length < GITHUB_MAX_PAGE_SIZE ? 1 : null);
+  if (lastPage === null) {
+    const comments = ghPaged(apiPath);
+    return { comments, total: comments.length };
+  }
+  if (lastPage <= 1) {
+    return {
+      comments: first.comments,
+      total: first.comments.length,
+    };
+  }
+
+  const last = fetchPrCloseCoverageProofCommentPageWithHeaders(
+    apiPath,
+    GITHUB_MAX_PAGE_SIZE,
+    lastPage,
+  ).comments;
+  const total = Math.max(0, (lastPage - 1) * GITHUB_MAX_PAGE_SIZE + last.length);
+  const keepStart = Math.floor(boundedLimit / 2);
+  const keepEnd = Math.max(0, boundedLimit - keepStart);
+  const head = first.comments.slice(0, keepStart);
+  let tailSource = last;
+  if (last.length < keepEnd && lastPage > 1) {
+    const previous =
+      lastPage - 1 === 1
+        ? first.comments
+        : fetchPrCloseCoverageProofCommentPage(apiPath, GITHUB_MAX_PAGE_SIZE, lastPage - 1);
+    tailSource = [...previous, ...last];
+  }
+  return { comments: [...head, ...tailSource.slice(-keepEnd)], total };
 }
 
 function fetchLastPrCloseCoverageProofComments(
@@ -1311,6 +1411,47 @@ function fetchPrCloseCoverageProofCommentPage(
 ): JsonValue[] {
   const entries = ghJson<JsonValue[]>(["api", githubLimitedPagePath(apiPath, perPage, page)]);
   return Array.isArray(entries) ? entries : [];
+}
+
+function fetchPrCloseCoverageProofCommentPageWithHeaders(
+  apiPath: string,
+  perPage: number,
+  page: number,
+): { comments: JsonValue[]; lastPageNumber: number | null } {
+  const limitedPath = githubLimitedPagePath(apiPath, perPage, page);
+  const output = ghWithRetry(["api", "-i", limitedPath]);
+  const { body, headers } = splitGithubResponse(output);
+  const entries = JSON.parse(body || "[]") as JsonValue;
+  return {
+    comments: Array.isArray(entries) ? entries : [],
+    lastPageNumber: githubLastPageNumber(headers),
+  };
+}
+
+function splitGithubResponse(output: string): { headers: string; body: string } {
+  const normalized = output.replace(/\r\n/g, "\n");
+  const separator = normalized.lastIndexOf("\n\n");
+  if (separator < 0) return { headers: "", body: normalized };
+  return {
+    headers: normalized.slice(0, separator),
+    body: normalized.slice(separator + 2),
+  };
+}
+
+function githubLastPageNumber(headers: string): number | null {
+  for (const line of headers.split("\n")) {
+    const delimiter = line.indexOf(":");
+    if (delimiter <= 0) continue;
+    if (line.slice(0, delimiter).trim().toLowerCase() !== "link") continue;
+    for (const part of line.slice(delimiter + 1).split(",")) {
+      if (!part.includes('rel="last"')) continue;
+      const page = part.match(/[?&]page=(\d+)/)?.[1];
+      if (!page) continue;
+      const value = Number(page);
+      if (Number.isSafeInteger(value) && value > 0) return value;
+    }
+  }
+  return null;
 }
 
 function compactPrCloseCoverageProofCommentWindow(
@@ -1387,13 +1528,17 @@ function prCloseCoverageProofRuntime() {
   return ghToken ? { ...runtime, ghToken } : runtime;
 }
 
-function validateMergeablePullRequest({ pullRequest, view }: LooseRecord) {
+function validateMergeablePullRequest({
+  pullRequest,
+  view,
+  allowedMergeStates = CLEAN_MERGE_STATES,
+}: LooseRecord) {
   if (pullRequest.state !== "open") return `pull request is ${pullRequest.state}`;
   if (pullRequest.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pullRequest.base?.ref ?? "") !== "main")
     return "pull request base is not main";
   if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
-  if (!CLEAN_MERGE_STATES.has(String(view.mergeStateStatus ?? ""))) {
+  if (!allowedMergeStates.has(String(view.mergeStateStatus ?? ""))) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
   }
   if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {

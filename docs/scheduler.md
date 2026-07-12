@@ -22,8 +22,9 @@ ClawSweeper has three issue/PR scheduler paths:
 
 The lanes share report storage and apply rules, but they intentionally do not
 share throughput. Event review and hot intake keep new maintainer-visible work
-fast. Normal backfill keeps older records moving with up to 89 concurrent Codex
-review shards when the system is quiet. Normal `openclaw/openclaw` review has an
+fast. Scheduled and manual normal backfill keep up to 89 concurrent Codex
+review shards when quiet.
+Normal `openclaw/openclaw` review has an
 active floor of 38 shards for scheduled runs and workflow-dispatch
 continuations: due items win first, and if fewer than 38 items are due, the
 planner fills the floor with the stalest currently-reviewed eligible items so
@@ -52,13 +53,21 @@ source only. For local record inspection, switch that checkout to `state` or run
 `scripts/hydrate-state.ts` from a `state`-branch checkout before using
 `records/`.
 
-The workflow has one concurrency group per lane and target repository. Scheduled
-normal review cannot overlap another normal review for the same target repo.
-GitHub may keep one pending run for a concurrency group; newer scheduled runs
-can replace older pending runs, but they do not cancel a running normal review
-because `cancel-in-progress` is only true for exact `repository_dispatch` runs.
+Broad normal and hot review workflows use run-scoped concurrency groups, so a
+new wave can overlap an older wave that has reached its long-tail or publish
+phase. Their plan jobs use a separate concurrency group per target repository
+with `cancel-in-progress: false`, serializing capacity decisions before each
+matrix expands. The default single-pending policy coalesces superseded planner
+ticks instead of retaining an unbounded history. Exact-item planners keep a
+run-scoped group and do not wait for broad background planning.
 Manual exact-item `workflow_dispatch` reviews use an exact-item concurrency
-group, so targeted maintainer checks do not wait behind broad normal backfill.
+group with the same single-pending policy, so newer revisions replace stale
+pending work instead of building a duplicate queue. Durable exact-review leases
+use lease-scoped workflow groups and remain owned by the Worker admission lane.
+Review publication and apply/comment sync use separate non-dropping per-target
+job queues. Each lane stays serialized, while tuple-aware state reconciliation
+allows one review publisher and one apply runner to make progress concurrently
+without stale review snapshots reviving closed records.
 
 ## Schedules
 
@@ -224,7 +233,7 @@ Current defaults:
 - exact manual hot intake: 1 shard, 1 item
 - broad hot intake: up to 44 shards when quiet, batch size 1, scans up to 10
   GitHub pages
-- scheduled normal backfill: up to 64 shards when quiet, batch size 3, scans up
+- scheduled normal backfill: up to 89 shards when quiet, batch size 3, scans up
   to 250 GitHub pages after reserving interactive and expansion capacity
 - normal active floor: 38 shards for `openclaw/openclaw` scheduled runs and
   workflow-dispatch continuations; stale current-review backfill is eligible
@@ -243,7 +252,7 @@ scheduled dispatches cannot temporarily exceed the shared worker budget while
 GitHub is still expanding jobs.
 
 Planning is also the runtime build point for matrix review. The plan job installs
-with pinned Node 24 and `pnpm@10.33.2`, builds `dist/` once, and uploads that
+with pinned Node 24 and `pnpm@11.10.0`, builds `dist/` once, and uploads that
 runtime artifact. Review shards download the built `dist/` and run
 `node dist/clawsweeper.js review` directly instead of running a per-shard pnpm
 install and build. This keeps 44-89 shard waves from stampeding the npm
@@ -261,22 +270,24 @@ shards can fetch current GitHub item state and write review artifacts without
 hydrating historical records. Publish and apply jobs keep full state history
 because they may rebase and push generated records.
 
-Normal backfill now runs every 5 minutes for `openclaw/openclaw`. Because its
-concurrency group allows only one running normal backfill per target repo, the
-effect is a continuous drain loop: when due backlog exists, the active run can
-hold up to 64 Codex review shards with up to three items per shard, and the next
-scheduled tick is available as the backstop or pending continuation. Manual
-normal reviews keep the larger default batch size for targeted catch-up runs.
+Normal backfill runs every 5 minutes for `openclaw/openclaw`. Its planner
+serializes per target repository, but the run-scoped workflow group allows a
+new wave to overlap an older wave that is finishing slow shards or publishing.
+One quiet-system run can hold up to 89 Codex review shards with up to three
+items per shard; each later planner subtracts the older wave's live shards
+before choosing its own matrix size.
 
 The quiet-system ceiling is not a promise that every scheduled run dispatches
 that many shards. The `mode` step checks active repair workers, exact-item sweep
 runs, commit-review pages, and live normal/hot review shard jobs, then asks
 `worker-limit normal_review` or `worker-limit hot_intake` for the current
-allowance. Planning, publish, queued, and not-yet-expanded background runs
-reserve one worker slot instead of a whole quiet-system lane. If
+allowance. Planning, queued, and not-yet-expanded background runs reserve their
+whole quiet-system lane. A run with completed shard jobs and no active shard
+jobs is publishing and counts as zero Codex workers, allowing the next planner
+to refill the lane. If
 repair/automerge is busy, background sweep dispatches fewer shards and leaves
 capacity for the specific work that is closest to a merge or maintainer request.
-Background lanes also subtract a 32-worker expansion reserve so independently
+Background lanes also subtract an 8-worker expansion reserve so independently
 planned exact-item and commit-review runs have room to start without pushing the
 live Codex count past the global budget.
 
@@ -417,9 +428,10 @@ The live scheduler estimate happens before planning and is intentionally coarse:
 it counts active repair-cluster workflow runs as priority work, active exact-item
 sweep runs as priority work, active commit-review workflow runs as background
 work weighted by the configured commit page size, and other active normal/hot
-sweep runs by their live active `Review shard` jobs. Runs that are only
-planning, publishing, queued, or waiting for matrix expansion count as one
-background worker. GitHub Actions can start or finish jobs after that estimate,
+sweep runs by their live active `Review shard` jobs. Runs that are planning,
+queued, or waiting for matrix expansion reserve their quiet lane. Runs whose
+shards have completed and are only publishing count as zero Codex workers.
+GitHub Actions can start or finish jobs after that estimate,
 so the scheduler is a throttle, not a distributed lock.
 
 Planning status intentionally does not run `pnpm run reconcile`. Reconciliation
@@ -445,15 +457,64 @@ association, paired issue/PR state, snapshot drift, and repository profile
 rules. It closes only unchanged high-confidence proposals and otherwise updates
 or syncs the durable ClawSweeper review comment.
 
+Apply reconciles hydrated records before both candidate preselection and
+execution. Each pass immediately publishes only the item, closed, plan, and
+decision-packet paths for record numbers it changed. This keeps folder moves
+and closed-item sidecar cleanup durable even when policy filtering, an empty
+comment-sync batch, or an empty close queue makes the rest of the run a no-op.
+If another publisher updates the same tuple first, its newer tuple wins and
+reconciliation defers that item instead of rebuilding stale report or sidecar
+content.
+
 Broad normal review publishes records first, then dispatches durable review
 comment sync into the separate apply/comment-sync lane. This includes scheduled
 runs and workflow-dispatch continuations, so slow GitHub comment writes do not
-hold the normal review concurrency group or delay the next 12-shard backfill
+hold the planner concurrency group or delay the next 89-shard backfill
 wave. Exact issue/PR reviews and repository-dispatch item runs still sync their
 selected comments inline before finishing.
 
-Long apply runs commit checkpoints and can dispatch continuation runs when they
-reach the configured close limit.
+Long apply runs commit checkpoints every 20 fresh closes and dispatch a
+continuation with a fresh GitHub App token after any checkpoint that closes at
+least one item. A saturated scan that closes nothing stops without chaining so
+the same records cannot create an unbounded runner loop.
+
+Untargeted cursor-based close apply starts with a 300-record scan window. If
+the previous cursor window was a full close-mode scan, closed nothing, skipped
+at least 80% of processed records, and did not hit a live-fetch, runtime-budget,
+or missing-cursor failure, the next automatic window expands to inspect more
+records, capped at 900. This changes only the deterministic scan window:
+`apply_limit`, checkpoint size, close gates, live-state checks, and maintainer
+policy gates stay unchanged. The workflow logs and sweep status detail include
+the selected scan window and reason.
+
+Automatic windows reserve up to two candidates for PR close-coverage proof,
+capped by the effective close budget. Confirmed proof-gated close proposals stay
+ahead of speculative promotion proofs; spare proof capacity rotates promotions
+on the same independent proof cursor. Reserved proofs run before deterministic
+closes could exhaust the checkpoint's mutation limit. An executor trace advances
+each cursor only through records actually examined, so a partial window preserves
+unexamined candidates and each pool resumes from its exact last-examined
+position. Coverage proof, live-state refresh, freshness checks, and close gates
+remain unchanged. Explicit targeted apply runs keep their requested item set and
+ordering policy.
+
+Before a close-mode apply run starts, the workflow summarizes the selected close
+candidate mix by quality bucket in the status detail. Buckets such as
+implemented-on-main, duplicate/superseded, needs PR close proof,
+aging/low-signal (including stalled-unproven and abandoned PRs),
+policy-sensitive, and retry-after-guard-skip are
+operator-facing telemetry only; the bucket classification does not change close
+limits, live-state checks, or policy gates. Stalled-unproven and abandoned PR
+proposals are eligible for apply selection, where the executor re-checks their
+PR-only age, activity, proof, status, and human-engagement gates before closing.
+
+Apply and comment-sync Actions run titles include the target repository. Before
+dispatching a default cursor-based apply continuation, the workflow checks
+recent active or queued same-target default cursor runs and treats one of those
+runs as the continuation instead of adding another pending run. Custom-input
+and explicit-item runs have a different title and cannot suppress the default
+cursor lane; their own continuations still dispatch with the exact inputs. The
+log identifies the default cursor run that covered the continuation.
 
 ## Continuation and Recovery
 

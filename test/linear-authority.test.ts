@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -332,8 +333,14 @@ test("stale_insufficient_info is an evidence-bearing close reason", () => {
 });
 
 test('EVIDENCE_CLOSE_REASONS contains the taxonomy reasons but excludes "none"', () => {
-  assert.equal(EVIDENCE_CLOSE_REASONS.has("implemented_on_main"), true);
-  assert.equal(EVIDENCE_CLOSE_REASONS.has("stale_insufficient_info"), true);
+  const schema = JSON.parse(
+    readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url), "utf8"),
+  );
+  const schemaReasons = schema.properties.closeReason.enum as string[];
+  assert.deepEqual(
+    [...EVIDENCE_CLOSE_REASONS].sort(),
+    schemaReasons.filter((reason) => reason !== "none").sort(),
+  );
   assert.equal(EVIDENCE_CLOSE_REASONS.has("none"), false);
 });
 

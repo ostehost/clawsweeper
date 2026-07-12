@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MAX_LIVE_WORKERS,
+  activeRepairWorkflowRunForJob,
   activeRepairWorkflowRunForJobAfterDispatchRecheck,
   fetchRecentWorkflowRuns,
   listActiveWorkflowRuns,
@@ -16,7 +17,7 @@ test("live worker capacity refuses limits above the global Codex cap", () => {
   assert.equal(MAX_LIVE_WORKERS, 128);
   assert.equal(readMaxLiveWorkers(), 51);
   assert.equal(readMaxLiveWorkers({ "max-live-workers": "1" }), 1);
-  assert.equal(readMaxLiveWorkers({ "max-live-workers": "51" }), 51);
+  assert.equal(readMaxLiveWorkers({ "max-live-workers": "127" }), 127);
   assert.throws(
     () => readMaxLiveWorkers({ "max-live-workers": "129" }),
     /max-live-workers must be <= 128/,
@@ -35,6 +36,13 @@ test("live worker capacity accepts env default within the global Codex cap", () 
 });
 
 test("repair run names match workflow dispatch titles", () => {
+  const issueJob = "jobs/openclaw/inbox/issue-openclaw-openclaw-75364.md";
+  assert.equal(repairRunNamePrefixForJob(issueJob), "issue implementation ");
+  assert.equal(repairRunNameForJob(issueJob), `issue implementation ${issueJob}`);
+  assert.equal(
+    repairRunNameForJob(issueJob, "automerge repair ", "router-issue123"),
+    `issue implementation ${issueJob} [router-issue123]`,
+  );
   assert.equal(
     repairRunNameForJob("jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md"),
     "automerge repair jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md",
@@ -50,6 +58,26 @@ test("repair run names match workflow dispatch titles", () => {
       "automerge repair",
     ),
     "automerge repair jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md",
+  );
+});
+
+test("repair run names include command receipt keys without hiding active jobs", () => {
+  const job = "jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md";
+  assert.equal(
+    repairRunNameForJob(job, "automerge repair ", "router-abc123"),
+    `automerge repair ${job} [router-abc123]`,
+  );
+  assert.equal(
+    activeRepairWorkflowRunForJob({
+      jobPath: job,
+      activeRunsByPrefix: new Map([
+        [
+          "automerge repair ",
+          [{ displayTitle: `automerge repair ${job} [router-abc123]`, status: "in_progress" }],
+        ],
+      ]),
+    })?.status,
+    "in_progress",
   );
 });
 

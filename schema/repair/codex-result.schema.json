@@ -285,7 +285,8 @@
             "source_prs",
             "repair_strategy",
             "allow_no_pr",
-            "branch_update_blockers"
+            "branch_update_blockers",
+            "repair_contract"
           ],
           "additionalProperties": false,
           "properties": {
@@ -356,6 +357,31 @@
               "items": {
                 "type": "string"
               }
+            },
+            "repair_contract": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": ["must_touch", "match"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "must_touch": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "match": {
+                      "type": "string",
+                      "enum": ["any", "all"]
+                    }
+                  }
+                }
+              ]
             }
           }
         }

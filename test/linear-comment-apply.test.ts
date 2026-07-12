@@ -159,14 +159,20 @@ function hydratedIssueNode() {
     id: "issue-uuid-244",
     identifier: "PAR-244",
     title: "Example issue",
+    description: "Example description",
     url: "https://linear.app/partnerai/issue/PAR-244",
     createdAt: "2026-06-01T00:00:00Z",
     updatedAt: "2026-06-20T00:00:00Z",
     priority: 2,
+    creator: { id: "user-1", name: "Reporter", admin: false, owner: false },
     team: { id: "team-1", key: "PAR", name: "PartnerAI" },
     project: { id: "proj-1", name: "ClawSweeper", state: "started" },
     state: { id: "state-1", name: "Backlog", type: "backlog" },
     labels: { nodes: [{ id: "lbl-1", name: "bug" }] },
+    attachments: {
+      nodes: [] as Array<{ id: string; url: string; title: string }>,
+      pageInfo: { hasNextPage: false, endCursor: null as string | null },
+    },
     comments: {
       nodes: [] as Array<{ id: string; body: string }>,
       pageInfo: { hasNextPage: false, endCursor: null as string | null },
@@ -194,6 +200,8 @@ test("fetchIssueByIdentifier returns a hydrated workspace item with comments", a
   assert.equal(item.team.key, "PAR");
   assert.equal(item.project?.name, "ClawSweeper");
   assert.deepEqual(item.comments, []);
+  assert.equal(item.description, "Example description");
+  assert.equal(item.creator?.name, "Reporter");
   // The query is scoped by team key + number.
   assert.equal(calls.length, 1);
   assert.equal(calls[0].vars["teamKey"], "PAR");

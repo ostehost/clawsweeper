@@ -117,6 +117,29 @@ the normalized gate as the authority before push; if anything remains, it feeds
 the full failure back into a dedicated validation-fix pass before spending the
 next review attempt.
 
+The executor materializes those commands as a deterministic staged proof DAG.
+Exact argv are deduplicated, narrow path-scoped tests run before broader gates,
+and every allowlisted command required by the artifact or repository profile is
+retained. Repository integrity and the canonical changed-surface gate are
+mandatory. Broad, live, docker, or e2e commands run last, and can be skipped
+only by an exact repository-owned subsumption contract; structured integration
+and QA/live proof is never subsumed. Snapshot/formatter mutation flags,
+package-manager cwd/prefix/config path overrides, known mutating subcommands,
+and mutating package-script names are rejected before planning. Workspace
+selectors remain intact and defer script existence to the selected workspace
+instead of the root package. Supported environment defaults are resolved
+without a shell; the concrete argv is then revalidated and digested, with
+package-manager global options parsed before the effective command or wrapper.
+The executor also verifies that each command
+leaves the checkout, head, and pinned base unchanged. A failed prerequisite,
+stalled canonical gate, checkout mutation, or command that exceeds the total
+proof budget stops later work and writes bounded digest-only trace entries,
+including the original prerequisite topology and subsumption-edge digests, to
+the repair report and merge preflight. Schema-v2 traces bind those entries to
+the exact validated head and base. Final and push-denied fallback history
+compaction both trigger re-proof and preflight rebinding; post-flight rejects a
+trace that does not match the fix action, live PR head, and live PR base.
+
 ## Exact-Head Rule
 
 Every automerge decision is bound to a concrete PR head SHA.
@@ -129,6 +152,23 @@ Every automerge decision is bound to a concrete PR head SHA.
   from an earlier failed or cancelled review; `/clawsweeper stop` still wins.
 - Merge commands use the reviewed head SHA so GitHub cannot merge a moved head
   accidentally.
+- Every repair merge owner requires a verifiable GitHub App installation plus
+  effective base-branch rules that enforce strict required status checks. The
+  app must not be a ruleset bypass actor. Ruleset and classic branch-protection
+  forms are supported; when neither can be verified, automerge remains blocked.
+- Credential identity is bound to the pinned `create-github-app-token`
+  `app-slug` and `installation-id` outputs for both mutation and ruleset
+  verifier tokens; no unsupported token-self-inspection endpoint is used.
+- Administration-backed ruleset verification runs only in a fresh trusted job
+  with no Codex setup or target code execution. It validates the job
+  frontmatter first, scopes both credentials to the exact repository, and
+  supports repository rulesets or classic protection; inherited organization
+  or enterprise rulesets fail closed until a separately scoped verifier exists.
+- Repair execution consumes one pre-authorized run directory and cannot retain
+  state write credentials or choose the final target repository. Successful
+  execution is replayed by a no-credential proof job against the exact
+  published head and current `origin/main`; only its receipt can unlock the
+  token-only mutation job. Failed or cancelled execution remains report-only.
 
 This is why repair workers dispatch an immediate exact-head review after a
 branch push instead of waiting for the normal scheduled sweep.

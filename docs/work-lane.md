@@ -43,20 +43,21 @@ When ClawSweeper does sync labels, the report frontmatter records
 as ClawSweeper-owned churn, similar to durable review comment syncs, so a
 label-only apply pass does not immediately queue another review of the same item.
 
-| Label                                 | Source condition                                                                                                              |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `clawsweeper:current-main-repro`      | `type: issue`, `reproduction_status: reproduced`, and `reproduction_confidence: high`                                         |
-| `clawsweeper:source-repro`            | `type: issue`, `reproduction_status: source_reproducible`, and `reproduction_confidence: high`                                |
-| `clawsweeper:not-repro-on-main`       | `type: issue`, `reproduction_status: not_reproduced`, and `reproduction_confidence: high`                                     |
-| `clawsweeper:needs-live-repro`        | `type: issue`, `reproduction_status: source_reproducible`, and reproduction confidence below high                             |
-| `clawsweeper:needs-info`              | `type: issue`, `reproduction_status: unclear`, and reproduction confidence below high                                         |
-| `clawsweeper:linked-pr-open`          | the live issue has an open GitHub closing-PR reference                                                                        |
-| `clawsweeper:no-new-fix-pr`           | an open linked PR, manual-review lane, product decision, or security review means a new automated fix PR should not be queued |
-| `clawsweeper:queueable-fix`           | `work_candidate: queue_fix_pr`, `work_status: candidate`, and `work_confidence: high`                                         |
-| `clawsweeper:fix-shape-clear`         | high-confidence `queue_fix_pr` or `manual_review` work includes a repair prompt, likely files, or validation                  |
-| `clawsweeper:needs-maintainer-review` | `work_candidate: manual_review` or `work_status: manual_review`                                                               |
-| `clawsweeper:needs-product-decision`  | `requires_product_decision: true`                                                                                             |
-| `clawsweeper:needs-security-review`   | `item_category: security` or a `securityReview` status of `needs_attention`                                                   |
+| Label                                 | Source condition                                                                                                                                                                                                        |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clawsweeper:current-main-repro`      | `type: issue`, `reproduction_status: reproduced`, and `reproduction_confidence: high`                                                                                                                                   |
+| `clawsweeper:source-repro`            | `type: issue`, `reproduction_status: source_reproducible`, and `reproduction_confidence: high`                                                                                                                          |
+| `clawsweeper:not-repro-on-main`       | `type: issue`, `reproduction_status: not_reproduced`, and `reproduction_confidence: high`                                                                                                                               |
+| `clawsweeper:needs-live-repro`        | `type: issue`, `reproduction_status: source_reproducible`, and reproduction confidence below high                                                                                                                       |
+| `clawsweeper:needs-info`              | `type: issue`, `reproduction_status: unclear`, and reproduction confidence below high                                                                                                                                   |
+| `clawsweeper:linked-pr-open`          | the live issue has an open GitHub closing-PR reference                                                                                                                                                                  |
+| `clawsweeper:no-new-fix-pr`           | an open linked PR, manual-review lane, product decision, or security review means a new automated fix PR should not be queued                                                                                           |
+| `clawsweeper:queueable-fix`           | `work_candidate: queue_fix_pr`, `work_status: candidate`, and `work_confidence: high`                                                                                                                                   |
+| `good first issue`                    | an unlocked, current-main reproduced, high-confidence `bug` with `small` complexity, a strict-bug repair prompt plus validation steps, and no linked-PR, feature, config, product, security, or protected-label blocker |
+| `clawsweeper:fix-shape-clear`         | high-confidence `queue_fix_pr` or `manual_review` work includes a repair prompt, likely files, or validation                                                                                                            |
+| `clawsweeper:needs-maintainer-review` | `work_candidate: manual_review` or `work_status: manual_review`                                                                                                                                                         |
+| `clawsweeper:needs-product-decision`  | `requires_product_decision: true`                                                                                                                                                                                       |
+| `clawsweeper:needs-security-review`   | `item_category: security` or a `securityReview` status of `needs_attention`                                                                                                                                             |
 
 When the advisory sync marks an issue `clawsweeper:queueable-fix`, it also adds
 the target repository's durable `no-stale` exemption and removes an existing
@@ -67,12 +68,21 @@ the `no-stale` exemption added for that queueable state; existing `no-stale`
 labels without prior queueable advisory state are preserved as unrelated labels.
 
 Except for that queueable-issue stale transition, the advisory-label sync owns
-only this label group. Reruns add labels that match the latest report, remove
-stale labels from this group, and preserve unrelated labels plus action/proof
-labels such as `clawsweeper:autofix`,
+only the `clawsweeper:*` and issue-rating labels in this group. Reruns add labels
+that match the latest report, remove stale labels from the owned group, and
+preserve unrelated labels plus action/proof labels such as `good first issue`,
+`clawsweeper:autofix`,
 `clawsweeper:automerge`, `clawsweeper:human-review`,
 `clawsweeper:merge-ready`, `proof: sufficient`, and
 `mantis: telegram-visible-proof`.
+
+`good first issue` uses GitHub's standard label name, color, and description.
+ClawSweeper keeps the bar narrower than merely "small": the bug must reproduce
+on current main with high confidence, fit one focused PR, include both a repair
+prompt and validation steps, and require no new feature, config, product,
+security, or protected-label decision. The label is add-only because GitHub does
+not expose current-label ownership. A human removal in the GitHub label timeline
+is treated as an opt-out; a later human re-add clears that opt-out.
 
 Plan artifacts are generated state. They are removed when the item closes,
 archives, becomes stale, or is reclassified away from `queue_fix_pr`; regenerate

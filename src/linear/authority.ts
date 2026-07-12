@@ -38,6 +38,8 @@
  *   union of existing ∪ additions. Use `mergeLabels` to compute that union.
  */
 
+import type { RepositoryCloseReason } from "../repository-profiles.js";
+
 export type MutationKind =
   | "comment-upsert" // post/edit the durable marker-keyed review comment
   | "label-add" // additive label write (read-merge-write the union)
@@ -94,19 +96,8 @@ export function resolveGates(overrides?: Partial<MutationGates>): MutationGates 
   };
 }
 
-// Close taxonomy — mirrors schema/clawsweeper-decision.schema.json `closeReason`.
-export type CloseReason =
-  | "implemented_on_main"
-  | "mostly_implemented_on_main"
-  | "cannot_reproduce"
-  | "clawhub"
-  | "duplicate_or_superseded"
-  | "low_signal_unmergeable_pr"
-  | "unconfirmed_product_direction"
-  | "not_actionable_in_repo"
-  | "incoherent"
-  | "stale_insufficient_info"
-  | "none";
+// Keep Linear authorization on the same close taxonomy as repository profiles.
+export type CloseReason = RepositoryCloseReason;
 
 export type CloseDecision = "close" | "keep_open";
 export type CloseConfidence = "high" | "medium" | "low";
@@ -122,7 +113,10 @@ export const EVIDENCE_CLOSE_REASONS: ReadonlySet<CloseReason> = new Set<CloseRea
   "clawhub",
   "duplicate_or_superseded",
   "low_signal_unmergeable_pr",
+  "stalled_unproven_pr",
+  "abandoned_pr",
   "unconfirmed_product_direction",
+  "unsponsored_feature_request",
   "not_actionable_in_repo",
   "incoherent",
   "stale_insufficient_info",

@@ -78,7 +78,7 @@ jobs:
       - name: Create ClawSweeper dispatch token
         id: token
         if: ${{ env.HAS_CLAWSWEEPER_APP_PRIVATE_KEY == 'true' }}
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
@@ -107,7 +107,7 @@ jobs:
             steps.comment_filter.outputs.is_command == 'true' &&
             env.HAS_CLAWSWEEPER_APP_PRIVATE_KEY == 'true'
           }}
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
@@ -239,7 +239,8 @@ endpoint is `/github/webhook`; the local equivalent is
 target installation token for acknowledgement/comment reactions, mints the
 `openclaw/clawsweeper` installation token for repository dispatch, and queues
 exact `clawsweeper_comment` or `clawsweeper_item` work. The durable Worker
-queue dispatches at most 32 leased exact-review executors. Keep the Actions
+queue dispatches at most 28 leased exact-review executors, with up to 24 active
+reviews per target repository. Keep the Actions
 dispatcher installed as a compatibility fallback; its legacy dispatch is
 bridged into the same queue before Codex starts.
 
@@ -247,7 +248,8 @@ The receiver keeps the review lane proposal-only, then runs exact apply for the
 selected item with only immediate-safe close reasons enabled:
 `implemented_on_main` and `duplicate_or_superseded`. Normal scheduled apply
 still handles the broader backlog, with `stale_insufficient_info` and
-`mostly_implemented_on_main` blocked until the item is at least 60 days old.
+`mostly_implemented_on_main` blocked until the item is at least 60 days old;
+stale-insufficient-info issues also require 60 days without a non-bot comment.
 
 `openclaw/clawhub` dispatches are intentionally skipped while the receiver
 variable `CLAWSWEEPER_ENABLE_CLAWHUB` is not `1`. Enable it only after the

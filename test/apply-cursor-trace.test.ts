@@ -1,0 +1,162 @@
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  implementedCloseReport,
+  reportWithSyncedReviewComment,
+  runApplyDecisionsForTest,
+  tmpPrefix,
+  withMockGh,
+  workPlanCandidateReport,
+} from "./helpers.ts";
+
+test("apply-decisions preserves auto-selected order and traces only examined records", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const tracePath = join(root, "apply-cursor-trace.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    for (const number of [10, 20]) {
+      writeFileSync(
+        join(itemsDir, `${number}.md`),
+        workPlanCandidateReport({
+          repository: "openclaw/openclaw",
+          number,
+          local_checkout_access: "unverified",
+          decision: "keep_open",
+          action_taken: "kept_open",
+        }),
+        "utf8",
+      );
+    }
+
+    runApplyDecisionsForTest({
+      itemsDir,
+      closedDir,
+      plansDir,
+      reportPath,
+      extraArgs: [
+        "--target-repo",
+        "openclaw/openclaw",
+        "--item-numbers",
+        "20,10",
+        "--processed-limit",
+        "1",
+        "--cursor-trace",
+        tracePath,
+      ],
+    });
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8"));
+    const trace = JSON.parse(readFileSync(tracePath, "utf8"));
+    assert.equal(report[0]?.number, 20);
+    assert.deepEqual(trace, { schema_version: 1, examined_item_numbers: [20] });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions keeps close-limit candidates out of the cursor trace", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const tracePath = join(root, "apply-cursor-trace.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const comments: Record<number, string> = {};
+    for (const number of [10, 20]) {
+      const synced = reportWithSyncedReviewComment(
+        implementedCloseReport({ number }),
+        number,
+        "implemented_on_main",
+      );
+      writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
+      comments[number] = synced.comment;
+    }
+
+    const ghMock = `
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
+const comments = ${JSON.stringify(comments)};
+if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(10|20)\\/timeline(?:\\?|$)/.test(path)) {
+  console.log("HTTP/2 200\\n\\n[]");
+} else if (args[0] === "api" && /\\/issues\\/(10|20)\\/comments(?:\\?|$)/.test(path)) {
+  const number = Number(path.match(/\\/issues\\/(\\d+)\\/comments/)[1]);
+  console.log(JSON.stringify([[
+    {
+      id: 9000 + number,
+      html_url: "https://github.com/openclaw/clawsweeper/issues/" + number + "#issuecomment-" + (9000 + number),
+      body: comments[number],
+      user: { login: "github-actions[bot]" },
+      created_at: "2026-05-01T01:00:00Z",
+      updated_at: "2026-05-01T01:00:00Z"
+    }
+  ]]));
+} else if (args[0] === "api" && /\\/issues\\/(10|20)$/.test(path)) {
+  const number = Number(path.match(/\\/issues\\/(\\d+)$/)[1]);
+  console.log(JSON.stringify({
+    number,
+    title: "Close limit trace " + number,
+    html_url: "https://github.com/openclaw/clawsweeper/issues/" + number,
+    created_at: "2026-05-01T00:00:00Z",
+    updated_at: "2026-05-01T00:00:00Z",
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "reporter" },
+    labels: [],
+    comments: 0,
+    pull_request: null
+  }));
+} else if (args[0] === "api" && path.startsWith("search/issues?")) {
+  console.log(JSON.stringify({ items: [] }));
+} else if (args[0] === "issue" && args[1] === "view") {
+  console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: [
+          "--dry-run",
+          "--limit",
+          "1",
+          "--processed-limit",
+          "10",
+          "--cursor-trace",
+          tracePath,
+        ],
+      });
+    });
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8"));
+    const trace = JSON.parse(readFileSync(tracePath, "utf8"));
+    assert.deepEqual(
+      report
+        .filter((entry: { action: string }) => entry.action === "closed")
+        .map((entry: { number: number }) => entry.number),
+      [10],
+    );
+    assert.deepEqual(trace, { schema_version: 1, examined_item_numbers: [10] });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

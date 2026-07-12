@@ -442,3 +442,116 @@ test("malformed connection (transport returns {}) throws error mentioning query 
     },
   );
 });
+
+function hydratedIssueNode(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "issue-1",
+    identifier: "PAR-1",
+    title: "Hydrated issue",
+    description: "See https://github.com/openclaw/openclaw/issues/1",
+    url: "https://linear.app/issue/PAR-1",
+    createdAt: "2026-06-01T00:00:00Z",
+    updatedAt: "2026-06-02T00:00:00Z",
+    priority: 2,
+    creator: { id: "user-1", name: "Maintainer", admin: true, owner: false },
+    team: { id: "team-1", key: "PAR", name: "Partner" },
+    project: null,
+    state: { id: "todo", name: "Todo", type: "unstarted" },
+    labels: { nodes: [{ id: "bug", name: "bug" }] },
+    attachments: {
+      nodes: [{ id: "att-1", url: "https://github.com/openclaw/openclaw/pull/2", title: "PR" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    comments: {
+      nodes: [{ id: "comment-1", body: "context" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    ...overrides,
+  };
+}
+
+test("fetchIssueByIdentifier queries and maps analysis context", async () => {
+  const calls: RecordedCall[] = [];
+  const transport = makeQueuedTransport(
+    {
+      IssueByIdentifier: [
+        {
+          issues: {
+            nodes: [hydratedIssueNode()],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      ],
+    },
+    calls,
+  );
+  const source = new LinearItemSource(transport);
+  const item = await source.fetchIssueByIdentifier("PAR-1");
+
+  assert.ok(item !== null);
+  assert.equal(item.description, "See https://github.com/openclaw/openclaw/issues/1");
+  assert.deepEqual(item.creator, {
+    id: "user-1",
+    name: "Maintainer",
+    admin: true,
+    owner: false,
+  });
+  assert.deepEqual(item.attachments, [
+    { id: "att-1", url: "https://github.com/openclaw/openclaw/pull/2", title: "PR" },
+  ]);
+  assert.deepEqual(item.comments, [{ id: "comment-1", body: "context" }]);
+  assert.match(calls[0]?.query ?? "", /description/);
+  assert.match(calls[0]?.query ?? "", /creator\s*\{/);
+  assert.match(calls[0]?.query ?? "", /attachments\(first: 250\)/);
+});
+
+test("fetchIssueByIdentifier rejects analysis-context drift while paginating comments", async () => {
+  const calls: RecordedCall[] = [];
+  const first = hydratedIssueNode({
+    comments: {
+      nodes: [{ id: "comment-1", body: "first" }],
+      pageInfo: { hasNextPage: true, endCursor: "next" },
+    },
+  });
+  const second = hydratedIssueNode({
+    description: "changed while comments paginated",
+    comments: {
+      nodes: [{ id: "comment-2", body: "second" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  });
+  const transport = makeQueuedTransport(
+    {
+      IssueByIdentifier: [
+        { issues: { nodes: [first], pageInfo: { hasNextPage: false, endCursor: null } } },
+        { issues: { nodes: [second], pageInfo: { hasNextPage: false, endCursor: null } } },
+      ],
+    },
+    calls,
+  );
+
+  await assert.rejects(
+    () => new LinearItemSource(transport).fetchIssueByIdentifier("PAR-1", 1),
+    /changed while paginating comments/,
+  );
+});
+
+test("fetchIssueByIdentifier rejects a truncated attachment page", async () => {
+  const transport: LinearTransport = async () => ({
+    issues: {
+      nodes: [
+        hydratedIssueNode({
+          attachments: {
+            nodes: [],
+            pageInfo: { hasNextPage: true, endCursor: "more" },
+          },
+        }),
+      ],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  });
+  await assert.rejects(
+    () => new LinearItemSource(transport).fetchIssueByIdentifier("PAR-1"),
+    /more than 250 attachments/,
+  );
+});

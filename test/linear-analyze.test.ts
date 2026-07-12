@@ -6,6 +6,9 @@ import {
   buildAnalysisPrompt,
   buildHarnessInputs,
   collectIssueUrls,
+  creatorIdentity,
+  isMaintainerAuthored,
+  loadPersistedAnalyzerFingerprint,
   loadFallbackOwners,
   parseArgs,
   repoInferenceItemFor,
@@ -40,6 +43,7 @@ function makeHydrated(overrides = {}) {
     comments: [],
     attachments: [],
     description: "",
+    creator: null,
     ...overrides,
   };
 }
@@ -129,6 +133,39 @@ test("loadFallbackOwners returns [] on a missing/unreadable config", () => {
   assert.deepEqual(owners, []);
 });
 
+test("loadPersistedAnalyzerFingerprint reconstructs the production model-skip cache key", () => {
+  const markdown = `---
+snapshot_hash: "snap"
+repo_head: "headsha"
+model_id: "internal"
+analyzer_version: "linear-analyzer/2"
+---
+`;
+  assert.equal(
+    loadPersistedAnalyzerFingerprint("records/linear-par/items/PAR-42.md", {
+      readFileSync: () => markdown,
+    }),
+    "snapshot=snap;head=headsha;model=internal;analyzer=linear-analyzer/2",
+  );
+});
+
+test("loadPersistedAnalyzerFingerprint fails open to re-analysis for missing or partial records", () => {
+  assert.equal(
+    loadPersistedAnalyzerFingerprint("missing", {
+      readFileSync: () => {
+        throw new Error("ENOENT");
+      },
+    }),
+    undefined,
+  );
+  assert.equal(
+    loadPersistedAnalyzerFingerprint("partial", {
+      readFileSync: () => 'snapshot_hash: "snap"\nrepo_head: "head"\n',
+    }),
+    undefined,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // collectIssueUrls / buildHarnessInputs / buildAnalysisPrompt
 // ---------------------------------------------------------------------------
@@ -151,15 +188,40 @@ test("buildHarnessInputs maps a Linear issue into a read-only Item with the nume
   assert.equal(item.number, 42);
   assert.equal(item.kind, "issue");
   assert.equal(git.mainSha, "mainsha");
+  assert.equal(git.releaseStateComplete, false);
+  assert.equal(git.latestRelease, null);
   assert.equal(context.issue.identifier, "PAR-42");
+});
+
+test("hydrated creator identity reaches the harness and maintainer guard", () => {
+  const hydrated = makeHydrated({
+    creator: { id: "user-1", name: "Peter", admin: true, owner: false },
+  });
+  const profile = repositoryProfileFor("openclaw/clawhub");
+  const { item } = buildHarnessInputs(hydrated, profile, "mainsha");
+  assert.equal(creatorIdentity(hydrated), "Peter");
+  assert.equal(isMaintainerAuthored(hydrated), true);
+  assert.equal(item.author, "Peter");
+  assert.equal(item.authorAssociation, "MEMBER");
 });
 
 test("buildAnalysisPrompt instructs read-only git + schema-bound output", () => {
   const profile = repositoryProfileFor("openclaw/clawhub");
-  const prompt = buildAnalysisPrompt(makeHydrated(), profile, "mainsha");
+  const prompt = buildAnalysisPrompt(
+    makeHydrated({
+      description: "Full issue body",
+      attachments: [{ id: "a", title: "proof", url: "https://github.com/openclaw/clawhub/1" }],
+      creator: { id: "user-1", name: "Peter", admin: false, owner: false },
+    }),
+    profile,
+    "mainsha",
+  );
   assert.ok(/READ-ONLY/i.test(prompt));
   assert.ok(/git blame\/log\/show/.test(prompt));
   assert.ok(/never closes/.test(prompt));
+  assert.match(prompt, /Creator: Peter/);
+  assert.match(prompt, /Full issue body/);
+  assert.match(prompt, /github\.com\/openclaw\/clawhub/);
 });
 
 // ---------------------------------------------------------------------------
@@ -221,6 +283,20 @@ test("analyzeItem: --analyze runs the model, derives closeLeaning, plans a comme
   assert.ok(summary.recordBody.includes("**Summary**"));
   assert.ok(summary.recordBody.startsWith("---\n"));
   assert.equal(summary.recordPath, "records/linear-par/items/PAR-42.md");
+});
+
+test("analyzeItem: workspace admin or owner authorship disables close leaning", async () => {
+  const hydrated = makeHydrated({
+    creator: { id: "user-1", name: "Maintainer", admin: false, owner: true },
+  });
+  const summary = await analyzeItem(
+    hydrated,
+    { nowIso: NOW, analyze: true },
+    baseDeps({ hydrated }),
+  );
+  assert.equal(summary.analyzed, true);
+  assert.equal(summary.closeLeaning, false);
+  assert.ok(summary.recordBody.includes('author: "Maintainer"'));
 });
 
 test("analyzeItem: an unverifiable cited sha forces closeLeaning=false (host re-verification)", async () => {

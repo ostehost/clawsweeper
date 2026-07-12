@@ -1,0 +1,466 @@
+{
+  "proof": "OpenClaw Bay deterministic Playwright browser proof",
+  "source_sha": "2d5793c1a0e1b39fd174c3d743118845152eaab6",
+  "route": "/bay-demo",
+  "data_classification": "fully synthetic and redacted; no live/private dashboard payloads",
+  "fixture_sha256": "FC584F8F0521221B77897384BDEB3A167E85AA6C17708A7783740FCDF363CD21",
+  "fixture_snapshots": [
+    {
+      "file": "fixtures/01-initial.json",
+      "sha256": "F052DEC5FD41FB83AB5237076DDE644A2363332580242AEE3B5C4ECB359BAEB0"
+    },
+    {
+      "file": "fixtures/02-forward.json",
+      "sha256": "34AA3F22C198D67C3FB6B9E9731C13ACD55E37E27BD829FABA54399124A2A0E2"
+    },
+    {
+      "file": "fixtures/03-retrigger.json",
+      "sha256": "39DA760BF2E1A9E982404B2F27ABAE8649EF18B21A20E558787921D314BFC4C0"
+    }
+  ],
+  "derived_real_tide_snapshot_sha256": "1B1B049ECB65CA4548053E92C99373B6A900B76E409A75029E596E7754746049",
+  "generated_at": "2026-07-12T14:00:47.968Z",
+  "assertions": [
+    {
+      "name": "real Bay route loaded",
+      "status": "PASS",
+      "route": "/bay-demo"
+    },
+    {
+      "name": "manual poll hook captured",
+      "status": "PASS"
+    },
+    {
+      "name": "visible redacted diagnostics",
+      "status": "PASS",
+      "text": "Live status is partial; some optional GitHub telemetry is unavailable.",
+      "title": "Synthetic proof fixture: optional telemetry unavailable [REDACTED]"
+    },
+    {
+      "name": "explicit terminal pools populated",
+      "status": "PASS",
+      "completed": 1,
+      "failed": 1,
+      "cancelled": 1
+    },
+    {
+      "name": "crustacean claw animation advances",
+      "status": "PASS",
+      "elapsed_animation_ms": 300
+    },
+    {
+      "name": "forward transition raises READY flag",
+      "status": "PASS"
+    },
+    {
+      "name": "master sweeper animation advances",
+      "status": "PASS",
+      "phase": "sweeping",
+      "elapsed_animation_ms": 300
+    },
+    {
+      "name": "forward transition lands in reported lane",
+      "status": "PASS",
+      "destination": "repairing"
+    },
+    {
+      "name": "retrigger uses tunnel journey",
+      "status": "PASS",
+      "source_hole": 1,
+      "target_hole": 1,
+      "target_hole_opacity": 0.392151,
+      "label": "openclaw/openclaw#97722 burrowing"
+    },
+    {
+      "name": "retrigger resurfaces in reported lane",
+      "status": "PASS",
+      "destination": "setting-up",
+      "run_id": 1002
+    },
+    {
+      "name": "search locates GitHub reference",
+      "status": "PASS",
+      "focused_number": "97722"
+    },
+    {
+      "name": "repository filter isolates selected repo",
+      "status": "PASS",
+      "visible_keys": [
+        "openclaw/clawhub#3058",
+        "openclaw/clawhub#97002"
+      ]
+    },
+    {
+      "name": "drawer exposes safe GitHub links",
+      "status": "PASS",
+      "links": [
+        {
+          "label": "Open GitHub item",
+          "href": "https://github.com/openclaw/clawhub/issues/3058",
+          "target": "_blank",
+          "rel": "noopener"
+        },
+        {
+          "label": "Open job",
+          "href": "https://github.com/openclaw/clawhub/actions/runs/2001/job/3001",
+          "target": "_blank",
+          "rel": "noopener"
+        },
+        {
+          "label": "Open workflow run",
+          "href": "https://github.com/openclaw/clawhub/actions/runs/2001",
+          "target": "_blank",
+          "rel": "noopener"
+        }
+      ]
+    },
+    {
+      "name": "layered preview tide visibly animates",
+      "status": "PASS",
+      "elapsed_animation_ms": 250,
+      "tide_layers": 3
+    },
+    {
+      "name": "preview tide follows explicit visual phases",
+      "status": "PASS",
+      "phases": [
+        "incoming",
+        "crest",
+        "receding",
+        "idle"
+      ]
+    },
+    {
+      "name": "reduced-motion tide is brief and non-spatial",
+      "status": "PASS",
+      "duration": "520ms",
+      "animation_name": "none",
+      "elapsed_ms": 629
+    },
+    {
+      "name": "tide previews do not poll status",
+      "status": "PASS",
+      "before_status_gets": 3,
+      "after_status_gets": 3
+    },
+    {
+      "name": "dense completed pool renders every buffered outcome",
+      "status": "PASS",
+      "completed": 9,
+      "overflow_notes": 0
+    },
+    {
+      "name": "dense terminal pool keeps references readable at constrained width",
+      "status": "PASS",
+      "references": 9,
+      "overlaps": false,
+      "columns": "2"
+    },
+    {
+      "name": "real tide washes terminal outcomes before clearing",
+      "status": "PASS",
+      "washed_terminal_count": 9,
+      "preview_class_used": false,
+      "terminal_after": 0,
+      "countdown": "0 / 20",
+      "active_keys_unchanged": true
+    },
+    {
+      "name": "preview tide preserves live outcome data",
+      "status": "PASS",
+      "before_keys": [
+        "openclaw/clawhub#97002",
+        "openclaw/clawsweeper#97003",
+        "openclaw/openclaw#97001"
+      ],
+      "after_keys": [
+        "openclaw/clawhub#97002",
+        "openclaw/clawsweeper#97003",
+        "openclaw/openclaw#97001"
+      ],
+      "reduced_motion_after_keys": [
+        "openclaw/clawhub#97002",
+        "openclaw/clawsweeper#97003",
+        "openclaw/openclaw#97001"
+      ],
+      "countdown": "3 / 20"
+    },
+    {
+      "name": "preview tide sends no mutation",
+      "status": "PASS",
+      "mutating_requests": []
+    },
+    {
+      "name": "browser sends no GitHub API request",
+      "status": "PASS",
+      "direct_github_requests": 0
+    },
+    {
+      "name": "no browser console errors",
+      "status": "PASS",
+      "errors": []
+    },
+    {
+      "name": "no uncaught page errors",
+      "status": "PASS",
+      "errors": []
+    }
+  ],
+  "evidence": [
+    {
+      "id": "01-initial-diagnostics",
+      "title": "Synthetic, redacted status fixture",
+      "detail": "Real Bay route and assets; visible partial-telemetry diagnostic; three explicit terminal outcomes.",
+      "storyboard_panel": 1
+    },
+    {
+      "id": "02-ready-for-sweep",
+      "title": "Forward transition: READY",
+      "detail": "The item remains in Reviewing and raises its flag before any lane movement.",
+      "storyboard_panel": 2
+    },
+    {
+      "id": "03-physical-forward-sweep",
+      "title": "Forward transition: physical sweep",
+      "detail": "The master and item are animated together; neither disappears between lanes.",
+      "storyboard_panel": 3
+    },
+    {
+      "id": "04-forward-landed",
+      "title": "Forward transition complete",
+      "detail": "The same GitHub reference is now visibly placed in Repairing.",
+      "storyboard_panel": 4
+    },
+    {
+      "id": "05-retrigger-tunnel",
+      "title": "New run detected: retrigger tunnel",
+      "detail": "A changed run ID digs from Repairing back toward Setting up with both tunnel openings visible.",
+      "storyboard_panel": 5
+    },
+    {
+      "id": "06-retrigger-resurfaced",
+      "title": "Retrigger resurfaced",
+      "detail": "The same GitHub reference reappears in Setting up for its new run.",
+      "storyboard_panel": 6
+    },
+    {
+      "id": "07-search-highlight",
+      "title": "Where's my crustacean?",
+      "detail": "Search focuses and highlights GitHub reference #97722 without another network request.",
+      "storyboard_panel": 7
+    },
+    {
+      "id": "08-repository-filter",
+      "title": "Repository waters filter",
+      "detail": "Only openclaw/clawhub active and terminal items remain visible.",
+      "storyboard_panel": 8
+    },
+    {
+      "id": "09-detail-drawer-links",
+      "title": "Read-only detail drawer",
+      "detail": "The selected item exposes only safe GitHub item, job, and workflow-run links.",
+      "storyboard_panel": 9
+    },
+    {
+      "id": "10-preview-tide-incoming",
+      "title": "Tide incoming along the shoreline",
+      "detail": "Layered translucent water, painted texture, foam, ripples, and bubbles approach the terminal pools.",
+      "storyboard_panel": 10
+    },
+    {
+      "id": "11-preview-tide-crest",
+      "title": "Foam crest washes the terminal pools",
+      "detail": "Terminal crustaceans drift seaward only inside the temporary local preview; live outcomes remain unchanged.",
+      "storyboard_panel": 11
+    },
+    {
+      "id": "12-preview-tide-backwash",
+      "title": "Backwash leaves a wet-sand sheen",
+      "detail": "The water and foam recede toward the illustrated sea while the preview crustaceans return.",
+      "storyboard_panel": 12
+    },
+    {
+      "id": "13-preview-tide-restored",
+      "title": "Preview returns to live state",
+      "detail": "The shoreline is restored and every terminal crustacean returns after the non-mutating preview.",
+      "storyboard_panel": 13
+    },
+    {
+      "id": "14-preview-tide-reduced-motion",
+      "title": "Reduced-motion tide cue",
+      "detail": "Motion-sensitive users receive a brief static shoreline wash with the same non-mutating semantics.",
+      "storyboard_panel": 14
+    },
+    {
+      "id": "15-dense-terminal-pool",
+      "title": "Dense completed pool uses the available shoreline",
+      "detail": "Nine completed outcomes stay individually visible, with staggered three-column placement and no hidden overflow.",
+      "storyboard_panel": 15
+    },
+    {
+      "id": "16-real-tide-cleared",
+      "title": "Real tide clears only after the wash",
+      "detail": "A generated tide first moves the proved terminal crustaceans seaward, then commits the empty shared buffer.",
+      "storyboard_panel": 16
+    },
+    {
+      "id": "17-visible-proof-diagnostics",
+      "title": "Network and state boundary",
+      "detail": "Visible diagnostics confirm no GitHub API or mutation request, unchanged preview data, and a proved real clear.",
+      "storyboard_panel": 17
+    }
+  ],
+  "tide_isolation": {
+    "phases": [
+      "incoming",
+      "crest",
+      "receding",
+      "idle"
+    ],
+    "before_keys": [
+      "openclaw/clawhub#97002",
+      "openclaw/clawsweeper#97003",
+      "openclaw/openclaw#97001"
+    ],
+    "after_keys": [
+      "openclaw/clawhub#97002",
+      "openclaw/clawsweeper#97003",
+      "openclaw/openclaw#97001"
+    ],
+    "reduced_motion_after_keys": [
+      "openclaw/clawhub#97002",
+      "openclaw/clawsweeper#97003",
+      "openclaw/openclaw#97001"
+    ],
+    "real_tide_terminal_after": 0
+  },
+  "drawer_links": [
+    {
+      "label": "Open GitHub item",
+      "href": "https://github.com/openclaw/clawhub/issues/3058",
+      "target": "_blank",
+      "rel": "noopener"
+    },
+    {
+      "label": "Open job",
+      "href": "https://github.com/openclaw/clawhub/actions/runs/2001/job/3001",
+      "target": "_blank",
+      "rel": "noopener"
+    },
+    {
+      "label": "Open workflow run",
+      "href": "https://github.com/openclaw/clawhub/actions/runs/2001",
+      "target": "_blank",
+      "rel": "noopener"
+    }
+  ],
+  "network": {
+    "requests": [
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/bay-demo",
+        "resource_type": "document"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/bay-background.webp",
+        "resource_type": "image"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/master-sweeper.webp",
+        "resource_type": "image"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/crustaceans-atlas.webp",
+        "resource_type": "image"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
+      }
+    ],
+    "responses": [
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/bay-demo"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/bay-background.webp"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/master-sweeper.webp"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/bay-assets/crustaceans-atlas.webp"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
+      }
+    ],
+    "direct_github_api_requests": 0,
+    "mutating_requests": 0
+  },
+  "console_errors": [],
+  "page_errors": []
+}

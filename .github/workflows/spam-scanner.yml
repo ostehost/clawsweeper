@@ -67,7 +67,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           filter: blob:none
           fetch-depth: 0
@@ -79,24 +79,27 @@ jobs:
             schema/clawsweeper-pr-close-coverage-proof.schema.json
             scripts/hydrate-state.ts
             src/clawsweeper-text.ts
+            src/command.ts
             src/codex-env.ts
             src/codex-output-capture.ts
             src/codex-process-worker.ts
             src/codex-process.ts
             src/codex-spawn.ts
             src/codex-transient.ts
+            src/github-json.ts
             src/github-retry.ts
             src/pr-close-coverage-proof.ts
             src/repair
             src/repository-profiles.ts
             package.json
             pnpm-lock.yaml
+            pnpm-workspace.yaml
             tsconfig.repair.json
           sparse-checkout-cone-mode: false
 
       - name: Create GitHub App token
         id: app_token
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}

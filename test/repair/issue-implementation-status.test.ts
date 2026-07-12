@@ -3,6 +3,8 @@ import fs from "node:fs";
 import test from "node:test";
 
 import {
+  isTerminalMutationState,
+  isSuccessfulTerminalMutationState,
   issueImplementationStatusMarker,
   renderIssueImplementationStatusComment,
 } from "../../dist/repair/issue-implementation-status.js";
@@ -35,6 +37,29 @@ test("issue implementation status includes a generated pull request", () => {
   });
 
   assert.match(body, /PR: https:\/\/github\.com\/steipete\/example\/pull\/51/);
+});
+
+test("blocked and failed status comments require the terminal mutation guard", () => {
+  for (const state of ["Complete", "PR Opened", "Blocked", "Failed"]) {
+    assert.equal(isTerminalMutationState(state), true, state);
+  }
+  for (const state of ["Queued", "Planning", "Building"]) {
+    assert.equal(isTerminalMutationState(state), false, state);
+  }
+  for (const state of ["Complete", "PR Opened"]) {
+    assert.equal(isSuccessfulTerminalMutationState(state), true, state);
+  }
+  for (const state of ["Blocked", "Failed"]) {
+    assert.equal(isSuccessfulTerminalMutationState(state), false, state);
+  }
+
+  const source = fs.readFileSync("src/repair/issue-implementation-status.ts", "utf8");
+  assert.match(source, /publicationReceiptSha256[\s\S]*runVerifiedPublishedPullMutation\(/);
+  assert.match(source, /--sealed-source-only[\s\S]*runVerifiedSealedSourceMutation\(/);
+  assert.match(
+    source,
+    /isSuccessfulTerminalMutationState\(state\) \|\| prUrl[\s\S]*requires a verified publication receipt/,
+  );
 });
 
 test("issue implementation status updates progress without replacing worker results", () => {
@@ -71,7 +96,37 @@ test("issue build workflow reports an opened PR without calling pending CI block
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
 
   assert.match(workflow, /state="PR Opened"/);
-  assert.match(workflow, /The implementation PR is open\. Post-flight status:/);
+  assert.match(workflow, /TRUSTED_PR_URL: \$\{\{ steps\.publish\.outputs\.target_pr_url \}\}/);
+  assert.match(
+    workflow,
+    /POST_FLIGHT_OUTCOME: \$\{\{ steps\.post_flight\.outputs\.report_outcome \}\}/,
+  );
+  assert.doesNotMatch(workflow, /POST_FLIGHT_OUTCOME: \$\{\{ steps\.post_flight\.outcome \}\}/);
+  assert.match(
+    workflow,
+    /steps\.post_flight\.outputs\.report_outcome == 'success'[\s\S]*completion-reason gates_passed/,
+  );
+  assert.match(
+    workflow,
+    /name: Post-flight finalize fix PRs[\s\S]*continue-on-error: true[\s\S]*name: Fail incomplete post-flight result/,
+  );
+  assert.match(
+    workflow,
+    /steps\.post_flight\.outcome == 'failure' \|\| steps\.post_flight\.outputs\.report_outcome != 'success'/,
+  );
+  assert.match(workflow, /The exact independently validated repair was published at/);
+  assert.match(
+    workflow,
+    /status_guard=\([\s\S]*--handoff-root \.clawsweeper-repair\/execution[\s\S]*--validation-receipt-sha256 "\$\{\{ needs\.validate\.outputs\.receipt_sha256 \}\}"/,
+  );
+  assert.match(
+    workflow,
+    /if \[ -n "\$PUBLICATION_RECEIPT_SHA256" \]; then[\s\S]*--publication-receipt-sha256 "\$PUBLICATION_RECEIPT_SHA256"[\s\S]*else[\s\S]*TRUSTED_PR_URL=""[\s\S]*--sealed-source-only/,
+  );
+  assert.match(
+    workflow,
+    /\[ -n "\$TRUSTED_PR_URL" \] && \[ -n "\$PUBLICATION_RECEIPT_SHA256" \][\s\S]*state="PR Opened"/,
+  );
   assert.doesNotMatch(
     workflow,
     /detail="The automatic implementation worker stopped before all post-flight gates passed:/,

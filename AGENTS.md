@@ -11,6 +11,7 @@ Keep changes narrow, evidence-backed, and automation-safe.
 - Tests: `test/*.test.ts` and `test/repair/*.test.ts`; add new coverage to the
   narrowest matching test file instead of growing `test/clawsweeper.test.ts`.
 - Workflow: `.github/workflows/sweep.yml`.
+- Vision and product boundaries: `VISION.md`.
 - Explainer: `README.md`; state/dashboard repo: `../clawsweeper-state`.
 - Open/reviewed records in state repo:
   `records/<repo-slug>/items/<number>.md`.
@@ -46,6 +47,8 @@ not split reports into issue/PR subtrees.
 
 ## Safety Rules
 
+- Never disable or pause the live ClawSweeper sweep workflow unless Peter
+  explicitly asks for that exact action.
 - Do not run live apply/close commands unless Peter explicitly asks.
 - For apply-path repros, copy one report into a temp `items/` dir and pass
   `--skip-dashboard`, `--item-number`, and a temp `--closed-dir`.

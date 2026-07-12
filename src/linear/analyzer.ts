@@ -15,7 +15,7 @@
  *
  * REUSE, never reinvent:
  *   - schema/clawsweeper-decision.schema.json is the model's --output-schema verbatim; this
- *     module consumes the PARSED Decision (the canonical 11-value closeReason enum, the
+ *     module consumes the parsed Decision and canonical closeReason enum, the
  *     evidence[] item shape, reproductionStatus/reproductionAssessment, changeSummary,
  *     workReason/bestSolution, rootCauseCluster). No new schema is coined.
  *   - closeLeaning is the ONLY new bit, and it is CODE-DERIVED, advisory, and NEVER a schema
@@ -33,9 +33,9 @@ import type { RepositoryItemKind, RepositoryProfile } from "../repository-profil
 import { isAutoCloseAllowed } from "../repository-profiles.js";
 
 /** Current analyzer version. Bump when the prompt, mapping, or sections change materially. */
-export const ANALYZER_VERSION = "linear-analyzer/1" as const;
+export const ANALYZER_VERSION = "linear-analyzer/2" as const;
 
-/** Model identity left to the harness config.toml (gpt-5.5); the runner records the resolved id. */
+/** Model identity is left to the harness config; the runner records the resolved id. */
 export const ANALYZER_INTERNAL_MODEL = "internal" as const;
 
 /**
@@ -59,7 +59,7 @@ export interface AnalyzerEvidence {
  */
 export interface AnalyzerDecision {
   decision: CloseDecision; // "close" | "keep_open"
-  closeReason: CloseReason; // canonical 11-value enum (incl. "none")
+  closeReason: CloseReason; // canonical schema enum (including "none")
   confidence: CloseConfidence; // "high" | "medium" | "low"
   changeSummary: string;
   evidence: AnalyzerEvidence[];

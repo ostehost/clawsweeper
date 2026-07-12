@@ -22,6 +22,11 @@ import {
 } from "./external-messages.js";
 import { runCommand as run } from "./command-runner.js";
 import {
+  remainingRepairBudgetMs,
+  repairTimeoutBudgetFromEnv,
+  repairWorkerTimeoutMs,
+} from "./execute-fix-timeout-budget.js";
+import {
   codexJsonlFailureDetail,
   codexRetryDelayMs,
   isCodexContextLimitError,
@@ -83,6 +88,12 @@ import {
 } from "./fix-prompt-builder.js";
 import { canTreatRebaseAsCompleteRepair } from "./fix-edit-policy.js";
 import { applyMechanicalChangelogFix } from "./mechanical-changelog.js";
+import {
+  finalBaseSyncRequiresReview,
+  finalizeExecutionReport,
+  pinRepairBase,
+  reviewAfterFinalBaseSync,
+} from "./execution-finalization.js";
 import { tryResolveMechanicalRebaseConflicts } from "./mechanical-rebase-conflicts.js";
 import { compactGeneratedBranchHistory } from "./compact-generated-branch.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
@@ -106,14 +117,37 @@ import {
   repairBranchPushRaceReason,
 } from "./repair-branch-push-errors.js";
 import {
+  buildTargetValidationProofPlan,
   canSkipInternalCodexReviewForRepairDelta,
+  classifyExternalBaseValidationFailure,
   prepareTargetToolchain,
   preflightTargetValidationPlan,
   repairDeltaValidationPlan,
-  runAllowedValidationCommands,
+  reproduceValidationFailureAtPinnedBase,
+  runStagedValidationProof,
   type TargetValidationOptions,
 } from "./target-validation.js";
+import {
+  isPassedStagedProofBundle,
+  stagedProofBundle,
+  stagedProofPlanArtifact,
+  stagedProofSummary,
+  stagedProofTraceFromError,
+  type StagedProofPlanArtifact,
+  type StagedProofTrace,
+} from "./staged-proof-gates.js";
+import {
+  authorizedFixArtifact,
+  createPreparedPublication,
+  executionIntentRepairDeltaBaseSha,
+  verifyExecutionIntentIdentity,
+} from "./prepared-publication.js";
 import { uniqueStrings } from "./validation-command-utils.js";
+import {
+  changedFilesFromNameOnlyZ,
+  enforceRepairContract,
+  repairContract,
+} from "./repair-contract.js";
 import {
   rebaseConflictEditDecision,
   unresolvedRebaseConflictReason,
@@ -140,24 +174,22 @@ import {
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
 const NON_EXECUTABLE_REPAIR_STRATEGIES = new Set(["already_fixed_on_main", "needs_human"]);
 const DEFAULT_BASE_BRANCH = "main";
+const DEFAULT_REPAIR_PUSH_SETTLE_SECONDS = 90;
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
 const resultPathArg = args._[1];
 const latest = Boolean(args.latest);
 const dryRun = Boolean(args["dry-run"] || process.env.CLAWSWEEPER_FIX_DRY_RUN === "1");
+const preparePublication = Boolean(args["prepare-publication"]);
+const deferPublication = Boolean(args["defer-publication"] || preparePublication);
+const publishReportOnly = Boolean(args["publish-report-only"]);
+const authorizationSha256 = String(args["authorization-sha256"] ?? "");
+const executionIntentPath = String(args["execution-intent"] ?? "");
 const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const executionModelArgs = codexModelArgs(model);
-const requestedCodexTimeoutMs = Number(
-  process.env.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS ?? 25 * 60 * 1000,
-);
-const fixStepTimeoutMs = Number(process.env.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS ?? 40 * 60 * 1000);
-const fixTimeoutReserveMs = Number(
-  process.env.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS ?? 10 * 60 * 1000,
-);
-const codexTimeoutMs = Math.min(
-  requestedCodexTimeoutMs,
-  Math.max(60 * 1000, fixStepTimeoutMs - fixTimeoutReserveMs),
+const { codexTimeoutMs, fixStepTimeoutMs, lateWorkerReserveMs } = repairTimeoutBudgetFromEnv(
+  process.env,
 );
 const codexPreflightTimeoutMs = Number(
   process.env.CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS ?? 2 * 60 * 1000,
@@ -232,6 +264,8 @@ const codexReviewNetworkAccess = parseBooleanEnv(
 );
 let workRoot = "";
 let targetDir = "";
+const validationProofTraces: StagedProofTrace[] = [];
+let validationProofPlan: StagedProofPlanArtifact | null = null;
 
 if (!jobPath) {
   console.error(
@@ -253,10 +287,10 @@ if (jobErrors.length > 0) {
 
 assertAllowedOwner(job.frontmatter.repo, process.env.CLAWSWEEPER_ALLOWED_OWNER);
 
-if (!["execute", "autonomous"].includes(job.frontmatter.mode)) {
+if (!publishReportOnly && !["execute", "autonomous"].includes(job.frontmatter.mode)) {
   throw new Error("refusing fix execution: job frontmatter mode is not execute or autonomous");
 }
-if (process.env.CLAWSWEEPER_ALLOW_EXECUTE !== "1") {
+if (!publishReportOnly && process.env.CLAWSWEEPER_ALLOW_EXECUTE !== "1") {
   throw new Error("refusing fix execution: CLAWSWEEPER_ALLOW_EXECUTE must be 1");
 }
 
@@ -273,6 +307,22 @@ if (result.cluster_id !== job.frontmatter.cluster_id) {
 if (result.mode !== job.frontmatter.mode) {
   throw new Error(`result mode ${result.mode} does not match job mode ${job.frontmatter.mode}`);
 }
+const executionIntent = preparePublication
+  ? verifyExecutionIntentIdentity(
+      JSON.parse(
+        fs.readFileSync(requiredPreparationArg(executionIntentPath, "execution-intent"), "utf8"),
+      ),
+    )
+  : null;
+if (preparePublication) {
+  requiredPreparationArg(authorizationSha256, "authorization-sha256");
+  if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) {
+    throw new Error("prepared execution must not receive GitHub credentials");
+  }
+  if (executionIntent?.target_repo !== result.repo) {
+    throw new Error("prepared execution intent does not match the target repository");
+  }
+}
 
 const automergeTargetValidation =
   String(job.frontmatter.source ?? "") === "pr_automerge" ||
@@ -288,11 +338,13 @@ const targetValidationOptions: TargetValidationOptions = {
   targetRepo: result.repo,
 };
 
-function currentTargetValidationOptions(): TargetValidationOptions {
+function currentTargetValidationOptions(proofSurfacePaths: string[] = []): TargetValidationOptions {
   const remainingMs = remainingFixStepBudgetMs();
   return {
     ...targetValidationOptions,
     installTimeoutMs: boundedTimeout(targetInstallTimeoutMs, remainingMs),
+    proofBudgetMs: remainingMs,
+    proofSurfacePaths,
     setupTimeoutMs: boundedTimeout(targetSetupTimeoutMs, remainingMs),
     validationTimeoutMs: boundedTimeout(targetValidationTimeoutMs, remainingMs),
   };
@@ -321,8 +373,13 @@ function runGitNetwork(args: string[], cwd: string = targetDir) {
   });
 }
 
-function currentCodexTimeoutMs() {
-  return boundedTimeout(codexTimeoutMs, remainingFixStepBudgetMs());
+function currentCodexTimeoutMs(preserveLateWorkerBudget = false) {
+  return repairWorkerTimeoutMs({
+    requestedTimeoutMs: codexTimeoutMs,
+    remainingBudgetMs: remainingFixStepBudgetMs(),
+    minimumTimeoutMs: minTargetCommandTimeoutMs,
+    preserveMs: preserveLateWorkerBudget ? lateWorkerReserveMs : 0,
+  });
 }
 
 function spawnCodexSyncWithHeartbeat(
@@ -379,8 +436,12 @@ function stopCodexHeartbeat(child: ChildProcess) {
 
 function remainingFixStepBudgetMs() {
   const elapsedMs = Date.now() - scriptStartedAt.getTime();
-  const remainingMs = fixStepTimeoutMs - elapsedMs - reportReserveMs;
-  return Math.max(minTargetCommandTimeoutMs, remainingMs);
+  return remainingRepairBudgetMs({
+    elapsedMs,
+    fixStepTimeoutMs,
+    reportReserveMs,
+    minimumTimeoutMs: minTargetCommandTimeoutMs,
+  });
 }
 
 function defaultFixWorkRoot(resultPath: string) {
@@ -412,6 +473,11 @@ const report: LooseRecord = {
   actions: [],
 };
 
+if (publishReportOnly) {
+  publishPersistedReport(resultPath);
+  process.exit(0);
+}
+
 logProgress("starting fix execution", {
   repo: result.repo,
   cluster_id: result.cluster_id,
@@ -429,7 +495,6 @@ updateAutomergeProgressStatus({
 if (plannedFixActions.length === 0) {
   report.status = "skipped";
   report.reason = "no planned fix actions";
-  appendAutomergeRepairOutcomeComment(report, resultPath);
   writeReport(report, resultPath);
   process.exit(0);
 }
@@ -465,6 +530,9 @@ if (NON_EXECUTABLE_REPAIR_STRATEGIES.has(repairStrategy)) {
 }
 
 let fixArtifact = validateFixArtifact(executableFixArtifact);
+if (executionIntent) {
+  fixArtifact = authorizedFixArtifact(executionIntent, fixArtifact);
+}
 const securityBlock = validateFixSecurityScope({ job, resultPath, fixArtifact, plannedFixActions });
 if (securityBlock) {
   report.status = "skipped";
@@ -544,7 +612,7 @@ const validationPreflight = preflightTargetValidationPlan(
     targetDir,
     baseBranch: DEFAULT_BASE_BRANCH,
   },
-  currentTargetValidationOptions(),
+  currentTargetValidationOptions(fixArtifact.likely_files ?? []),
 );
 report.validation_preflight = validationPreflight;
 if (validationPreflight.status === "blocked") {
@@ -631,6 +699,7 @@ try {
           status: "failed",
           reason: error.message,
         });
+        if (executionIntent) throw error;
         if (!shouldFallbackToReplacementAfterRepairError(error)) throw error;
         const fallbackTargetDir = prepareFallbackReplacementCheckout(targetDir);
         outcome = executeReplacementBranch({
@@ -717,7 +786,7 @@ function isBlockedFixError(error: JsonValue) {
   if (isRepairBranchPushBlocked(error)) return true;
   if (isRetryableCodexErrorMessage(String(error?.message ?? error))) return true;
   if (isCodexContextLimitError(String(error?.message ?? error))) return true;
-  return /Codex produced no target repo changes|Codex \/review did not pass|Codex (?:fix worker|review-fix worker|\/review) timed out|Codex (?:fix worker|review-fix worker|\/review) failed|validation command failed|command timed out after \d+ms: git (?:fetch|push)|rebase (?:conflicts remain unresolved|produced additional conflicts)/i.test(
+  return /external base blocker|Codex produced no target repo changes|Codex \/review did not pass|Codex (?:fix worker|review-fix worker|\/review) timed out|Codex (?:fix worker|review-fix worker|\/review) failed|validation command failed|command timed out after \d+ms: git (?:fetch|push)|rebase (?:conflicts remain unresolved|produced additional conflicts)/i.test(
     String(error?.message ?? error),
   );
 }
@@ -796,6 +865,17 @@ function preflightRepairSourceBranchWrite(fixArtifact: LooseRecord) {
   if (fixArtifact.repair_strategy !== "repair_contributor_branch") {
     return { status: "not_applicable" };
   }
+  if (executionIntent) {
+    const sourcePr = authorizedSourcePullRequest();
+    return {
+      status: "writable",
+      source_pr: sourcePr.url,
+      head_repo: sourcePr.head.repo.full_name,
+      head_ref: sourcePr.head.ref,
+      same_repo_branch: true,
+      maintainer_can_modify: true,
+    };
+  }
   const sourcePr = firstSourcePullRequest(fixArtifact);
   const pull = fetchPullRequest(result.repo, sourcePr.number);
   if (pull.state !== "open") {
@@ -842,7 +922,9 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
   const baseBranch = String(process.env.CLAWSWEEPER_FIX_BASE_BRANCH ?? DEFAULT_BASE_BRANCH);
   const sourcePr = firstSourcePullRequest(fixArtifact);
   logProgress("repairing contributor branch", { source_pr: sourcePr.url, base_branch: baseBranch });
-  const pull = fetchPullRequest(result.repo, sourcePr.number);
+  const pull = executionIntent
+    ? authorizedSourcePullRequest()
+    : fetchPullRequest(result.repo, sourcePr.number);
   if (pull.state !== "open") throw new Error(`source PR #${sourcePr.number} is ${pull.state}`);
   const initialPauseBlock = liveRepairPauseBlock({
     pull,
@@ -861,6 +943,7 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
   );
   logProgress("fetching latest base for contributor repair", { base_branch: baseBranch });
   runGitNetwork(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], targetDir);
+  assertAuthorizedRef("target base", `origin/${baseBranch}`, executionIntent?.target_base_sha);
   logProgress("fetching contributor PR head", {
     source_pr: sourcePr.url,
     head_repo: pull.head.repo.full_name,
@@ -875,6 +958,11 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
   });
   ensureMergeBaseAvailable({ targetDir, baseBranch });
   const sourceHead = currentHead(targetDir);
+  assertAuthorizedSha(
+    "source pull request head",
+    sourceHead,
+    executionIntent?.source.expected_head_sha,
+  );
   logProgress("preparing target toolchain", { source_head: sourceHead });
   prepareTargetToolchain(targetDir, currentTargetValidationOptions());
   const codexOwnsInitialRebase =
@@ -977,10 +1065,28 @@ function pushRepairBranchAndUpdateStatus({
       merge_preflight: prep.merge_preflight,
     };
   }
+  if (executionIntent) {
+    return preparedPublicationOutcome({
+      fixArtifact,
+      targetDir,
+      prep,
+      branch: executionIntent.output_branch,
+      target: sourcePr.url,
+      branchRewritten: branchUpdate.rewritten,
+    });
+  }
 
   ghAuthSetupGit(targetDir);
   if (!sameRepoBranch) {
     assertRepairBranchWritable({ targetDir, pull, rewritten: branchUpdate.rewritten });
+  }
+  const settleSeconds = repairPushSettleSeconds();
+  if (settleSeconds > 0) {
+    logProgress("settling repair before branch push", {
+      source_pr: sourcePr.url,
+      seconds: settleSeconds,
+    });
+    sleepMs(settleSeconds * 1000);
   }
   const livePull = fetchPullRequest(result.repo, sourcePr.number);
   const livePauseBlock = liveRepairPauseBlock({
@@ -991,6 +1097,15 @@ function pushRepairBranchAndUpdateStatus({
     branchUpdate,
   });
   if (livePauseBlock) return livePauseBlock;
+  const liveHeadBlock = repairPushSettleBlock({
+    initialPull: pull,
+    livePull,
+    number: sourcePr.number,
+    target: sourcePr.url,
+    commit: prep.commit,
+    branchUpdate,
+  });
+  if (liveHeadBlock) return liveHeadBlock;
   const pushArgs = repairBranchPushArgs({ pull, rewritten: branchUpdate.rewritten });
   try {
     runGitNetwork(pushArgs, targetDir);
@@ -1015,6 +1130,7 @@ function pushRepairBranchAndUpdateStatus({
         fixArtifact,
         sourcePr,
         targetDir,
+        sourceHead,
         prep,
         fallbackReason: blockedReason,
       });
@@ -1073,10 +1189,101 @@ function pushRepairBranchAndUpdateStatus({
   };
 }
 
+function preparedPublicationOutcome({
+  fixArtifact,
+  targetDir,
+  prep,
+  branch,
+  target = null,
+  branchRewritten = null,
+  resumedBranch = null,
+  contributorCredits = [],
+}: LooseRecord) {
+  if (!executionIntent) throw new Error("prepared publication requires an execution intent");
+  if (branch !== executionIntent.output_branch) {
+    throw new Error("prepared repair branch differs from the authorized output branch");
+  }
+  const preparedHeadSha = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+  const preparedTreeSha = run("git", ["rev-parse", "HEAD^{tree}"], { cwd: targetDir }).trim();
+  assertAuthorizedSha("prepared repair head", preparedHeadSha, prep.commit);
+  const repairDeltaBaseSha = executionIntentRepairDeltaBaseSha(executionIntent);
+  if (prep.repair_delta_base_sha !== repairDeltaBaseSha) {
+    throw new Error("prepared repair proof used a non-authorized repair delta base");
+  }
+  const publication = createPreparedPublication({
+    outputDir: path.dirname(resultPath),
+    targetDir,
+    authorizationSha256,
+    executionIntent,
+    fixArtifact,
+    repairDeltaBaseSha,
+    preparedHeadSha,
+    preparedTreeSha,
+  });
+  return {
+    action: executionIntent.action_name,
+    status: "prepared",
+    ...(target ? { target } : {}),
+    branch,
+    ...(branchRewritten !== null ? { branch_rewritten: branchRewritten } : {}),
+    ...(resumedBranch !== null ? { resumed_branch: resumedBranch } : {}),
+    commit: preparedHeadSha,
+    repair_delta_base_sha: publication.repair_delta_base_sha,
+    prepared_tree_sha: preparedTreeSha,
+    publication_intent_sha256: publication.identity_sha256,
+    checkpoint_commits: prep.checkpoint_commits ?? [],
+    merge_preflight: prep.merge_preflight,
+    supersede_sources: executionIntent.superseded_source_prs,
+    contributor_credit: contributorCredits.map(publicContributorCredit),
+  };
+}
+
+function repairPushSettleSeconds() {
+  const configured = Number(
+    process.env.CLAWSWEEPER_BRANCH_PUSH_SETTLE_SECONDS ?? DEFAULT_REPAIR_PUSH_SETTLE_SECONDS,
+  );
+  if (!Number.isFinite(configured)) return DEFAULT_REPAIR_PUSH_SETTLE_SECONDS;
+  return Math.min(120, Math.max(0, Math.floor(configured)));
+}
+
+function repairPushSettleBlock({
+  initialPull,
+  livePull,
+  number,
+  target,
+  commit,
+  branchUpdate,
+}: LooseRecord) {
+  const liveState = String(livePull?.state ?? "").toLowerCase();
+  if (liveState !== "open") {
+    return {
+      action: "repair_contributor_branch",
+      status: "blocked",
+      target,
+      commit,
+      branch_rewritten: branchUpdate?.rewritten ?? null,
+      reason: `source PR #${number} is ${liveState || "no longer open"} after the repair settle window; refusing to push`,
+    };
+  }
+  const initialHead = String(initialPull?.head?.sha ?? "");
+  const liveHead = String(livePull?.head?.sha ?? "");
+  if (!initialHead || !liveHead || initialHead === liveHead) return null;
+  return {
+    action: "repair_contributor_branch",
+    status: "blocked",
+    target,
+    commit,
+    branch_rewritten: branchUpdate?.rewritten ?? null,
+    reason: `source PR #${number} changed during the repair settle window; requeue against the latest head`,
+    requeue_required: true,
+  };
+}
+
 function openReplacementPrFromPreparedRepairCheckout({
   fixArtifact,
   sourcePr,
   targetDir,
+  sourceHead,
   prep,
   fallbackReason,
 }: LooseRecord) {
@@ -1119,6 +1326,26 @@ function openReplacementPrFromPreparedRepairCheckout({
   });
   prep.commit = historyCompaction.commit;
   prep.history_compaction = historyCompaction;
+  const validatedBaseSha = run("git", ["rev-parse", `origin/${baseBranch}`], {
+    cwd: targetDir,
+  }).trim();
+  const repairDeltaBaseHead = executionIntent
+    ? executionIntentRepairDeltaBaseSha(executionIntent)
+    : sourceHead;
+  ensureFinalStagedProof({
+    fixArtifact,
+    targetDir,
+    baseBranch,
+    sourceHead: repairDeltaBaseHead,
+    validatedHeadSha: prep.commit,
+    validatedBaseSha,
+  });
+  prep.repair_delta_base_sha = repairDeltaBaseHead;
+  prep.merge_preflight = bindMergePreflightToStagedProof({
+    preflight: prep.merge_preflight,
+    validatedHeadSha: prep.commit,
+    validatedBaseSha,
+  });
   const mergedSourceSkip = skipMergedSourceReplacementWithoutDiff({
     mergedSource,
     targetDir,
@@ -1166,11 +1393,13 @@ function openReplacementPrFromPreparedRepairCheckout({
     provenance,
     contributorCredits,
     maintainerAttribution: jobMaintainerAttribution(),
-    sourceClosingReferences: sourceClosingReferences({
-      fixArtifact,
-      targetDir,
-      repo: result.repo,
-    }),
+    sourceClosingReferences: executionIntent
+      ? executionIntent.source_closing_references
+      : sourceClosingReferences({
+          fixArtifact,
+          targetDir,
+          repo: result.repo,
+        }),
   });
   const bodyPath = path.join(workRoot, "replacement-pr-body.md");
   fs.writeFileSync(bodyPath, body);
@@ -1330,6 +1559,7 @@ function tryAutomergeFastRebaseRepair({
     commit,
     prep: {
       commit,
+      repair_delta_base_sha: sourceHead,
       checkpoint_commits: [],
       merge_preflight: {
         target: null,
@@ -1437,20 +1667,28 @@ function executeReplacementBranch({
   fallbackReason,
 }: LooseRecord) {
   const baseBranch = String(process.env.CLAWSWEEPER_FIX_BASE_BRANCH ?? DEFAULT_BASE_BRANCH);
-  const contributorCredits = sourceContributorCredits({
-    fixArtifact,
-    targetDir,
-    repo: result.repo,
-  });
-  const mergedSource = mergedReplacementSourcePr({ fixArtifact, targetDir });
-  const branch = replacementBranchName(result.cluster_id);
-  const areaCapacityBlock = validateActivePrAreaCapacity({
-    fixArtifact,
-    targetDir,
-    branch,
-    repo: result.repo,
-    maxActivePrsPerArea,
-  });
+  const contributorCredits = executionIntent
+    ? executionIntent.contributor_credits
+    : sourceContributorCredits({
+        fixArtifact,
+        targetDir,
+        repo: result.repo,
+      });
+  const mergedSource = executionIntent
+    ? null
+    : mergedReplacementSourcePr({ fixArtifact, targetDir });
+  const branch = executionIntent
+    ? executionIntent.output_branch
+    : replacementBranchName(result.cluster_id);
+  const areaCapacityBlock = executionIntent
+    ? null
+    : validateActivePrAreaCapacity({
+        fixArtifact,
+        targetDir,
+        branch,
+        repo: result.repo,
+        maxActivePrsPerArea,
+      });
   if (areaCapacityBlock) {
     return {
       action: "open_fix_pr",
@@ -1460,13 +1698,31 @@ function executeReplacementBranch({
       ...areaCapacityBlock,
     };
   }
-  runGitNetwork(["fetch", "origin", baseBranch], targetDir);
-  const branchState = checkoutRecoverableReplacementBranch({
-    targetDir,
-    branch,
-    baseBranch,
-    fixArtifact,
-  });
+  let branchState;
+  if (executionIntent) {
+    branchState = checkoutAuthorizedPublicationBranch({
+      targetDir,
+      branch,
+      baseBranch,
+      fixArtifact,
+    });
+  } else {
+    runGitNetwork(["fetch", "origin", baseBranch], targetDir);
+    branchState = checkoutRecoverableReplacementBranch({
+      targetDir,
+      branch,
+      baseBranch,
+      fixArtifact,
+    });
+  }
+  const sourceHead = currentHead(targetDir);
+  if (executionIntent) {
+    assertAuthorizedSha(
+      "replacement repair delta base",
+      sourceHead,
+      executionIntentRepairDeltaBaseSha(executionIntent),
+    );
+  }
   prepareTargetToolchain(targetDir, currentTargetValidationOptions());
   const rebaseResult = rebaseOntoBase({ targetDir, baseBranch });
   const mechanicalConflictResolution = tryResolveMechanicalRebaseConflicts({
@@ -1477,7 +1733,7 @@ function executeReplacementBranch({
     logProgress("mechanically resolved replacement rebase conflicts", mechanicalConflictResolution);
   }
 
-  if (!dryRun) ghAuthSetupGit(targetDir);
+  if (!dryRun && !executionIntent) ghAuthSetupGit(targetDir);
   const prep = editValidatePrepareMerge({
     fixArtifact,
     targetDir,
@@ -1488,7 +1744,9 @@ function executeReplacementBranch({
     contributorCredits,
     allowExistingChanges: branchState.resumed && branchHasBaseDiff({ targetDir, baseBranch }),
     reconcileWithBase: branchState.resumed,
-    pushCheckpoint: dryRun ? null : () => pushRecoverableBranch({ targetDir, branch }),
+    pushCheckpoint:
+      dryRun || executionIntent ? null : () => pushRecoverableBranch({ targetDir, branch }),
+    sourceHead,
     rebaseResult,
   });
   const provenance = externalMessageProvenance({
@@ -1551,6 +1809,16 @@ function executeReplacementBranch({
       contributor_credit: contributorCredits.map(publicContributorCredit),
       reason: "replacement branch has no changes versus base after repair",
     };
+  }
+  if (executionIntent) {
+    return preparedPublicationOutcome({
+      fixArtifact,
+      targetDir,
+      prep,
+      branch,
+      resumedBranch: branchState.resumed,
+      contributorCredits,
+    });
   }
 
   pushRecoverableBranch({ targetDir, branch });
@@ -1937,6 +2205,8 @@ function editValidatePrepareMerge({
   let producedChanges = allowExistingChanges;
   let previousSummary = "";
   const checkpointCommits: JsonValue[] = [];
+  const hasRepairContract = repairContract(fixArtifact) !== null;
+  const pushIntermediateCheckpoint = hasRepairContract ? null : pushCheckpoint;
   if (
     !producedChanges &&
     canTreatRebaseAsCompleteRepair({
@@ -1978,9 +2248,30 @@ function editValidatePrepareMerge({
     if (producedChanges) logProgress("applied mechanical changelog fix");
   }
   const repositoryContext = buildRepositoryContext({ fixArtifact, targetDir });
+  const targetBaseSha = pinRepairBase(() =>
+    run("git", ["rev-parse", `origin/${baseBranch}`], { cwd: targetDir }),
+  ).sha;
   const shouldRunCodexEdit = !producedChanges || reconcileWithBase;
-  const repairDeltaBaseHead =
-    rebaseResult?.status === "conflicts" ? sourceHead : currentHead(targetDir);
+  const repairDeltaBaseHead = sourceHead ?? targetBaseSha;
+  const proofPreviewOptions = {
+    ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
+    pinnedBaseRef: targetBaseSha,
+  };
+  const proofPreviewScope = repairDeltaValidationPlan(
+    { fixArtifact, targetDir, sourceHead: repairDeltaBaseHead },
+    proofPreviewOptions,
+  );
+  validationProofPlan = buildTargetValidationProofPlan(
+    proofPreviewScope.commands,
+    targetDir,
+    proofPreviewScope.options,
+    baseBranch,
+  );
+  report.validation_proof_plan = validationProofPlan;
+  logProgress("prepared staged validation proof plan", {
+    plan_id: validationProofPlan.plan_id,
+    summary: stagedProofSummary(validationProofPlan),
+  });
   if (shouldRunCodexEdit) {
     for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
       const headBeforeAttempt = currentHead(targetDir);
@@ -2001,10 +2292,12 @@ function editValidatePrepareMerge({
             : rebaseResult,
         maxEditAttempts,
         validationCommands: validationPreflight.resolved_commands ?? [],
+        validationProofPlan,
+        targetBaseSha,
         isAutomergeRepair: isAutomergeRepairJob(),
       });
       const summaryPath = path.join(workRoot, `${mode}-codex-summary-${attempt}.md`);
-      const workerTimeoutMs = currentCodexTimeoutMs();
+      const workerTimeoutMs = currentCodexTimeoutMs(true);
       logProgress("starting Codex edit pass", {
         mode,
         attempt,
@@ -2138,7 +2431,6 @@ function editValidatePrepareMerge({
 
   const completedRebase = completeRebaseIfResolved({ targetDir });
   if (completedRebase.status === "continued") {
-    producedChanges = true;
     logProgress("completed resolved rebase", {
       previous_head: completedRebase.previous_head,
       current_head: completedRebase.current_head,
@@ -2152,80 +2444,107 @@ function editValidatePrepareMerge({
   });
   if (firstCheckpoint) {
     checkpointCommits.push(firstCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
 
-  let codexReview = null;
-  const maxFinalBaseSyncAttempts = Math.max(
-    1,
-    Number(process.env.CLAWSWEEPER_FINAL_BASE_SYNC_ATTEMPTS ?? 1),
+  logProgress("starting validation/review loop", { mode, attempt: 1 });
+  updateAutomergeProgressStatus({
+    id: `validation-review-${mode}-1`,
+    label: "validation and review 1",
+    status: "running",
+    details: mode,
+    headSha: currentHead(targetDir),
+  });
+  let codexReview = validateAndReviewLoop({
+    fixArtifact,
+    targetDir,
+    mode,
+    baseBranch,
+    targetBaseSha,
+    sourceHead: repairDeltaBaseHead,
+    onReviewFix: (reviewAttempt: JsonValue) => {
+      const checkpoint = commitCheckpointIfNeeded({
+        targetDir,
+        message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+        trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
+      });
+      if (checkpoint) {
+        checkpointCommits.push(checkpoint);
+        pushIntermediateCheckpoint?.();
+      }
+    },
+  });
+  const finalSyncRepairDeltaPaths = run(
+    "git",
+    ["diff", "--name-only", `${repairDeltaBaseHead}..HEAD`],
+    { cwd: targetDir },
+  )
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const sync = reconcileLatestBaseBeforePush({
+    fixArtifact,
+    targetDir,
+    branch,
+    mode,
+    baseBranch,
+    contributorCredits,
+    attempt: 1,
+    repositoryContext,
+    sourceHead,
+  });
+  logProgress("final base sync result", { mode, attempt: 1, status: sync.status });
+  updateAutomergeProgressStatus({
+    id: `validation-review-${mode}-1`,
+    label: "validation and review 1",
+    status: "complete",
+    details: sync.status,
+    headSha: currentHead(targetDir),
+  });
+  const synchronizedBaseSha = String(
+    sync.base_sha ??
+      run("git", ["rev-parse", `origin/${baseBranch}`], {
+        cwd: targetDir,
+      }).trim(),
   );
-  for (let attempt = 1; attempt <= maxFinalBaseSyncAttempts; attempt += 1) {
-    logProgress("starting validation/review loop", { mode, attempt });
-    updateAutomergeProgressStatus({
-      id: `validation-review-${mode}-${attempt}`,
-      label: `validation and review ${attempt}`,
-      status: "running",
-      details: mode,
-      headSha: currentHead(targetDir),
-    });
-    codexReview = validateAndReviewLoop({
-      fixArtifact,
-      targetDir,
-      mode,
-      baseBranch,
-      sourceHead: repairDeltaBaseHead,
-      onReviewFix: (reviewAttempt: JsonValue) => {
+  const syncRequiresReview = finalBaseSyncRequiresReview({
+    syncStatus: String(sync.status),
+    synchronizedBaseSha,
+    validatedBaseSha: targetBaseSha,
+  });
+  if (syncRequiresReview) {
+    codexReview = reviewAfterFinalBaseSync({
+      syncChanged: syncRequiresReview,
+      currentReview: codexReview,
+      reviewSynchronizedTree: () =>
+        validateAndReviewSynchronizedTree({
+          fixArtifact,
+          targetDir,
+          mode,
+          baseBranch,
+          targetBaseSha: synchronizedBaseSha,
+          sourceHead: repairDeltaBaseHead,
+          repairDeltaPaths: finalSyncRepairDeltaPaths,
+        }),
+      checkpointSynchronizedTree: () => {
         const checkpoint = commitCheckpointIfNeeded({
           targetDir,
-          message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+          message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (1)`,
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
         if (checkpoint) {
           checkpointCommits.push(checkpoint);
-          pushCheckpoint?.();
+          pushIntermediateCheckpoint?.();
         }
       },
     });
-    const sync = reconcileLatestBaseBeforePush({
-      fixArtifact,
-      targetDir,
-      branch,
-      mode,
-      baseBranch,
-      contributorCredits,
-      attempt,
-      repositoryContext,
-      sourceHead,
-    });
-    logProgress("final base sync result", { mode, attempt, status: sync.status });
-    updateAutomergeProgressStatus({
-      id: `validation-review-${mode}-${attempt}`,
-      label: `validation and review ${attempt}`,
-      status: sync.status === "already-current" ? "complete" : "base moved",
-      details: sync.status,
-      headSha: currentHead(targetDir),
-    });
-    if (sync.status === "already-current") break;
-    const checkpoint = commitCheckpointIfNeeded({
-      targetDir,
-      message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (${attempt})`,
-      trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
-    });
-    if (checkpoint) {
-      checkpointCommits.push(checkpoint);
-      pushCheckpoint?.();
-    }
-    if (attempt === maxFinalBaseSyncAttempts) {
-      codexReview.final_base_sync = {
-        status: "accepted_after_final_sync",
-        reason:
-          "origin/main moved during final validation; pushed the branch after the last successful final-base sync and left review/CI/automerge to gate the exact head",
-        attempts: maxFinalBaseSyncAttempts,
-        sync,
-      };
-      break;
-    }
+    codexReview.final_base_sync = {
+      status: "accepted_after_final_sync",
+      reason:
+        "origin/main moved after pinned-base validation; the deterministically synchronized tree passed one bounded validation and Codex review before push",
+      attempts: 1,
+      sync,
+      target_base_sha: synchronizedBaseSha,
+    };
   }
   const finalCheckpoint = commitCheckpointIfNeeded({
     targetDir,
@@ -2234,7 +2553,7 @@ function editValidatePrepareMerge({
   });
   if (finalCheckpoint) {
     checkpointCommits.push(finalCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
   const historyCompaction =
     mode === "replacement"
@@ -2246,15 +2565,31 @@ function editValidatePrepareMerge({
           checkpointCommits,
         })
       : null;
-  if (historyCompaction?.status === "compacted") {
+  enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch });
+  const commit = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+  const validatedBaseSha = String(codexReview.final_base_sync?.target_base_sha ?? targetBaseSha);
+  ensureFinalStagedProof({
+    fixArtifact,
+    targetDir,
+    baseBranch,
+    sourceHead: repairDeltaBaseHead,
+    validatedHeadSha: commit,
+    validatedBaseSha,
+  });
+  if (hasRepairContract || historyCompaction?.status === "compacted") {
     pushCheckpoint?.();
   }
-  const commit = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
   return {
     commit,
+    repair_delta_base_sha: repairDeltaBaseHead,
     checkpoint_commits: checkpointCommits,
     history_compaction: historyCompaction,
-    merge_preflight: buildMergePreflight({ fixArtifact, codexReview }),
+    merge_preflight: buildMergePreflight({
+      fixArtifact,
+      codexReview,
+      validatedHeadSha: commit,
+      validatedBaseSha,
+    }),
   };
 }
 
@@ -2294,7 +2629,7 @@ function updateAutomergeProgressStatus({
   details = null,
   headSha = null,
 }: LooseRecord) {
-  if (!isBranchRepairStatusJob() || dryRun) return false;
+  if (executionIntent || !isBranchRepairStatusJob() || dryRun) return false;
   const target = automergeOutcomeTargetPrNumber();
   if (!target) return false;
   try {
@@ -2343,12 +2678,14 @@ function reconcileLatestBaseBeforePush({
 }: LooseRecord) {
   runGitNetwork(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], targetDir);
   const baseRef = `origin/${baseBranch}`;
+  const baseSha = run("git", ["rev-parse", baseRef], { cwd: targetDir }).trim();
+  assertAuthorizedSha("target base", baseSha, executionIntent?.target_base_sha);
   if (isAncestor({ targetDir, ancestor: baseRef, descendant: "HEAD" })) {
-    return { status: "already-current" };
+    return { status: "already-current", base_sha: baseSha };
   }
 
   const rebaseResult = rebaseOntoBase({ targetDir, baseBranch });
-  if (rebaseResult.status !== "conflicts") return rebaseResult;
+  if (rebaseResult.status !== "conflicts") return { ...rebaseResult, base_sha: baseSha };
 
   runCodexBaseReconcile({
     fixArtifact,
@@ -2364,6 +2701,7 @@ function reconcileLatestBaseBeforePush({
   const completed = completeRebaseIfResolved({ targetDir });
   return {
     status: "codex-reconciled",
+    base_sha: baseSha,
     rebase_result: rebaseResult,
     completed_rebase: completed,
   };
@@ -2402,7 +2740,7 @@ function runCodexBaseReconcile({
       workRoot,
       `${mode}-final-base-reconcile-summary-${attempt}-${codexAttempt}.md`,
     );
-    const reconcileTimeoutMs = currentCodexTimeoutMs();
+    const reconcileTimeoutMs = currentCodexTimeoutMs(true);
     const codexResult = spawnCodexSyncWithHeartbeat(
       `Codex final rebase worker ${mode} attempt ${attempt}.${codexAttempt}`,
       [
@@ -2633,24 +2971,28 @@ function validateAndReviewLoop({
   targetDir,
   mode,
   baseBranch = DEFAULT_BASE_BRANCH,
+  targetBaseSha,
   onReviewFix = null,
   sourceHead = null,
 }: LooseRecord) {
   let lastReview = null;
   let validationCommands: LooseRecord[] = [];
   for (let attempt = 1; attempt <= maxReviewAttempts; attempt += 1) {
+    const validationOptions = {
+      ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
+      pinnedBaseRef: targetBaseSha,
+    };
     const validationPlan = repairDeltaValidationPlan(
       { fixArtifact, targetDir, sourceHead },
-      currentTargetValidationOptions(),
+      validationOptions,
     );
     try {
-      validationCommands = runAllowedValidationCommands(
+      validationCommands = runTargetValidationProof(
         validationPlan.commands,
         targetDir,
         validationPlan.options,
         baseBranch,
       );
-      runDiffCheck({ targetDir, baseBranch });
       if (canSkipInternalCodexReviewForRepairDelta(validationPlan)) {
         return {
           status: "passed_repair_delta_validation",
@@ -2667,6 +3009,25 @@ function validateAndReviewLoop({
         };
       }
     } catch (error) {
+      const baseError = reproduceValidationFailureAtPinnedBase({
+        commands: validationPlan.commands,
+        targetDir,
+        options: validationPlan.options,
+        baseBranch,
+      });
+      const externalBaseBlocker = classifyExternalBaseValidationFailure({
+        targetDir,
+        pinnedBaseRef: targetBaseSha,
+        repairBaseRef: sourceHead,
+        error,
+        baseError,
+      });
+      if (externalBaseBlocker) {
+        throw new Error(
+          `external base blocker: ${externalBaseBlocker.reason}: ${externalBaseBlocker.paths.join(", ")}`,
+          { cause: error },
+        );
+      }
       if (attempt < maxReviewAttempts && isFixableValidationError(error)) {
         lastReview = {
           status: "validation_failed",
@@ -2684,6 +3045,7 @@ function validateAndReviewLoop({
           attempt,
           validationPlan,
           validationCommands,
+          targetBaseSha,
         });
         onReviewFix?.(`validation-${attempt}`);
         continue;
@@ -2697,6 +3059,7 @@ function validateAndReviewLoop({
         mode,
         attempt,
         baseBranch,
+        targetBaseSha,
         validationCommands,
         validationPlan,
       });
@@ -2724,19 +3087,19 @@ function validateAndReviewLoop({
         mode,
         review: lastReview,
         attempt: `${attempt}-final`,
+        targetBaseSha,
       });
       onReviewFix?.(`${attempt}-final`);
       const finalValidationPlan = repairDeltaValidationPlan(
         { fixArtifact, targetDir, sourceHead },
-        currentTargetValidationOptions(),
+        validationOptions,
       );
-      validationCommands = runAllowedValidationCommands(
+      validationCommands = runTargetValidationProof(
         finalValidationPlan.commands,
         targetDir,
         finalValidationPlan.options,
         baseBranch,
       );
-      runDiffCheck({ targetDir, baseBranch });
       return {
         status: "passed_after_final_review_fix",
         summary:
@@ -2755,11 +3118,85 @@ function validateAndReviewLoop({
         },
       };
     }
-    runCodexReviewFix({ fixArtifact, targetDir, mode, review: lastReview, attempt });
+    runCodexReviewFix({
+      fixArtifact,
+      targetDir,
+      mode,
+      review: lastReview,
+      attempt,
+      targetBaseSha,
+    });
     onReviewFix?.(attempt);
   }
   const summary = codexReviewFailureSummary(lastReview);
   throw new Error(`Codex /review did not pass after ${maxReviewAttempts} attempt(s): ${summary}`);
+}
+
+function validateAndReviewSynchronizedTree({
+  fixArtifact,
+  targetDir,
+  mode,
+  baseBranch,
+  targetBaseSha,
+  sourceHead,
+  repairDeltaPaths,
+}: LooseRecord) {
+  const validationOptions = {
+    ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
+    pinnedBaseRef: targetBaseSha,
+  };
+  const validationPlan = repairDeltaValidationPlan(
+    { fixArtifact, targetDir, sourceHead },
+    validationOptions,
+  );
+  let validationCommands;
+  try {
+    validationCommands = runTargetValidationProof(
+      validationPlan.commands,
+      targetDir,
+      validationPlan.options,
+      baseBranch,
+    );
+  } catch (error) {
+    const baseError = reproduceValidationFailureAtPinnedBase({
+      commands: validationPlan.commands,
+      targetDir,
+      options: validationPlan.options,
+      baseBranch,
+    });
+    const externalBaseBlocker = classifyExternalBaseValidationFailure({
+      targetDir,
+      pinnedBaseRef: targetBaseSha,
+      repairBaseRef: sourceHead,
+      repairDeltaPaths,
+      error,
+      baseError,
+    });
+    if (externalBaseBlocker) {
+      throw new Error(
+        `external base blocker: ${externalBaseBlocker.reason}: ${externalBaseBlocker.paths.join(", ")}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  const review = runCodexReview({
+    fixArtifact,
+    targetDir,
+    mode,
+    attempt: "final-sync",
+    baseBranch,
+    targetBaseSha,
+    validationCommands,
+    validationPlan,
+  });
+  review.validation_commands_run = validationCommands;
+  if (!isCleanCodexReview(review)) {
+    throw new Error(
+      `Codex /review did not pass after final base synchronization: ${codexReviewFailureSummary(review)}`,
+    );
+  }
+  return review;
 }
 
 function codexReviewFailureSummary(review: LooseRecord | null): string {
@@ -2773,7 +3210,13 @@ function codexReviewFailureSummary(review: LooseRecord | null): string {
 
 function isFixableValidationError(error: JsonValue) {
   const message = String(error?.message ?? error);
-  if (/no merge base|validation_script_missing/i.test(message)) return false;
+  if (
+    /no merge base|validation_script_missing|mutated checkout|proof identity|clean validation checkout|staged proof runtime budget exhausted|validation command runtime budget exhausted/i.test(
+      message,
+    )
+  ) {
+    return false;
+  }
   return /validation command failed|git diff --check/i.test(message);
 }
 
@@ -2783,10 +3226,78 @@ function isRetryableCodexReviewError(error: JsonValue) {
   );
 }
 
-function runDiffCheck({ targetDir, baseBranch }: LooseRecord) {
-  ensureMergeBaseAvailable({ targetDir, baseBranch });
-  run("git", ["diff", "--check", `origin/${baseBranch}...HEAD`], { cwd: targetDir });
-  run("git", ["diff", "--check"], { cwd: targetDir });
+function runTargetValidationProof(
+  commands: LooseRecord[],
+  cwd: string,
+  options: TargetValidationOptions,
+  baseBranch: string,
+) {
+  validationProofPlan = buildTargetValidationProofPlan(commands, cwd, options, baseBranch);
+  report.validation_proof_plan = validationProofPlan;
+  try {
+    const proof = runStagedValidationProof(commands, cwd, options, baseBranch);
+    validationProofPlan = stagedProofPlanArtifact(proof.plan);
+    report.validation_proof_plan = validationProofPlan;
+    validationProofTraces.push(proof.trace);
+    logProgress("staged validation proof passed", {
+      plan_id: proof.trace.plan_id,
+      summary: stagedProofSummary(proof.trace),
+    });
+    return proof.commands;
+  } catch (error) {
+    const trace = stagedProofTraceFromError(error);
+    if (trace) {
+      validationProofTraces.push(trace);
+      logProgress("staged validation proof failed", {
+        plan_id: trace.plan_id,
+        summary: stagedProofSummary(trace),
+      });
+    }
+    throw error;
+  }
+}
+
+function ensureFinalStagedProof({
+  fixArtifact,
+  targetDir,
+  baseBranch,
+  sourceHead,
+  validatedHeadSha,
+  validatedBaseSha,
+}: LooseRecord) {
+  const validationOptions = {
+    ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
+    pinnedBaseRef: validatedBaseSha,
+  };
+  const validationPlan = repairDeltaValidationPlan(
+    { fixArtifact, targetDir, sourceHead },
+    validationOptions,
+  );
+  const requiredPlan = buildTargetValidationProofPlan(
+    validationPlan.commands,
+    targetDir,
+    validationPlan.options,
+    baseBranch,
+  );
+  const latest = validationProofTraces.at(-1);
+  if (
+    latest?.status === "passed" &&
+    latest.validated_head_sha === validatedHeadSha &&
+    latest.validated_base_sha === validatedBaseSha &&
+    validationProofPlan?.plan_id === latest.plan_id &&
+    requiredPlan.plan_id === latest.plan_id
+  ) {
+    return;
+  }
+  runTargetValidationProof(validationPlan.commands, targetDir, validationPlan.options, baseBranch);
+  const finalTrace = validationProofTraces.at(-1);
+  if (
+    finalTrace?.status !== "passed" ||
+    finalTrace.validated_head_sha !== validatedHeadSha ||
+    finalTrace.validated_base_sha !== validatedBaseSha
+  ) {
+    throw new Error("final staged proof is not bound to the final repair head and base");
+  }
 }
 
 function runCodexReview({
@@ -2795,6 +3306,7 @@ function runCodexReview({
   mode,
   attempt,
   baseBranch = DEFAULT_BASE_BRANCH,
+  targetBaseSha,
   validationCommands = [],
   validationPlan = null,
 }: LooseRecord) {
@@ -2803,7 +3315,7 @@ function runCodexReview({
   const prompt = [
     "/review",
     "",
-    `Review the current ClawSweeper Repair fix branch diff against origin/${baseBranch} before it can be merged.`,
+    `Review the current ClawSweeper Repair fix branch diff against pinned target base ${targetBaseSha} (${baseBranch}) before it can be merged.`,
     "",
     "Required checks:",
     "- security-sensitive issues are resolved or absent;",
@@ -2819,6 +3331,7 @@ function runCodexReview({
     "- repository policy overrides fix artifact credit wording: for openclaw/openclaw changelog entries, do not require or re-add forbidden `Thanks @codex`, `Thanks @openclaw`, or `Thanks @steipete` attribution; PR body/history/source links are acceptable credit for those source authors.",
     "",
     `Validation commands actually run: ${validationCommands.join("; ") || "none"}`,
+    `Staged validation proof: ${stagedProofSummary(stagedProofBundle(validationProofTraces))}`,
     validationPlan
       ? `Validation scope: ${validationPlan.scope}; ${validationPlan.reason}; changed files: ${(validationPlan.changed_files ?? []).join(", ") || "none"}`
       : "",
@@ -2921,11 +3434,19 @@ function isCodexReview(value: JsonValue) {
   );
 }
 
-function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: LooseRecord) {
+function runCodexReviewFix({
+  fixArtifact,
+  targetDir,
+  mode,
+  review,
+  attempt,
+  targetBaseSha,
+}: LooseRecord) {
   const prompt = [
     "Address every actionable finding from Codex /review.",
     "",
     "Rules:",
+    `- keep all inspection and validation anchored to pinned target base ${targetBaseSha};`,
     "- keep the patch narrow;",
     "- keep shell output bounded; inspect targeted files and avoid broad repo-wide dumps;",
     "- do not commit, push, open PRs, close PRs, or call gh;",
@@ -2987,6 +3508,7 @@ function runCodexValidationFix({
   attempt,
   validationPlan,
   validationCommands = [],
+  targetBaseSha,
 }: LooseRecord) {
   const validationError = compactText(String(error?.message ?? error), 8000);
   const changedFiles = run("git", ["diff", "--name-only"], { cwd: targetDir })
@@ -2997,6 +3519,7 @@ function runCodexValidationFix({
     "Fix the current repair patch so the changed-surface validation gate passes.",
     "",
     "Rules:",
+    `- keep all inspection and validation anchored to pinned target base ${targetBaseSha};`,
     "- keep the patch narrow;",
     "- fix only issues introduced by the current repair branch or required to make its changed gate pass;",
     "- keep shell output bounded; inspect targeted files and avoid broad repo-wide dumps;",
@@ -3008,6 +3531,9 @@ function runCodexValidationFix({
     "- prefer the smallest lint/typecheck/test fix over broad rewrites.",
     "",
     `Validation commands attempted: ${validationCommands.join("; ") || "none"}`,
+    validationProofTraces.length > 0
+      ? `Latest staged proof: ${stagedProofSummary(validationProofTraces.at(-1)!)}`
+      : "",
     validationPlan
       ? `Validation scope: ${validationPlan.scope}; ${validationPlan.reason}; changed files: ${(validationPlan.changed_files ?? []).join(", ") || "none"}`
       : "",
@@ -3067,34 +3593,64 @@ function isCleanCodexReview(review: LooseRecord) {
   );
 }
 
-function buildMergePreflight({ fixArtifact, codexReview }: LooseRecord) {
+function buildMergePreflight({
+  fixArtifact,
+  codexReview,
+  validatedHeadSha,
+  validatedBaseSha,
+}: LooseRecord) {
   const validationCommands = codexReview.validation_commands_run?.length
     ? codexReview.validation_commands_run
     : fixArtifact.validation_commands;
-  return {
-    target: null,
-    security_status: "cleared",
-    security_evidence: [
-      "ClawSweeper Repair scoped security scan found no security-sensitive fix target, source PR, or fix artifact scope.",
-    ],
-    comments_status: "resolved",
-    comments_evidence: [
-      "Agentic fix pass addressed human PR/review comments named in the fix artifact.",
-    ],
-    bot_comments_status: "resolved",
-    bot_comments_evidence: [
-      "Agentic fix pass addressed Greptile/Codex/Asile/CodeRabbit/Copilot-style findings named in the fix artifact.",
-    ],
-    codex_review: {
-      command: "/review",
-      status: codexReview.status === "clean" ? "clean" : "passed",
-      findings_addressed: true,
-      evidence: codexReview.evidence?.length
-        ? codexReview.evidence
-        : [`Codex /review passed after agentic fix loop: ${codexReview.summary ?? "clean"}`],
+  return bindMergePreflightToStagedProof({
+    preflight: {
+      target: null,
+      security_status: "cleared",
+      security_evidence: [
+        "ClawSweeper Repair scoped security scan found no security-sensitive fix target, source PR, or fix artifact scope.",
+      ],
+      comments_status: "resolved",
+      comments_evidence: [
+        "Agentic fix pass addressed human PR/review comments named in the fix artifact.",
+      ],
+      bot_comments_status: "resolved",
+      bot_comments_evidence: [
+        "Agentic fix pass addressed Greptile/Codex/Asile/CodeRabbit/Copilot-style findings named in the fix artifact.",
+      ],
+      codex_review: {
+        command: "/review",
+        status: codexReview.status === "clean" ? "clean" : "passed",
+        findings_addressed: true,
+        evidence: codexReview.evidence?.length
+          ? codexReview.evidence
+          : [`Codex /review passed after agentic fix loop: ${codexReview.summary ?? "clean"}`],
+      },
+      validation_commands: validationCommands,
+      final_base_sync: codexReview.final_base_sync ?? null,
     },
-    validation_commands: validationCommands,
-    final_base_sync: codexReview.final_base_sync ?? null,
+    validatedHeadSha,
+    validatedBaseSha,
+  });
+}
+
+function bindMergePreflightToStagedProof({
+  preflight,
+  validatedHeadSha,
+  validatedBaseSha,
+}: LooseRecord) {
+  const validationProof = stagedProofBundle(validationProofTraces);
+  if (
+    !isPassedStagedProofBundle(validationProof, validationProofPlan) ||
+    validationProof.validated_head_sha !== validatedHeadSha ||
+    validationProof.validated_base_sha !== validatedBaseSha
+  ) {
+    throw new Error("merge preflight staged proof is not bound to the final repair head and base");
+  }
+  return {
+    ...preflight,
+    validation_proof: validationProof,
+    validated_head_sha: validatedHeadSha,
+    validated_base_sha: validatedBaseSha,
   };
 }
 
@@ -3148,6 +3704,64 @@ function ensureTargetCheckout(repo: string, targetDir: string) {
   if (status) throw new Error(`target checkout has uncommitted changes: ${targetDir}`);
 }
 
+function checkoutAuthorizedPublicationBranch({
+  targetDir,
+  branch,
+  baseBranch,
+  fixArtifact,
+}: LooseRecord) {
+  if (!executionIntent) throw new Error("authorized checkout requires an execution intent");
+  if (
+    branch !== executionIntent.output_branch ||
+    baseBranch !== executionIntent.target_base_ref ||
+    fixArtifact.repair_strategy !== executionIntent.repair_strategy
+  ) {
+    throw new Error("target checkout differs from the authorized publication intent");
+  }
+  runGitNetwork(
+    ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+    targetDir,
+  );
+  assertAuthorizedRef("target base", `origin/${baseBranch}`, executionIntent.target_base_sha);
+
+  if (executionIntent.expected_output_sha) {
+    runGitNetwork(
+      ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      targetDir,
+    );
+    assertAuthorizedRef(
+      "existing output branch",
+      `origin/${branch}`,
+      executionIntent.expected_output_sha,
+    );
+    run("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: targetDir });
+    return { resumed: true, branch };
+  }
+
+  if (executionIntent.source.kind === "pull_request" && executionIntent.source.number) {
+    const sourceRef = `refs/remotes/clawsweeper/source-pr-${executionIntent.source.number}`;
+    runGitNetwork(
+      ["fetch", "origin", `+refs/pull/${executionIntent.source.number}/head:${sourceRef}`],
+      targetDir,
+    );
+    assertAuthorizedRef(
+      "source pull request head",
+      sourceRef,
+      executionIntent.source.expected_head_sha,
+    );
+    run("git", ["checkout", "-B", branch, sourceRef], { cwd: targetDir });
+    return {
+      resumed: false,
+      branch,
+      source_pr: executionIntent.source.url,
+      source_head_sha: executionIntent.source.expected_head_sha,
+    };
+  }
+
+  run("git", ["checkout", "-B", branch, `origin/${baseBranch}`], { cwd: targetDir });
+  return { resumed: false, branch };
+}
+
 function cloneTargetCheckout(repo: string, targetDir: string) {
   fs.mkdirSync(path.dirname(targetDir), { recursive: true });
   setupGitHubCredentialHelper();
@@ -3177,6 +3791,51 @@ function cloneTargetCheckout(repo: string, targetDir: string) {
   }
   fs.rmSync(targetDir, { recursive: true, force: true });
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function authorizedSourcePullRequest(): LooseRecord {
+  if (
+    !executionIntent ||
+    executionIntent.operation !== "update_source_pr" ||
+    executionIntent.source.kind !== "pull_request" ||
+    !executionIntent.source.number ||
+    !executionIntent.source.url
+  ) {
+    throw new Error("authorized repair does not target a source pull request");
+  }
+  return {
+    number: executionIntent.source.number,
+    url: executionIntent.source.url,
+    state: "open",
+    draft: false,
+    maintainer_can_modify: true,
+    head: {
+      repo: { full_name: executionIntent.source.expected_head_repo },
+      ref: executionIntent.source.expected_head_ref,
+      sha: executionIntent.source.expected_head_sha,
+    },
+    base: {
+      ref: executionIntent.source.expected_base_ref,
+      sha: executionIntent.source.expected_base_sha,
+    },
+  };
+}
+
+function assertAuthorizedRef(label: string, ref: string, expected: JsonValue) {
+  if (!expected) return;
+  const actual = run("git", ["rev-parse", ref], { cwd: targetDir }).trim();
+  assertAuthorizedSha(label, actual, expected);
+}
+
+function assertAuthorizedSha(label: string, actual: JsonValue, expected: JsonValue) {
+  if (expected && actual !== expected) {
+    throw new Error(`${label} changed after execution authorization`);
+  }
+}
+
+function requiredPreparationArg(value: string, name: string): string {
+  if (!value.trim()) throw new Error(`--${name} is required with --prepare-publication`);
+  return value;
 }
 
 function setupGitHubCredentialHelper() {
@@ -3309,6 +3968,15 @@ function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRe
   return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
 }
 
+function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch }: LooseRecord) {
+  if (!repairContract(fixArtifact)) return;
+  const baseRef = `origin/${baseBranch}`;
+  const changedFiles = changedFilesFromNameOnlyZ(
+    run("git", ["diff", "--name-only", "-z", `${baseRef}..HEAD`], { cwd: targetDir }),
+  );
+  enforceRepairContract({ fixArtifact, changedFiles });
+}
+
 function pushRecoverableBranch({ targetDir, branch }: LooseRecord) {
   assertIssueImplementationNotPaused();
   const remoteSha = remoteBranchSha({ targetDir, branch });
@@ -3410,18 +4078,48 @@ function findLatestResultPath() {
 }
 
 function writeReport(report: LooseRecord, resultPath: string) {
-  appendIssueImplementationStatusComment(report);
-  appendAutomergeRepairOutcomeComment(report, resultPath);
-  const reportPath =
-    typeof args.report === "string"
-      ? path.resolve(args.report)
-      : path.join(path.dirname(resultPath), "fix-execution-report.json");
+  const reportPath = fixExecutionReportPath(resultPath);
+  if (validationProofTraces.length > 0) {
+    report.validation_proof = stagedProofBundle(validationProofTraces);
+  }
   const debugDir = copyFixDebugArtifacts(path.dirname(reportPath));
   if (debugDir) {
     report.debug_artifacts = path.relative(repoRoot(), debugDir);
   }
-  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  finalizeExecutionReport({
+    deferPublication,
+    reportPath,
+    serialize: () => `${JSON.stringify(report, null, 2)}\n`,
+    publish: () => publishReportOutcome(report, resultPath),
+  });
   console.log("Wrote fix execution report.");
+}
+
+function publishPersistedReport(resultPath: string) {
+  const reportPath = fixExecutionReportPath(resultPath);
+  if (!fs.existsSync(reportPath)) {
+    console.warn(`No deferred fix execution report exists at ${reportPath}; skipping publication.`);
+    return;
+  }
+  const persistedReport = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  finalizeExecutionReport({
+    deferPublication: false,
+    reportPath,
+    serialize: () => `${JSON.stringify(persistedReport, null, 2)}\n`,
+    publish: () => publishReportOutcome(persistedReport, resultPath),
+  });
+  console.log("Published deferred fix execution outcome.");
+}
+
+function publishReportOutcome(report: LooseRecord, resultPath: string) {
+  appendIssueImplementationStatusComment(report);
+  appendAutomergeRepairOutcomeComment(report, resultPath);
+}
+
+function fixExecutionReportPath(resultPath: string) {
+  return typeof args.report === "string"
+    ? path.resolve(args.report)
+    : path.join(path.dirname(resultPath), "fix-execution-report.json");
 }
 
 function appendIssueImplementationStatusComment(report: LooseRecord) {

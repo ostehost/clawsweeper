@@ -5,18 +5,21 @@ import http from "node:http";
 import { repositoryProfileFor } from "../repository-profiles.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import {
+  isAssistPublicationCommentBody,
   isProofNudgeCommentBody,
   parseCommand,
   staleClosedItemCommandReason,
 } from "./comment-router-core.js";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
+import { isExactReviewCloseGuardLabel } from "./exact-review-guard-labels.js";
+import { commentBodySha256 } from "./comment-router-utils.js";
 
 const DEFAULT_PORT = 8787;
 const REVIEW_REPO = "openclaw/clawsweeper";
 const COMMAND_PATTERN =
   /(^|[ \t\r\n])@(?:clawsweeper|openclaw-clawsweeper)\b(?:\[bot\])?|(^|[ \t\r\n])\/(?:clawsweeper|review|re-review|rerun[ -]?review|status|explain|fix|build|implement|create[ -]?pr|fix[ -]?issue|autofix|auto[ -]?fix|automerge|auto[ -]?merge|approve|stop|autoclose)\b/i;
 const ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-const ISSUE_ITEM_ACTIONS = new Set(["opened", "reopened", "edited"]);
+const ISSUE_ITEM_ACTIONS = new Set(["opened", "reopened", "edited", "unlocked", "unlabeled"]);
 const PULL_ITEM_ACTIONS = new Set([
   "opened",
   "reopened",
@@ -24,6 +27,8 @@ const PULL_ITEM_ACTIONS = new Set([
   "ready_for_review",
   "converted_to_draft",
   "edited",
+  "unlocked",
+  "unlabeled",
 ]);
 const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
 const inFlightFastAcks = new Map<string, Promise<number>>();
@@ -37,6 +42,8 @@ type AcceptedIssueCommentWebhook = {
   commentId: number;
   installationId: number;
   sourceAction: string;
+  commentUpdatedAt?: string;
+  commentBodySha256?: string;
 };
 
 type AcceptedItemWebhook = {
@@ -144,6 +151,8 @@ export async function handleGitHubWebhook({
     commentId: accepted.commentId,
     statusCommentId,
     sourceAction: accepted.sourceAction,
+    ...(accepted.commentUpdatedAt ? { commentUpdatedAt: accepted.commentUpdatedAt } : {}),
+    ...(accepted.commentBodySha256 ? { commentBodyDigest: accepted.commentBodySha256 } : {}),
   });
   settleFastAckComments({
     token: targetToken,
@@ -176,6 +185,9 @@ export function classifyIssueCommentWebhook({
   const issue = asRecord(payload.issue);
   const repo = asRecord(payload.repository);
   const association = String(comment.author_association ?? "").toUpperCase();
+  if (isAssistPublicationCommentBody(String(comment.body ?? ""))) {
+    return { accepted: false, reason: "assist publication comment" };
+  }
   if (isProofNudgeCommentBody(String(comment.body ?? ""))) {
     return { accepted: false, reason: "proof nudge comment" };
   }
@@ -220,6 +232,7 @@ export function classifyIssueCommentWebhook({
   if (!Number.isInteger(installationId) || installationId <= 0) {
     return { accepted: false, reason: "missing installation id" };
   }
+  const commentUpdatedAt = exactWebhookTimestamp(comment.updated_at);
   return {
     accepted: true,
     type: "issue_comment",
@@ -229,7 +242,18 @@ export function classifyIssueCommentWebhook({
     commentId,
     installationId,
     sourceAction: String(payload.action ?? "created"),
+    ...(commentUpdatedAt
+      ? {
+          commentUpdatedAt,
+          commentBodySha256: commentBodySha256(comment.body),
+        }
+      : {}),
   };
+}
+
+function exactWebhookTimestamp(value: JsonValue) {
+  const text = String(value ?? "").trim();
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
 }
 
 export function classifyItemWebhook({ event, payload }: { event: string; payload: LooseRecord }) {
@@ -246,6 +270,9 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
 
   if (event === "issues") {
     if (!ISSUE_ITEM_ACTIONS.has(action)) return { accepted: false, reason: "unsupported action" };
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
     const issue = asRecord(payload.issue);
     const itemNumber = Number(issue.number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
@@ -261,12 +288,15 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
       installationId,
       sourceEvent: "issues",
       sourceAction: action,
-      supersedesInProgress: action === "edited",
+      supersedesInProgress: ["edited", "unlocked", "unlabeled"].includes(action),
     };
   }
 
   if (event === "pull_request") {
     if (!PULL_ITEM_ACTIONS.has(action)) return { accepted: false, reason: "unsupported action" };
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
     const pull = asRecord(payload.pull_request);
     const itemNumber = Number(pull.number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
@@ -283,13 +313,26 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
       installationId,
       sourceEvent: "pull_request",
       sourceAction: action,
-      supersedesInProgress: ["edited", "synchronize", "ready_for_review"].includes(action),
+      supersedesInProgress: [
+        "edited",
+        "synchronize",
+        "ready_for_review",
+        "unlocked",
+        "unlabeled",
+      ].includes(action),
       codexTimeoutMs: reviewBudget.codexTimeoutMs,
       mediaProofTimeoutMs: reviewBudget.mediaProofTimeoutMs,
     };
   }
 
   return { accepted: false, reason: "unsupported event" };
+}
+
+function isCloseGuardLabel(value: JsonValue) {
+  const label = String(asRecord(value).name ?? "")
+    .trim()
+    .toLowerCase();
+  return isExactReviewCloseGuardLabel(label);
 }
 
 export function adaptiveCodexTimeoutMsForTest(pull: LooseRecord) {
@@ -655,7 +698,9 @@ async function addReaction({
       body: { content },
     });
   } catch (error) {
-    if (!/\b422\b|already exists/i.test(String(error))) throw error;
+    if (!/\b422\b|already exists/i.test(String(error))) {
+      console.warn(`[clawsweeper webhook] comment reaction failed: ${String(error)}`);
+    }
   }
 }
 
@@ -697,6 +742,8 @@ async function dispatchCommentRouter({
   commentId,
   statusCommentId,
   sourceAction,
+  commentUpdatedAt,
+  commentBodyDigest,
 }: {
   token: string;
   targetRepo: string;
@@ -705,6 +752,8 @@ async function dispatchCommentRouter({
   commentId: number;
   statusCommentId: number;
   sourceAction: string;
+  commentUpdatedAt?: string;
+  commentBodyDigest?: string;
 }) {
   await githubFetch({
     token,
@@ -720,7 +769,9 @@ async function dispatchCommentRouter({
         status_comment_id: statusCommentId,
         source_event: "issue_comment",
         source_action: sourceAction,
-        max_comments: "1",
+        comment_event_auth: "github_webhook_v1",
+        ...(commentUpdatedAt ? { comment_updated_at: commentUpdatedAt } : {}),
+        ...(commentBodyDigest ? { comment_body_sha256: commentBodyDigest } : {}),
       },
     },
   });

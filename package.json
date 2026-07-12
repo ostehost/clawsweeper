@@ -5,12 +5,13 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "tsgo -p tsconfig.json",
-    "build:repair": "tsgo -p tsconfig.repair.json",
-    "build:dashboard": "tsgo -p tsconfig.dashboard.json",
+    "build": "tsc -p tsconfig.json",
+    "build:repair": "tsc -p tsconfig.repair.json",
+    "build:dashboard": "tsc -p tsconfig.dashboard.json",
     "build:all": "pnpm run build && pnpm run build:repair && pnpm run build:dashboard",
     "plan": "node dist/clawsweeper.js plan",
     "review": "node dist/clawsweeper.js review",
+    "codex:local:check": "node scripts/check-local-codex.mjs",
     "retry-failed-reviews": "node dist/clawsweeper.js retry-failed-reviews",
     "apply-artifacts": "node dist/clawsweeper.js apply-artifacts",
     "apply-decisions": "node dist/clawsweeper.js apply-decisions",
@@ -27,6 +28,7 @@
     "linear:triage": "node scripts/linear-triage.mjs",
     "linear:triage:review": "node scripts/linear-triage.mjs --review-only --json",
     "linear:review": "node scripts/linear-snapshot.mjs | node scripts/linear-triage.mjs --review-only --json",
+    "linear:analyze": "node scripts/linear-analyze.mjs",
     "linear:comment:dry-run": "node scripts/linear-comment-apply.mjs --json",
     "linear:review-apply": "node scripts/linear-review-apply.mjs",
     "linear:review-apply:dry-run": "node scripts/linear-review-apply.mjs --json",
@@ -48,6 +50,8 @@
     "repair:collect-codex-debug": "node dist/repair/collect-codex-debug.js",
     "repair:apply-result": "node dist/repair/apply-result.js",
     "repair:execute-fix": "node dist/repair/execute-fix-artifact.js",
+    "repair:execution-handoff": "node dist/repair/execution-handoff-cli.js",
+    "repair:resolve-run-artifact": "node dist/repair/resolve-run-artifact.js",
     "repair:post-flight": "node dist/repair/post-flight.js",
     "repair:finalize-open-prs": "node dist/repair/finalize-open-prs.js",
     "repair:cleanup-replacement-labels": "node dist/repair/cleanup-replacement-labels.js",
@@ -77,8 +81,8 @@
     "repair:review-results": "node dist/repair/review-results.js",
     "repair:message-samples": "node dist/repair/render-message-samples.js",
     "target-fanout": "node dist/repair/target-fanout.js",
-    "dashboard:deploy": "npx wrangler@4.90.0 deploy --config dashboard/wrangler.toml",
-    "dashboard:dev": "npx wrangler@4.90.0 dev --config dashboard/wrangler.toml",
+    "dashboard:deploy": "npx wrangler@4.107.0 deploy --config dashboard/wrangler.toml",
+    "dashboard:dev": "npx wrangler@4.107.0 dev --config dashboard/wrangler.toml",
     "dashboard:refresh-ci": "node scripts/dashboard-refresh-ci.mjs",
     "dashboard:smoke": "node scripts/dashboard-smoke.mjs",
     "smoke:pr-close-coverage": "pnpm run build && node scripts/pr-close-coverage-smoke.mjs",
@@ -107,15 +111,18 @@
     "crabbox:warmup": "crabbox warmup",
     "repair:pr-intake": "node dist/repair/pr-repair-intake.js"
   },
+  "dependencies": {
+    "typescript": "^7.0.2",
+    "yaml": "^2.9.0"
+  },
   "devDependencies": {
-    "@types/node": "^25.9.2",
-    "@typescript/native-preview": "7.0.0-dev.20260609.1",
-    "oxfmt": "^0.54.0",
-    "oxlint": "^1.69.0",
-    "oxlint-tsgolint": "0.23.0"
+    "@types/node": "^26.1.1",
+    "oxfmt": "^0.58.0",
+    "oxlint": "^1.73.0",
+    "oxlint-tsgolint": "0.24.0"
   },
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@10.33.2"
+  "packageManager": "pnpm@11.10.0"
 }

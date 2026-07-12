@@ -7,7 +7,7 @@
  *
  *   fetchIssueByIdentifier (read)  ->  inferTargetRepo (SKIP if ambiguous; never guess/default)
  *     -> repositoryProfileFor().checkoutDir/promptNote/apply_close_rules
- *     -> [--analyze only] runCodex (sandbox:'read-only', model:'internal' so config.toml/gpt-5.5
+ *     -> [--analyze only] runCodex (sandbox:'read-only', model:'internal' so harness config
  *        governs; the MODEL runs read-only git blame/log/show, emits evidence{file,line,command,sha})
  *     -> parseDecision (harness) -> HOST re-verifies cited shas (git rev-parse/cat-file)
  *     -> deriveCloseLeaning (code-derived, advisory; forced false on any unverifiable sha)
@@ -155,6 +155,37 @@ export function loadFallbackOwners(deps = {}) {
     .map((f) => ({ owner: f.owner, allowRepoNamePattern: new RegExp(f.allow_repo_name_pattern) }));
 }
 
+function recordFrontMatterValue(markdown, key) {
+  const match = markdown.match(new RegExp(`^${key}:\\s*("(?:\\\\.|[^"\\\\])*")\\s*$`, "m"));
+  if (!match?.[1]) return undefined;
+  try {
+    return String(JSON.parse(match[1]));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reconstructs the analyzer fingerprint from a persisted audit record. Missing, unreadable,
+ * legacy, or malformed records deliberately return undefined so the safe fallback is to run
+ * analysis again rather than trust an incomplete cache key.
+ */
+export function loadPersistedAnalyzerFingerprint(recordPath, deps = {}) {
+  const readFile = deps.readFileSync ?? readFileSync;
+  let markdown;
+  try {
+    markdown = readFile(deps.path ?? join(ROOT, recordPath), "utf8");
+  } catch {
+    return undefined;
+  }
+  const snapshotHash = recordFrontMatterValue(markdown, "snapshot_hash")?.trim();
+  const repoHEAD = recordFrontMatterValue(markdown, "repo_head")?.trim();
+  const modelId = recordFrontMatterValue(markdown, "model_id")?.trim();
+  const analyzerVersion = recordFrontMatterValue(markdown, "analyzer_version")?.trim();
+  if (!snapshotHash || !repoHEAD || !modelId || !analyzerVersion) return undefined;
+  return analyzerFingerprint({ snapshotHash, repoHEAD, modelId, analyzerVersion });
+}
+
 /** Collects the issue's repo-bearing URLs from its url, attachments, and description. Pure. */
 export function collectIssueUrls(hydrated) {
   const urls = [];
@@ -181,6 +212,16 @@ export function repoInferenceItemFor(hydrated) {
   };
 }
 
+/** Workspace admins and owners are treated as maintainer-authored. */
+export function isMaintainerAuthored(hydrated) {
+  return hydrated.creator?.admin === true || hydrated.creator?.owner === true;
+}
+
+/** Stable, non-PII author identity for prompts and audit records. */
+export function creatorIdentity(hydrated) {
+  return hydrated.creator?.name?.trim() || hydrated.creator?.id?.trim() || "linear";
+}
+
 /**
  * Maps a hydrated Linear issue + resolved profile into the Linear-shaped Item/ItemContext/GitInfo
  * the harness consumes as plain data. The Item is read-only; runCodex with our own `prompt`
@@ -197,8 +238,8 @@ export function buildHarnessInputs(hydrated, profile, mainSha) {
     url: issue.url ?? "",
     createdAt: issue.createdAt ?? "",
     updatedAt: issue.updatedAt ?? "",
-    author: "linear",
-    authorAssociation: "NONE",
+    author: creatorIdentity(hydrated),
+    authorAssociation: isMaintainerAuthored(hydrated) ? "MEMBER" : "NONE",
     labels: (issue.labels ?? []).map((l) => l.name ?? ""),
   };
   const context = {
@@ -210,7 +251,7 @@ export function buildHarnessInputs(hydrated, profile, mainSha) {
     comments: hydrated.comments ?? [],
     timeline: [],
   };
-  const git = { mainSha, latestRelease: null };
+  const git = { mainSha, releaseStateComplete: false, latestRelease: null };
   return { item, context, git };
 }
 
@@ -221,6 +262,9 @@ export function buildHarnessInputs(hydrated, profile, mainSha) {
  */
 export function buildAnalysisPrompt(hydrated, profile, mainSha) {
   const issue = hydrated.issue ?? {};
+  const attachmentUrls = (hydrated.attachments ?? [])
+    .map((attachment) => attachment?.url)
+    .filter((url) => typeof url === "string" && url.trim() !== "");
   return [
     "You are ClawSweeper reviewing a Linear issue against a local source checkout, READ-ONLY.",
     "",
@@ -230,9 +274,13 @@ export function buildAnalysisPrompt(hydrated, profile, mainSha) {
     "",
     `Issue: ${issue.identifier} — ${issue.title ?? ""}`,
     `URL: ${issue.url ?? ""}`,
+    `Creator: ${creatorIdentity(hydrated)}${isMaintainerAuthored(hydrated) ? " (workspace maintainer)" : ""}`,
     "",
     "Description:",
     (hydrated.description ?? "(none)").trim(),
+    "",
+    "Attachments:",
+    attachmentUrls.length > 0 ? attachmentUrls.join("\n") : "(none)",
     "",
     "Run read-only git (git blame/log/show) inside the sandbox to gather provenance. For every",
     "evidence item, cite the concrete file, line, the git command you ran, and the commit sha.",
@@ -368,7 +416,7 @@ export async function analyzeItem(hydrated, options, deps) {
     decision: analyzerDecision,
     profile,
     kind: "issue",
-    maintainerAuthored: deps.maintainerAuthored === true,
+    maintainerAuthored: deps.maintainerAuthored ?? isMaintainerAuthored(hydrated),
     shaVerification,
   });
 
@@ -394,7 +442,7 @@ export async function analyzeItem(hydrated, options, deps) {
       close_reason: analyzerDecision.closeReason,
       confidence: analyzerDecision.confidence,
       type: "issue",
-      author: record.url,
+      author: creatorIdentity(hydrated),
       action_taken: "reviewed",
       reviewed_at: nowIso,
       item_updated_at: record.updatedAt,
@@ -473,6 +521,9 @@ async function main() {
 
     const catalog = buildRepoCatalog(loadFallbackOwners());
     const repoInferenceItem = repoInferenceItemFor(hydrated);
+    const persistedFingerprint = loadPersistedAnalyzerFingerprint(
+      mapWorkspaceItem(hydrated).recordPath,
+    );
 
     // Resolve the checkout dir lazily — only when the repo is known and --analyze is on do we
     // touch git or the model. analyzeItem itself decides whether to call runModel.
@@ -522,6 +573,7 @@ async function main() {
       verifySha: runModelDeps.verifySha,
       runModel: runModelDeps.runModel,
       modelId: "internal",
+      persistedFingerprint,
     });
 
     if (summary.analyzed && summary.recordBody) {

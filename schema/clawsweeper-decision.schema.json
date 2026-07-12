@@ -12,9 +12,11 @@
     "likelyOwners",
     "risks",
     "bestSolution",
+    "maintainerDecision",
     "triagePriority",
     "impactLabels",
     "mergeRiskLabels",
+    "maturityLabels",
     "mergeRiskOptions",
     "reviewMetrics",
     "labelJustifications",
@@ -69,7 +71,10 @@
         "clawhub",
         "duplicate_or_superseded",
         "low_signal_unmergeable_pr",
+        "stalled_unproven_pr",
+        "abandoned_pr",
         "unconfirmed_product_direction",
+        "unsponsored_feature_request",
         "not_actionable_in_repo",
         "incoherent",
         "stale_insufficient_info",
@@ -169,6 +174,81 @@
       "type": "string",
       "description": "The best possible product/code/docs direction for this item, whether the item should close or stay open. Do not repeat the change summary, workReason, or risk list."
     },
+    "maintainerDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "kind", "question", "rationale", "options", "likelyOwner"],
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "True only when automation should pause for a maintainer choice that Codex can state precisely."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "none",
+            "product_direction",
+            "security_boundary",
+            "proof_sufficiency",
+            "release_inclusion",
+            "merge_risk",
+            "manual_review"
+          ],
+          "description": "The human decision category. Use none when required is false."
+        },
+        "question": {
+          "type": "string",
+          "description": "The exact item-specific question the maintainer should answer, or an empty string when required is false."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why model judgment cannot safely resolve this choice without maintainer intent, or an empty string when required is false."
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "description": "One to three item-specific choices when required is true; [] otherwise. Exactly one choice must be recommended when required is true.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "body", "recommended"],
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Short decision option title."
+              },
+              "body": {
+                "type": "string",
+                "description": "One concrete sentence explaining the outcome or tradeoff."
+              },
+              "recommended": {
+                "type": "boolean",
+                "description": "True for exactly one option when a decision is required."
+              }
+            }
+          }
+        },
+        "likelyOwner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["person", "reason", "confidence"],
+          "properties": {
+            "person": {
+              "type": "string",
+              "description": "The likely decision owner selected from likelyOwners, or an empty string when required is false."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why this person is the best available owner for this choice, or an empty string when required is false."
+            },
+            "confidence": {
+              "type": "string",
+              "enum": ["high", "medium", "low"]
+            }
+          }
+        }
+      }
+    },
     "triagePriority": {
       "type": "string",
       "enum": ["P0", "P1", "P2", "P3", "none"],
@@ -186,10 +266,12 @@
           "impact:message-loss",
           "impact:session-state",
           "impact:auth-provider",
+          "impact:ux-release-blocker",
+          "impact:ux-friction",
           "impact:other"
         ]
       },
-      "description": "ClawSweeper-owned GitHub impact labels for maintainers to find the affected problem class on issues. Use [] for pull requests and when no meaningful owned impact signal applies. These describe what the issue is about, not PR merge risk. Use at most 3; impact:other counts toward this max and means meaningful maintainer-visible impact exists but no specific owned impact label fits. Prefer a specific impact label over impact:other. impact:data-loss: This issue is about lost, corrupted, or silently dropped user/session/config data. impact:security: This issue is about security boundaries, credentials, authz, sandboxing, or sensitive data. impact:crash-loop: This issue is about crashes, hangs, restart loops, or process-level availability. impact:message-loss: This issue is about lost, duplicated, misrouted, or suppressed channel messages. impact:session-state: This issue is about session, memory, transcript, context, or agent state drift. impact:auth-provider: This issue is about auth, provider routing, model choice, or SecretRef resolution. impact:other: This issue has meaningful maintainer-visible impact outside the owned taxonomy."
+      "description": "ClawSweeper-owned GitHub impact labels for maintainers to find the affected problem class on issues. Use [] for pull requests and when no meaningful owned impact signal applies. These describe what the issue is about, not PR merge risk. Use at most 3; impact:other counts toward this max and means meaningful maintainer-visible impact exists but no specific owned impact label fits. Prefer a specific impact label over impact:other, and prefer impact:ux-release-blocker over impact:ux-friction when the same evidence supports both. UX override: a non-technical first-time or community user blocked in website/download/install/update/setup/onboarding/auth/provider setup/first useful run/in-product recovery with no in-product path forward requires P0 plus impact:ux-release-blocker. The same applies when completing or recovering that blocked path requires terminal commands, config edits, log inspection, manual file edits, internal knowledge, or maintainer/support intervention. Recoverable docs/support/guessing paths use P1/P2 plus impact:ux-friction. Do not promote ordinary advanced configuration or optional power-user workflows solely because they use a terminal or config file. Technical recovery from a blocker should recommend a Doctor button, Fix button, setup wizard, inline recovery, or visible command launcher in bestSolution/workReason. impact:data-loss: This issue is about lost, corrupted, or silently dropped user/session/config data. impact:security: This issue is about security boundaries, credentials, authz, sandboxing, or sensitive data. impact:crash-loop: This issue is about crashes, hangs, restart loops, or process-level availability. impact:message-loss: This issue is about lost, duplicated, misrouted, or suppressed channel messages. impact:session-state: This issue is about session, memory, transcript, context, or agent state drift. impact:auth-provider: This issue is about auth, provider routing, model choice, or SecretRef resolution. impact:ux-release-blocker: A non-technical user is blocked without terminal, logs, config, or support. impact:ux-friction: User-facing flow adds avoidable confusion or support burden without fully blocking progress. impact:other: This issue has meaningful maintainer-visible impact outside the owned taxonomy."
     },
     "mergeRiskLabels": {
       "type": "array",
@@ -208,6 +290,15 @@
         ]
       },
       "description": "PR-only ClawSweeper-owned GitHub labels for merge risks that green CI does not settle. These describe what could go wrong specifically because this PR is merged, not the affected or solved problem class. Use at most 3 for pull requests and [] for issues and when no meaningful owned merge-risk signal applies. Do not use merge-risk: 🚨 automation only because CI is red, pending, flaky, or absent; use it only when the PR diff changes automation behavior or plausibly causes CI, automerge, proof capture, label sync, or related automation to fail after merge. merge-risk: 🚨 other counts toward this max and means meaningful merge risk exists but no specific owned merge-risk label fits. Prefer a specific merge-risk label over merge-risk: 🚨 other. merge-risk: 🚨 compatibility: 🚨 Merging this PR could break existing users, config, migrations, defaults, or upgrades. merge-risk: 🚨 message-delivery: 🚨 Merging this PR could drop, duplicate, misroute, suppress, or wrongly target messages. merge-risk: 🚨 session-state: 🚨 Merging this PR could lose, corrupt, stale, or mis-associate session or agent state. merge-risk: 🚨 auth-provider: 🚨 Merging this PR could break OAuth, tokens, provider routing, model choice, or credentials. merge-risk: 🚨 security-boundary: 🚨 Merging this PR could weaken sandboxing, authorization, credentials, or sensitive data. merge-risk: 🚨 availability: 🚨 Merging this PR could cause crashes, hangs, restart loops, stalls, or process outages. merge-risk: 🚨 automation: 🚨 Merging this PR could break CI, automerge, proof capture, label sync, or automation. merge-risk: 🚨 other: 🚨 Merging this PR has meaningful risk outside the owned taxonomy."
+    },
+    "maturityLabels": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["maturity:stable"]
+      },
+      "description": "Issue-only labels for mature taxonomy matches. Use [] for PRs. Select maturity:stable only when an active matched feature is currently M4/M5 in qa/maturity-scores.yaml."
     },
     "mergeRiskOptions": {
       "type": "array",
@@ -284,7 +375,10 @@
               "impact:message-loss",
               "impact:session-state",
               "impact:auth-provider",
+              "impact:ux-release-blocker",
+              "impact:ux-friction",
               "impact:other",
+              "maturity:stable",
               "merge-risk: 🚨 compatibility",
               "merge-risk: 🚨 message-delivery",
               "merge-risk: 🚨 session-state",
@@ -301,7 +395,7 @@
           }
         }
       },
-      "description": "One justification for every selected ClawSweeper-managed triage, impact, and merge-risk label. Include the selected triagePriority unless it is none, every selected impactLabels entry, and every selected mergeRiskLabels entry. Do not include labels that were not selected."
+      "description": "One justification for every selected ClawSweeper-managed triage, impact, maturity, and merge-risk label. Include the selected triagePriority unless it is none, every selected impactLabels entry, every selected maturityLabels entry, and every selected mergeRiskLabels entry. Do not include labels that were not selected."
     },
     "itemCategory": {
       "type": "string",
@@ -492,7 +586,8 @@
           "confidenceScore",
           "file",
           "lineStart",
-          "lineEnd"
+          "lineEnd",
+          "lateFinding"
         ],
         "properties": {
           "title": {
@@ -524,6 +619,10 @@
           "lineEnd": {
             "type": "integer",
             "minimum": 1
+          },
+          "lateFinding": {
+            "type": "boolean",
+            "description": "True when this finding targets code unchanged since an earlier reviewed head where the concern was equally visible but was not raised. Use false for findings introduced by new commits or newly available evidence."
           }
         }
       }
@@ -676,7 +775,7 @@
     "mantisRecommendation": {
       "type": "object",
       "additionalProperties": false,
-      "description": "For PRs, recommend a copy-paste maintainer comment for OpenClaw Mantis only when live transport or visual proof would materially help review. Do not claim Mantis has run and do not dispatch any workflow.",
+      "description": "For PRs, recommend a copy-paste maintainer comment for OpenClaw Mantis only when Telegram, Discord, or web UI chat proof would materially help review. Mantis is proof-only: it may reproduce or inspect those surfaces and return redacted screenshots, transcripts, logs, or interaction results. Do not ask Mantis to edit code, fix CI, update branches, push commits, repair PRs, change labels or comments, close items, or perform other GitHub mutations; those belong to ClawSweeper's deterministic repair, apply, and automerge lanes. Do not claim Mantis has run and do not dispatch any workflow.",
       "required": ["status", "scenario", "reason", "maintainerComment"],
       "properties": {
         "status": {
@@ -691,17 +790,16 @@
             "telegram_desktop_proof",
             "discord_status_reactions",
             "discord_thread_attachment",
-            "slack_desktop_smoke",
-            "visual_task"
+            "web_ui_chat_proof"
           ]
         },
         "reason": {
           "type": "string",
-          "description": "One concise sentence explaining why this Mantis lane would or would not add useful maintainer proof."
+          "description": "One concise sentence explaining why this supported Mantis lane would or would not add useful maintainer proof. For unsupported proof surfaces such as WinUI, generic browser pages, screenshots, local artifacts, or terminal-only behavior, explain the better non-Mantis proof path while using not_recommended."
         },
         "maintainerComment": {
           "type": "string",
-          "description": "When recommended, a single-line PR comment starting with @openclaw-mantis that a maintainer can paste. ClawSweeper validates and renders this mention inside a fenced text block so the public recommendation is directly copyable without starting Mantis workflows. Do not use shorter or ambiguous Mantis account mentions. For not_recommended, use an empty string."
+          "description": "When recommended, a single-line proof-only PR comment starting with @openclaw-mantis that asks Mantis to reproduce or inspect supported Telegram, Discord, or web UI chat behavior and return redacted evidence. Include an explicit proof action such as verify, reproduce, capture, inspect, record, or test; ambiguous requests without proof intent fail closed. Never ask for code edits, CI fixes, branch updates, commits, PR repair, labels, comments, closes, merges, or other GitHub mutations. ClawSweeper validates and renders this mention inside a fenced text block so the public recommendation is directly copyable without starting Mantis workflows. Do not use shorter or ambiguous Mantis account mentions. For not_recommended, use an empty string."
         }
       }
     },

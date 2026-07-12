@@ -12,7 +12,7 @@ on PAR-123", a single-item review/triage, or leaving a ClawSweeper review commen
 on one issue. For the whole board use the bulk review path (see Related).
 
 Entrypoint: `scripts/linear-comment-apply.mjs` (this repo). Build first if `dist/`
-is stale (`pnpm run build`; tsgo — scripts import `../dist/linear`).
+is stale (`pnpm run build`; the scripts import `../dist/linear`).
 
 ## Quick start
 

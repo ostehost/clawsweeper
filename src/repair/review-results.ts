@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { validateRepairContractShape } from "./repair-contract.js";
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs, parseJob, repoRoot } from "./lib.js";
@@ -441,6 +442,12 @@ function validateMergePreflight(
         failures.push(`${target} merge_preflight.${key} must be a non-empty list`);
       }
     }
+    const validationProof = preflight.validation_proof;
+    if (validationProof != null) {
+      failures.push(
+        `${target} merge_preflight.validation_proof must be omitted until deterministic execution`,
+      );
+    }
     const codexReview = preflight.codex_review;
     if (!codexReview || typeof codexReview !== "object") {
       failures.push(`${target} merge_preflight.codex_review is required`);
@@ -526,6 +533,7 @@ function validateFixArtifact(fixArtifact: LooseRecord, failures: LooseRecord[]) 
   if (typeof fixArtifact.changelog_required !== "boolean") {
     failures.push("fix_artifact.changelog_required must be boolean");
   }
+  failures.push(...validateRepairContractShape(fixArtifact));
   if (!FIX_REPAIR_STRATEGIES.has(fixArtifact.repair_strategy)) {
     failures.push("fix_artifact.repair_strategy is required");
   }

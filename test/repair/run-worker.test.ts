@@ -7,6 +7,31 @@ import test from "node:test";
 
 const repoRoot = process.cwd();
 
+test("repair output schema keeps every strict object property required", () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "schema/repair/codex-result.schema.json"), "utf8"),
+  );
+
+  const visit = (value: unknown, location: string): void => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const node = value as Record<string, unknown>;
+    if (node.type === "object" && node.additionalProperties === false) {
+      const properties = Object.keys((node.properties ?? {}) as Record<string, unknown>).sort();
+      const required = Array.isArray(node.required) ? node.required.map(String).sort() : [];
+      assert.deepEqual(required, properties, `${location} must require every declared property`);
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (Array.isArray(child)) {
+        child.forEach((entry, index) => visit(entry, `${location}.${key}[${index}]`));
+      } else {
+        visit(child, `${location}.${key}`);
+      }
+    }
+  };
+
+  visit(schema, "schema");
+});
+
 test("run-worker starts Codex in the target checkout when one is available", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-run-worker-"));
   const fakeBin = path.join(tmp, "bin");

@@ -5,6 +5,8 @@ import { stripAnsi } from "./comment-router-utils.js";
 import { ghCliEnv } from "./process-env.js";
 import { repoRoot } from "./paths.js";
 import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
+import { parseGhJsonWithRetry, parseGhJsonWithRetryAsync } from "../github-json.js";
+import { resolveCommand } from "../command.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,14 +28,22 @@ export function ghJsonWithRetry<T = JsonValue>(
   ghArgs: string[],
   options: GhRetryOptions | number = {},
 ): T {
-  return JSON.parse(ghTextWithRetry(ghArgs, options) || "null") as T;
+  return parseGhJsonWithRetry<T>(() => ghTextWithRetry(ghArgs, options) || "null", ghArgs, {
+    onRetry: (_error, attempt) => sleepMs(ghRetryWaitMs("transient", attempt - 1)),
+  });
 }
 
 export async function ghJsonWithRetryAsync<T = JsonValue>(
   ghArgs: string[],
   options: GhRetryOptions | number = {},
 ): Promise<T> {
-  return JSON.parse((await ghTextWithRetryAsync(ghArgs, options)) || "null") as T;
+  return parseGhJsonWithRetryAsync<T>(
+    async () => (await ghTextWithRetryAsync(ghArgs, options)) || "null",
+    ghArgs,
+    {
+      onRetry: (_error, attempt) => sleepAsync(ghRetryWaitMs("transient", attempt - 1)),
+    },
+  );
 }
 
 export function ghJsonBestEffort<T = JsonValue>(
@@ -141,9 +151,11 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
 }
 
 export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
-  const text = execFileSync("gh", ghArgs, {
+  const env = ghEnv(options.env);
+  const command = ghCommand(ghArgs, env);
+  const text = execFileSync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
-    env: ghEnv(options.env),
+    env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: 64 * 1024 * 1024,
@@ -191,9 +203,11 @@ export async function ghTextWithRetryAsync(
 
 export async function ghTextAsync(ghArgs: string[], options: GhRunOptions = {}): Promise<string> {
   if (options.input !== undefined) return ghText(ghArgs, options);
-  const { stdout } = await execFileAsync("gh", ghArgs, {
+  const env = ghEnv(options.env);
+  const command = ghCommand(ghArgs, env);
+  const { stdout } = await execFileAsync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
-    env: ghEnv(options.env),
+    env,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -220,10 +234,12 @@ export function ghBestEffortWithRetry(
 }
 
 export function ghSpawn(ghArgs: string[], options: GhRunOptions = {}) {
-  return spawnSync("gh", ghArgs, {
+  const env = ghEnv(options.env);
+  const command = ghCommand(ghArgs, env);
+  return spawnSync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
     encoding: "utf8",
-    env: ghEnv(options.env),
+    env,
     input: options.input,
     stdio: "pipe",
   });
@@ -263,7 +279,20 @@ export function ghStdoutFromError(error: unknown): string {
 
 function resolveRetryOptions(options: GhRetryOptions | number): GhRetryOptions {
   if (typeof options === "number") return { attempts: options };
-  return options;
+  if (options.attempts !== undefined) return options;
+  const configuredValue =
+    options.env?.CLAWSWEEPER_GH_RETRY_ATTEMPTS ?? process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  if (configuredValue == null || configuredValue.trim() === "") return options;
+  const configuredAttempts = Number(configuredValue);
+  if (!Number.isFinite(configuredAttempts)) return options;
+  return { ...options, attempts: Math.max(1, Math.floor(configuredAttempts)) };
+}
+
+function ghCommand(
+  ghArgs: readonly string[],
+  env: NodeJS.ProcessEnv,
+): { command: string; args: string[] } {
+  return resolveCommand("gh", ghArgs, env);
 }
 
 function githubPathWithQueryDefaults(

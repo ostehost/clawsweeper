@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { pipeline } from "node:stream";
 import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
@@ -46,7 +47,9 @@ child.stderr.on("data", (chunk: Buffer) => {
   appendCodexOutputCapture(stderr, chunk);
 });
 child.stdin.on("error", () => {});
-process.stdin.pipe(child.stdin);
+pipeline(process.stdin, child.stdin, (error) => {
+  if (error && !terminating && !spawnError) spawnError = error;
+});
 
 child.once("error", (error) => {
   spawnError = error;

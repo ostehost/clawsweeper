@@ -1,11 +1,17 @@
-# Linear Integration (Design)
+# Linear Integration
 
-This is a design document for planned work. Nothing described here has been
-implemented or shipped yet. The goal is to let ClawSweeper triage and review all
-Linear issues once weekly or on demand, preserving the same conservative doctrine
-ClawSweeper already applies to GitHub issues and pull requests: proposal-only by
-default, no mutations without concrete evidence, one durable marker-backed comment
-per item, and safety gates that default closed.
+Status: implemented as operator-run sidecar tooling, not as a native workflow or
+`TrackerProvider` lane. `src/linear/` contains the source, mapping, policy,
+authorization, comment, scope, repository-inference, and analysis layers.
+`scripts/linear-*.mjs` provides workspace snapshots, review-only triage, optional
+read-only Codex analysis, and receipt-gated comment/additive-label apply runners.
+The package scripts expose the common entry points.
+
+Every runner defaults to dry-run. The implemented apply surface can sync a durable
+review comment and additive routing labels after explicit approval and drift checks;
+it never closes Linear issues or changes their workflow state or priority. The
+architecture sections below preserve the original design record and the unbuilt
+native-provider direction.
 
 ## Doctrine
 
@@ -82,7 +88,7 @@ issues through the same planner the GitHub lane already uses.
 This is the right end-state for native lane and record parity: Linear issues
 flowing through the exact same review, apply, and repair paths as GitHub items,
 with `records/<workspace>/items/<id>.md` audit files and identical safety checks.
-It touches the monolith — `src/clawsweeper.ts` is a 19,500-line file — and adds
+It touches the large `src/clawsweeper.ts` monolith and adds
 a hosted webhook receiver, so it is appropriate only after the new pieces have
 been proven in Option B.
 
@@ -91,10 +97,10 @@ risk. Refactor toward the `TrackerProvider` seam in Option A once the
 auto-classifier and comment capability are in production and their behaviour is
 understood.
 
-## What Must Be Built (Child Work Items)
+## Original Work Breakdown
 
-These are the genuinely new pieces both paths require. They correspond to the
-child issues under Linear epic PAR-208.
+These were the original child work items under Linear epic PAR-208. The sidecar
+implements them; the native provider direction described above remains future work.
 
 **1. Auto-classification and review heuristic.** This is the central gap. The
 existing `linear-board-triage` skill requires an operator-supplied `--selected`
@@ -169,8 +175,8 @@ On-demand runs use the same cron entry via `openclaw cron run <id>`, callable
 by a human or by another agent through the exec tool. This is the Linear-side
 equivalent of ClawSweeper's `repository_dispatch` trigger for exact GitHub events.
 
-Conventions from existing cron jobs apply: logic lives in a committed
-`openclaw/scripts/*.mjs` file (the cron agent only routes and summarizes); an
+Conventions from existing cron jobs apply: logic lives in committed scripts in the
+ClawSweeper checkout (the cron agent only routes and summarizes); an
 `expectations.json` block specifies `deliveryStrict`, `semanticFailurePatterns`,
 and `maxRunAgeMs`; runs end with a sentinel string such as `TRIAGE_OK` or
 `TRIAGE_ALERT_SENT`. Paths in the cron message use `/Users/ostemini/...` (the
@@ -180,9 +186,10 @@ The deterministic trigger-wiring and run-expectations contract is now implemente
 in `src/linear/trigger.ts`. `weeklyTriageCronSpec()` builds the OpenClaw cron spec
 (the Monday-09:00 `America/Chicago` schedule, the `main` agent with `exec,message`
 tools, a 600s timeout, and a message that routes to the committed review-only
-runner and ends with the `TRIAGE_OK` / `TRIAGE_ALERT_SENT` sentinels); it rejects
-a `/Users/ostehost/...` macbook-node path so the schedule never ships a path the
-hub user cannot run. `onDemandTriggerHandle(id)` builds the `openclaw cron run`
+snapshot → review-only triage pipeline and ends with the `TRIAGE_OK` /
+`TRIAGE_ALERT_SENT` sentinels); it accepts only safe paths under
+`/Users/ostemini/projects/` so the schedule never ships a path the hub user cannot run.
+`onDemandTriggerHandle(id)` builds the `openclaw cron run`
 handles for the same entry, the Linear-side equivalent of `repository_dispatch`.
 `triageRunExpectations()` produces the `deliveryStrict` / `semanticFailurePatterns`
 / `maxRunAgeMs` contract, and `evaluateRunExpectations()` is a pure, clock-free
@@ -230,4 +237,4 @@ Before any mutation scope is enabled, several questions need operator answers:
 ## Source Research
 
 The full source-of-truth research, verified key paths, and build sequence are in
-[`LINEAR-INTEGRATION-HANDOFF.md`](https://github.com/openclaw/clawsweeper/blob/main/LINEAR-INTEGRATION-HANDOFF.md).
+[`LINEAR-INTEGRATION-HANDOFF.md`](https://github.com/ostehost/clawsweeper/blob/main/LINEAR-INTEGRATION-HANDOFF.md).

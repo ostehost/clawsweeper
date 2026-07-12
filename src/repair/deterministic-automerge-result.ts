@@ -78,6 +78,7 @@ export function deterministicAutomergeResult({
     repair_strategy: "repair_contributor_branch",
     allow_no_pr: false,
     branch_update_blockers: [],
+    repair_contract: null,
   };
 
   return {

@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 export type CodexEnvOptions = {
   ghToken?: string | undefined;
+  preserveCodexAuth?: boolean | undefined;
 };
 
 export type CodexLoginMethod = "api" | "chatgpt";
@@ -76,8 +77,16 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN;
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
-  delete env.OPENAI_API_KEY;
-  delete env.CODEX_API_KEY;
+  delete env.LINEAR_API_KEY;
+  delete env.LINEAR_TOKEN;
+  for (const key of Object.keys(env)) {
+    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
+  }
+  if (!options.preserveCodexAuth) {
+    delete env.OPENAI_API_KEY;
+    delete env.CODEX_API_KEY;
+    delete env.CODEX_ACCESS_TOKEN;
+  }
   delete env.CLAWSWEEPER_INTERNAL_MODEL;
   if (ghToken) env.GH_TOKEN = ghToken;
   env.GIT_OPTIONAL_LOCKS = "0";

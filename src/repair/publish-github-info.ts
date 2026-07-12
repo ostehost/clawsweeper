@@ -146,7 +146,7 @@ export function githubIssueUrl(repo: string, ref: unknown): string {
 
 export function earlierIso(left: unknown, right: unknown): unknown {
   if (!left) return right ?? null;
-  if (!right) return left ?? null;
+  if (!right) return left;
   return String(left).localeCompare(String(right)) <= 0 ? left : right;
 }
 

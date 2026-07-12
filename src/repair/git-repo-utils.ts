@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import { runCommand as run } from "./command-runner.js";
+import type { SpawnSyncReturns } from "node:child_process";
+import { runCommandResult } from "./command-runner.js";
 import { uniqueStrings } from "./validation-command-utils.js";
 
 const gitNetworkTimeoutMs = Math.max(
@@ -12,6 +12,7 @@ const gitNetworkTimeoutMs = Math.max(
       5 * 60 * 1000,
   ),
 );
+const DEFAULT_GIT_TIMEOUT_MS = 10 * 60 * 1000;
 
 type TargetDir = {
   targetDir: string;
@@ -42,7 +43,22 @@ export type CompleteRebaseResult = {
 };
 
 export function currentHead(targetDir: string): string {
-  return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+  return gitOutput(["rev-parse", "HEAD"], { targetDir }).trim();
+}
+
+export function runGitCommand(
+  args: string[],
+  {
+    targetDir,
+    timeoutMs = DEFAULT_GIT_TIMEOUT_MS,
+    env = process.env,
+  }: TargetDir & { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): SpawnSyncReturns<string> {
+  return runCommandResult("git", args, {
+    cwd: targetDir,
+    env,
+    timeoutMs,
+  });
 }
 
 export function isAncestor({
@@ -50,10 +66,8 @@ export function isAncestor({
   ancestor,
   descendant,
 }: TargetDir & { ancestor: string; descendant: string }): boolean {
-  const child = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
+  const child = runGitCommand(["merge-base", "--is-ancestor", ancestor, descendant], {
+    targetDir,
   });
   return child.status === 0;
 }
@@ -63,11 +77,9 @@ export function remoteBranchExists(options: TargetBranch): boolean {
 }
 
 export function remoteBranchSha({ targetDir, branch }: TargetBranch): string {
-  const child = spawnSync("git", ["ls-remote", "--heads", "origin", branch], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-    timeout: gitNetworkTimeoutMs,
+  const child = runGitCommand(["ls-remote", "--heads", "origin", branch], {
+    targetDir,
+    timeoutMs: gitNetworkTimeoutMs,
   });
   if (child.status !== 0) return "";
   const sha = child.stdout.trim().split(/\s+/)[0] ?? "";
@@ -76,21 +88,13 @@ export function remoteBranchSha({ targetDir, branch }: TargetBranch): string {
 
 export function branchHasBaseDiff({ targetDir, baseBranch }: TargetBaseBranch): boolean {
   const range = `origin/${baseBranch}...HEAD`;
-  const first = spawnSync("git", ["diff", "--name-only", range], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const first = runGitCommand(["diff", "--name-only", range], { targetDir });
   if (first.status === 0) return Boolean(first.stdout.trim());
   const detail = `${first.stderr ?? ""}\n${first.stdout ?? ""}`;
   if (!/no merge base/i.test(detail)) throw new Error(detail.trim());
 
   fetchDeeperHistory({ targetDir, baseBranch });
-  const retry = spawnSync("git", ["diff", "--name-only", range], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const retry = runGitCommand(["diff", "--name-only", range], { targetDir });
   if (retry.status === 0) return Boolean(retry.stdout.trim());
   const retryDetail = `${retry.stderr ?? ""}\n${retry.stdout ?? ""}`;
   if (/no merge base/i.test(retryDetail)) return true;
@@ -100,19 +104,11 @@ export function branchHasBaseDiff({ targetDir, baseBranch }: TargetBaseBranch): 
 export function ensureMergeBaseAvailable({ targetDir, baseBranch }: TargetBaseBranch): string {
   gitFetch(targetDir, ["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`]);
   const baseRef = `origin/${baseBranch}`;
-  const first = spawnSync("git", ["merge-base", baseRef, "HEAD"], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const first = runGitCommand(["merge-base", baseRef, "HEAD"], { targetDir });
   if (first.status === 0 && first.stdout.trim()) return first.stdout.trim();
 
   fetchDeeperHistory({ targetDir, baseBranch });
-  const retry = spawnSync("git", ["merge-base", baseRef, "HEAD"], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const retry = runGitCommand(["merge-base", baseRef, "HEAD"], { targetDir });
   if (retry.status === 0 && retry.stdout.trim()) return retry.stdout.trim();
 
   const detail = `${retry.stderr ?? ""}\n${retry.stdout ?? ""}`.trim();
@@ -122,7 +118,7 @@ export function ensureMergeBaseAvailable({ targetDir, baseBranch }: TargetBaseBr
 export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): RebaseOntoBaseResult {
   ensureMergeBaseAvailable({ targetDir, baseBranch });
   const baseRef = `origin/${baseBranch}`;
-  const baseSha = run("git", ["rev-parse", baseRef], { cwd: targetDir }).trim();
+  const baseSha = gitOutput(["rev-parse", baseRef], { targetDir }).trim();
   const previousHead = currentHead(targetDir);
   if (isAncestor({ targetDir, ancestor: baseRef, descendant: "HEAD" })) {
     return {
@@ -134,11 +130,7 @@ export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): Reb
     };
   }
 
-  const child = spawnSync("git", ["rebase", baseRef], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const child = runGitCommand(["rebase", baseRef], { targetDir });
   const detail = `${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
   if (child.status === 0) {
     return {
@@ -174,17 +166,15 @@ export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteReba
   }
 
   assertNoConflictMarkers({ targetDir, paths: unmergedPaths(targetDir) });
-  run("git", ["add", "--all"], { cwd: targetDir });
+  gitOutput(["add", "--all"], { targetDir });
   const unresolved = unmergedPaths(targetDir);
   if (unresolved.length > 0) {
     throw new Error(`rebase conflicts remain unresolved: ${unresolved.join(", ")}`);
   }
   let detail = "";
   while (hasRebaseInProgress(targetDir)) {
-    const child = spawnSync("git", ["-c", "core.editor=true", "rebase", "--continue"], {
-      cwd: targetDir,
-      env: process.env,
-      encoding: "utf8",
+    const child = runGitCommand(["-c", "core.editor=true", "rebase", "--continue"], {
+      targetDir,
     });
     detail = `${detail}\n${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
     if (child.status !== 0) {
@@ -217,7 +207,7 @@ function assertNoConflictMarkers({ targetDir, paths }: TargetDir & { paths: stri
 }
 
 export function hasRebaseInProgress(targetDir: string): boolean {
-  const gitDir = run("git", ["rev-parse", "--git-dir"], { cwd: targetDir }).trim();
+  const gitDir = gitOutput(["rev-parse", "--git-dir"], { targetDir }).trim();
   const absoluteGitDir = path.isAbsolute(gitDir) ? gitDir : path.join(targetDir, gitDir);
   return (
     fs.existsSync(path.join(absoluteGitDir, "rebase-merge")) ||
@@ -226,11 +216,7 @@ export function hasRebaseInProgress(targetDir: string): boolean {
 }
 
 export function unmergedPaths(targetDir: string): string[] {
-  const child = spawnSync("git", ["diff", "--name-only", "--diff-filter=U"], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-  });
+  const child = runGitCommand(["diff", "--name-only", "--diff-filter=U"], { targetDir });
   if (child.status !== 0) return [];
   return child.stdout
     .split("\n")
@@ -239,10 +225,8 @@ export function unmergedPaths(targetDir: string): string[] {
 }
 
 function fetchDeeperHistory({ targetDir, baseBranch }: TargetBaseBranch): void {
-  const shallow = spawnSync("git", ["rev-parse", "--is-shallow-repository"], {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
+  const shallow = runGitCommand(["rev-parse", "--is-shallow-repository"], {
+    targetDir,
   }).stdout.trim();
   if (shallow === "true" || fs.existsSync(path.join(targetDir, ".git", "shallow"))) {
     gitFetch(targetDir, ["--unshallow", "origin"]);
@@ -253,16 +237,16 @@ function fetchDeeperHistory({ targetDir, baseBranch }: TargetBaseBranch): void {
 }
 
 function gitFetch(targetDir: string, args: string[]): void {
-  run("git", ["fetch", ...args], { cwd: targetDir, timeoutMs: gitNetworkTimeoutMs });
+  gitOutput(["fetch", ...args], { targetDir, timeoutMs: gitNetworkTimeoutMs });
 }
 
 export function gitChangedFiles(targetDir: string, baseBranch: string): string[] {
   const baseRef = `origin/${baseBranch}`;
-  const committed = run("git", ["diff", "--name-only", `${baseRef}...HEAD`], { cwd: targetDir })
+  const committed = gitOutput(["diff", "--name-only", `${baseRef}...HEAD`], { targetDir })
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  const uncommitted = run("git", ["status", "--porcelain"], { cwd: targetDir })
+  const uncommitted = gitOutput(["status", "--porcelain"], { targetDir })
     .split("\n")
     .map((line) => line.trim())
     .map((line) => line.replace(/^.. /, ""))
@@ -272,8 +256,18 @@ export function gitChangedFiles(targetDir: string, baseBranch: string): string[]
 }
 
 export function gitLsFiles(targetDir: string): string[] {
-  return run("git", ["ls-files"], { cwd: targetDir })
+  return gitOutput(["ls-files"], { targetDir })
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function gitOutput(
+  args: string[],
+  options: TargetDir & { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): string {
+  const child = runGitCommand(args, options);
+  if (child.status === 0) return child.stdout ?? "";
+  const detail = [child.stderr, child.stdout].filter(Boolean).join("\n").trim();
+  throw new Error(detail || `git exited ${child.status ?? `with signal ${child.signal}`}`);
 }

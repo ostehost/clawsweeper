@@ -83,8 +83,9 @@ export const ISSUES_QUERY = `
 `;
 
 // Fetch a single issue by its human identifier (team key + number, e.g. "PAR-244"),
-// scoped to one team. Hydrates the issue's comments in the SAME read pass so a comment
-// upsert can be planned without snapshot/comment drift. Returns at most one node.
+// scoped to one team. Hydrates comments plus analysis context in the SAME read pass so a
+// comment upsert or source analysis can be planned without pagination drift. Returns at most
+// one node. Attachments are bounded; the source fails closed rather than analyze truncation.
 export const ISSUE_BY_IDENTIFIER_QUERY = `
   query IssueByIdentifier(
     $teamKey: String!
@@ -106,10 +107,17 @@ export const ISSUE_BY_IDENTIFIER_QUERY = `
         id
         identifier
         title
+        description
         url
         createdAt
         updatedAt
         priority
+        creator {
+          id
+          name
+          admin
+          owner
+        }
         team {
           id
           key
@@ -129,6 +137,17 @@ export const ISSUE_BY_IDENTIFIER_QUERY = `
           nodes {
             id
             name
+          }
+        }
+        attachments(first: 250) {
+          nodes {
+            id
+            url
+            title
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
           }
         }
         comments(first: $commentFirst, after: $commentAfter) {

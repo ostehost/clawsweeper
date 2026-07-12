@@ -322,23 +322,23 @@ function activeRuns(options) {
       );
     }
     try {
-      return JSON.parse(result.stdout || "[]").filter((run) => {
-        const createdAt = Date.parse(run.createdAt || "");
-        return (
-          run.workflowName === workflowDisplayName(options.workflow) &&
-          Number.isFinite(createdAt) &&
-          createdAt >= cutoff
-        );
-      });
+      return recentActiveRuns(JSON.parse(result.stdout || "[]"), cutoff);
     } catch (error) {
       throw new Error(`could not parse gh run list output: ${error.message}`);
     }
   });
 }
 
-export function workflowDisplayName(workflowNameOrFile) {
-  if (workflowNameOrFile === "sweep.yml") return "ClawSweeper";
-  return workflowNameOrFile;
+/**
+ * Keeps fresh runs from gh's already workflow-scoped result. Do not compare workflowName:
+ * gh reports the human display name, which cannot be derived from an arbitrary workflow file.
+ */
+export function recentActiveRuns(runs, cutoff) {
+  if (!Array.isArray(runs)) throw new Error("gh run list output must be an array");
+  return runs.filter((run) => {
+    const createdAt = Date.parse(run.createdAt || "");
+    return Number.isFinite(createdAt) && createdAt >= cutoff;
+  });
 }
 
 function run(binary, args, { capture }) {

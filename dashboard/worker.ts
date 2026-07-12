@@ -2,6 +2,9 @@ import {
   commandTextForClawSweeperFastAck,
   isClawSweeperReReviewCommandText,
 } from "../src/repair/comment-command-text.ts";
+import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
+import { stableJson } from "../src/stable-json.ts";
+import { bayHtml } from "./bay-page.ts";
 import { TRIAGE_ROUTING_GROUPS, triageRoutingGroupsForLabels } from "./triage-routing-groups.ts";
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
@@ -9,6 +12,7 @@ const QUEUED_RUN_STATUSES = new Set(["queued", "waiting", "requested", "pending"
 type DashboardEnv = Record<string, unknown>;
 type DashboardContext = { waitUntil?: (promise: Promise<unknown>) => void };
 type GithubAppJsonOptions = { method?: string; body?: BodyInit; errorLabel?: string };
+type GithubJsonReader = (path: string) => ReturnType<typeof githubJson>;
 type StoredValue = { value: string; expires_at?: number };
 type WorkflowRunSummary = {
   id: number | string;
@@ -30,10 +34,14 @@ type ExactReviewDecision = {
   supersedesInProgress: boolean;
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
+  commandStatusMarker?: string;
+  statusCommentId?: number;
+  additionalPrompt?: string;
 };
 type ExactReviewQueueItem = {
   key: string;
   decision: ExactReviewDecision;
+  leaseDecision?: ExactReviewDecision;
   state: "pending" | "dispatching" | "leased";
   revision: number;
   createdAt: number;
@@ -44,10 +52,38 @@ type ExactReviewQueueItem = {
   leaseRevision?: number;
   leaseExpiresAt?: number;
   claimedRunId?: string;
+  claimedRunAttempt?: number;
+  claimGeneration?: number;
+  claimProtocolVersion?: 1 | 2;
+};
+type ExactReviewCompletionOutcome = "success" | "failure" | "cancelled";
+type ExactReviewClaimedRun = {
+  runId: string;
+  runAttempt?: number;
+  claimGeneration: number;
 };
 type ExactReviewQueueState = {
-  deliveries: Record<string, number>;
   items: Record<string, ExactReviewQueueItem>;
+  dispatcher?: {
+    state: "active" | "paused" | "blocked" | "unknown";
+    reason?: "workflow_not_active" | "workflow_status_unavailable";
+    workflowState?: string;
+    checkedAt: number;
+    retryAt?: number;
+  };
+};
+type LegacyExactReviewQueueState = ExactReviewQueueState & {
+  deliveries?: Record<string, number>;
+};
+type ExactReviewQueueBaseline = {
+  items: Map<string, string>;
+  dispatcherJson: string | null;
+};
+type ExactReviewQueueStorageMeta = {
+  schema_version: number;
+  migrated_at: number;
+  storage_generation: number;
+  dispatcher_json: string | null;
 };
 type DurableObjectStub = { fetch: (request: Request) => Promise<Response> };
 type DurableObjectNamespace = {
@@ -64,6 +100,12 @@ const ACTIVE_RUN_STATUS_FILTERS = ["in_progress", "queued", "waiting", "requeste
 const TERMINAL_BAD_CONCLUSIONS = new Set(["failure", "timed_out", "action_required"]);
 const EVENT_LIMIT = 200;
 const EVENT_STORE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const BAY_TERMINAL_STATE_KEY = "openclaw-bay:terminal-state:v1";
+const BAY_TIDE_THRESHOLD = 20;
+const BAY_SEEN_EVENT_LIMIT = 256;
+const BAY_WASH_VISIBLE_MS = 60_000;
+const BAY_TIMING_WINDOW_MS = 60 * 60 * 1000;
+const BAY_TIMING_MAX_SAMPLE_MS = 24 * 60 * 60 * 1000;
 const AVERAGE_LIMIT = 4;
 const RECENT_CLOSED_LIMIT = 8;
 const CLOSED_STATS_HOURS = 24;
@@ -71,20 +113,50 @@ const CLOSED_STATS_PAGE_LIMIT = 10;
 const DEFAULT_CLAWSWEEPER_BOT_LOGINS = ["clawsweeper[bot]", "openclaw-clawsweeper[bot]"];
 const GITHUB_TIMEOUT_MS = 4500;
 const DEFAULT_STALE_QUEUED_WORKFLOW_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 40;
+const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 28;
+const DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT = 24;
 const DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS = 10 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
+const DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = 60_000;
+const EXACT_REVIEW_COMPLETION_RETRY_MAX_MS = 2 * 60 * 60 * 1000;
+const EXACT_REVIEW_RECONCILE_RUN_LIMIT = 32;
+const EXACT_REVIEW_RECONCILE_CLAIM_MATCH_LIMIT = EXACT_REVIEW_RECONCILE_RUN_LIMIT * 2;
+const EXACT_REVIEW_RECONCILE_CONCURRENCY = 4;
+// This is an idempotency policy, not a storage-size control. Receipts live in
+// individual indexed SQLite rows and are pruned in bounded batches.
 const EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const EXACT_REVIEW_QUEUE_DELIVERY_PRUNE_BATCH = 1_000;
+const EXACT_REVIEW_QUEUE_DELIVERY_PRUNE_MAX_BATCHES = 5;
+const EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH = 50;
+const EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION = 1;
+const EXACT_REVIEW_QUEUE_LEGACY_ROLLBACK_MS = 24 * 60 * 60 * 1000;
+const EXACT_REVIEW_QUEUE_LEGACY_SHADOW_MAX_BYTES = 1 * 1024 * 1024;
+const EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_ROW_LIMIT = 20_000;
+const EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_SHIFT_MS = 2 * 24 * 60 * 60 * 1000;
+const EXACT_REVIEW_QUEUE_ROLLBACK_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX = "__clawsweeper_sql_generation:";
 const EXACT_REVIEW_QUEUE_STATE_KEY = "exact-review-queue";
+const EXACT_REVIEW_QUEUE_META_TABLE = "exact_review_queue_meta";
+const EXACT_REVIEW_QUEUE_ITEM_TABLE = "exact_review_queue_items";
+const EXACT_REVIEW_QUEUE_DELIVERY_TABLE = "exact_review_queue_deliveries";
 const EXACT_REVIEW_QUEUE_NAME = "global";
+const EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN =
+  /^<!-- clawsweeper-command-status:[^<>\r\n]{1,200} -->$/;
+const EXACT_REVIEW_ADDITIONAL_PROMPT_MAX_CHARS = 5000;
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
 const CLAWSWEEPER_STATE_REPO = "openclaw/clawsweeper-state";
 const CLAWSWEEPER_STATE_REF = "state";
 const DEFAULT_CRABFLEET_URL = "https://crabfleet.openclaw.ai";
 const CLUSTER_REPAIR_INTAKE_WORKFLOW = "repair-cluster-intake.yml";
 const CLAWSWEEPER_ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-const CLAWSWEEPER_ISSUE_ITEM_ACTIONS = new Set(["opened", "reopened", "edited"]);
+const CLAWSWEEPER_ISSUE_ITEM_ACTIONS = new Set([
+  "opened",
+  "reopened",
+  "edited",
+  "unlocked",
+  "unlabeled",
+]);
 const CLAWSWEEPER_PULL_ITEM_ACTIONS = new Set([
   "opened",
   "reopened",
@@ -92,6 +164,8 @@ const CLAWSWEEPER_PULL_ITEM_ACTIONS = new Set([
   "ready_for_review",
   "converted_to_draft",
   "edited",
+  "unlocked",
+  "unlabeled",
 ]);
 const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
 const inFlightFastAcks = new Map();
@@ -275,6 +349,36 @@ export class StatusStore {
       return new Response(null, { status: 204 });
     }
 
+    if (request.method === "POST" && key === BAY_TERMINAL_STATE_KEY) {
+      const body = await request.json();
+      const current = (await this.storage.get(key)) as StoredValue | undefined;
+      const currentValue =
+        current?.value && (!current.expires_at || current.expires_at > Date.now())
+          ? JSON.parse(current.value)
+          : null;
+      const generatedAt = String(body?.generated_at || new Date().toISOString());
+      const next = mergeBayTerminalState(
+        currentValue,
+        body?.attempts,
+        body?.closed_items,
+        generatedAt,
+        body?.active_item_keys,
+      );
+      if (
+        currentValue &&
+        bayTerminalStateSignature(currentValue) === bayTerminalStateSignature(next)
+      ) {
+        return json(currentValue);
+      }
+      const expiresAt = Date.now() + numberFrom(body?.ttl_seconds, EVENT_STORE_TTL_SECONDS) * 1000;
+      await this.storage.put(key, {
+        value: JSON.stringify(next),
+        expires_at: expiresAt,
+      });
+      await this.scheduleCleanup(expiresAt);
+      return json(next);
+    }
+
     if (request.method === "POST" && key === "events") {
       const body = await request.json();
       const current = (await this.storage.get("events")) as StoredValue | undefined;
@@ -323,190 +427,1034 @@ export class StatusStore {
 export class ExactReviewQueue {
   private storage;
   private env;
+  private ready: Promise<void>;
+  private migratedAt = 0;
+  private legacyMirrorDisabled = false;
+  private legacyMirrorWarningReported = false;
+  private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
 
   constructor(state, env) {
     this.storage = state.storage;
     this.env = env;
+    const initialize = () => this.initializeStorage();
+    this.ready =
+      typeof state.blockConcurrencyWhile === "function"
+        ? Promise.resolve(state.blockConcurrencyWhile(initialize))
+        : initialize();
   }
 
   async fetch(request: Request) {
+    await this.ready;
+    this.cleanupLegacyCompatibilitySync();
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/enqueue") {
       const body = objectValue(await request.json().catch(() => null));
       const deliveryId = String(body.delivery_id || "").trim();
       const decision = exactReviewDecisionFrom(body.decision);
       if (!deliveryId) return json({ error: "missing_delivery_id" }, 400);
+      if (deliveryId.startsWith(EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX)) {
+        return json({ error: "reserved_delivery_id" }, 400);
+      }
       if (!decision) return json({ error: "invalid_exact_review_item" }, 400);
       if (!isExactReviewQueueTargetEnabled(decision, this.env)) {
         return json({ ok: true, accepted: false, reason: "target not enabled" }, 202);
       }
 
       const now = Date.now();
-      const state = await this.readState();
-      pruneExactReviewDeliveries(state, now);
-      const existingDelivery = state.deliveries[deliveryId];
-      if (existingDelivery) {
+      const accepted = this.storage.transactionSync(() => {
+        this.pruneDeliveryReceiptsSync(now);
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+            WHERE delivery_id = ? AND received_at <= ?`,
+          deliveryId,
+          now - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS,
+        );
+        const insertedReceipts = Array.from(
+          this.storage.sql.exec(
+            `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+             (delivery_id, received_at) VALUES (?, ?)
+           RETURNING delivery_id`,
+            deliveryId,
+            now,
+          ),
+        );
+        if (insertedReceipts.length !== 1) {
+          this.syncLegacyCompatibilitySync(this.readStateSync());
+          return { deduped: true as const };
+        }
+
+        const state = this.readStateSync();
+        const key = exactReviewItemKey(decision);
+        const current = state.items[key];
+        const nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
+        if (current) {
+          // A pending command has no executor yet, so an ordinary item event must not erase its
+          // acknowledgement context. Once dispatched, that lease already owns the context and a
+          // newer revision should start clean unless it carries its own command fields.
+          current.decision =
+            current.state === "pending"
+              ? mergePendingExactReviewDecision(current.decision, decision)
+              : decision;
+          current.revision += 1;
+          current.updatedAt = now;
+          current.nextAttemptAt = nextAttemptAt;
+          if (current.state === "pending") current.attempts = 0;
+        } else {
+          state.items[key] = {
+            key,
+            decision,
+            state: "pending",
+            revision: 1,
+            createdAt: now,
+            updatedAt: now,
+            nextAttemptAt,
+            attempts: 0,
+          };
+        }
+        this.writeStateSync(state);
+        return { deduped: false as const, key, state };
+      });
+      if (accepted.deduped) {
         return json({ ok: true, deduped: true, item_key: exactReviewItemKey(decision) }, 202);
       }
-
-      state.deliveries[deliveryId] = now;
-      const key = exactReviewItemKey(decision);
-      const current = state.items[key];
-      if (current) {
-        current.decision = decision;
-        current.revision += 1;
-        current.updatedAt = now;
-        current.nextAttemptAt = now;
-        if (current.state === "pending") current.attempts = 0;
-      } else {
-        state.items[key] = {
-          key,
-          decision,
-          state: "pending",
-          revision: 1,
-          createdAt: now,
-          updatedAt: now,
-          nextAttemptAt: now,
-          attempts: 0,
-        };
-      }
-      await this.writeState(state);
-      await this.scheduleNext(state, now);
-      return json({ ok: true, queued: true, item_key: key }, 202);
+      await this.scheduleNext(accepted.state, now);
+      return json({ ok: true, queued: true, item_key: accepted.key }, 202);
     }
 
     if (request.method === "POST" && url.pathname === "/claim") {
       const body = objectValue(await request.json().catch(() => null));
       const leaseId = String(body.lease_id || "").trim();
+      const itemKey = String(body.item_key || "").trim();
+      const leaseRevision = Number(body.lease_revision);
       const runId = String(body.run_id || "").trim();
       if (!leaseId || !runId) return json({ error: "missing_lease_or_run" }, 400);
+      if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
+      const tupleClaim = Boolean(itemKey) || body.lease_revision !== undefined;
+      if (tupleClaim && (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1)) {
+        return json({ error: "invalid_lease_revision" }, 400);
+      }
+      const claimProtocolVersion: 1 | 2 = tupleClaim ? 2 : 1;
+      const runAttempt = exactReviewRunAttempt(body.run_attempt);
+      if (body.run_attempt !== undefined && runAttempt === null) {
+        return json({ error: "invalid_run_attempt" }, 400);
+      }
 
       const now = Date.now();
-      const state = await this.readState();
-      const item = exactReviewItemForLease(state, leaseId);
-      if (!item || !isLiveExactReviewLease(item, now)) {
+      const state = this.readStateSync();
+      const item = tupleClaim ? state.items[itemKey] : exactReviewItemForLease(state, leaseId);
+      if (
+        !item ||
+        item.leaseId !== leaseId ||
+        (tupleClaim && item.leaseRevision !== leaseRevision) ||
+        !isLiveExactReviewLease(item, now)
+      ) {
         return json({ error: "lease_not_active" }, 409);
       }
       if (item.claimedRunId && item.claimedRunId !== runId) {
         return json({ error: "lease_already_claimed" }, 409);
       }
 
+      // Deploys can observe a pre-snapshot lease. Recover it only when no newer
+      // enqueue has replaced the decision that was dispatched for this revision.
+      if (!item.leaseDecision) {
+        if (item.revision !== item.leaseRevision) {
+          return json({ error: "lease_decision_unavailable" }, 409);
+        }
+        item.leaseDecision = { ...item.decision };
+      }
+
+      const claimedRunAttempt = item.claimedRunAttempt;
+      if (item.claimedRunId && claimedRunAttempt !== undefined) {
+        if (runAttempt === null) return json({ error: "missing_run_attempt" }, 409);
+        if (runAttempt < claimedRunAttempt) {
+          return json({ error: "stale_run_attempt" }, 409);
+        }
+        if (runAttempt === claimedRunAttempt) {
+          if (
+            item.claimProtocolVersion !== undefined &&
+            item.claimProtocolVersion !== claimProtocolVersion
+          ) {
+            return json({ error: "claim_protocol_mismatch" }, 409);
+          }
+          const claimGeneration = Math.max(1, exactReviewClaimGeneration(item.claimGeneration));
+          if (
+            item.claimGeneration !== claimGeneration ||
+            item.claimProtocolVersion !== claimProtocolVersion
+          ) {
+            item.claimGeneration = claimGeneration;
+            item.claimProtocolVersion = claimProtocolVersion;
+            await this.writeState(state);
+          }
+          return json(exactReviewClaimResponse(item, claimProtocolVersion, claimGeneration));
+        }
+      } else if (item.claimedRunId && runAttempt === null) {
+        if (
+          item.claimProtocolVersion !== undefined &&
+          item.claimProtocolVersion !== claimProtocolVersion
+        ) {
+          return json({ error: "claim_protocol_mismatch" }, 409);
+        }
+        const claimGeneration = Math.max(1, exactReviewClaimGeneration(item.claimGeneration));
+        if (
+          item.claimGeneration !== claimGeneration ||
+          item.claimProtocolVersion !== claimProtocolVersion
+        ) {
+          item.claimGeneration = claimGeneration;
+          item.claimProtocolVersion = claimProtocolVersion;
+          await this.writeState(state);
+        }
+        return json(exactReviewClaimResponse(item, claimProtocolVersion, claimGeneration));
+      }
+
       item.state = "leased";
       item.claimedRunId = runId;
+      item.claimedRunAttempt = runAttempt ?? undefined;
+      item.claimGeneration = exactReviewClaimGeneration(item.claimGeneration) + 1;
+      item.claimProtocolVersion = claimProtocolVersion;
       item.leaseExpiresAt = now + exactReviewExecutionLeaseMs(this.env);
       await this.writeState(state);
       await this.scheduleNext(state, now);
-      return json({
-        ok: true,
-        claimed: true,
-        item_key: item.key,
-        revision: item.leaseRevision,
-      });
+      return json(exactReviewClaimResponse(item, claimProtocolVersion, item.claimGeneration));
     }
 
     if (request.method === "POST" && url.pathname === "/complete") {
       const body = objectValue(await request.json().catch(() => null));
       const leaseId = String(body.lease_id || "").trim();
+      const itemKey = String(body.item_key || "").trim();
+      const leaseRevision = Number(body.lease_revision);
+      const claimGeneration = Number(body.claim_generation);
       const runId = String(body.run_id || "").trim();
       if (!leaseId || !runId) return json({ error: "missing_lease_or_run" }, 400);
+      if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
+      const tupleCompletion =
+        Boolean(itemKey) ||
+        body.lease_revision !== undefined ||
+        body.claim_generation !== undefined;
+      if (tupleCompletion) {
+        if (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1) {
+          return json({ error: "invalid_lease_revision" }, 400);
+        }
+        if (!Number.isInteger(claimGeneration) || claimGeneration < 1) {
+          return json({ error: "invalid_claim_generation" }, 400);
+        }
+      }
+      const completionProtocolVersion: 1 | 2 = tupleCompletion ? 2 : 1;
+      const runAttempt = exactReviewRunAttempt(body.run_attempt);
+      if (body.run_attempt !== undefined && runAttempt === null) {
+        return json({ error: "invalid_run_attempt" }, 400);
+      }
+      const outcome = exactReviewCompletionOutcome(body.outcome, "success");
+      if (!outcome) return json({ error: "invalid_outcome" }, 400);
+      const requeueLatest = body.requeue_latest === true;
+      if (body.requeue_latest !== undefined && typeof body.requeue_latest !== "boolean") {
+        return json({ error: "invalid_requeue_latest" }, 400);
+      }
+      if (requeueLatest && outcome !== "success") {
+        return json({ error: "invalid_requeue_latest_outcome" }, 400);
+      }
 
       const now = Date.now();
-      const state = await this.readState();
-      const item = exactReviewItemForLease(state, leaseId);
-      if (!item || item.claimedRunId !== runId) return json({ error: "lease_not_claimed" }, 409);
-
-      const requeued = item.revision > Number(item.leaseRevision || 0);
-      if (requeued) {
-        clearExactReviewLease(item);
-        item.state = "pending";
-        item.nextAttemptAt = now;
-        item.attempts = 0;
-        item.updatedAt = now;
-      } else {
-        delete state.items[item.key];
+      const requestedRetryAt = exactReviewCompletionRetryAt(body.retry_at, now);
+      if (body.retry_at !== undefined && requestedRetryAt === null) {
+        return json({ error: "invalid_retry_at" }, 400);
       }
+      const state = this.readStateSync();
+      const item = tupleCompletion ? state.items[itemKey] : exactReviewItemForLease(state, leaseId);
+      if (
+        !item ||
+        item.leaseId !== leaseId ||
+        (tupleCompletion && item.leaseRevision !== leaseRevision) ||
+        (tupleCompletion && exactReviewClaimGeneration(item.claimGeneration) !== claimGeneration) ||
+        item.claimedRunId !== runId
+      ) {
+        return json({ error: "lease_not_claimed" }, 409);
+      }
+      if ((item.claimProtocolVersion ?? 1) !== completionProtocolVersion) {
+        return json({ error: "lease_protocol_not_claimed" }, 409);
+      }
+      if (
+        item.claimedRunAttempt !== undefined &&
+        (runAttempt === null || runAttempt !== item.claimedRunAttempt)
+      ) {
+        return json({ error: "lease_attempt_not_claimed" }, 409);
+      }
+
+      // A successful finalizer still runs before GitHub records the workflow-run conclusion.
+      // Keep the claim until the signed workflow_run backstop verifies that exact attempt as
+      // terminal, otherwise cancellation or a failing post-action could be acknowledged as
+      // success. A newer revision is already known to need another review and can requeue now.
+      if (
+        outcome === "success" &&
+        !requeueLatest &&
+        item.revision <= Number(item.leaseRevision || 0)
+      ) {
+        await this.scheduleNext(state, now);
+        return json({ ok: true, requeued: false, deferred: true });
+      }
+
+      const requeued = finishExactReviewQueueItem(
+        state,
+        item,
+        now,
+        outcome,
+        requestedRetryAt ?? undefined,
+        requeueLatest,
+      );
       await this.writeState(state);
       await this.scheduleNext(state, now);
       return json({ ok: true, requeued });
     }
 
+    if (request.method === "POST" && url.pathname === "/claimed-runs") {
+      const body = objectValue(await request.json().catch(() => null));
+      const requestedRuns = exactReviewRequestedRuns(body.runs);
+      if (!requestedRuns) return json({ error: "invalid_requested_runs" }, 400);
+
+      // The workflow_run hook names the exact terminal run. Return at most two matches for
+      // each requested id so a corrupt duplicate remains ambiguous without sampling the first
+      // N unrelated leases. This keeps the response bounded while allowing any live claim in
+      // the durable queue to be reconciled.
+      const requestedRunIds = new Set(requestedRuns.map((run) => run.runId));
+      const matchesByRunId = new Map<string, ExactReviewQueueItem[]>();
+      const state = this.readStateSync();
+      for (const item of Object.values(state.items)) {
+        if (
+          item.state !== "leased" ||
+          !item.claimedRunId ||
+          !requestedRunIds.has(item.claimedRunId)
+        ) {
+          continue;
+        }
+        const matches = matchesByRunId.get(item.claimedRunId) || [];
+        if (matches.length < 2) matches.push(item);
+        matchesByRunId.set(item.claimedRunId, matches);
+      }
+      const runs = [...matchesByRunId.values()].flatMap((matches) =>
+        matches.map((item) => ({
+          run_id: String(item.claimedRunId),
+          run_attempt: item.claimedRunAttempt ?? null,
+          claim_generation: exactReviewClaimGeneration(item.claimGeneration),
+        })),
+      );
+      return json({ runs });
+    }
+
+    if (request.method === "POST" && url.pathname === "/reconcile") {
+      const body = objectValue(await request.json().catch(() => null));
+      const runs = exactReviewTerminalRuns(body.runs);
+      if (!runs) return json({ error: "invalid_terminal_runs" }, 400);
+
+      const now = Date.now();
+      const state = this.readStateSync();
+      let reconciled = 0;
+      let requeued = 0;
+      let completed = 0;
+      for (const run of runs) {
+        const matches = Object.values(state.items).filter(
+          (item) =>
+            item.state === "leased" &&
+            item.claimedRunId === run.runId &&
+            exactReviewClaimGeneration(item.claimGeneration) === run.claimGeneration &&
+            (item.claimedRunAttempt ?? null) === (run.claimedRunAttempt ?? null),
+        );
+        if (matches.length !== 1) continue;
+        const item = matches[0];
+        const didRequeue = finishExactReviewQueueItem(state, item, now, run.outcome);
+        reconciled += 1;
+        if (didRequeue) requeued += 1;
+        else completed += 1;
+      }
+      if (reconciled) {
+        await this.writeState(state);
+        await this.scheduleNext(state, now);
+      }
+      return json({ ok: true, reconciled, requeued, completed });
+    }
+
     if (request.method === "GET" && url.pathname === "/stats") {
-      const state = await this.readState();
-      return json(exactReviewQueueStats(state));
+      const now = Date.now();
+      const state = this.storage.transactionSync(() => {
+        this.pruneDeliveryReceiptsSync(now);
+        const current = this.readStateSync();
+        // Dashboard reads are also the operational heartbeat. Reclaim leases and
+        // restore the alarm here so a deploy or lost alarm cannot strand backlog.
+        const changed = reclaimExpiredExactReviewLeases(current, now);
+        if (changed) this.writeStateSync(current);
+        else this.syncLegacyCompatibilitySync(current);
+        return current;
+      });
+      await this.scheduleNext(state, now);
+      return json({
+        ...exactReviewQueueStats(
+          state,
+          now,
+          exactReviewQueueCapacity(this.env),
+          exactReviewTargetCapacity(this.env),
+        ),
+        delivery_receipts: this.deliveryReceiptCountSync(),
+        storage_schema_version: EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION,
+        legacy_rollback_available:
+          !this.legacyMirrorDisabled &&
+          now < this.migratedAt + EXACT_REVIEW_QUEUE_LEGACY_ROLLBACK_MS,
+      });
     }
 
     return new Response("not found", { status: 404 });
   }
 
   async alarm() {
-    const now = Date.now();
-    const state = await this.readState();
-    let changed = reclaimExpiredExactReviewLeases(state, now);
+    await this.ready;
+    this.cleanupLegacyCompatibilitySync();
+    const startedAt = Date.now();
+    await this.storage.deleteAlarm();
+    this.storage.transactionSync(() => {
+      this.pruneDeliveryReceiptsSync(startedAt);
+      this.syncLegacyCompatibilitySync(this.readStateSync());
+    });
+    const snapshot = this.readStateSync();
+    const snapshotChanged = reclaimExpiredExactReviewLeases(snapshot, startedAt);
     const capacity = exactReviewQueueCapacity(this.env);
-    const slots = Math.max(0, capacity - exactReviewQueueActiveCount(state));
-    const admitted = Object.values(state.items)
-      .filter((item) => item.state === "pending" && item.nextAttemptAt <= now)
-      .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key))
-      .slice(0, slots);
+    const targetCapacity = exactReviewTargetCapacity(this.env);
+    const snapshotAdmission = exactReviewQueueAdmittedItems(
+      snapshot,
+      startedAt,
+      capacity,
+      targetCapacity,
+    );
+    if (!snapshotAdmission.length) {
+      if (snapshotChanged) await this.writeState(snapshot);
+      await this.scheduleNext(snapshot, startedAt);
+      return;
+    }
 
+    let preflight: { ok: true; token: string; workflowState: string } | { ok: false } = {
+      ok: false,
+    };
+    try {
+      const token = await exactReviewDispatchToken(this.env);
+      preflight = { ok: true, token, workflowState: await exactReviewWorkflowState(token) };
+    } catch {
+      preflight = { ok: false };
+    }
+
+    // External fetches release the Durable Object input gate. Re-read before any
+    // write so concurrent enqueue, claim, or complete requests cannot be lost.
+    const now = Date.now();
+    const state = this.readStateSync();
+    reclaimExpiredExactReviewLeases(state, now);
+    const admitted = exactReviewQueueAdmittedItems(state, now, capacity, targetCapacity);
+    if (!preflight.ok) {
+      const retryAt = now + exactReviewWorkflowPausedRetryMs(this.env);
+      state.dispatcher = {
+        state: "blocked",
+        reason: "workflow_status_unavailable",
+        checkedAt: now,
+        retryAt,
+      };
+      deferPausedExactReviewQueue(state, now, retryAt);
+      await this.writeState(state);
+      await this.scheduleNext(state, now);
+      return;
+    }
+    if (preflight.workflowState !== "active") {
+      const retryAt = now + exactReviewWorkflowPausedRetryMs(this.env);
+      state.dispatcher = {
+        state: "paused",
+        reason: "workflow_not_active",
+        workflowState: preflight.workflowState,
+        checkedAt: now,
+        retryAt,
+      };
+      deferPausedExactReviewQueue(state, now, retryAt);
+      await this.writeState(state);
+      await this.scheduleNext(state, now);
+      return;
+    }
+
+    state.dispatcher = {
+      state: "active",
+      workflowState: preflight.workflowState,
+      checkedAt: now,
+    };
     for (const item of admitted) {
       item.state = "dispatching";
       item.leaseId = crypto.randomUUID();
       item.leaseRevision = item.revision;
+      item.leaseDecision = { ...item.decision };
       item.leaseExpiresAt = now + exactReviewDispatchLeaseMs(this.env);
       item.claimedRunId = undefined;
-      changed = true;
+      item.claimedRunAttempt = undefined;
+      item.claimGeneration = undefined;
     }
-    if (changed) await this.writeState(state);
+    await this.writeState(state);
+    if (!admitted.length) {
+      await this.scheduleNext(state, now);
+      return;
+    }
 
-    if (admitted.length) {
-      let token: string | null = null;
+    const failures: Array<{ key: string; leaseId: string }> = [];
+    for (const item of admitted) {
       try {
-        token = await exactReviewDispatchToken(this.env);
+        await dispatchClawsweeperItem({
+          token: preflight.token,
+          decision: item.leaseDecision || item.decision,
+          itemKey: item.key,
+          leaseId: item.leaseId,
+          leaseRevision: item.leaseRevision,
+        });
       } catch {
-        token = null;
+        failures.push({ key: item.key, leaseId: String(item.leaseId || "") });
       }
-      for (const item of admitted) {
-        try {
-          if (!token) throw new Error("exact review dispatch token unavailable");
-          await dispatchClawsweeperItem({ token, decision: item.decision, leaseId: item.leaseId });
-        } catch {
-          clearExactReviewLease(item);
-          item.state = "pending";
-          item.attempts += 1;
-          item.nextAttemptAt = now + exactReviewRetryDelayMs(item.attempts);
-          item.updatedAt = now;
-          changed = true;
-        }
-      }
-      if (changed) await this.writeState(state);
     }
 
-    await this.scheduleNext(state, now);
+    // Dispatch calls also release the input gate. Merge failures into current
+    // state only when the exact lease still owns the item.
+    const completedAt = Date.now();
+    const current = this.readStateSync();
+    let currentChanged = false;
+    for (const failure of failures) {
+      const item = current.items[failure.key];
+      if (
+        !item ||
+        !failure.leaseId ||
+        item.leaseId !== failure.leaseId ||
+        item.state !== "dispatching" ||
+        item.claimedRunId
+      ) {
+        continue;
+      }
+      clearExactReviewLease(item);
+      item.state = "pending";
+      item.attempts += 1;
+      item.nextAttemptAt = completedAt + exactReviewRetryDelayMs(item.attempts);
+      item.updatedAt = completedAt;
+      currentChanged = true;
+    }
+    if (currentChanged) await this.writeState(current);
+    await this.scheduleNext(current, completedAt);
   }
 
-  private async readState(): Promise<ExactReviewQueueState> {
-    const stored = (await this.storage.get(EXACT_REVIEW_QUEUE_STATE_KEY)) as
-      | ExactReviewQueueState
+  private async initializeStorage() {
+    this.ensureStorageSchemaSync();
+    let meta = this.readStorageMetaSync();
+    let migratedLegacy = false;
+    const legacy = this.storage.kv.get(EXACT_REVIEW_QUEUE_STATE_KEY) as
+      | LegacyExactReviewQueueState
       | undefined;
+    if (!meta) {
+      const migratedAt = Date.now();
+      this.migratedAt = migratedAt;
+      this.storage.transactionSync(() => {
+        if (this.readStorageMetaSync()) return;
+
+        const itemRows = Object.entries(
+          legacy?.items && typeof legacy.items === "object" ? legacy.items : {},
+        ).map(([itemKey, item]) => [itemKey, JSON.stringify({ ...item, key: itemKey })]);
+        this.insertMigrationRowsSync(
+          EXACT_REVIEW_QUEUE_ITEM_TABLE,
+          ["item_key", "item_json"],
+          itemRows,
+        );
+
+        const receiptCutoff = migratedAt - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS;
+        const receiptRows = Object.entries(
+          legacy?.deliveries && typeof legacy.deliveries === "object" ? legacy.deliveries : {},
+        )
+          .filter(
+            ([deliveryId, receivedAt]) =>
+              !deliveryId.startsWith(EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX) &&
+              Number.isSafeInteger(receivedAt) &&
+              receivedAt > receiptCutoff,
+          )
+          .map(([deliveryId, receivedAt]) => [deliveryId, receivedAt]);
+        this.insertMigrationRowsSync(
+          EXACT_REVIEW_QUEUE_DELIVERY_TABLE,
+          ["delivery_id", "received_at"],
+          receiptRows,
+        );
+
+        const dispatcherJson =
+          legacy?.dispatcher && typeof legacy.dispatcher === "object"
+            ? JSON.stringify(legacy.dispatcher)
+            : null;
+        this.storage.sql.exec(
+          `INSERT INTO ${EXACT_REVIEW_QUEUE_META_TABLE}
+             (singleton_id, schema_version, migrated_at, storage_generation, dispatcher_json)
+           VALUES (1, ?, ?, 1, ?)`,
+          EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION,
+          migratedAt,
+          dispatcherJson,
+        );
+        migratedLegacy = true;
+        this.syncLegacyCompatibilitySync(this.readStateSync());
+      });
+      meta = this.readStorageMetaSync();
+    }
+    if (!meta || Number(meta.schema_version) !== EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION) {
+      throw new Error(`unsupported exact-review queue storage schema ${meta?.schema_version}`);
+    }
+    if (!Number.isSafeInteger(meta.storage_generation) || meta.storage_generation < 1) {
+      throw new Error("invalid exact-review queue storage generation");
+    }
+    if (!Number.isSafeInteger(meta.migrated_at) || meta.migrated_at < 1) {
+      throw new Error("invalid exact-review queue migration time");
+    }
+    this.migratedAt = Number(meta.migrated_at);
+    // Reconcile a surviving generation even after the ordinary shadow window:
+    // an actual rollback can keep mutating it while the new Worker is absent.
+    if (!migratedLegacy) {
+      this.storage.transactionSync(() => {
+        if (legacy) this.reconcileLegacyRollbackSync(legacy, meta);
+        this.syncLegacyCompatibilitySync(this.readStateSync());
+      });
+    }
+  }
+
+  private ensureStorageSchemaSync() {
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_META_TABLE} (
+         singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+         schema_version INTEGER NOT NULL,
+         migrated_at INTEGER NOT NULL,
+         storage_generation INTEGER NOT NULL,
+         dispatcher_json TEXT
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_ITEM_TABLE} (
+         item_key TEXT PRIMARY KEY,
+         item_json TEXT NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} (
+         delivery_id TEXT PRIMARY KEY,
+         received_at INTEGER NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS exact_review_queue_deliveries_received_at
+         ON ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} (received_at, delivery_id)`,
+    );
+  }
+
+  private readStorageMetaSync() {
+    return Array.from(
+      this.storage.sql.exec(
+        `SELECT schema_version, migrated_at, storage_generation, dispatcher_json
+           FROM ${EXACT_REVIEW_QUEUE_META_TABLE}
+          WHERE singleton_id = 1`,
+      ),
+    )[0] as ExactReviewQueueStorageMeta | undefined;
+  }
+
+  private insertMigrationRowsSync(table: string, columns: string[], rows: unknown[][]) {
+    for (let offset = 0; offset < rows.length; offset += EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH) {
+      const batch = rows.slice(offset, offset + EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH);
+      const placeholders = batch.map(() => `(${columns.map(() => "?").join(", ")})`).join(", ");
+      this.storage.sql.exec(
+        `INSERT OR REPLACE INTO ${table} (${columns.join(", ")}) VALUES ${placeholders}`,
+        ...batch.flat(),
+      );
+    }
+  }
+
+  private readDeliveryReceiptsByIdSync(deliveryIds: string[]) {
+    const receipts = new Map<string, number>();
+    for (
+      let offset = 0;
+      offset < deliveryIds.length;
+      offset += EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH
+    ) {
+      const batch = deliveryIds.slice(offset, offset + EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH);
+      const placeholders = batch.map(() => "?").join(", ");
+      for (const row of this.storage.sql.exec(
+        `SELECT delivery_id, received_at
+           FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+          WHERE delivery_id IN (${placeholders})`,
+        ...batch,
+      ) as Iterable<{ delivery_id: string; received_at: number }>) {
+        receipts.set(row.delivery_id, row.received_at);
+      }
+    }
+    return receipts;
+  }
+
+  private reconcileLegacyRollbackSync(
+    legacy: LegacyExactReviewQueueState,
+    meta: ExactReviewQueueStorageMeta,
+  ) {
+    const legacyState = this.normalizeLegacyState(legacy);
+    const sqlState = this.readStateSync();
+    const stateMatches = stableJson(legacyState) === stableJson(sqlState);
+    const { generation: legacyGeneration, receipts } = this.readLegacyBridge(legacy);
+    const sqlGeneration = Number(meta.storage_generation);
+
+    if (legacyGeneration !== undefined && legacyGeneration > sqlGeneration) {
+      throw new Error(
+        `invalid exact-review legacy rollback generation ${legacyGeneration} > ${sqlGeneration}`,
+      );
+    }
+    if (legacyGeneration !== undefined && legacyGeneration < sqlGeneration && !stateMatches) {
+      // A stale shadow can mean either a failed mirror write by this version or
+      // rollback-era mutations by the old version. Neither side is safe to discard.
+      throw new Error(
+        `ambiguous exact-review legacy rollback state at generations ${legacyGeneration} and ${sqlGeneration}`,
+      );
+    }
+    if (legacyGeneration === undefined && !stateMatches) {
+      throw new Error("ambiguous exact-review legacy rollback state without a generation marker");
+    }
+
+    const replaceState = legacyGeneration === sqlGeneration && !stateMatches;
+    const sqlReceipts = this.readDeliveryReceiptsByIdSync(
+      receipts.map(([deliveryId]) => String(deliveryId)),
+    );
+    const receiptChanges: unknown[][] = [];
+    if (legacyGeneration === sqlGeneration) {
+      const latestRollbackTime = Date.now() + EXACT_REVIEW_QUEUE_ROLLBACK_CLOCK_SKEW_MS;
+      for (const [deliveryId, receivedAt] of receipts) {
+        const sqlReceivedAt = sqlReceipts.get(String(deliveryId));
+        if (
+          sqlReceivedAt !== undefined &&
+          Number(receivedAt) === this.legacyReceiptTimestamp(sqlReceivedAt)
+        ) {
+          continue;
+        }
+        if (!Number.isSafeInteger(receivedAt) || Number(receivedAt) > latestRollbackTime) {
+          throw new Error(`invalid exact-review rollback receipt ${deliveryId}`);
+        }
+        receiptChanges.push([deliveryId, receivedAt]);
+      }
+    } else if (legacyGeneration !== undefined) {
+      for (const [deliveryId, receivedAt] of receipts) {
+        const sqlReceivedAt = sqlReceipts.get(String(deliveryId));
+        if (
+          sqlReceivedAt === undefined ||
+          Number(receivedAt) !== this.legacyReceiptTimestamp(sqlReceivedAt)
+        ) {
+          throw new Error(
+            `ambiguous exact-review legacy rollback receipt at generations ${legacyGeneration} and ${sqlGeneration}`,
+          );
+        }
+      }
+    }
+
+    if (replaceState) {
+      this.storage.sql.exec(`DELETE FROM ${EXACT_REVIEW_QUEUE_ITEM_TABLE}`);
+      this.insertMigrationRowsSync(
+        EXACT_REVIEW_QUEUE_ITEM_TABLE,
+        ["item_key", "item_json"],
+        Object.entries(legacyState.items).map(([itemKey, item]) => [itemKey, JSON.stringify(item)]),
+      );
+    }
+    this.insertMigrationRowsSync(
+      EXACT_REVIEW_QUEUE_DELIVERY_TABLE,
+      ["delivery_id", "received_at"],
+      receiptChanges,
+    );
+    if (!replaceState && receiptChanges.length === 0) return;
+    this.storage.sql.exec(
+      `UPDATE ${EXACT_REVIEW_QUEUE_META_TABLE}
+          SET dispatcher_json = ?, storage_generation = storage_generation + 1
+        WHERE singleton_id = 1 AND storage_generation = ?`,
+      replaceState && legacyState.dispatcher
+        ? JSON.stringify(legacyState.dispatcher)
+        : replaceState
+          ? null
+          : meta.dispatcher_json,
+      sqlGeneration,
+    );
+    const reconciledGeneration = this.readStorageMetaSync()?.storage_generation;
+    if (reconciledGeneration !== sqlGeneration + 1) {
+      throw new Error("exact-review legacy rollback reconciliation lost its generation race");
+    }
+  }
+
+  private normalizeLegacyState(legacy: LegacyExactReviewQueueState): ExactReviewQueueState {
+    const items = Object.fromEntries(
+      Object.entries(legacy.items && typeof legacy.items === "object" ? legacy.items : {}).map(
+        ([itemKey, item]) => [itemKey, { ...item, key: itemKey }],
+      ),
+    ) as Record<string, ExactReviewQueueItem>;
     return {
-      deliveries:
-        stored?.deliveries && typeof stored.deliveries === "object" ? stored.deliveries : {},
-      items: stored?.items && typeof stored.items === "object" ? stored.items : {},
+      items,
+      ...(legacy.dispatcher && typeof legacy.dispatcher === "object"
+        ? { dispatcher: legacy.dispatcher }
+        : {}),
     };
   }
 
-  private async writeState(state: ExactReviewQueueState) {
-    await this.storage.put(EXACT_REVIEW_QUEUE_STATE_KEY, state);
+  private readLegacyBridge(legacy: LegacyExactReviewQueueState) {
+    const deliveries =
+      legacy.deliveries && typeof legacy.deliveries === "object" ? legacy.deliveries : {};
+    const generationMarkers = Object.entries(deliveries).filter(([deliveryId]) =>
+      deliveryId.startsWith(EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX),
+    );
+    if (generationMarkers.length > 1) {
+      throw new Error("invalid exact-review legacy rollback generation markers");
+    }
+
+    let generation: number | undefined;
+    if (generationMarkers.length === 1) {
+      const [deliveryId, markedAt] = generationMarkers[0];
+      const rawGeneration = deliveryId.slice(EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX.length);
+      generation = Number(rawGeneration);
+      if (
+        !/^\d+$/.test(rawGeneration) ||
+        !Number.isSafeInteger(generation) ||
+        generation < 1 ||
+        markedAt !== Number.MAX_SAFE_INTEGER
+      ) {
+        throw new Error("invalid exact-review legacy rollback generation marker");
+      }
+    }
+
+    const receiptCutoff = Date.now() - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS;
+    const receipts = Object.entries(deliveries)
+      .filter(
+        ([deliveryId, receivedAt]) =>
+          !deliveryId.startsWith(EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX) &&
+          Number.isSafeInteger(receivedAt) &&
+          receivedAt > receiptCutoff,
+      )
+      .map(([deliveryId, receivedAt]) => [deliveryId, receivedAt]);
+    return { generation, receipts };
+  }
+
+  private readStateSync(): ExactReviewQueueState {
+    const meta = this.readStorageMetaSync();
+    if (!meta || Number(meta.schema_version) !== EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION) {
+      throw new Error("exact-review queue storage is not initialized");
+    }
+
+    const items: Record<string, ExactReviewQueueItem> = {};
+    const baselineItems = new Map<string, string>();
+    for (const row of this.storage.sql.exec(
+      `SELECT item_key, item_json FROM ${EXACT_REVIEW_QUEUE_ITEM_TABLE}`,
+    ) as Iterable<{ item_key: string; item_json: string }>) {
+      let item: ExactReviewQueueItem;
+      try {
+        item = JSON.parse(row.item_json) as ExactReviewQueueItem;
+      } catch {
+        throw new Error(`invalid exact-review queue item JSON for ${row.item_key}`);
+      }
+      if (!item || typeof item !== "object" || item.key !== row.item_key) {
+        throw new Error(`invalid exact-review queue item for ${row.item_key}`);
+      }
+      items[row.item_key] = item;
+      baselineItems.set(row.item_key, row.item_json);
+    }
+
+    let dispatcher: ExactReviewQueueState["dispatcher"];
+    if (meta.dispatcher_json) {
+      try {
+        dispatcher = JSON.parse(meta.dispatcher_json) as ExactReviewQueueState["dispatcher"];
+      } catch {
+        throw new Error("invalid exact-review queue dispatcher JSON");
+      }
+    }
+    const state = { items, dispatcher };
+    this.baselines.set(state, {
+      items: baselineItems,
+      dispatcherJson: meta.dispatcher_json,
+    });
+    return state;
+  }
+
+  private writeState(state: ExactReviewQueueState) {
+    this.storage.transactionSync(() => this.writeStateSync(state));
+  }
+
+  private writeStateSync(state: ExactReviewQueueState) {
+    const baseline = this.baselines.get(state) || this.readStateBaselineSync();
+    const nextItems = new Map<string, string>();
+    for (const [itemKey, item] of Object.entries(state.items)) {
+      const itemJson = JSON.stringify(item);
+      nextItems.set(itemKey, itemJson);
+      if (baseline.items.get(itemKey) === itemJson) continue;
+      this.storage.sql.exec(
+        `INSERT INTO ${EXACT_REVIEW_QUEUE_ITEM_TABLE} (item_key, item_json)
+         VALUES (?, ?)
+         ON CONFLICT(item_key) DO UPDATE SET item_json = excluded.item_json`,
+        itemKey,
+        itemJson,
+      );
+    }
+    for (const itemKey of baseline.items.keys()) {
+      if (!nextItems.has(itemKey)) {
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_QUEUE_ITEM_TABLE} WHERE item_key = ?`,
+          itemKey,
+        );
+      }
+    }
+
+    const dispatcherJson = state.dispatcher ? JSON.stringify(state.dispatcher) : null;
+    this.storage.sql.exec(
+      `UPDATE ${EXACT_REVIEW_QUEUE_META_TABLE}
+          SET dispatcher_json = ?, storage_generation = storage_generation + 1
+        WHERE singleton_id = 1`,
+      dispatcherJson,
+    );
+    this.syncLegacyCompatibilitySync(state);
+    this.baselines.set(state, { items: nextItems, dispatcherJson });
+  }
+
+  private readStateBaselineSync(): ExactReviewQueueBaseline {
+    const items = new Map<string, string>();
+    for (const row of this.storage.sql.exec(
+      `SELECT item_key, item_json FROM ${EXACT_REVIEW_QUEUE_ITEM_TABLE}`,
+    ) as Iterable<{ item_key: string; item_json: string }>) {
+      items.set(row.item_key, row.item_json);
+    }
+    return {
+      items,
+      dispatcherJson: this.readStorageMetaSync()?.dispatcher_json ?? null,
+    };
+  }
+
+  private pruneDeliveryReceiptsSync(now: number) {
+    const cutoff = now - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS;
+    for (let batch = 0; batch < EXACT_REVIEW_QUEUE_DELIVERY_PRUNE_MAX_BATCHES; batch += 1) {
+      const deleted = Array.from(
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+          WHERE delivery_id IN (
+            SELECT delivery_id
+              FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+             WHERE received_at <= ?
+             ORDER BY received_at, delivery_id
+             LIMIT ${EXACT_REVIEW_QUEUE_DELIVERY_PRUNE_BATCH}
+          )
+        RETURNING delivery_id`,
+          cutoff,
+        ),
+      );
+      if (deleted.length < EXACT_REVIEW_QUEUE_DELIVERY_PRUNE_BATCH) break;
+    }
+  }
+
+  private deliveryReceiptCountSync() {
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT COUNT(*) AS receipt_count FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}`,
+      ),
+    )[0] as { receipt_count?: number } | undefined;
+    return Number(row?.receipt_count || 0);
+  }
+
+  private legacyReceiptTimestamp(receivedAt: number) {
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      receivedAt + EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_SHIFT_MS,
+    );
+  }
+
+  private legacyDeliverySnapshotSync(now: number) {
+    const rows = Array.from(
+      this.storage.sql.exec(
+        `SELECT delivery_id, received_at
+           FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+          WHERE received_at > ?
+          ORDER BY delivery_id
+          LIMIT ${EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_ROW_LIMIT + 1}`,
+        now - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS,
+      ) as Iterable<{ delivery_id: string; received_at: number }>,
+    );
+    if (rows.length > EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_ROW_LIMIT) return undefined;
+    return Object.fromEntries(
+      rows.map((row) => [row.delivery_id, this.legacyReceiptTimestamp(row.received_at)]),
+    );
+  }
+
+  private syncLegacyCompatibilitySync(state: ExactReviewQueueState) {
+    const now = Date.now();
+    if (now >= this.migratedAt + EXACT_REVIEW_QUEUE_LEGACY_ROLLBACK_MS) {
+      this.cleanupLegacyCompatibilitySync();
+      return;
+    }
+    const generation = this.readStorageMetaSync()?.storage_generation;
+    if (!Number.isSafeInteger(generation) || Number(generation) < 1) {
+      throw new Error("invalid exact-review queue storage generation");
+    }
+    const deliveries = this.legacyDeliverySnapshotSync(now);
+    if (!deliveries) {
+      this.disableLegacyMirrorSync(
+        `active receipt count exceeds ${EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_ROW_LIMIT}`,
+      );
+      return;
+    }
+    // Old Worker code preserves the marker as an inert receipt. If it mutates
+    // this shadow after a rollback, the next upgrade can reconcile that exact
+    // generation instead of silently choosing one side. Its five-day receipt
+    // pruner sees timestamps shifted by two days, preserving the restored
+    // seven-day contract without changing the normalized SQL timestamps.
+    const shadow = {
+      deliveries: {
+        ...deliveries,
+        [`${EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX}${generation}`]: Number.MAX_SAFE_INTEGER,
+      },
+      items: state.items,
+      dispatcher: state.dispatcher,
+    };
+    const shadowBytes = new TextEncoder().encode(JSON.stringify(shadow)).byteLength;
+    if (shadowBytes > EXACT_REVIEW_QUEUE_LEGACY_SHADOW_MAX_BYTES) {
+      this.disableLegacyMirrorSync(`shadow is ${shadowBytes} bytes`);
+      return;
+    }
+    try {
+      this.storage.kv.put(EXACT_REVIEW_QUEUE_STATE_KEY, shadow);
+      this.legacyMirrorDisabled = false;
+    } catch (error) {
+      this.disableLegacyMirrorSync(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private disableLegacyMirrorSync(reason: string) {
+    try {
+      // A failed refresh must not leave a stale generation that becomes
+      // indistinguishable from rollback-era mutations on the next upgrade.
+      this.storage.kv.delete(EXACT_REVIEW_QUEUE_STATE_KEY);
+    } catch (error) {
+      console.warn(
+        "exact-review stale legacy rollback shadow could not be removed",
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+    this.reportLegacyMirrorUnavailable(reason);
+  }
+
+  private reportLegacyMirrorUnavailable(reason: string) {
+    this.legacyMirrorDisabled = true;
+    if (this.legacyMirrorWarningReported) return;
+    this.legacyMirrorWarningReported = true;
+    console.warn("exact-review legacy rollback shadow unavailable", reason);
+  }
+
+  private cleanupLegacyCompatibilitySync() {
+    if (!this.migratedAt || Date.now() < this.migratedAt + EXACT_REVIEW_QUEUE_LEGACY_ROLLBACK_MS) {
+      return;
+    }
+    this.storage.kv.delete(EXACT_REVIEW_QUEUE_STATE_KEY);
   }
 
   private async scheduleNext(state: ExactReviewQueueState, now: number) {
-    const next = exactReviewQueueNextWakeAt(state, now);
+    const next = exactReviewQueueNextWakeAt(
+      state,
+      now,
+      exactReviewQueueCapacity(this.env),
+      exactReviewTargetCapacity(this.env),
+    );
     if (next === null) {
       await this.storage.deleteAlarm();
       return;
     }
-    await this.storage.setAlarm(next);
+    const scheduled = await this.storage.getAlarm();
+    if (scheduled === null || scheduled <= now || next < scheduled) {
+      await this.storage.setAlarm(next);
+    }
   }
 }
 
@@ -521,7 +1469,13 @@ export default {
       return json({ error: "not_found" }, 404);
     }
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-    if (url.pathname === "/api/health") return json({ ok: true, service: "clawsweeper-status" });
+    if (url.pathname === "/api/health") {
+      return json({
+        ok: true,
+        service: "clawsweeper-status",
+        deployment_sha: nullableString(env.CLAWSWEEPER_DEPLOY_SHA),
+      });
+    }
     if (url.pathname === "/api/events" && request.method === "POST")
       return ingestEvent(request, env);
     if (url.pathname === "/github/webhook" && request.method === "GET")
@@ -534,12 +1488,15 @@ export default {
       return exactReviewQueueRequest(env, "/claim", request);
     if (url.pathname === "/internal/exact-review/complete" && request.method === "POST")
       return exactReviewQueueRequest(env, "/complete", request);
+    if (url.pathname === "/internal/exact-review/reconcile" && request.method === "POST")
+      return authenticatedExactReviewReconcile(request, env);
     if (url.pathname === "/api/exact-review-queue" && request.method === "GET")
       return exactReviewQueueRequest(env, "/stats");
     if (url.pathname === "/api/status") return statusJson(request, env, ctx);
     if (url.pathname === "/api/triage") return triageJson(request, env, ctx);
     if (url.pathname === "/api/pr-proof-triage") return prProofTriageJson(request, env, ctx);
     if (url.pathname === "/" || url.pathname === "/index.html") return html(dashboardHtml(env));
+    if (url.pathname === "/bay-demo") return demoHtml(bayHtml());
     if (url.pathname === "/triage" || url.pathname === "/triage.html")
       return html(triageHtml(issueTriagePageConfig()));
     if (url.pathname === "/pr-proof-triage" || url.pathname === "/pr-proof-triage.html")
@@ -639,7 +1596,7 @@ async function refreshStatusCaches(request, env) {
 }
 
 function statusCacheRequest(request, bucket) {
-  return new Request(new URL(`/api/status-cache/${bucket}`, request.url).toString(), {
+  return new Request(new URL(`/api/status-cache/v2/${bucket}`, request.url).toString(), {
     method: "GET",
   });
 }
@@ -801,7 +1758,7 @@ async function githubWebhook(request, env, ctx) {
     return json({ ok: true, accepted: false, reason: decision.reason }, 202);
   }
 
-  if (decision.type === "item") {
+  if ("type" in decision && decision.type === "item") {
     const deliveryId = request.headers.get("x-github-delivery") || "";
     const queued = await enqueueExactReview({
       env,
@@ -905,6 +1862,7 @@ function classifyGithubIssueCommentWebhook({ event, payload }) {
   if (!Number.isInteger(installationId) || installationId <= 0) {
     return { accepted: false, reason: "missing installation id" };
   }
+  const commentUpdatedAt = exactWebhookTimestamp(comment.updated_at);
   return {
     accepted: true,
     type: "issue_comment",
@@ -914,7 +1872,18 @@ function classifyGithubIssueCommentWebhook({ event, payload }) {
     commentId,
     installationId,
     sourceAction: action,
+    ...(commentUpdatedAt
+      ? {
+          commentUpdatedAt,
+          commentBody: String(comment.body || ""),
+        }
+      : {}),
   };
+}
+
+function exactWebhookTimestamp(value) {
+  const text = String(value || "").trim();
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
 }
 
 function classifyGithubItemWebhook({ event, payload }) {
@@ -934,6 +1903,9 @@ function classifyGithubItemWebhook({ event, payload }) {
     if (!CLAWSWEEPER_ISSUE_ITEM_ACTIONS.has(action)) {
       return { accepted: false, reason: "unsupported action" };
     }
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
     const itemNumber = Number(objectValue(payload.issue).number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
       return { accepted: false, reason: "missing issue number" };
@@ -948,12 +1920,15 @@ function classifyGithubItemWebhook({ event, payload }) {
       installationId,
       sourceEvent: "issues",
       sourceAction: action,
-      supersedesInProgress: action === "edited",
+      supersedesInProgress: ["edited", "unlocked", "unlabeled"].includes(action),
     };
   }
 
   if (event === "pull_request") {
     if (!CLAWSWEEPER_PULL_ITEM_ACTIONS.has(action)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
       return { accepted: false, reason: "unsupported action" };
     }
     const itemNumber = Number(objectValue(payload.pull_request).number);
@@ -970,11 +1945,24 @@ function classifyGithubItemWebhook({ event, payload }) {
       installationId,
       sourceEvent: "pull_request",
       sourceAction: action,
-      supersedesInProgress: ["edited", "synchronize", "ready_for_review"].includes(action),
+      supersedesInProgress: [
+        "edited",
+        "synchronize",
+        "ready_for_review",
+        "unlocked",
+        "unlabeled",
+      ].includes(action),
     };
   }
 
   return { accepted: false, reason: "unsupported event" };
+}
+
+function isCloseGuardLabel(value) {
+  const label = String(objectValue(value).name || "")
+    .trim()
+    .toLowerCase();
+  return isExactReviewCloseGuardLabel(label);
 }
 
 function isEligibleGithubWebhookRepository(repo) {
@@ -1053,6 +2041,117 @@ async function authenticatedExactReviewEnqueue(request, env) {
   );
 }
 
+async function authenticatedExactReviewReconcile(request, env) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const bodyText = await request.text();
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText }))) {
+    return json({ error: "invalid_signature" }, 401);
+  }
+  const body = parseJsonObject(bodyText);
+  if (!body) return json({ error: "invalid_json" }, 400);
+  const requestedRuns = exactReviewRequestedRuns(body.runs ?? body.run_ids);
+  if (!requestedRuns) return json({ error: "invalid_runs" }, 400);
+
+  const claimedResponse = await exactReviewQueueRequest(
+    env,
+    "/claimed-runs",
+    new Request("https://clawsweeper-exact-review-queue/claimed-runs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        runs: requestedRuns.map((run) => ({
+          run_id: run.runId,
+          ...(run.runAttempt ? { run_attempt: run.runAttempt } : {}),
+        })),
+      }),
+    }),
+  );
+  if (!claimedResponse.ok) return json({ error: "exact_review_queue_unavailable" }, 503);
+  const claimedBody = objectValue(await claimedResponse.json().catch(() => null));
+  const claimedRuns = exactReviewClaimedRuns(claimedBody.runs);
+  if (!claimedRuns) return json({ error: "exact_review_queue_unavailable" }, 503);
+  const candidates: Array<ExactReviewClaimedRun & { requestedRunAttempt?: number }> = [];
+  for (const requested of requestedRuns) {
+    const matches = claimedRuns.filter((claimed) => claimed.runId === requested.runId);
+    if (matches.length !== 1) continue;
+    candidates.push({ ...matches[0], requestedRunAttempt: requested.runAttempt });
+  }
+  if (!candidates.length) {
+    return json({
+      ok: true,
+      requested: requestedRuns.length,
+      claimed: 0,
+      terminal: 0,
+      unavailable: 0,
+      reconciled: 0,
+      requeued: 0,
+      completed: 0,
+    });
+  }
+
+  let token: string;
+  try {
+    token = await exactReviewActionsReadToken(env);
+  } catch {
+    return json({ error: "github_run_status_unavailable" }, 502);
+  }
+  const checked = await mapWithConcurrency(
+    candidates,
+    EXACT_REVIEW_RECONCILE_CONCURRENCY,
+    async (candidate) => {
+      try {
+        return await exactReviewTerminalRun(token, candidate);
+      } catch {
+        return undefined;
+      }
+    },
+  );
+  const unavailable = checked.filter((result) => result === undefined).length;
+  const terminalRuns = checked.filter(
+    (
+      result,
+    ): result is {
+      run_id: string;
+      run_attempt: number;
+      claimed_run_attempt: number | null;
+      claim_generation: number;
+      outcome: ExactReviewCompletionOutcome;
+    } => Boolean(result),
+  );
+  let reconciliation = { reconciled: 0, requeued: 0, completed: 0 };
+  if (terminalRuns.length) {
+    const response = await exactReviewQueueRequest(
+      env,
+      "/reconcile",
+      new Request("https://clawsweeper-exact-review-queue/reconcile", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ runs: terminalRuns }),
+      }),
+    );
+    if (!response.ok) return json({ error: "exact_review_reconcile_failed" }, 502);
+    const result = objectValue(await response.json().catch(() => null));
+    reconciliation = {
+      reconciled: Number(result.reconciled) || 0,
+      requeued: Number(result.requeued) || 0,
+      completed: Number(result.completed) || 0,
+    };
+  }
+  return json(
+    {
+      ok: unavailable === 0,
+      requested: requestedRuns.length,
+      claimed: candidates.length,
+      terminal: terminalRuns.length,
+      unavailable,
+      ...reconciliation,
+    },
+    unavailable ? 502 : 200,
+  );
+}
+
 async function enqueueExactReview({
   deliveryId,
   decision,
@@ -1084,12 +2183,39 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
   const itemKind = String(decision.itemKind || "");
   const sourceEvent = String(decision.sourceEvent || "");
   const sourceAction = String(decision.sourceAction || "");
+  const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
+  const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
+  const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
+  const statusCommentId = hasStatusCommentId ? Number(decision.statusCommentId) : undefined;
+  const hasAdditionalPrompt = Object.hasOwn(decision, "additionalPrompt");
+  const additionalPrompt = hasAdditionalPrompt ? decision.additionalPrompt : undefined;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) return null;
   if (!/^[A-Za-z0-9_./-]+$/.test(targetBranch)) return null;
   if (!Number.isInteger(itemNumber) || itemNumber <= 0) return null;
   if (itemKind !== "issue" && itemKind !== "pull_request") return null;
   if (sourceEvent !== "issues" && sourceEvent !== "pull_request") return null;
   if (!sourceAction) return null;
+  if (
+    hasCommandStatusMarker &&
+    (typeof commandStatusMarker !== "string" ||
+      !EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN.test(commandStatusMarker))
+  ) {
+    return null;
+  }
+  if (
+    hasStatusCommentId &&
+    (!Number.isSafeInteger(statusCommentId) || Number(statusCommentId) <= 0)
+  ) {
+    return null;
+  }
+  if (
+    hasAdditionalPrompt &&
+    (typeof additionalPrompt !== "string" ||
+      additionalPrompt.length > EXACT_REVIEW_ADDITIONAL_PROMPT_MAX_CHARS ||
+      additionalPrompt.includes("\0"))
+  ) {
+    return null;
+  }
   return {
     targetRepo,
     targetBranch,
@@ -1104,7 +2230,25 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
     ...(Number.isFinite(Number(decision.mediaProofTimeoutMs))
       ? { mediaProofTimeoutMs: Number(decision.mediaProofTimeoutMs) }
       : {}),
+    ...(hasCommandStatusMarker ? { commandStatusMarker } : {}),
+    ...(hasStatusCommentId ? { statusCommentId } : {}),
+    ...(hasAdditionalPrompt ? { additionalPrompt } : {}),
   };
+}
+
+function mergePendingExactReviewDecision(
+  current: ExactReviewDecision,
+  next: ExactReviewDecision,
+): ExactReviewDecision {
+  const merged = { ...current, ...next };
+  if (
+    Object.hasOwn(next, "commandStatusMarker") &&
+    next.commandStatusMarker !== current.commandStatusMarker &&
+    !Object.hasOwn(next, "statusCommentId")
+  ) {
+    delete merged.statusCommentId;
+  }
+  return merged;
 }
 
 function exactReviewItemKey(decision: ExactReviewDecision) {
@@ -1122,11 +2266,182 @@ function exactReviewItemForLease(state: ExactReviewQueueState, leaseId: string) 
   return Object.values(state.items).find((item) => item.leaseId === leaseId) || null;
 }
 
+function exactReviewClaimResponse(
+  item: ExactReviewQueueItem,
+  protocolVersion: 1 | 2,
+  claimGeneration: number,
+) {
+  return {
+    ok: true,
+    claimed: true,
+    protocol_version: protocolVersion,
+    item_key: item.key,
+    ...(protocolVersion === 1 ? { revision: item.leaseRevision } : {}),
+    lease_revision: item.leaseRevision,
+    claim_generation: claimGeneration,
+    decision: item.leaseDecision,
+  };
+}
+
+function exactReviewCompletionOutcome(
+  value,
+  fallback?: ExactReviewCompletionOutcome,
+): ExactReviewCompletionOutcome | null {
+  const normalized =
+    value === undefined || value === null || value === "" ? fallback : String(value);
+  return normalized === "success" || normalized === "failure" || normalized === "cancelled"
+    ? normalized
+    : null;
+}
+
+function exactReviewRunAttempt(value): number | null {
+  const runAttempt = Number(value);
+  return Number.isInteger(runAttempt) && runAttempt > 0 ? runAttempt : null;
+}
+
+function exactReviewClaimGeneration(value) {
+  const generation = Number(value);
+  return Number.isInteger(generation) && generation >= 0 ? generation : 0;
+}
+
+function exactReviewTerminalRuns(value) {
+  if (!Array.isArray(value) || value.length > EXACT_REVIEW_RECONCILE_RUN_LIMIT) return null;
+  const runs: Array<
+    ExactReviewClaimedRun & {
+      runAttempt: number;
+      claimedRunAttempt?: number;
+      outcome: ExactReviewCompletionOutcome;
+    }
+  > = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const record = objectValue(entry);
+    const runId = String(record.run_id || "").trim();
+    const runAttempt = exactReviewRunAttempt(record.run_attempt);
+    const claimedRunAttempt =
+      record.claimed_run_attempt === null || record.claimed_run_attempt === undefined
+        ? undefined
+        : exactReviewRunAttempt(record.claimed_run_attempt);
+    const claimGeneration = Number(record.claim_generation);
+    const outcome = exactReviewCompletionOutcome(record.outcome);
+    if (
+      !/^\d+$/.test(runId) ||
+      !runAttempt ||
+      claimedRunAttempt === null ||
+      !Number.isInteger(claimGeneration) ||
+      claimGeneration < 0 ||
+      !outcome
+    ) {
+      return null;
+    }
+    const key = `${runId}:${runAttempt}:${claimGeneration}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    runs.push({ runId, runAttempt, claimedRunAttempt, claimGeneration, outcome });
+  }
+  return runs;
+}
+
+function exactReviewRequestedRuns(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > EXACT_REVIEW_RECONCILE_RUN_LIMIT
+  ) {
+    return null;
+  }
+  const runs: Array<{ runId: string; runAttempt?: number }> = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const record = objectValue(entry);
+    const runId = String(record.run_id || (typeof entry !== "object" ? entry : "")).trim();
+    if (!/^\d+$/.test(runId)) return null;
+    const hasRunAttempt = Object.hasOwn(record, "run_attempt");
+    const runAttempt = hasRunAttempt ? exactReviewRunAttempt(record.run_attempt) : null;
+    if (hasRunAttempt && !runAttempt) return null;
+    const key = `${runId}:${runAttempt || "latest"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    runs.push({ runId, ...(runAttempt ? { runAttempt } : {}) });
+  }
+  return runs;
+}
+
+function exactReviewClaimedRuns(value): ExactReviewClaimedRun[] | null {
+  if (!Array.isArray(value) || value.length > EXACT_REVIEW_RECONCILE_CLAIM_MATCH_LIMIT) {
+    return null;
+  }
+  const runs: ExactReviewClaimedRun[] = [];
+  for (const entry of value) {
+    const record = objectValue(entry);
+    const runId = String(record.run_id || "").trim();
+    const runAttempt =
+      record.run_attempt === null || record.run_attempt === undefined
+        ? undefined
+        : exactReviewRunAttempt(record.run_attempt);
+    const claimGeneration = Number(record.claim_generation);
+    if (
+      !/^\d+$/.test(runId) ||
+      runAttempt === null ||
+      !Number.isInteger(claimGeneration) ||
+      claimGeneration < 0
+    ) {
+      return null;
+    }
+    runs.push({ runId, runAttempt, claimGeneration });
+  }
+  return runs;
+}
+
+function finishExactReviewQueueItem(
+  state: ExactReviewQueueState,
+  item: ExactReviewQueueItem,
+  now: number,
+  outcome: ExactReviewCompletionOutcome,
+  requestedRetryAt = 0,
+  requeueLatest = false,
+) {
+  const retryingFailure = outcome !== "success";
+  const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
+  const requeued = retryingFailure || hasNewerRevision || requeueLatest;
+  if (requeued) {
+    clearExactReviewLease(item);
+    item.state = "pending";
+    if (retryingFailure) {
+      item.attempts += 1;
+      item.nextAttemptAt = Math.max(
+        exactReviewQueueEnqueueAttemptAt(state, now),
+        now + exactReviewRetryDelayMs(item.attempts),
+        hasNewerRevision ? 0 : requestedRetryAt,
+      );
+    } else {
+      item.nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
+      item.attempts = 0;
+    }
+    item.updatedAt = now;
+  } else {
+    delete state.items[item.key];
+  }
+  return requeued;
+}
+
+function exactReviewCompletionRetryAt(value, now: number): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const retryAt = Date.parse(String(value));
+  if (!Number.isFinite(retryAt)) return null;
+  if (retryAt > now + EXACT_REVIEW_COMPLETION_RETRY_MAX_MS) return null;
+  return Math.max(now, retryAt);
+}
+
 function clearExactReviewLease(item: ExactReviewQueueItem) {
   item.leaseId = undefined;
   item.leaseRevision = undefined;
+  item.leaseDecision = undefined;
   item.leaseExpiresAt = undefined;
   item.claimedRunId = undefined;
+  item.claimedRunAttempt = undefined;
+  item.claimGeneration = undefined;
+  item.claimProtocolVersion = undefined;
 }
 
 function isLiveExactReviewLease(item: ExactReviewQueueItem, now: number) {
@@ -1150,15 +2465,112 @@ function reclaimExpiredExactReviewLeases(state: ExactReviewQueueState, now: numb
   return changed;
 }
 
+function exactReviewQueueEnqueueAttemptAt(state: ExactReviewQueueState, now: number) {
+  const retryAt = Number(state.dispatcher?.retryAt || 0);
+  return (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
+    retryAt > now
+    ? retryAt
+    : now;
+}
+
+function deferPausedExactReviewQueue(state: ExactReviewQueueState, now: number, retryAt: number) {
+  for (const item of Object.values(state.items)) {
+    if (item.state !== "pending" || item.nextAttemptAt >= retryAt) continue;
+    item.nextAttemptAt = retryAt;
+    item.updatedAt = now;
+  }
+}
+
 function exactReviewQueueActiveCount(state: ExactReviewQueueState) {
   return Object.values(state.items).filter(
     (item) => item.state === "dispatching" || item.state === "leased",
   ).length;
 }
 
-function exactReviewQueueStats(state: ExactReviewQueueState) {
+function exactReviewQueueAdmittedItems(
+  state: ExactReviewQueueState,
+  now: number,
+  capacity: number,
+  targetCapacity: number,
+) {
+  const slots = Math.max(0, capacity - exactReviewQueueActiveCount(state));
+  const activeTargets = new Map<string, number>();
+  for (const item of Object.values(state.items)) {
+    if (item.state !== "dispatching" && item.state !== "leased") continue;
+    const target = item.decision.targetRepo;
+    activeTargets.set(target, (activeTargets.get(target) || 0) + 1);
+  }
+  const admitted: ExactReviewQueueItem[] = [];
+  const pending = Object.values(state.items)
+    .filter((item) => item.state === "pending" && item.nextAttemptAt <= now)
+    .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
+  for (const item of pending) {
+    if (admitted.length >= slots) break;
+    const target = item.decision.targetRepo;
+    const active = activeTargets.get(target) || 0;
+    if (active >= targetCapacity) continue;
+    activeTargets.set(target, active + 1);
+    admitted.push(item);
+  }
+  return admitted;
+}
+
+function exactReviewQueueStats(
+  state: ExactReviewQueueState,
+  now = Date.now(),
+  capacity = Number.POSITIVE_INFINITY,
+  targetCapacity = Number.POSITIVE_INFINITY,
+) {
   const items = Object.values(state.items);
   const pending = items.filter((item) => item.state === "pending");
+  const targets = new Map<
+    string,
+    {
+      target_repo: string;
+      pending: number;
+      dispatching: number;
+      leased: number;
+      oldest_pending_at: number | null;
+    }
+  >();
+  for (const item of items) {
+    const targetRepo = item.decision.targetRepo;
+    const current = targets.get(targetRepo) ?? {
+      target_repo: targetRepo,
+      pending: 0,
+      dispatching: 0,
+      leased: 0,
+      oldest_pending_at: null,
+    };
+    if (item.state === "pending") {
+      current.pending += 1;
+      current.oldest_pending_at =
+        current.oldest_pending_at === null
+          ? item.createdAt
+          : Math.min(current.oldest_pending_at, item.createdAt);
+    } else if (item.state === "dispatching") {
+      current.dispatching += 1;
+    } else {
+      current.leased += 1;
+    }
+    targets.set(targetRepo, current);
+  }
+  const targetStats = [...targets.values()]
+    .map((target) => ({
+      target_repo: target.target_repo,
+      pending: target.pending,
+      dispatching: target.dispatching,
+      leased: target.leased,
+      oldest_pending_at:
+        target.oldest_pending_at === null ? null : new Date(target.oldest_pending_at).toISOString(),
+    }))
+    .sort(
+      (left, right) =>
+        right.pending - left.pending ||
+        right.dispatching + right.leased - (left.dispatching + left.leased) ||
+        left.target_repo.localeCompare(right.target_repo),
+    );
+  const nextWakeAt = exactReviewQueueNextWakeAt(state, now, capacity, targetCapacity);
   return {
     pending: pending.length,
     dispatching: items.filter((item) => item.state === "dispatching").length,
@@ -1166,34 +2578,94 @@ function exactReviewQueueStats(state: ExactReviewQueueState) {
     oldest_pending_at: pending.length
       ? new Date(Math.min(...pending.map((item) => item.createdAt))).toISOString()
       : null,
+    oldest_pending_age_seconds: pending.length
+      ? Math.max(0, Math.floor((now - Math.min(...pending.map((item) => item.createdAt))) / 1000))
+      : null,
+    next_wake_at: nextWakeAt === null ? null : new Date(nextWakeAt).toISOString(),
+    dispatcher: {
+      state: state.dispatcher?.state || "unknown",
+      reason: state.dispatcher?.reason || null,
+      workflow_state: state.dispatcher?.workflowState || null,
+      checked_at: state.dispatcher?.checkedAt
+        ? new Date(state.dispatcher.checkedAt).toISOString()
+        : null,
+      retry_at: state.dispatcher?.retryAt ? new Date(state.dispatcher.retryAt).toISOString() : null,
+    },
+    target_stats: targetStats,
   };
 }
 
-function exactReviewQueueNextWakeAt(state: ExactReviewQueueState, now: number) {
+function exactReviewQueueNextWakeAt(
+  state: ExactReviewQueueState,
+  now: number,
+  capacity = Number.POSITIVE_INFINITY,
+  targetCapacity = Number.POSITIVE_INFINITY,
+) {
   const items = Object.values(state.items);
   if (!items.length) return null;
+  const activeItems = items.filter(
+    (item) => item.state === "dispatching" || item.state === "leased",
+  );
+  const activeLeaseWakeAt = activeItems
+    .map((item) => item.leaseExpiresAt)
+    .filter((value): value is number => Boolean(value && value > now));
+  if (activeItems.some((item) => !item.leaseExpiresAt || item.leaseExpiresAt <= now)) {
+    return now + 1_000;
+  }
+  if (activeItems.length >= capacity && activeLeaseWakeAt.length) {
+    return Math.max(now + 1_000, Math.min(...activeLeaseWakeAt));
+  }
+  const activeTargetWakeAt = new Map<string, number>();
+  const activeTargetCounts = new Map<string, number>();
+  for (const item of items) {
+    if (
+      (item.state === "dispatching" || item.state === "leased") &&
+      item.leaseExpiresAt &&
+      item.leaseExpiresAt > now
+    ) {
+      const target = item.decision.targetRepo;
+      activeTargetCounts.set(target, (activeTargetCounts.get(target) || 0) + 1);
+      const current = activeTargetWakeAt.get(item.decision.targetRepo);
+      activeTargetWakeAt.set(
+        target,
+        current === undefined ? item.leaseExpiresAt : Math.min(current, item.leaseExpiresAt),
+      );
+    }
+  }
   const times = items.flatMap((item) => {
-    if (item.state === "pending") return [item.nextAttemptAt];
+    if (item.state === "pending") {
+      const target = item.decision.targetRepo;
+      const blockedUntil =
+        (activeTargetCounts.get(target) || 0) >= targetCapacity
+          ? activeTargetWakeAt.get(target)
+          : undefined;
+      return [blockedUntil ?? item.nextAttemptAt];
+    }
     return item.leaseExpiresAt ? [item.leaseExpiresAt] : [];
   });
   if (!times.length) return now + DEFAULT_EXACT_REVIEW_RETRY_MS;
   return Math.max(now + 1_000, Math.min(...times));
 }
 
-function pruneExactReviewDeliveries(state: ExactReviewQueueState, now: number) {
-  for (const [deliveryId, receivedAt] of Object.entries(state.deliveries)) {
-    if (!Number.isFinite(receivedAt) || receivedAt + EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS <= now) {
-      delete state.deliveries[deliveryId];
-    }
-  }
-}
-
 export function exactReviewQueueCapacity(env) {
   return Math.max(
     1,
     Math.min(
-      64,
+      32,
       numberFrom(env.EXACT_REVIEW_QUEUE_MAX_CONCURRENT, DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT),
+    ),
+  );
+}
+
+function exactReviewTargetCapacity(env) {
+  return Math.max(
+    1,
+    Math.min(
+      exactReviewQueueCapacity(env),
+      numberFrom(
+        env.EXACT_REVIEW_TARGET_MAX_CONCURRENT,
+        DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT,
+      ),
     ),
   );
 }
@@ -1216,7 +2688,28 @@ function exactReviewRetryDelayMs(attempt: number) {
   return Math.min(5 * 60_000, DEFAULT_EXACT_REVIEW_RETRY_MS * 2 ** Math.min(attempt - 1, 4));
 }
 
+function exactReviewWorkflowPausedRetryMs(env) {
+  return Math.max(
+    30_000,
+    Math.min(
+      15 * 60_000,
+      numberFrom(
+        env.EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS,
+        DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS,
+      ),
+    ),
+  );
+}
+
 async function exactReviewDispatchToken(env) {
+  return exactReviewRepositoryToken(env, { actions: "read", contents: "write" });
+}
+
+async function exactReviewActionsReadToken(env) {
+  return exactReviewRepositoryToken(env, { actions: "read" });
+}
+
+async function exactReviewRepositoryToken(env, permissions) {
   const credentials = githubAppCredentials(env);
   if (!credentials) throw new Error("github app is not configured");
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
@@ -1226,8 +2719,75 @@ async function exactReviewDispatchToken(env) {
     installationId,
     label: CLAWSWEEPER_REVIEW_REPO,
     repositories: [repoName(CLAWSWEEPER_REVIEW_REPO)],
-    permissions: { contents: "write" },
+    permissions,
   });
+}
+
+async function exactReviewWorkflowState(token: string) {
+  const payload = await githubTokenJson({
+    token,
+    path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/workflows/sweep.yml`,
+    method: "GET",
+    body: undefined,
+    errorLabel: "ClawSweeper workflow status",
+  });
+  const state = String(payload.state || "").trim();
+  if (!state) throw new Error("ClawSweeper workflow status response missing state");
+  return state;
+}
+
+async function exactReviewTerminalRun(
+  token: string,
+  candidate: ExactReviewClaimedRun & { requestedRunAttempt?: number },
+) {
+  const expectedRunAttempt = candidate.requestedRunAttempt ?? candidate.runAttempt;
+  const latest = await githubTokenJson({
+    token,
+    path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${candidate.runId}`,
+    method: "GET",
+    body: undefined,
+    errorLabel: "ClawSweeper run status",
+  });
+  if (String(latest.id || "") !== candidate.runId) {
+    throw new Error("ClawSweeper run status response id mismatch");
+  }
+  const latestRunAttempt = exactReviewRunAttempt(latest.run_attempt);
+  if (!latestRunAttempt) {
+    throw new Error("ClawSweeper run status response attempt mismatch");
+  }
+  if (expectedRunAttempt && latestRunAttempt !== expectedRunAttempt) return null;
+  if (String(latest.status || "") !== "completed") return null;
+
+  const payload = await githubTokenJson({
+    token,
+    path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${candidate.runId}/attempts/${latestRunAttempt}`,
+    method: "GET",
+    body: undefined,
+    errorLabel: "ClawSweeper run attempt status",
+  });
+  if (
+    String(payload.id || "") !== candidate.runId ||
+    exactReviewRunAttempt(payload.run_attempt) !== latestRunAttempt ||
+    String(payload.status || "") !== "completed"
+  ) {
+    throw new Error("ClawSweeper run attempt status response mismatch");
+  }
+  const conclusion = String(payload.conclusion || "").trim();
+  if (!conclusion) throw new Error("ClawSweeper completed run missing conclusion");
+  return {
+    run_id: candidate.runId,
+    run_attempt: latestRunAttempt,
+    claimed_run_attempt: candidate.runAttempt ?? null,
+    claim_generation: candidate.claimGeneration,
+    outcome:
+      conclusion === "success" ? "success" : conclusion === "cancelled" ? "cancelled" : "failure",
+  } satisfies {
+    run_id: string;
+    run_attempt: number;
+    claimed_run_attempt: number | null;
+    claim_generation: number;
+    outcome: ExactReviewCompletionOutcome;
+  };
 }
 
 async function createGithubAppTokenFor({
@@ -1427,7 +2987,9 @@ async function addIssueCommentReaction({ token, repo, commentId, content }) {
     body: { content },
     errorLabel: "ClawSweeper comment reaction",
   }).catch((error) => {
-    if (!String(error.message || "").includes("422")) throw error;
+    if (!String(error.message || "").includes("422")) {
+      console.error(`ClawSweeper comment reaction failed: ${error?.message || error}`);
+    }
     return null;
   });
 }
@@ -1435,12 +2997,30 @@ async function addIssueCommentReaction({ token, repo, commentId, content }) {
 async function dispatchClawsweeperItem({
   token,
   decision,
+  itemKey,
   leaseId,
+  leaseRevision,
 }: {
   token: string;
   decision: ExactReviewDecision;
-  leaseId?: string;
+  itemKey: string;
+  leaseId: string;
+  leaseRevision: number;
 }) {
+  // Keep the v1 fields during the rolling-upgrade window. Old workflows consume
+  // this immutable dispatch snapshot, while v2 workflows ignore it after claim
+  // and consume the Worker's leaseDecision response instead.
+  const reviewOptions = {
+    ...(decision.codexTimeoutMs ? { codex_timeout_ms: decision.codexTimeoutMs } : {}),
+    ...(decision.mediaProofTimeoutMs
+      ? { media_proof_timeout_ms: decision.mediaProofTimeoutMs }
+      : {}),
+    ...(decision.commandStatusMarker
+      ? { command_status_marker: decision.commandStatusMarker }
+      : {}),
+    ...(decision.statusCommentId ? { status_comment_id: decision.statusCommentId } : {}),
+    ...(decision.additionalPrompt ? { additional_prompt: decision.additionalPrompt } : {}),
+  };
   await githubTokenJson({
     token,
     path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/dispatches`,
@@ -1448,6 +3028,12 @@ async function dispatchClawsweeperItem({
     body: {
       event_type: "clawsweeper_item",
       client_payload: {
+        queue_lease_id: leaseId,
+        queue_claim: {
+          protocol_version: 2,
+          item_key: itemKey,
+          lease_revision: leaseRevision,
+        },
         target_repo: decision.targetRepo,
         target_branch: decision.targetBranch,
         item_number: decision.itemNumber,
@@ -1455,11 +3041,7 @@ async function dispatchClawsweeperItem({
         source_event: decision.sourceEvent,
         source_action: decision.sourceAction,
         supersedes_in_progress: decision.supersedesInProgress,
-        ...(leaseId ? { queue_lease_id: leaseId } : {}),
-        ...(decision.codexTimeoutMs ? { codex_timeout_ms: decision.codexTimeoutMs } : {}),
-        ...(decision.mediaProofTimeoutMs
-          ? { media_proof_timeout_ms: decision.mediaProofTimeoutMs }
-          : {}),
+        ...(Object.keys(reviewOptions).length > 0 ? { review_options: reviewOptions } : {}),
       },
     },
     errorLabel: "ClawSweeper item dispatch",
@@ -1467,6 +3049,14 @@ async function dispatchClawsweeperItem({
 }
 
 async function dispatchClawsweeperComment({ token, decision, statusCommentId }) {
+  const exactVersion =
+    decision.commentUpdatedAt && typeof decision.commentBody === "string"
+      ? {
+          comment_event_auth: "github_webhook_v1",
+          comment_updated_at: decision.commentUpdatedAt,
+          comment_body_sha256: await sha256Text(decision.commentBody),
+        }
+      : {};
   await githubTokenJson({
     token,
     path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/dispatches`,
@@ -1481,11 +3071,16 @@ async function dispatchClawsweeperComment({ token, decision, statusCommentId }) 
         status_comment_id: statusCommentId,
         source_event: "issue_comment",
         source_action: decision.sourceAction,
-        max_comments: "1",
+        ...exactVersion,
       },
     },
     errorLabel: "ClawSweeper comment dispatch",
   });
+}
+
+async function sha256Text(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return hexEncode(new Uint8Array(digest));
 }
 
 async function githubTokenJson({ token, path, method = "GET", body, errorLabel }) {
@@ -1576,8 +3171,9 @@ function constantTimeEqual(left, right) {
 async function statusSnapshot(env) {
   const ttl = numberFrom(env.CACHE_TTL_SECONDS, 20);
   const cached = await readCachedSnapshot(env, ttl);
-  if (cached) return cached;
+  if (cached?.bay?.timings?.sample_kind === "latest_completed_jobs") return cached;
 
+  const github = createGithubJsonCache(env);
   const generatedAt = new Date().toISOString();
   const errors = [];
   const repo = env.CLAWSWEEPER_REPO || "openclaw/clawsweeper";
@@ -1587,15 +3183,15 @@ async function statusSnapshot(env) {
     .filter(Boolean);
   const budget = numberFrom(env.WORKER_BUDGET, 128);
   const [runs, completedRuns, filteredActiveRuns] = await Promise.all([
-    githubJson(env, `/repos/${repo}/actions/runs?per_page=100`).catch((error) => {
+    github(`/repos/${repo}/actions/runs?per_page=100`).catch((error) => {
       errors.push(`workflow runs: ${error.message}`);
       return null;
     }),
-    githubJson(env, `/repos/${repo}/actions/runs?status=completed&per_page=100`).catch((error) => {
+    github(`/repos/${repo}/actions/runs?status=completed&per_page=100`).catch((error) => {
       errors.push(`workflow runs completed: ${error.message}`);
       return null;
     }),
-    activeWorkflowRuns(env, repo, errors),
+    activeWorkflowRuns(env, repo, errors, github),
   ]);
   const workflowRuns = Array.isArray(runs?.workflow_runs) ? runs.workflow_runs : [];
   const completedWorkflowRuns = uniqueWorkflowRuns([
@@ -1615,11 +3211,11 @@ async function statusSnapshot(env) {
       codexJobName(`${run.name || ""} ${run.display_title || ""}`) &&
       TERMINAL_BAD_CONCLUSIONS.has(String(run.conclusion)),
   );
-  const activeJobs = await activeWorkerSnapshot(env, repo, workerRuns);
-  const [workerHealth, pipeline, clusterRepair, automerge, closed, storedEvents] =
+  const activeJobs = await activeWorkerSnapshot(env, repo, workerRuns, github);
+  const [workerHealth, pipeline, clusterRepair, applyHealth, automerge, closed, storedEvents] =
     await Promise.all([
       withTimeout(
-        recentWorkerHealth(env, repo, completedWorkflowRuns),
+        recentWorkerHealth(env, repo, completedWorkflowRuns, github),
         OPTIONAL_SECTION_TIMEOUT_MS * 2,
         "worker health",
       ).catch((error) => {
@@ -1627,7 +3223,7 @@ async function statusSnapshot(env) {
         return emptyWorkerHealth(generatedAt);
       }),
       withTimeout(
-        pipelineItems(env, workerRuns.slice(0, 30)),
+        pipelineItems(env, workerRuns.slice(0, 30), github),
         OPTIONAL_SECTION_TIMEOUT_MS,
         "pipeline",
       ).catch((error) => {
@@ -1635,7 +3231,7 @@ async function statusSnapshot(env) {
         return workerRuns.slice(0, 30).map((run) => classifyRun(run));
       }),
       withTimeout(
-        clusterRepairStatus(env, repo, targetRepos, activeRuns),
+        clusterRepairStatus(env, repo, targetRepos, activeRuns, github),
         OPTIONAL_SECTION_TIMEOUT_MS,
         "cluster repair intake",
       ).catch((error) => {
@@ -1643,7 +3239,15 @@ async function statusSnapshot(env) {
         return emptyClusterRepairStatus(targetRepos);
       }),
       withTimeout(
-        recentAutomerge(env, targetRepos[0] || "openclaw/openclaw"),
+        applyHealthStatus(env, targetRepos, github),
+        OPTIONAL_SECTION_TIMEOUT_MS,
+        "apply health",
+      ).catch((error) => {
+        errors.push(error.message);
+        return emptyApplyHealthStatus(targetRepos);
+      }),
+      withTimeout(
+        recentAutomerge(env, targetRepos[0] || "openclaw/openclaw", github),
         OPTIONAL_SECTION_TIMEOUT_MS,
         "automerge timing",
       ).catch((error) => {
@@ -1651,7 +3255,7 @@ async function statusSnapshot(env) {
         return { average_ms: null, samples: 0, items: [] };
       }),
       withTimeout(
-        recentClawsweeperClosed(env, targetRepos),
+        recentClawsweeperClosed(env, targetRepos, github),
         OPTIONAL_SECTION_TIMEOUT_MS,
         "recent closed",
       ).catch((error) => {
@@ -1665,6 +3269,21 @@ async function statusSnapshot(env) {
     ]);
   errors.push(...activeJobs.errors);
   errors.push(...workerHealth.errors);
+  const terminalBay = await updateBayTerminalState(
+    env,
+    workerHealth.recent_attempts,
+    closed.items,
+    generatedAt,
+    activeBayItemKeys(activeJobs.workers),
+  ).catch((error) => {
+    errors.push(`OpenClaw Bay terminal state: ${error instanceof Error ? error.message : error}`);
+    return emptyBayTerminalState(generatedAt);
+  });
+  const bay = {
+    ...terminalBay,
+    timings: summarizeBayTimings(workerHealth.recent_attempts, generatedAt),
+  };
+  const { recent_attempts: _recentAttempts, ...publicWorkerHealth } = workerHealth;
 
   const snapshot = {
     schema_version: 1,
@@ -1686,7 +3305,7 @@ async function statusSnapshot(env) {
       worker_detail_runs: activeJobs.detailRuns,
       worker_detail_fallbacks: activeJobs.fallbacks,
     },
-    health: workerHealth,
+    health: publicWorkerHealth,
     averages: {
       automerge_command_to_merge_ms: automerge.average_ms,
       automerge_samples: automerge.samples,
@@ -1694,8 +3313,10 @@ async function statusSnapshot(env) {
     workers: activeJobs.workers,
     automatic_work: automaticIssueWork(storedEvents, activeJobs.workers),
     pipeline,
+    bay,
     recent: {
       cluster_repair: clusterRepair,
+      apply_health: applyHealth,
       automerge: automerge.items,
       closed_items: closed.items,
       closed_stats: closed.stats,
@@ -2575,7 +4196,12 @@ function githubSearchUrl(query) {
   return `https://github.com/issues?q=${encodeURIComponent(query)}&s=created&o=desc`;
 }
 
-async function activeWorkerSnapshot(env, repo, runs) {
+async function activeWorkerSnapshot(
+  env,
+  repo,
+  runs,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const detailRunLimit = Math.max(
     1,
     numberFrom(env.WORKER_DETAIL_RUN_LIMIT, DEFAULT_WORKER_DETAIL_RUN_LIMIT),
@@ -2587,7 +4213,7 @@ async function activeWorkerSnapshot(env, repo, runs) {
   const detailRuns: WorkflowRunSummary[] = runs.slice(0, detailRunLimit);
   const results = await mapWithConcurrency(detailRuns, fetchConcurrency, async (run) => {
     try {
-      const jobs = await workflowJobsForRun(env, repo, run.id);
+      const jobs = await workflowJobsForRun(env, repo, run.id, github);
       return {
         run,
         workers: jobs
@@ -2657,8 +4283,13 @@ async function activeWorkerSnapshot(env, repo, runs) {
   };
 }
 
-async function recentWorkerHealth(env, repo, runs: WorkflowRunSummary[]) {
-  const cacheKey = `worker-health:v1:${String(repo || "").toLowerCase()}`;
+async function recentWorkerHealth(
+  env,
+  repo,
+  runs: WorkflowRunSummary[],
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
+  const cacheKey = `worker-health:v3:${String(repo || "").toLowerCase()}`;
   const cached = await readStoredJson(env, cacheKey);
   if (cached) return cached;
 
@@ -2680,7 +4311,7 @@ async function recentWorkerHealth(env, repo, runs: WorkflowRunSummary[]) {
   const results = await mapWithConcurrency(completedRuns, fetchConcurrency, async (run) => {
     try {
       return {
-        attempts: (await workflowJobsForRun(env, repo, run.id))
+        attempts: (await workflowJobsForRun(env, repo, run.id, github))
           .filter((job) => isCodexWorkerJob(job))
           .map((job) => workerHealthAttempt(run, job))
           .filter(Boolean),
@@ -2730,6 +4361,13 @@ async function recentWorkerHealth(env, repo, runs: WorkflowRunSummary[]) {
     unresolved_failures: failures.length - recoveredFailures,
     error_rate_percent: ratePercent(failures.length, measuredAttempts),
     recovery_rate_percent: failures.length ? ratePercent(recoveredFailures, failures.length) : null,
+    recent_attempts: [...attempts]
+      .sort(
+        (left, right) =>
+          Date.parse(right.completed_at || right.started_at || "") -
+          Date.parse(left.completed_at || left.started_at || ""),
+      )
+      .slice(0, 50),
     failures: failures.slice(0, 10),
     errors: results.flatMap((result) => (result.error ? [result.error] : [])).slice(0, 10),
     updated_at: new Date().toISOString(),
@@ -2754,9 +4392,51 @@ function emptyWorkerHealth(updatedAt) {
     unresolved_failures: 0,
     error_rate_percent: 0,
     recovery_rate_percent: null,
+    recent_attempts: [],
     failures: [],
     errors: [],
     updated_at: updatedAt,
+  };
+}
+
+function boundedBayTimingDuration(startedAt, completedAt) {
+  const started = Date.parse(String(startedAt || ""));
+  const completed = Date.parse(String(completedAt || ""));
+  const duration = completed - started;
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || duration < 0) return null;
+  if (duration > BAY_TIMING_MAX_SAMPLE_MS) return null;
+  return duration;
+}
+
+export function summarizeBayTimings(attempts, generatedAt) {
+  const parsedNow = Date.parse(String(generatedAt || ""));
+  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  const cutoff = now - BAY_TIMING_WINDOW_MS;
+  const overallDurations: number[] = [];
+  for (const attempt of Array.isArray(attempts) ? attempts : []) {
+    const completedAt = Date.parse(String(attempt?.completed_at || ""));
+    if (!Number.isFinite(completedAt) || completedAt < cutoff || completedAt > now) continue;
+    const totalDuration = Number(attempt?.total_duration_ms);
+    if (
+      Number.isFinite(totalDuration) &&
+      totalDuration >= 0 &&
+      totalDuration <= BAY_TIMING_MAX_SAMPLE_MS
+    ) {
+      overallDurations.push(totalDuration);
+    }
+  }
+  return {
+    window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
+    sample_kind: "latest_completed_jobs",
+    sample_limit: 50,
+    overall: {
+      average_ms: overallDurations.length
+        ? Math.round(
+            overallDurations.reduce((total, value) => total + value, 0) / overallDurations.length,
+          )
+        : null,
+      samples: overallDurations.length,
+    },
   };
 }
 
@@ -2778,6 +4458,15 @@ function workerHealthAttempt(run, job) {
           ? "success"
           : null;
   if (!outcome) return null;
+  const jobConclusion = String(job?.conclusion || run?.conclusion || "");
+  const terminalOutcome =
+    jobConclusion === "cancelled"
+      ? "cancelled"
+      : TERMINAL_BAD_CONCLUSIONS.has(jobConclusion)
+        ? "failure"
+        : jobConclusion === "success" || jobConclusion === "neutral"
+          ? "success"
+          : null;
   const itemNumbers = [...target.itemNumbers].sort((left, right) => left - right);
   const targetKey =
     target.repository && itemNumbers.length
@@ -2787,9 +4476,12 @@ function workerHealthAttempt(run, job) {
           .replace(/\[clawsweeper-recovery-attempt=\d+\]/g, "")
           .replace(/\s+/g, " ")
           .trim()}`;
+  const startedAt = job?.started_at || run.created_at || null;
+  const completedAt = job?.completed_at || run.updated_at || startedAt;
   return {
     key: targetKey,
     outcome,
+    terminal_outcome: terminalOutcome,
     workflow_title: runItem.title,
     job_name: String(job?.name || runItem.title || "Codex worker"),
     repository: target.repository,
@@ -2797,7 +4489,242 @@ function workerHealthAttempt(run, job) {
     conclusion: conclusion || null,
     failed_step: failedStep ? String(failedStep.name || "Unknown step") : null,
     url: job?.html_url || run.html_url,
-    started_at: job?.started_at || run.created_at || null,
+    run_id: run.id,
+    job_id: job?.id || null,
+    started_at: startedAt,
+    completed_at: completedAt,
+    total_duration_ms: boundedBayTimingDuration(run.created_at || startedAt, completedAt),
+  };
+}
+
+function activeBayItemKeys(workers) {
+  const keys = new Set();
+  for (const worker of Array.isArray(workers) ? workers : []) {
+    const targets = new Map<number, Record<string, unknown>>(
+      (Array.isArray(worker?.target_items) ? worker.target_items : []).map(
+        (item): [number, Record<string, unknown>] => {
+          const target = objectValue(item);
+          return [Number(target.number), target];
+        },
+      ),
+    );
+    const numbers = Array.isArray(worker?.item_numbers)
+      ? worker.item_numbers
+      : worker?.item_number
+        ? [worker.item_number]
+        : [];
+    for (const value of numbers) {
+      const number = Number(value);
+      const target = targets.get(number);
+      const repository = nullableString(worker?.repository || target?.repository);
+      if (repository && Number.isInteger(number) && number > 0) keys.add(`${repository}#${number}`);
+    }
+  }
+  return [...keys];
+}
+
+async function updateBayTerminalState(env, attempts, closedItems, generatedAt, activeItemKeys) {
+  if (isDurableStatusStore(env.STATUS_STORE)) {
+    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(
+      statusStoreRequest(BAY_TERMINAL_STATE_KEY, "POST"),
+      {
+        method: "POST",
+        body: JSON.stringify({
+          attempts,
+          closed_items: closedItems,
+          generated_at: generatedAt,
+          ttl_seconds: EVENT_STORE_TTL_SECONDS,
+          active_item_keys: activeItemKeys,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`status store Bay merge failed: ${response.status}`);
+    return publicBayTerminalState(await response.json());
+  }
+  const stored = await readStoredJson(env, BAY_TERMINAL_STATE_KEY);
+  const next = mergeBayTerminalState(stored, attempts, closedItems, generatedAt, activeItemKeys);
+  if (!stored || bayTerminalStateSignature(stored) !== bayTerminalStateSignature(next)) {
+    await writeStoredJson(env, BAY_TERMINAL_STATE_KEY, next, EVENT_STORE_TTL_SECONDS);
+    return publicBayTerminalState(next);
+  }
+  return publicBayTerminalState(stored);
+}
+
+export function mergeBayTerminalState(
+  previous,
+  attempts,
+  closedItems,
+  generatedAt,
+  activeItemKeys = [],
+) {
+  const now = Date.parse(generatedAt);
+  const source = previous && previous.schema_version === 1 ? previous : {};
+  const activeKeys = new Set(
+    (Array.isArray(activeItemKeys) ? activeItemKeys : []).map((value) => String(value)),
+  );
+  const buffer = Array.isArray(source.terminal_buffer)
+    ? source.terminal_buffer.filter(
+        (item) => item?.event_id && item?.item_key && !activeKeys.has(String(item.item_key)),
+      )
+    : [];
+  const seenEvents = Array.isArray(source.seen_events)
+    ? source.seen_events.filter((item) => item?.event_id)
+    : [];
+  const seenIds = new Set(seenEvents.map((item) => item.event_id));
+  const recentlyWashed =
+    Array.isArray(source.recently_washed) &&
+    Number.isFinite(now) &&
+    now - Date.parse(source.washed_at || "") <= BAY_WASH_VISIBLE_MS
+      ? source.recently_washed
+      : [];
+  let washedAt = recentlyWashed.length ? source.washed_at || null : null;
+  let tideGeneration = Math.max(0, Number(source.tide_generation) || 0);
+  let lastTideAt = nullableString(source.last_tide_at);
+
+  for (const candidate of bayTerminalCandidates(attempts, closedItems)) {
+    if (activeKeys.has(candidate.item_key)) continue;
+    if (seenIds.has(candidate.event_id)) continue;
+    seenIds.add(candidate.event_id);
+    seenEvents.push({ event_id: candidate.event_id, seen_at: candidate.completed_at });
+    const existingIndex = buffer.findIndex((item) => item.item_key === candidate.item_key);
+    if (existingIndex === -1) {
+      buffer.push(candidate);
+      continue;
+    }
+    if (
+      Date.parse(candidate.completed_at || "") >=
+      Date.parse(buffer[existingIndex]?.completed_at || "")
+    ) {
+      buffer[existingIndex] = candidate;
+    }
+  }
+  buffer.sort(
+    (left, right) => Date.parse(left.completed_at || "") - Date.parse(right.completed_at || ""),
+  );
+
+  let washed = recentlyWashed;
+  while (buffer.length >= BAY_TIDE_THRESHOLD) {
+    washed = buffer.splice(0, BAY_TIDE_THRESHOLD);
+    washedAt = generatedAt;
+    lastTideAt = generatedAt;
+    tideGeneration += 1;
+  }
+
+  return {
+    schema_version: 1,
+    tide_threshold: BAY_TIDE_THRESHOLD,
+    tide_generation: tideGeneration,
+    last_tide_at: lastTideAt,
+    terminal_count: buffer.length,
+    terminal_buffer: buffer,
+    washed_at: washedAt,
+    recently_washed: washed,
+    seen_events: seenEvents.slice(-BAY_SEEN_EVENT_LIMIT),
+    updated_at: generatedAt,
+  };
+}
+
+function bayTerminalStateSignature(state) {
+  return JSON.stringify({
+    schema_version: state?.schema_version,
+    tide_threshold: state?.tide_threshold,
+    tide_generation: state?.tide_generation,
+    last_tide_at: state?.last_tide_at,
+    terminal_count: state?.terminal_count,
+    terminal_buffer: state?.terminal_buffer,
+    washed_at: state?.washed_at,
+    recently_washed: state?.recently_washed,
+    seen_events: state?.seen_events,
+  });
+}
+
+function bayTerminalCandidates(attempts, closedItems) {
+  const candidates = [];
+  for (const attempt of Array.isArray(attempts) ? attempts : []) {
+    const outcome = String(attempt?.terminal_outcome || "");
+    if (!new Set(["success", "failure", "cancelled"]).has(outcome)) continue;
+    const repository = nullableString(attempt?.repository);
+    const completedAt = nullableString(attempt?.completed_at || attempt?.started_at);
+    if (!repository || !completedAt) continue;
+    for (const numberValue of Array.isArray(attempt?.item_numbers) ? attempt.item_numbers : []) {
+      const number = Number(numberValue);
+      if (!Number.isInteger(number) || number <= 0) continue;
+      const itemKey = `${repository}#${number}`;
+      const eventId = [
+        "worker",
+        attempt?.run_id || "run",
+        attempt?.job_id || "job",
+        itemKey,
+        outcome,
+        completedAt,
+      ].join(":");
+      candidates.push({
+        event_id: eventId,
+        item_key: itemKey,
+        repository,
+        number,
+        outcome,
+        title: nullableString(attempt?.workflow_title || attempt?.job_name) || itemKey,
+        item_url: `https://github.com/${repository}/issues/${number}`,
+        job_url: nullableString(attempt?.url),
+        run_id: attempt?.run_id || null,
+        completed_at: completedAt,
+        current_step: nullableString(attempt?.failed_step || attempt?.conclusion),
+        source: "worker_attempt",
+      });
+    }
+  }
+  for (const item of Array.isArray(closedItems) ? closedItems : []) {
+    const repository = nullableString(item?.repository);
+    const number = Number(item?.number);
+    const completedAt = nullableString(item?.closed_at);
+    if (!repository || !Number.isInteger(number) || number <= 0 || !completedAt) continue;
+    const itemKey = `${repository}#${number}`;
+    candidates.push({
+      event_id: ["closed", itemKey, completedAt].join(":"),
+      item_key: itemKey,
+      repository,
+      number,
+      outcome: "success",
+      title: nullableString(item?.title) || itemKey,
+      item_url: nullableString(item?.url) || `https://github.com/${repository}/issues/${number}`,
+      job_url: null,
+      run_id: null,
+      completed_at: completedAt,
+      current_step: "Closed by ClawSweeper",
+      source: "closed_item",
+    });
+  }
+  return candidates.sort(
+    (left, right) => Date.parse(left.completed_at) - Date.parse(right.completed_at),
+  );
+}
+
+function publicBayTerminalState(state) {
+  return {
+    schema_version: 1,
+    tide_threshold: state.tide_threshold,
+    tide_generation: state.tide_generation,
+    last_tide_at: state.last_tide_at,
+    terminal_count: state.terminal_count,
+    terminal_buffer: state.terminal_buffer,
+    washed_at: state.washed_at,
+    recently_washed: state.recently_washed,
+    updated_at: state.updated_at,
+  };
+}
+
+function emptyBayTerminalState(generatedAt) {
+  return {
+    schema_version: 1,
+    tide_threshold: BAY_TIDE_THRESHOLD,
+    tide_generation: 0,
+    last_tide_at: null,
+    terminal_count: 0,
+    terminal_buffer: [],
+    washed_at: null,
+    recently_washed: [],
+    updated_at: generatedAt,
   };
 }
 
@@ -2947,14 +4874,18 @@ async function mapWithConcurrency<Item, Result>(
   return results;
 }
 
-async function workflowJobsForRun(env, repo, runId) {
+async function workflowJobsForRun(
+  env,
+  repo,
+  runId,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const key = `workflow-jobs:${repo}:${runId}`;
   const cached = await readStoredJson(env, key);
   if (Array.isArray(cached)) return cached;
   const jobs = [];
   for (let page = 1; page <= WORKER_JOB_PAGE_LIMIT; page += 1) {
-    const payload = await githubJson(
-      env,
+    const payload = await github(
       `/repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100&page=${page}`,
     );
     const pageJobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
@@ -3127,16 +5058,20 @@ function workerStatusRank(status) {
   return 2;
 }
 
-async function activeWorkflowRuns(env, repo, errors) {
+async function activeWorkflowRuns(
+  env,
+  repo,
+  errors,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const pages = await Promise.all(
     ACTIVE_RUN_STATUS_FILTERS.map(async (status) => {
-      const runs = await githubJson(
-        env,
-        `/repos/${repo}/actions/runs?status=${status}&per_page=100`,
-      ).catch((error) => {
-        errors.push(`workflow runs ${status}: ${error.message}`);
-        return null;
-      });
+      const runs = await github(`/repos/${repo}/actions/runs?status=${status}&per_page=100`).catch(
+        (error) => {
+          errors.push(`workflow runs ${status}: ${error.message}`);
+          return null;
+        },
+      );
       return Array.isArray(runs?.workflow_runs) ? runs.workflow_runs : [];
     }),
   );
@@ -3177,7 +5112,11 @@ function newestWorkflowRunFirst(left, right) {
   return Date.parse(right.created_at || "") - Date.parse(left.created_at || "");
 }
 
-async function pipelineItems(env, runs) {
+async function pipelineItems(
+  env,
+  runs,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const items = [];
   const prCandidates = [];
   for (const run of runs) {
@@ -3191,7 +5130,7 @@ async function pipelineItems(env, runs) {
       prCandidates
         .filter((item) => !item.ci || item.ci.source === "workflow" || item.ci.state === "unknown")
         .slice(0, 4)
-        .map((item) => attachCiStatus(env, item)),
+        .map((item) => attachCiStatus(env, item, github)),
     );
   }
   return items.sort(
@@ -3278,12 +5217,15 @@ async function attachStoredCiStatuses(env, items) {
   );
 }
 
-async function attachCiStatus(env, item) {
+async function attachCiStatus(
+  env,
+  item,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   try {
-    const pr = await githubJson(env, `/repos/${item.repository}/pulls/${item.item_number}`);
+    const pr = await github(`/repos/${item.repository}/pulls/${item.item_number}`);
     if (!pr?.head?.sha) return;
-    const checks = await githubJson(
-      env,
+    const checks = await github(
       `/repos/${item.repository}/commits/${pr.head.sha}/check-runs?per_page=100`,
     );
     const runs = Array.isArray(checks?.check_runs) ? checks.check_runs : [];
@@ -3307,37 +5249,20 @@ async function attachCiStatus(env, item) {
   }
 }
 
-async function recentAutomerge(env, repo) {
+async function recentAutomerge(
+  env,
+  repo,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const cacheKey = `recent-automerge:${String(repo).toLowerCase()}`;
   const cached = await readStoredJson(env, cacheKey);
   if (cached?.items && Array.isArray(cached.items)) return cached;
 
-  const search = await githubJson(
-    env,
+  const search = await github(
     `/search/issues?q=${encodeURIComponent(`repo:${repo} is:pr is:merged label:clawsweeper:automerge sort:updated-desc`)}&per_page=${AVERAGE_LIMIT}`,
   );
-  const items = await Promise.all(
-    (Array.isArray(search?.items) ? search.items : []).map(async (issue) => {
-      const number = issue.number;
-      const [pr, comments] = await Promise.all([
-        githubJson(env, `/repos/${repo}/pulls/${number}`),
-        githubJson(env, `/repos/${repo}/issues/${number}/comments?per_page=100`),
-      ]);
-      const commandAt = firstAutomergeCommandAt(comments);
-      const mergedAt = pr?.merged_at || null;
-      const durationMs =
-        commandAt && mergedAt ? Date.parse(mergedAt) - Date.parse(commandAt) : null;
-      return {
-        url: issue.html_url,
-        title: issue.title,
-        number,
-        command_at: commandAt,
-        merged_at: mergedAt,
-        duration_ms: durationMs,
-        merge_commit_sha: pr?.merge_commit_sha || null,
-      };
-    }),
-  );
+  const issues = Array.isArray(search?.items) ? search.items : [];
+  const items = await recentAutomergeItems(env, repo, issues, github);
   const durations = items
     .map((item) => item.duration_ms)
     .filter((value) => Number.isFinite(value) && value >= 0);
@@ -3357,13 +5282,102 @@ async function recentAutomerge(env, repo) {
   return result;
 }
 
-async function clusterRepairStatus(env, repo, targetRepos, activeRuns) {
+async function recentAutomergeItems(env, repo, issues, github: GithubJsonReader) {
+  if (hasGithubAuth(env) && issues.length) {
+    try {
+      return await recentAutomergeItemsGraphql(env, repo, issues);
+    } catch {
+      // Keep dashboards on the existing REST path when GraphQL hydration is unavailable.
+    }
+  }
+  return Promise.all(issues.map((issue) => recentAutomergeItemRest(repo, issue, github)));
+}
+
+async function recentAutomergeItemsGraphql(env, repo, issues) {
+  const [owner, name] = String(repo || "").split("/");
+  if (!owner || !name) throw new Error(`invalid repository ${repo}`);
+  const aliases = issues
+    .map(
+      (issue, index) => `
+        pr${index}: pullRequest(number: ${Number(issue.number)}) {
+          mergedAt
+          mergeCommit { oid }
+          comments(first: 100) {
+            nodes {
+              body
+              createdAt
+            }
+          }
+        }`,
+    )
+    .join("\n");
+  const data = await githubGraphql(
+    env,
+    `query RecentAutomerge($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        ${aliases}
+      }
+    }`,
+    { owner, name },
+  );
+  const repository = data?.repository || {};
+  return issues.map((issue, index) => {
+    const pr = repository[`pr${index}`];
+    if (!pr) throw new Error(`missing automerge PR ${issue.number}`);
+    const comments = Array.isArray(pr?.comments?.nodes)
+      ? pr.comments.nodes.map((comment) => ({
+          body: comment?.body || "",
+          created_at: comment?.createdAt || null,
+        }))
+      : [];
+    return recentAutomergeItem(issue, {
+      merged_at: pr.mergedAt || null,
+      merge_commit_sha: pr.mergeCommit?.oid || null,
+      comments,
+    });
+  });
+}
+
+async function recentAutomergeItemRest(repo, issue, github: GithubJsonReader) {
+  const number = issue.number;
+  const [pr, comments] = await Promise.all([
+    github(`/repos/${repo}/pulls/${number}`),
+    github(`/repos/${repo}/issues/${number}/comments?per_page=100`),
+  ]);
+  return recentAutomergeItem(issue, {
+    merged_at: pr?.merged_at || null,
+    merge_commit_sha: pr?.merge_commit_sha || null,
+    comments,
+  });
+}
+
+function recentAutomergeItem(issue, details) {
+  const commandAt = firstAutomergeCommandAt(details.comments);
+  const mergedAt = details.merged_at || null;
+  const durationMs = commandAt && mergedAt ? Date.parse(mergedAt) - Date.parse(commandAt) : null;
+  return {
+    url: issue.html_url,
+    title: issue.title,
+    number: issue.number,
+    command_at: commandAt,
+    merged_at: mergedAt,
+    duration_ms: durationMs,
+    merge_commit_sha: details.merge_commit_sha || null,
+  };
+}
+
+async function clusterRepairStatus(
+  env,
+  repo,
+  targetRepos,
+  activeRuns,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const [workflowRuns, markers] = await Promise.all([
-    githubJson(
-      env,
+    github(
       `/repos/${repo}/actions/workflows/${encodeURIComponent(CLUSTER_REPAIR_INTAKE_WORKFLOW)}/runs?per_page=5`,
     ).catch(() => ({ workflow_runs: [] })),
-    Promise.all(targetRepos.map((targetRepo) => readClusterRepairMarker(env, targetRepo))),
+    Promise.all(targetRepos.map((targetRepo) => readClusterRepairMarker(env, targetRepo, github))),
   ]);
   const intakeRuns = Array.isArray(workflowRuns?.workflow_runs) ? workflowRuns.workflow_runs : [];
   return {
@@ -3379,14 +5393,253 @@ async function clusterRepairStatus(env, repo, targetRepos, activeRuns) {
   };
 }
 
-async function readClusterRepairMarker(env, targetRepo) {
+async function applyHealthStatus(
+  env,
+  targetRepos,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
+  const items = await Promise.all(
+    targetRepos.map((targetRepo) => readApplyHealthMarker(env, targetRepo, github)),
+  );
+  const attention = items.filter((item) => applyHealthNeedsAttention(item.status));
+  return {
+    items,
+    attention_count: attention.length,
+    latest_attention_at: latestIso(attention.map((item) => item.updated_at)),
+  };
+}
+
+async function readApplyHealthMarker(
+  env,
+  targetRepo,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
+  const stateRepo = String(env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO);
+  const stateRef = String(env.CLAWSWEEPER_STATE_REF || CLAWSWEEPER_STATE_REF);
+  const repoSlug = String(targetRepo || "").replace(/\//g, "-");
+  const statusPath = `results/sweep-status/${repoSlug}.json`;
+  try {
+    const content = await github(
+      `/repos/${stateRepo}/contents/${githubPath(statusPath)}?ref=${encodeURIComponent(stateRef)}`,
+    );
+    const status = parseJsonObject(decodeGithubContent(content?.content)) || {};
+    const health = objectValue(status.apply_health);
+    const skipReasons = numericRecord(health.skip_reasons);
+    const nextActions = applyHealthNextActions(health.next_actions);
+    const cursor = objectValue(health.cursor);
+    return {
+      target_repo: nullableString(status.target_repo) || targetRepo,
+      status_path: statusPath,
+      state: nullableString(status.state),
+      detail: nullableString(status.detail),
+      run_url: nullableString(health.run_url) || nullableString(status.run_url),
+      updated_at: nullableString(health.generated_at) || nullableString(status.updated_at),
+      mode: nullableString(health.mode),
+      status: nullableString(health.status) || "unavailable",
+      summary: nullableString(health.summary),
+      examined: optionalNumber(health.examined),
+      action_records: numberOrNull(health.action_records),
+      processed: numberOrNull(health.processed),
+      processed_limit: numberOrNull(health.processed_limit),
+      close_limit: numberOrNull(health.close_limit),
+      closed: numberOrNull(health.closed),
+      comment_synced: numberOrNull(health.comment_synced),
+      skipped: numberOrNull(health.skipped),
+      skip_reasons: skipReasons,
+      cursor_required: health.cursor_required === true,
+      lanes: applyHealthLanes(health.lanes),
+      next_actions: nextActions,
+      next_action_buckets: numericRecord(health.next_action_buckets),
+      cycle: applyHealthCycle(health.cycle),
+      attention_reasons: Array.isArray(health.attention_reasons)
+        ? health.attention_reasons
+            .map((reason) => String(reason))
+            .filter(Boolean)
+            .slice(0, 8)
+        : [],
+      cursor: cursor.next_after_number
+        ? {
+            next_after_number: numberOrNull(cursor.next_after_number),
+            next_after_apply_checked_at: nullableString(cursor.next_after_apply_checked_at),
+            updated_at: nullableString(cursor.updated_at),
+          }
+        : null,
+    };
+  } catch {
+    return {
+      target_repo: targetRepo,
+      status_path: statusPath,
+      state: null,
+      detail: null,
+      run_url: null,
+      updated_at: null,
+      mode: null,
+      status: "unavailable",
+      summary: null,
+      processed: null,
+      processed_limit: null,
+      close_limit: null,
+      closed: null,
+      comment_synced: null,
+      skipped: null,
+      skip_reasons: {},
+      cursor_required: false,
+      lanes: emptyApplyHealthLanes(),
+      next_actions: [],
+      next_action_buckets: {},
+      cycle: emptyApplyHealthCycle(),
+      attention_reasons: [],
+      cursor: null,
+    };
+  }
+}
+
+function emptyApplyHealthStatus(targetRepos) {
+  return {
+    items: targetRepos.map((targetRepo) => ({
+      target_repo: targetRepo,
+      status_path: `results/sweep-status/${String(targetRepo || "").replace(/\//g, "-")}.json`,
+      status: "unavailable",
+      updated_at: null,
+      skip_reasons: {},
+      cursor_required: false,
+      lanes: emptyApplyHealthLanes(),
+      next_actions: [],
+      next_action_buckets: {},
+      cycle: emptyApplyHealthCycle(),
+      attention_reasons: [],
+      cursor: null,
+    })),
+    attention_count: 0,
+    latest_attention_at: null,
+  };
+}
+
+function applyHealthNeedsAttention(status) {
+  return ["attention", "blocked", "degraded", "failed", "needs_attention", "warning"].includes(
+    String(status || "").toLowerCase(),
+  );
+}
+
+function applyHealthLanes(value) {
+  const source = objectValue(value);
+  return {
+    closure: applyHealthLane(source.closure),
+    comment_sync: applyHealthLane(source.comment_sync),
+  };
+}
+
+function emptyApplyHealthLanes() {
+  return {
+    closure: applyHealthLane(null),
+    comment_sync: applyHealthLane(null),
+  };
+}
+
+function applyHealthLane(value) {
+  const source = objectValue(value);
+  return {
+    processed: numberOrNull(source.processed),
+    closed: numberOrNull(source.closed),
+    comment_synced: numberOrNull(source.comment_synced),
+    skipped: numberOrNull(source.skipped),
+    skip_reasons: numericRecord(source.skip_reasons),
+  };
+}
+
+function applyHealthNextActions(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const source = objectValue(entry);
+      const reason = nullableString(source.reason);
+      if (!reason) return null;
+      return {
+        reason,
+        count: numberOrNull(source.count),
+        bucket: nullableString(source.bucket),
+        owner: nullableString(source.owner),
+        retryable: Boolean(source.retryable),
+        label: nullableString(source.label),
+        summary: nullableString(source.summary),
+        next_step: nullableString(source.next_step),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function applyHealthCycle(value) {
+  const source = objectValue(value);
+  return {
+    basis: nullableString(source.basis),
+    apply_ready_count: optionalNumber(source.apply_ready_count),
+    candidate_counts: applyHealthCandidateCounts(source.candidate_counts),
+    window_size: optionalNumber(source.window_size),
+    estimated_full_cycle_windows: optionalNumber(source.estimated_full_cycle_windows),
+    estimated_full_cycle_minutes: optionalNumber(source.estimated_full_cycle_minutes),
+    scheduled_interval_minutes: optionalNumber(source.scheduled_interval_minutes),
+    label: nullableString(source.label),
+  };
+}
+
+function emptyApplyHealthCycle() {
+  return {
+    basis: null,
+    apply_ready_count: null,
+    candidate_counts: null,
+    window_size: null,
+    estimated_full_cycle_windows: null,
+    estimated_full_cycle_minutes: null,
+    scheduled_interval_minutes: null,
+    label: null,
+  };
+}
+function applyHealthCandidateCounts(value) {
+  const source = objectValue(value);
+  const keys = [
+    "confirmed_proposal",
+    "guarded_retry",
+    "proof_required",
+    "promotion_total",
+    "promotion_eligible",
+    "promotion_cooldown_eligible",
+    "cooldown_eligible_total",
+    "inconsistent_or_stale",
+  ];
+  if (!keys.some((key) => Number.isFinite(Number(source[key])))) return null;
+  return Object.fromEntries(keys.map((key) => [key, numberOrNull(source[key]) || 0]));
+}
+function latestIso(values) {
+  const timestamps = values
+    .map((value) => Date.parse(value || ""))
+    .filter((value) => Number.isFinite(value));
+  if (!timestamps.length) return null;
+  return new Date(Math.max(...timestamps)).toISOString();
+}
+
+function numericRecord(value) {
+  const record = objectValue(value);
+  return Object.fromEntries(
+    Object.entries(record)
+      .map(([key, count]) => ({ key, count: numberOrNull(count) }))
+      .filter((entry) => entry.count !== null && entry.count > 0)
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map((entry) => [entry.key, entry.count]),
+  );
+}
+
+async function readClusterRepairMarker(
+  env,
+  targetRepo,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const stateRepo = String(env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO);
   const stateRef = String(env.CLAWSWEEPER_STATE_REF || CLAWSWEEPER_STATE_REF);
   const repoSlug = String(targetRepo || "").replace(/\//g, "-");
   const markerPath = `results/cluster-repair-intake/${repoSlug}.json`;
   try {
-    const content = await githubJson(
-      env,
+    const content = await github(
       `/repos/${stateRepo}/contents/${githubPath(markerPath)}?ref=${encodeURIComponent(stateRef)}`,
     );
     const marker = JSON.parse(decodeGithubContent(content?.content));
@@ -3458,7 +5711,11 @@ function decodeGithubContent(value) {
   return new TextDecoder().decode(bytes);
 }
 
-async function recentClawsweeperClosed(env, repos) {
+async function recentClawsweeperClosed(
+  env,
+  repos,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const trustedBotLogins = clawsweeperBotLogins(env);
   const cacheKey = [
     "recent-closed",
@@ -3470,7 +5727,7 @@ async function recentClawsweeperClosed(env, repos) {
 
   const since = new Date(Date.now() - CLOSED_STATS_HOURS * 60 * 60 * 1000).toISOString();
   const rows = await Promise.all(
-    repos.map((repo) => recentClawsweeperClosedForRepo(env, repo, since, trustedBotLogins)),
+    repos.map((repo) => recentClawsweeperClosedForRepo(env, repo, since, trustedBotLogins, github)),
   );
   const items = rows
     .flat()
@@ -3488,14 +5745,20 @@ async function recentClawsweeperClosed(env, repos) {
   return result;
 }
 
-async function recentClawsweeperClosedForRepo(env, repo, since, trustedBotLogins) {
+async function recentClawsweeperClosedForRepo(
+  env,
+  repo,
+  since,
+  trustedBotLogins,
+  github: GithubJsonReader = (path) => githubJson(env, path),
+) {
   const items = [];
-  const firstPage = await githubJson(env, closedIssuesPath(repo, since, 1)).catch(() => []);
+  const firstPage = await github(closedIssuesPath(repo, since, 1)).catch(() => []);
   const pages = [Array.isArray(firstPage) ? firstPage : []];
   if (pages[0].length >= 100 && CLOSED_STATS_PAGE_LIMIT > 1) {
     const remainingPages = await Promise.all(
       Array.from({ length: CLOSED_STATS_PAGE_LIMIT - 1 }, (_, index) =>
-        githubJson(env, closedIssuesPath(repo, since, index + 2)).catch(() => []),
+        github(closedIssuesPath(repo, since, index + 2)).catch(() => []),
       ),
     );
     pages.push(...remainingPages.map((issues) => (Array.isArray(issues) ? issues : [])));
@@ -3883,12 +6146,20 @@ function emptyClosedStats(generatedAt) {
 
 function firstAutomergeCommandAt(comments) {
   if (!Array.isArray(comments)) return null;
-  const command = comments.find((comment) =>
-    /@clawsweeper\s+auto\s*-?\s*merge|@clawsweeper\s+automerge|\/clawsweeper\s+auto\s*-?\s*merge|\/clawsweeper\s+automerge/i.test(
-      String(comment.body || ""),
-    ),
-  );
+  const command = comments
+    .slice()
+    .sort((left, right) => automergeCommentTime(left) - automergeCommentTime(right))
+    .find((comment) =>
+      /@clawsweeper\s+auto\s*-?\s*merge|@clawsweeper\s+automerge|\/clawsweeper\s+auto\s*-?\s*merge|\/clawsweeper\s+automerge/i.test(
+        String(comment.body || ""),
+      ),
+    );
   return command?.created_at || null;
+}
+
+function automergeCommentTime(comment) {
+  const timestamp = Date.parse(String(comment?.created_at || ""));
+  return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
 }
 
 async function readCachedSnapshot(env, ttlSeconds) {
@@ -3896,6 +6167,7 @@ async function readCachedSnapshot(env, ttlSeconds) {
   const text = await readStatusStoreText(env.STATUS_STORE, "snapshot");
   if (!text) return null;
   const snapshot = JSON.parse(text);
+  if (!snapshot?.bay) return null;
   if (Date.now() - Date.parse(snapshot.generated_at || "") > ttlSeconds * 1000) return null;
   return snapshot;
 }
@@ -4028,6 +6300,19 @@ function storeCacheRequest(key) {
   return new Request(`https://clawsweeper.internal/store/${encodeURIComponent(key)}`, {
     method: "GET",
   });
+}
+
+function createGithubJsonCache(env): GithubJsonReader {
+  const cache = new Map<string, ReturnType<typeof githubJson>>();
+  return (path: string) => {
+    const key = String(path);
+    let request = cache.get(key);
+    if (!request) {
+      request = githubJson(env, key);
+      cache.set(key, request);
+    }
+    return request;
+  };
 }
 
 async function githubJson(env, path) {
@@ -4424,6 +6709,11 @@ function numberOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  return numberOrNull(value);
+}
+
 function numberFrom(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -4446,6 +6736,22 @@ function html(value) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+    },
+  });
+}
+
+function demoHtml(value) {
+  return new Response(value, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy":
+        "default-src 'self'; img-src 'self' data:; connect-src 'self' https://*.openclaw.ai; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "x-robots-tag": "noindex, nofollow, noarchive",
     },
   });
 }
@@ -4564,6 +6870,133 @@ function externalHttpUrl(value, fallback) {
   }
 }
 
+function dashboardThemeInitScript() {
+  return `<script>
+(() => {
+  const themeKey = "clawsweeper-theme";
+  const themeChoices = new Set(["system", "light", "dark"]);
+  const themeQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
+  const themeColor = { light: "#f6f3ec", dark: "#141110" };
+  let themeChoice = "system";
+  try {
+    const saved = window.localStorage?.getItem(themeKey);
+    if (themeChoices.has(saved)) themeChoice = saved;
+  } catch {}
+  const active = themeChoice === "system" && themeQuery?.matches ? "dark" : themeChoice === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = active;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor[active]);
+})();
+</script>`;
+}
+
+function dashboardThemeCss() {
+  return `
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+.theme-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.theme-control > span {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.theme-options {
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.theme-options button {
+  appearance: none;
+  min-width: 48px;
+  min-height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.theme-options button:hover {
+  color: var(--text);
+}
+.theme-options button[aria-pressed="true"] {
+  color: var(--claw);
+  background: color-mix(in srgb, var(--claw) 10%, transparent);
+}
+`;
+}
+
+function dashboardThemeControlHtml() {
+  return `<div class="theme-control" aria-label="Theme">
+        <span>Theme</span>
+        <div class="theme-options" role="group" aria-label="Theme preference">
+          <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
+          <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+          <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+        </div>
+      </div>`;
+}
+
+function dashboardThemeControlScript() {
+  return `(() => {
+  const themeKey = "clawsweeper-theme";
+  const themeChoices = new Set(["system", "light", "dark"]);
+  const themeColor = { light: "#f6f3ec", dark: "#141110" };
+  const themeQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
+  const themeButtons = document.querySelectorAll("[data-theme-choice]");
+  const readThemeChoice = () => {
+    try {
+      const saved = window.localStorage?.getItem(themeKey);
+      return themeChoices.has(saved) ? saved : "system";
+    } catch {
+      return "system";
+    }
+  };
+  let themeChoice = readThemeChoice();
+  const activeTheme = () => themeChoice === "system" && themeQuery?.matches ? "dark" : themeChoice === "dark" ? "dark" : "light";
+  const applyTheme = () => {
+    const active = activeTheme();
+    document.documentElement.dataset.theme = active;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor[active]);
+    themeButtons.forEach(button => {
+      const selected = button.dataset.themeChoice === themeChoice;
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+  };
+  themeButtons.forEach(button => button.addEventListener("click", () => {
+    const choice = button.dataset.themeChoice;
+    if (!themeChoices.has(choice)) return;
+    themeChoice = choice;
+    try {
+      window.localStorage?.setItem(themeKey, choice);
+    } catch {}
+    applyTheme();
+  }));
+  const updateSystemTheme = () => {
+    if (themeChoice === "system") applyTheme();
+  };
+  if (typeof themeQuery?.addEventListener === "function") {
+    themeQuery.addEventListener("change", updateSystemTheme);
+  } else {
+    themeQuery?.addListener?.(updateSystemTheme);
+  }
+  applyTheme();
+})();`;
+}
+
 function serializedPageConfig(config) {
   return JSON.stringify(config).replace(/</g, "\\u003c");
 }
@@ -4583,104 +7016,148 @@ function triageHtml(config) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f6f3ec">
 <title>${escapeHtml(config.title)}</title>
+${dashboardThemeInitScript()}
 <style>
 :root {
-  color-scheme: dark;
-  --bg: #0a0e14;
-  --panel: #111821;
-  --panel-2: #151f2b;
-  --line: #2a3646;
-  --text: #e7edf5;
-  --muted: #9aa8ba;
-  --blue: #67b7ff;
-  --green: #4ed891;
-  --amber: #f3b759;
-  --red: #f46d75;
-  --violet: #b99cff;
+  color-scheme: light dark;
+  --bg: light-dark(#f6f3ec, #141110);
+  --panel: light-dark(#fffefa, #1c1916);
+  --line: light-dark(#e6dfd2, #2d2822);
+  --line-soft: light-dark(#eee8dd, #262019);
+  --text: light-dark(#211c15, #ece5da);
+  --muted: light-dark(#857a69, #988b7b);
+  --claw: light-dark(#d94a26, #ff6f48);
+  --green: light-dark(#31824f, #5cc088);
+  --amber: light-dark(#b3831d, #dcaf5e);
+  --red: light-dark(#c03d33, #ef685c);
+  --violet: light-dark(#6b59c8, #a893f0);
 }
 * { box-sizing: border-box; }
+html { scrollbar-color: light-dark(#cfc6b6, #3a332b) transparent; }
+${dashboardThemeCss()}
 body {
   margin: 0;
   background: var(--bg);
-  background-image:
-    radial-gradient(circle at 20% 80%, rgba(103, 183, 255, 0.03) 0%, transparent 50%),
-    radial-gradient(circle at 80% 20%, rgba(78, 216, 145, 0.03) 0%, transparent 50%),
-    radial-gradient(circle at 40% 40%, rgba(185, 156, 255, 0.02) 0%, transparent 50%);
-  background-attachment: fixed;
   color: var(--text);
-  font: 14px/1.45 "Avenir Next", "Helvetica Neue", sans-serif;
-  letter-spacing: 0;
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
-main { width: min(1560px, calc(100vw - 40px)); margin: 0 auto; padding: 28px 0 48px; }
-header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
-h1 { margin: 0; font-size: 28px; line-height: 1.1; letter-spacing: 0; }
-h2 { margin: 24px 0 12px; font-size: 16px; font-weight: 600; letter-spacing: 0; }
-a { color: var(--blue); text-decoration: none; }
-a:hover { color: #89c8ff; text-decoration: underline; }
+body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--claw);
+  z-index: 10;
+}
+::selection { background: color-mix(in srgb, var(--claw) 22%, transparent); }
+:focus-visible { outline: 2px solid color-mix(in srgb, var(--claw) 60%, transparent); outline-offset: 2px; }
+main { width: min(1560px, calc(100vw - 48px)); margin: 0 auto; padding: 34px 0 72px; }
+header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+header h1 + .muted { margin-top: 6px; font-size: 12px; }
+h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+h1::before { content: "🦞"; font-size: 20px; }
+h2 {
+  margin: 32px 0 12px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+h2::before { content: ""; flex: 0 0 auto; width: 14px; height: 2px; border-radius: 1px; background: var(--claw); }
+a { color: var(--claw); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-.top-links { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.top-links { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.top-link { color: var(--muted); font-size: 12.5px; font-weight: 500; }
+.top-link:hover { color: var(--claw); text-decoration: none; }
+#updated { font-size: 11px; }
 .pill,
 .tab,
 .query-link {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 24px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  background: #1a2532;
-  border: 1px solid #2a3646;
-  color: var(--text);
+  min-height: 22px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
   font-weight: 500;
+  transition: border-color 0.15s ease, color 0.15s ease;
 }
-.query-link { color: var(--blue); }
-.grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
-.metric {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  padding: 14px 16px;
-  min-height: 88px;
-  overflow: hidden;
+.pill:hover,
+.tab:hover,
+.query-link:hover { border-color: color-mix(in srgb, var(--claw) 45%, var(--line)); color: var(--text); }
+a.pill:hover,
+.query-link:hover { color: var(--claw); text-decoration: none; }
+.query-link { color: var(--claw); border-color: color-mix(in srgb, var(--claw) 35%, transparent); }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-bottom: 24px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
-.metric strong { display: block; font-size: 28px; line-height: 1.1; margin-top: 8px; font-weight: 700; }
-.metric span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
+.metric { padding: 16px 18px 14px; border-left: 1px solid var(--line-soft); min-width: 0; overflow: hidden; }
+.metric:first-child { border-left: 0; padding-left: 0; }
+.metric strong { display: block; margin-top: 9px; font-size: 28px; font-weight: 560; line-height: 1; letter-spacing: -0.03em; }
+.metric span { color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; }
+.metric .muted { font-size: 12px; margin-top: 4px; }
 .tabs {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   border-bottom: 1px solid var(--line);
-  margin-bottom: 12px;
-  padding-bottom: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
 }
 button.tab {
   cursor: pointer;
   font: inherit;
 }
 button.tab[aria-selected="true"] {
-  background: rgba(103, 183, 255, 0.16);
-  border-color: rgba(103, 183, 255, 0.55);
+  color: var(--claw);
+  border-color: color-mix(in srgb, var(--claw) 55%, transparent);
+  background: color-mix(in srgb, var(--claw) 8%, transparent);
 }
 .view-head {
   display: flex;
   align-items: end;
   justify-content: space-between;
   gap: 16px;
-  margin: 12px 0;
+  margin: 14px 0;
 }
 .view-title { display: grid; gap: 3px; min-width: 0; }
-.view-title strong { font-size: 18px; }
+.view-title strong { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
 .controls {
   display: flex;
   align-items: end;
   justify-content: space-between;
   gap: 12px;
-  margin: 0 0 12px;
+  margin: 0 0 14px;
   flex-wrap: wrap;
 }
 .control-group {
@@ -4696,39 +7173,43 @@ button.tab[aria-selected="true"] {
 }
 .field span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 input,
 select,
 .secondary-button {
-  min-height: 36px;
+  min-height: 34px;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #0d131b;
+  border-radius: 8px;
+  background: var(--panel);
   color: var(--text);
-  padding: 7px 10px;
+  padding: 6px 10px;
   font: inherit;
 }
-input { min-width: min(460px, calc(100vw - 40px)); }
+input { min-width: min(460px, calc(100vw - 48px)); }
 select { min-width: 190px; }
+input::placeholder { color: var(--muted); }
 input:focus,
 select:focus,
 .secondary-button:focus {
-  outline: 2px solid rgba(103, 183, 255, 0.4);
+  outline: 2px solid color-mix(in srgb, var(--claw) 55%, transparent);
   outline-offset: 1px;
 }
 .secondary-button {
   cursor: pointer;
   min-width: 70px;
   font-weight: 600;
+  color: var(--muted);
+  transition: border-color 0.15s ease, color 0.15s ease;
 }
+.secondary-button:hover { color: var(--claw); border-color: color-mix(in srgb, var(--claw) 45%, var(--line)); }
 .table-wrap {
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--panel);
 }
 table {
@@ -4739,29 +7220,32 @@ table {
 th,
 td {
   padding: 8px 10px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-soft);
   text-align: left;
   vertical-align: top;
 }
 th {
   position: relative;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   text-transform: uppercase;
-  background: #0d131b;
+  background: transparent;
   font-weight: 600;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.1em;
+  border-bottom-color: var(--line);
 }
-tbody tr:hover { background: rgba(103, 183, 255, 0.03); }
+tbody tr:hover { background: color-mix(in srgb, var(--claw) 3%, transparent); }
 tr:last-child td { border-bottom: 0; }
 .issue-cell { display: grid; gap: 4px; min-width: 0; }
 .issue-title {
   display: block;
   white-space: normal;
   overflow-wrap: anywhere;
-  line-height: 1.25;
-  font-weight: 650;
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--text);
 }
+.issue-title:hover { color: var(--claw); }
 .label-list { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .assignee-list { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .pr-list { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
@@ -4770,11 +7254,11 @@ tr:last-child td { border-bottom: 0; }
   display: inline-flex;
   align-items: center;
   min-height: 19px;
-  padding: 1px 6px;
-  border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.16);
-  background: #1a2532;
-  color: var(--text);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
   font-size: 11px;
   line-height: 1.25;
   max-width: 100%;
@@ -4782,27 +7266,37 @@ tr:last-child td { border-bottom: 0; }
   font-family: inherit;
   font-weight: 500;
   cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
 }
-.label-pill.clawsweeper { border-color: rgba(103, 183, 255, 0.35); }
-.label-pill.highlight { border-color: rgba(103, 183, 255, 0.35); }
+.label-pill.dot::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--label-color, transparent);
+}
+.label-pill.clawsweeper,
+.label-pill.highlight { color: var(--claw); border-color: color-mix(in srgb, var(--claw) 40%, transparent); }
 .label-pill:hover,
 .priority-filter:hover {
-  border-color: rgba(103, 183, 255, 0.55);
-  color: #ffffff;
+  border-color: color-mix(in srgb, var(--claw) 55%, transparent);
+  color: var(--claw);
 }
 .priority-filter {
-  border-color: rgba(243, 183, 89, 0.42);
-  background: rgba(243, 183, 89, 0.1);
+  border-color: color-mix(in srgb, var(--amber) 45%, transparent);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
   color: var(--amber);
 }
 .assignee-pill {
   display: inline-flex;
   align-items: center;
   min-height: 19px;
-  padding: 1px 6px;
-  border-radius: 10px;
-  border: 1px solid rgba(103, 183, 255, 0.28);
-  background: rgba(103, 183, 255, 0.1);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--violet) 40%, transparent);
+  background: color-mix(in srgb, var(--violet) 7%, transparent);
   color: var(--text);
   font-size: 11px;
   line-height: 1.25;
@@ -4814,19 +7308,19 @@ tr:last-child td { border-bottom: 0; }
   align-items: center;
   gap: 4px;
   min-height: 19px;
-  padding: 1px 6px;
-  border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.16);
-  background: #1a2532;
-  color: var(--text);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
   font-size: 11px;
   line-height: 1.25;
   max-width: 100%;
   overflow-wrap: anywhere;
 }
-.pr-chip.open { border-color: rgba(78, 216, 145, 0.45); color: var(--green); }
-.pr-chip.merged { border-color: rgba(185, 156, 255, 0.45); color: var(--violet); }
-.pr-chip.closed { border-color: rgba(244, 109, 117, 0.45); color: var(--red); }
+.pr-chip.open { border-color: color-mix(in srgb, var(--green) 45%, transparent); color: var(--green); }
+.pr-chip.merged { border-color: color-mix(in srgb, var(--violet) 45%, transparent); color: var(--violet); }
+.pr-chip.closed { border-color: color-mix(in srgb, var(--red) 45%, transparent); color: var(--red); }
 .resize-handle {
   position: absolute;
   top: 0;
@@ -4848,7 +7342,7 @@ tr:last-child td { border-bottom: 0; }
 }
 .resize-handle:hover::after,
 body.resizing-col .resize-handle::after {
-  background: rgba(103, 183, 255, 0.55);
+  background: color-mix(in srgb, var(--claw) 55%, transparent);
 }
 body.resizing-col {
   cursor: col-resize;
@@ -4857,17 +7351,28 @@ body.resizing-col {
 .priority { color: var(--amber); }
 .empty,
 .error {
-  padding: 24px;
+  padding: 26px;
   color: var(--muted);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
   text-align: center;
 }
-.error { color: var(--red); border-color: rgba(244,109,117,0.35); }
-@media (max-width: 1280px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } header, .view-head { align-items: start; flex-direction: column; } .top-links { justify-content: flex-start; } }
-@media (max-width: 760px) { main { width: min(100vw - 20px, 1560px); padding-top: 16px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+.empty::before { content: "🦞 "; opacity: 0.5; }
+.error { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+@media (max-width: 1280px) {
+  .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric:nth-child(3n + 1) { border-left: 0; padding-left: 0; }
+  header, .view-head { align-items: start; flex-direction: column; }
+  .top-links { justify-content: flex-start; }
+}
+@media (max-width: 760px) {
+  main { width: min(100vw - 24px, 1560px); padding-top: 20px; }
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -4878,7 +7383,8 @@ body.resizing-col {
       <div class="muted" id="subtitle">${escapeHtml(config.loadingSubtitle)}</div>
     </div>
     <div class="top-links">
-      ${config.links.map((link) => `<a class="pill" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
+      ${config.links.map((link) => `<a class="top-link" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
+      ${dashboardThemeControlHtml()}
       <span class="muted mono" id="updated"></span>
     </div>
   </header>
@@ -4920,6 +7426,7 @@ body.resizing-col {
   <section id="diagnostics" class="muted"></section>
 </main>
 <script>
+${dashboardThemeControlScript()}
 const PAGE = ${pageConfig};
 const fmt = new Intl.NumberFormat();
 const rel = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
@@ -5014,9 +7521,9 @@ function metric(label, count, detail) {
 function labelPill(label) {
   const name = label.name || String(label);
   const color = label.color ? '#' + label.color : '';
-  const style = color ? ' style="background: color-mix(in srgb, ' + esc(color) + ' 22%, #1a2532); border-color: color-mix(in srgb, ' + esc(color) + ' 55%, #2a3646);"' : '';
+  const style = color ? ' style="--label-color: ' + esc(color) + ';"' : '';
   const highlighted = (PAGE.highlightLabelPrefixes || []).some(prefix => name.startsWith(prefix));
-  const cls = highlighted ? "label-pill highlight" : "label-pill";
+  const cls = (highlighted ? "label-pill highlight" : "label-pill") + (color ? " dot" : "");
   return '<button class="' + cls + '" type="button" data-filter-value="' + esc(name) + '"' + style + ' title="Filter by ' + esc(name) + '">' + esc(name) + '</button>';
 }
 function assigneePills(row) {
@@ -5336,136 +7843,140 @@ function dashboardHtml(env: DashboardEnv = {}) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f6f3ec">
+${dashboardThemeInitScript()}
 <title>🦞 ClawSweeper Live</title>
 <style>
 :root {
-  color-scheme: dark;
-  --bg: #0a0e14;
-  --panel: #111821;
-  --panel-2: #151f2b;
-  --line: #2a3646;
-  --text: #e7edf5;
-  --muted: #9aa8ba;
-  --blue: #67b7ff;
-  --green: #4ed891;
-  --amber: #f3b759;
-  --red: #f46d75;
-  --violet: #b99cff;
-  --accent: #ff7a66;
+  color-scheme: light dark;
+  --bg: light-dark(#f6f3ec, #141110);
+  --panel: light-dark(#fffefa, #1c1916);
+  --line: light-dark(#e6dfd2, #2d2822);
+  --line-soft: light-dark(#eee8dd, #262019);
+  --track: light-dark(#ebe4d7, #2b2620);
+  --text: light-dark(#211c15, #ece5da);
+  --muted: light-dark(#857a69, #988b7b);
+  --claw: light-dark(#d94a26, #ff6f48);
+  --green: light-dark(#31824f, #5cc088);
+  --amber: light-dark(#b3831d, #dcaf5e);
+  --red: light-dark(#c03d33, #ef685c);
+  --violet: light-dark(#6b59c8, #a893f0);
 }
 * { box-sizing: border-box; }
-@keyframes wave {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-3px) rotate(1deg); }
-}
-@keyframes bubble {
-  0% { transform: translateY(0) scale(1); opacity: 0.05; }
-  50% { opacity: 0.08; }
-  100% { transform: translateY(-400px) scale(1.2); opacity: 0; }
-}
+html { scrollbar-color: light-dark(#cfc6b6, #3a332b) transparent; }
+${dashboardThemeCss()}
 body {
   margin: 0;
   background: var(--bg);
-  background-image:
-    radial-gradient(circle at 20% 80%, rgba(103, 183, 255, 0.03) 0%, transparent 50%),
-    radial-gradient(circle at 80% 20%, rgba(78, 216, 145, 0.03) 0%, transparent 50%),
-    radial-gradient(circle at 40% 40%, rgba(185, 156, 255, 0.02) 0%, transparent 50%);
-  background-attachment: fixed;
   color: var(--text);
-  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  letter-spacing: 0;
-  position: relative;
-  overflow-x: hidden;
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 body::before {
   content: "";
   position: fixed;
-  bottom: -50px;
-  left: -50px;
-  right: -50px;
-  height: 120px;
-  background: radial-gradient(ellipse at bottom, rgba(103, 183, 255, 0.05) 0%, transparent 70%);
-  animation: wave 8s ease-in-out infinite;
-  pointer-events: none;
-  z-index: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--claw);
+  z-index: 10;
 }
-main { width: min(1440px, calc(100vw - 40px)); margin: 0 auto; padding: 28px 0 48px; position: relative; z-index: 1; }
-header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+::selection { background: color-mix(in srgb, var(--claw) 22%, transparent); }
+:focus-visible { outline: 2px solid color-mix(in srgb, var(--claw) 60%, transparent); outline-offset: 2px; }
+main { width: min(1280px, calc(100vw - 48px)); margin: 0 auto; padding: 26px 0 72px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 h1 {
   margin: 0;
-  font-size: 28px;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
 }
-h1::before { content: "🦞"; font-size: 32px; animation: wave 3s ease-in-out infinite; }
+h1::before { content: "🦞"; font-size: 18px; }
+.live-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--claw) 45%, transparent);
+  border-radius: 999px;
+  color: var(--claw);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.live-tag::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--claw);
+  animation: heartbeat 2.4s ease-in-out infinite;
+}
+@keyframes heartbeat {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.top-links { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.top-link { color: var(--muted); font-size: 12.5px; font-weight: 500; }
+.top-link:hover { color: var(--claw); text-decoration: none; }
+#updated { font-size: 11px; }
+.hero { margin: 44px 0 10px; }
+.hero-headline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-size: 38px;
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+.hero-dot {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--muted) 50%, transparent);
+}
+.hero-dot.ok { background: var(--green); box-shadow: 0 0 0 5px color-mix(in srgb, var(--green) 14%, transparent); }
+.hero-dot.amber { background: var(--amber); box-shadow: 0 0 0 5px color-mix(in srgb, var(--amber) 16%, transparent); }
+.hero-dot.red { background: var(--red); box-shadow: 0 0 0 5px color-mix(in srgb, var(--red) 16%, transparent); }
+.hero > .muted { margin-top: 10px; font-size: 12.5px; }
 h2 {
-  margin: 28px 0 12px;
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  margin: 44px 0 12px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
   display: flex;
   align-items: center;
   gap: 8px;
 }
+h2::before { content: ""; flex: 0 0 auto; width: 14px; height: 2px; border-radius: 1px; background: var(--claw); }
 .muted { color: var(--muted); }
-.grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
-.metric {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  padding: 14px 16px;
-  min-height: 92px;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.2s ease;
+.grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-top: 30px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
-.metric:hover {
-  border-color: rgba(103, 183, 255, 0.4);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-}
-.metric::before {
-  content: "";
-  position: absolute;
-  top: -2px;
-  right: -2px;
-  width: 40px;
-  height: 40px;
-  background: radial-gradient(circle, rgba(103, 183, 255, 0.08) 0%, transparent 70%);
-  border-radius: 0 16px 0 100%;
-  pointer-events: none;
-}
-.metric strong { display: block; font-size: 28px; line-height: 1.1; margin-top: 8px; font-weight: 700; }
-.metric span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
-.band { height: 7px; margin-top: 12px; background: #1a2532; border-radius: 999px; overflow: hidden; position: relative; }
-.band::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
-  animation: shimmer 2s infinite;
-}
-@keyframes shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
-}
-.band > i { display: block; height: 100%; background: var(--blue); width: 0; transition: width 0.6s ease; }
-.overview-shell {
-  margin-top: 18px;
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: 20px;
-  background:
-    linear-gradient(135deg, rgba(103, 183, 255, 0.06), transparent 42%),
-    var(--panel);
-  box-shadow: inset 0 1px rgba(255,255,255,0.025);
-}
+.metric { padding: 18px 20px 16px; border-left: 1px solid var(--line-soft); min-width: 0; }
+.metric:first-child { border-left: 0; padding-left: 0; }
+.metric span { color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; }
+.metric strong { display: block; margin-top: 10px; font-size: 30px; font-weight: 560; line-height: 1; letter-spacing: -0.03em; }
+.metric > div.muted { margin-top: 4px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.band { width: 54px; height: 2px; margin-top: 12px; background: var(--track); border-radius: 999px; overflow: hidden; }
+.band > i { display: block; height: 100%; border-radius: 999px; background: var(--claw); width: 0; transition: width 0.6s ease; }
+.overview-shell { margin: 0; padding: 0; border: 0; background: transparent; }
 .overview-head,
 .automatic-head,
 .workers-head,
@@ -5475,257 +7986,244 @@ h2 {
   justify-content: space-between;
   gap: 12px;
 }
+.overview-head,
+.automatic-head,
+.workers-head { margin-top: 44px; }
 .overview-head h2,
 .automatic-head h2,
 .workers-head h2 { margin: 0; }
+.overview-head .muted,
+.automatic-head .muted,
+.workers-head .muted,
+.worker-toolbar .muted { font-size: 12px; }
 .flow-map {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 1px;
-  margin-top: 16px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: var(--line);
+  gap: 28px;
+  margin-top: 26px;
 }
-.flow-node {
-  min-width: 0;
-  min-height: 112px;
-  padding: 14px;
-  background: #0d141d;
-  position: relative;
-}
-.flow-node:not(:last-child)::after {
-  content: "›";
+.flow-node { position: relative; min-width: 0; padding-top: 18px; }
+.flow-node::before {
+  content: "";
   position: absolute;
-  z-index: 2;
-  right: -8px;
-  top: calc(50% - 15px);
-  width: 16px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  color: var(--blue);
+  top: 0;
+  left: 0;
+  right: -28px;
+  height: 2px;
   background: var(--line);
-  font: 20px/1 ui-monospace, monospace;
+}
+.flow-node:last-child::before { right: 0; }
+.flow-node::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--claw);
 }
 .flow-node span {
   color: var(--muted);
   font-size: 10px;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.11em;
+  letter-spacing: 0.1em;
 }
 .flow-node strong {
   display: block;
   margin-top: 7px;
-  font-size: 25px;
+  font-size: 26px;
+  font-weight: 560;
+  letter-spacing: -0.02em;
   line-height: 1;
 }
 .flow-node p {
   margin: 7px 0 0;
   color: var(--muted);
   font-size: 12px;
-  line-height: 1.35;
+  line-height: 1.4;
 }
-.capacity-rail {
-  display: grid;
-  grid-template-columns: repeat(16, minmax(0, 1fr));
-  gap: 4px;
-  margin-top: 14px;
-}
-.capacity-slot {
-  height: 8px;
-  border-radius: 2px;
-  background: #26313e;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
-}
-.capacity-slot.active {
-  background: var(--green);
-  box-shadow: 0 0 12px rgba(78,216,145,0.32);
-}
-.capacity-slot.waiting {
-  background: var(--amber);
-  box-shadow: 0 0 12px rgba(243,183,89,0.25);
-}
-.capacity-legend {
+.capacity-rail { margin-top: 30px; }
+.capacity-bar {
   display: flex;
-  gap: 14px;
-  margin-top: 8px;
-  color: var(--muted);
-  font-size: 11px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--track);
+  overflow: hidden;
 }
-.capacity-legend i,
+.capacity-bar i { display: block; height: 100%; }
+.capacity-bar .active { background: var(--claw); }
+.capacity-bar .waiting { background: var(--amber); }
+.capacity-meta { margin-top: 8px; color: var(--muted); font-size: 12px; }
 .status-dot {
   display: inline-block;
+  flex: 0 0 auto;
   width: 7px;
   height: 7px;
-  margin-right: 5px;
   border-radius: 50%;
-  background: #526172;
+  background: color-mix(in srgb, var(--muted) 50%, transparent);
 }
-.capacity-legend .active,
-.status-dot.active { background: var(--green); }
-.capacity-legend .waiting,
+.status-dot.active { background: var(--claw); }
 .status-dot.waiting { background: var(--amber); }
 .status-dot.done { background: var(--green); }
 .status-dot.failed { background: var(--red); }
-.automatic-head { margin-top: 24px; }
-.automatic-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 9px;
-  margin-top: 12px;
-}
-.automatic-card {
-  appearance: none;
+.apply-health-alert {
   display: grid;
   gap: 8px;
-  width: 100%;
-  min-width: 0;
-  padding: 13px;
-  text-align: left;
-  color: var(--text);
-  background:
-    linear-gradient(135deg, rgba(185,156,255,0.08), transparent 55%),
-    #0d141d;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  cursor: pointer;
-  font: inherit;
-  transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent);
+  border-left: 3px solid var(--amber);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--amber) 7%, transparent);
 }
-.automatic-card:hover,
-.automatic-card:focus-visible {
-  transform: translateY(-1px);
-  border-color: rgba(185,156,255,0.65);
-  background: #111b27;
-  outline: none;
-}
-.automatic-card-top,
-.automatic-card-meta {
+.apply-health-heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+.apply-health-heading strong { color: var(--amber); }
+.apply-health-alert p { margin: 0; color: var(--muted); font-size: 13px; }
+.apply-health-next strong { color: var(--text); }
+.apply-health-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.apply-health-meta .pill {
+  min-height: 21px;
+  padding: 1px 8px;
+  font-size: 11px;
+}
+.apply-health-reason { cursor: help; }
+.apply-health-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+}
+.apply-health-command {
   min-width: 0;
-}
-.automatic-title {
-  display: -webkit-box;
-  overflow: hidden;
-  color: #f0eaff;
-  font-weight: 650;
-  line-height: 1.35;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-.automatic-card-meta {
-  color: var(--muted);
+  padding: 6px 9px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: normal;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  line-height: 1.45;
   font-size: 12px;
 }
-.workers-head { margin-top: 24px; }
-.worker-toolbar { margin-top: 10px; align-items: flex-start; }
-.worker-filters { display: flex; flex-wrap: wrap; gap: 6px; }
-.filter-button {
-  appearance: none;
+.apply-health-copy { min-height: 27px; }
+@media (max-width: 740px) {
+  .apply-health-action { grid-template-columns: 1fr; }
+}
+.worker-toolbar { margin-top: 12px; }
+.worker-filters {
+  display: inline-flex;
+  flex-wrap: wrap;
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 5px 10px;
-  background: #0d141d;
-  color: var(--muted);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
+  background: var(--panel);
+  overflow: hidden;
 }
-.filter-button:hover,
-.filter-button.active {
-  color: var(--text);
-  border-color: rgba(103,183,255,0.55);
-  background: rgba(103,183,255,0.1);
-}
-.worker-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 9px;
-  margin-top: 12px;
-}
-.worker-card {
+.filter-button {
   appearance: none;
-  width: 100%;
-  min-width: 0;
-  padding: 13px;
-  text-align: left;
-  color: var(--text);
-  background: #0d141d;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  cursor: pointer;
+  border: 0;
+  border-left: 1px solid var(--line-soft);
+  padding: 5px 13px;
+  background: transparent;
+  color: var(--muted);
   font: inherit;
-  transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease;
 }
-.worker-card:hover,
-.worker-card:focus-visible {
-  transform: translateY(-1px);
-  border-color: rgba(103,183,255,0.6);
-  background: #111b27;
-  outline: none;
+.filter-button:first-child { border-left: 0; }
+.filter-button:hover { color: var(--text); }
+.filter-button.active {
+  color: var(--claw);
+  background: color-mix(in srgb, var(--claw) 8%, transparent);
 }
-.worker-card-top,
-.worker-card-meta,
-.worker-card-step {
-  display: flex;
+.worker-list {
+  margin-top: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.worker-row {
+  appearance: none;
+  display: block;
+  width: 100%;
+  padding: 11px 16px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.worker-row:last-child { border-bottom: 0; }
+.worker-row:hover,
+.worker-row:focus-visible { background: color-mix(in srgb, var(--claw) 3%, transparent); outline: none; }
+.worker-row-main {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1.1fr) minmax(0, 1.5fr) auto;
+  gap: 12px;
   align-items: center;
-  gap: 8px;
-  min-width: 0;
 }
-.worker-card-top { justify-content: space-between; }
+.automatic-row .worker-row-main { grid-template-columns: auto auto minmax(0, 1fr) auto; }
 .worker-name {
-  margin: 10px 0 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 650;
+  font-weight: 600;
+  font-size: 13.5px;
 }
-.worker-card-meta {
+.worker-step {
+  color: var(--claw);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worker-step::before { content: "↳ "; }
+.worker-time { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
+.worker-row-sub {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin-top: 6px;
+  padding-left: 19px;
+}
+.worker-target-ref { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.worker-target-title {
   color: var(--muted);
   font-size: 12px;
-}
-.worker-card-meta > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.worker-target-title {
-  display: -webkit-box;
-  margin-top: 7px;
-  overflow: hidden;
-  color: #dcecff;
-  font-size: 13px;
-  line-height: 1.35;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-.worker-target-ref { flex: 0 0 auto; }
-.worker-card-step {
-  margin-top: 11px;
-  color: var(--blue);
-  font-size: 12px;
-}
-.worker-card-step span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .worker-progress {
-  height: 3px;
-  margin-top: 10px;
-  overflow: hidden;
+  width: 64px;
+  height: 2px;
   border-radius: 999px;
-  background: #22303e;
+  background: var(--track);
+  overflow: hidden;
 }
 .worker-progress i {
   display: block;
   height: 100%;
-  background: var(--blue);
+  border-radius: 999px;
+  background: var(--claw);
 }
 dialog {
   width: min(680px, calc(100vw - 28px));
@@ -5733,14 +8231,14 @@ dialog {
   margin: 14px 14px 14px auto;
   padding: 0;
   color: var(--text);
-  background: #0c121a;
+  background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 20px;
-  box-shadow: 0 28px 90px rgba(0,0,0,0.55);
+  border-radius: 14px;
+  box-shadow: 0 24px 70px light-dark(rgba(48, 34, 22, 0.2), rgba(0, 0, 0, 0.6));
 }
 dialog::backdrop {
-  background: rgba(3,7,12,0.72);
-  backdrop-filter: blur(5px);
+  background: light-dark(rgba(52, 40, 28, 0.32), rgba(0, 0, 0, 0.55));
+  backdrop-filter: blur(4px);
 }
 .drawer {
   display: grid;
@@ -5754,29 +8252,36 @@ dialog::backdrop {
   gap: 18px;
   padding: 20px;
   border-bottom: 1px solid var(--line);
-  background: linear-gradient(135deg, rgba(103,183,255,0.09), transparent 55%);
 }
 .drawer-head h3 {
   margin: 9px 0 0;
-  font-size: 22px;
-  line-height: 1.2;
+  font-size: 19px;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
 }
+.drawer-head .pill { margin-right: 4px; }
 .drawer-close {
   appearance: none;
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   border: 1px solid var(--line);
   border-radius: 50%;
-  color: var(--text);
-  background: #111b27;
+  color: var(--muted);
+  background: transparent;
   cursor: pointer;
-  font-size: 18px;
+  font-size: 16px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.drawer-close:hover {
+  color: var(--claw);
+  border-color: color-mix(in srgb, var(--claw) 45%, var(--line));
 }
 .drawer-body {
   min-height: 0;
   padding: 20px;
   overflow: auto;
 }
+.drawer-body h2 { margin: 26px 0 10px; }
 .drawer-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5784,27 +8289,30 @@ dialog::backdrop {
 }
 .drawer-stat {
   padding: 11px 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--bg);
 }
 .drawer-stat span {
   display: block;
   color: var(--muted);
   font-size: 10px;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.09em;
 }
 .drawer-stat strong {
   display: block;
   margin-top: 5px;
   overflow-wrap: anywhere;
+  font-weight: 600;
 }
 .drawer-links { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.drawer-links .filter-button { border: 1px solid var(--line); border-radius: 999px; }
 .step-list {
   display: grid;
   gap: 0;
-  margin: 14px 0 0;
+  margin: 10px 0 0;
   padding: 0;
   list-style: none;
 }
@@ -5815,25 +8323,25 @@ dialog::backdrop {
   align-items: center;
   min-height: 37px;
   padding: 7px 0;
-  border-bottom: 1px solid rgba(42,54,70,0.65);
+  border-bottom: 1px solid var(--line-soft);
 }
 .step-row:last-child { border-bottom: 0; }
 .step-mark {
-  width: 9px;
-  height: 9px;
-  border: 2px solid #526172;
+  width: 8px;
+  height: 8px;
+  border: 2px solid color-mix(in srgb, var(--muted) 55%, transparent);
   border-radius: 50%;
 }
 .step-row.completed .step-mark { border-color: var(--green); background: var(--green); }
 .step-row.in_progress .step-mark {
-  border-color: var(--blue);
-  background: var(--blue);
-  box-shadow: 0 0 0 5px rgba(103,183,255,0.12);
+  border-color: var(--claw);
+  background: var(--claw);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--claw) 15%, transparent);
 }
 .step-row.queued .step-mark,
 .step-row.pending .step-mark,
 .step-row.waiting .step-mark { border-color: var(--amber); }
-.step-row strong { font-size: 12px; font-weight: 550; }
+.step-row strong { font-size: 12.5px; font-weight: 550; }
 .step-row span { color: var(--muted); font-size: 11px; }
 table {
   width: 100%;
@@ -5842,49 +8350,56 @@ table {
   border-collapse: collapse;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 10px;
   overflow: hidden;
 }
-th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th, td { padding: 10px 12px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
 td { overflow-wrap: anywhere; }
 th {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   text-transform: uppercase;
-  background: #0d131b;
+  background: transparent;
   font-weight: 600;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.1em;
+  border-bottom-color: var(--line);
 }
 tbody tr { transition: background-color 0.15s ease; }
-tbody tr:hover { background: rgba(103, 183, 255, 0.03); }
+tbody tr:hover { background: color-mix(in srgb, var(--claw) 3%, transparent); }
 tr:last-child td { border-bottom: 0; }
-a { color: var(--blue); text-decoration: none; transition: color 0.15s ease; }
-a:hover { color: #89c8ff; text-decoration: underline; }
-.top-links { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+a { color: var(--claw); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 24px;
-  padding: 3px 10px;
-  border-radius: 12px;
-  background: #1a2532;
-  border: 1px solid #2a3646;
-  color: var(--text);
+  min-height: 22px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
   font-weight: 500;
-  transition: all 0.15s ease;
+  transition: border-color 0.15s ease, color 0.15s ease;
 }
-.pill:hover { border-color: rgba(103, 183, 255, 0.4); }
+.pill:hover { border-color: color-mix(in srgb, var(--claw) 45%, var(--line)); color: var(--text); }
+a.pill:hover { color: var(--claw); text-decoration: none; }
 .green { color: var(--green); }
 .amber { color: var(--amber); }
 .red { color: var(--red); }
 .violet { color: var(--violet); }
+.pill.green { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+.pill.amber { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.pill.red { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+.pill.violet { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 40%, transparent); }
+.run-link { color: var(--claw); }
+.pill.run-link { color: var(--claw); border-color: color-mix(in srgb, var(--claw) 35%, transparent); }
 .split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 420px);
-  gap: 24px;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 390px);
+  gap: 32px;
   align-items: start;
 }
 .split > div,
@@ -5905,41 +8420,43 @@ a:hover { color: #89c8ff; text-decoration: underline; }
 #events {
   min-width: 0;
   overflow: hidden;
-  border-radius: 14px;
+  border-radius: 10px;
 }
 .work-list,
 .side-list {
-  display: grid;
-  gap: 8px;
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
 }
 .work-row,
 .side-row {
   display: grid;
   gap: 12px;
   min-width: 0;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  transition: border-color 0.15s ease, background-color 0.15s ease;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  transition: background-color 0.15s ease;
 }
+.work-row:last-child,
+.side-row:last-child { border-bottom: 0; }
 .work-row {
-  grid-template-columns: minmax(0, 1fr) minmax(210px, 260px) 82px;
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 250px) 74px;
   align-items: center;
-  padding: 12px 14px;
+  padding: 11px 14px;
 }
 .cluster-marker-row {
-  grid-template-columns: minmax(0, 1fr) minmax(210px, 260px);
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 250px);
 }
 .side-row {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
-  padding: 11px 12px;
+  padding: 10px 12px;
 }
 .work-row:hover,
-.side-row:hover {
-  border-color: rgba(103, 183, 255, 0.35);
-  background: rgba(103, 183, 255, 0.03);
-}
+.side-row:hover { background: color-mix(in srgb, var(--claw) 3%, transparent); }
 .work-main,
 .side-main {
   min-width: 0;
@@ -5981,9 +8498,7 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   gap: 2px;
   min-width: 74px;
 }
-.run-link {
-  color: var(--blue);
-}
+.stage-block strong { font-size: 13px; font-weight: 600; }
 .timebox {
   display: grid;
   justify-items: end;
@@ -5991,8 +8506,10 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   white-space: nowrap;
 }
 .timebox strong {
-  font-size: 18px;
+  font-size: 15px;
+  font-weight: 620;
   line-height: 1;
+  letter-spacing: -0.01em;
 }
 .timebox span,
 .side-meta {
@@ -6009,60 +8526,106 @@ a:hover { color: #89c8ff; text-decoration: underline; }
 .closed-stats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 .closed-stat {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 10px 12px;
+  padding: 12px 14px 12px;
+  border-left: 1px solid var(--line-soft);
   min-width: 0;
 }
+.closed-stat:first-child { border-left: 0; padding-left: 0; }
 .closed-stat span {
   display: block;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.09em;
 }
 .closed-stat strong {
   display: block;
-  margin-top: 4px;
+  margin-top: 6px;
   font-size: 22px;
+  font-weight: 560;
+  letter-spacing: -0.02em;
   line-height: 1;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
 .empty {
-  padding: 24px;
+  padding: 26px;
   color: var(--muted);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
   text-align: center;
-  font-style: italic;
 }
-.empty::before { content: "🦀 "; opacity: 0.3; }
-@media (max-width: 1280px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .split { grid-template-columns: 1fr; } .left-col { order: 1; } .side-col { order: 2; } .cluster-col-desktop { display: none; } .cluster-col-mobile { display: block; order: 3; } header { align-items: start; flex-direction: column; } .top-links { justify-content: flex-start; } .worker-grid, .automatic-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 900px) { .flow-map { grid-template-columns: 1fr; } .flow-node { min-height: 0; } .flow-node:not(:last-child)::after { content: "⌄"; right: 18px; top: auto; bottom: -16px; } }
-@media (max-width: 760px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .work-row { grid-template-columns: 1fr; align-items: start; } .work-state, .stage-block, .timebox { justify-content: start; justify-items: start; } .worker-grid, .automatic-grid { grid-template-columns: 1fr; } .worker-toolbar { align-items: stretch; flex-direction: column; } }
-@media (max-width: 560px) { main { width: min(100vw - 20px, 1440px); padding-top: 16px; } .grid, .closed-stats, .drawer-grid { grid-template-columns: 1fr; } .side-row { grid-template-columns: 1fr; } .side-meta { justify-content: flex-start; } .overview-shell { padding: 13px; } .capacity-rail { grid-template-columns: repeat(8, minmax(0, 1fr)); } dialog { margin: 7px; max-height: calc(100vh - 14px); } }
+.empty::before { content: "🦞 "; opacity: 0.5; }
+@media (max-width: 1280px) {
+  .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric { padding: 16px 18px 14px; }
+  .metric:nth-child(3n + 1) { border-left: 0; padding-left: 0; }
+  .split { grid-template-columns: 1fr; }
+  .left-col { order: 1; }
+  .side-col { order: 2; }
+  .cluster-col-desktop { display: none; }
+  .cluster-col-mobile { display: block; order: 3; }
+  header { align-items: start; flex-direction: column; }
+  .top-links { justify-content: flex-start; }
+}
+@media (max-width: 900px) {
+  .hero-headline { font-size: 28px; }
+  .flow-map { grid-template-columns: 1fr; gap: 16px; }
+  .flow-node { padding-top: 0; padding-left: 20px; }
+  .flow-node::before { display: none; }
+  .flow-node::after { top: 5px; }
+}
+@media (max-width: 760px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric:nth-child(3n + 1) { border-left: 1px solid var(--line-soft); padding-left: 18px; }
+  .metric:nth-child(2n + 1) { border-left: 0; padding-left: 0; }
+  .worker-row-main { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+  .worker-step { display: none; }
+  .work-row { grid-template-columns: 1fr; align-items: start; }
+  .work-state, .stage-block, .timebox { justify-content: start; justify-items: start; }
+  .worker-toolbar { align-items: stretch; flex-direction: column; }
+}
+@media (max-width: 560px) {
+  main { width: min(100vw - 24px, 1280px); padding-top: 18px; }
+  .hero { margin-top: 30px; }
+  .hero-headline { font-size: 23px; gap: 10px; }
+  .hero-dot { width: 10px; height: 10px; }
+  .grid, .drawer-grid { grid-template-columns: 1fr; }
+  .metric, .metric:nth-child(3n + 1) { border-left: 0; border-top: 1px solid var(--line-soft); padding-left: 0; }
+  .metric:first-child { border-top: 0; }
+  .closed-stats { grid-template-columns: 1fr; }
+  .closed-stat { border-left: 0; border-top: 1px solid var(--line-soft); padding-left: 0; }
+  .closed-stat:first-child { border-top: 0; }
+  .side-row { grid-template-columns: 1fr; }
+  .side-meta { justify-content: flex-start; }
+  .worker-row-sub { grid-template-columns: auto minmax(0, 1fr); }
+  .worker-progress { display: none; }
+  dialog { margin: 7px; max-height: calc(100vh - 14px); }
+}
 </style>
 </head>
 <body>
 <main>
   <header>
-    <div>
-      <h1>ClawSweeper Live</h1>
-      <div class="muted" id="subtitle">🌊 Loading pipeline state...</div>
-    </div>
+    <h1>ClawSweeper <span class="live-tag">Live</span></h1>
     <div class="top-links">
-      <a class="pill" href="/triage">Issue triage</a>
-      <a class="pill" href="/pr-proof-triage">PR proof triage</a>
-      <a class="pill" href="${escapeHtml(crabfleetUrl)}">Live terminals</a>
+      <a class="top-link" href="/triage">Issue triage</a>
+      <a class="top-link" href="/pr-proof-triage">PR proof triage</a>
+      <a class="top-link" href="${escapeHtml(crabfleetUrl)}">Live terminals</a>
+      ${dashboardThemeControlHtml()}
       <span class="muted mono" id="updated"></span>
     </div>
   </header>
+  <section class="hero">
+    <div class="hero-headline"><span class="hero-dot" id="hero-dot"></span><span id="hero-headline">Loading pipeline state...</span></div>
+    <div class="muted" id="subtitle"></div>
+  </section>
   <section class="grid" id="metrics"></section>
   <section class="overview-shell" aria-labelledby="system-overview-title">
     <div class="overview-head">
@@ -6071,11 +8634,7 @@ a:hover { color: #89c8ff; text-decoration: underline; }
     </div>
     <div class="flow-map" id="flow-map"></div>
     <div class="capacity-rail" id="capacity-rail"></div>
-    <div class="capacity-legend">
-      <span><i class="active"></i>running</span>
-      <span><i class="waiting"></i>waiting</span>
-      <span><i></i>available</span>
-    </div>
+    <div id="apply-health"></div>
     <div class="automatic-head">
       <h2>Automatic Builds</h2>
       <span class="muted" id="automatic-summary"></span>
@@ -6094,29 +8653,29 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   <section class="split">
     <div class="left-col">
       <div class="pipeline-col">
-        <h2>🌀 Active Pipeline</h2>
+        <h2>Active Pipeline</h2>
         <div id="pipeline"></div>
       </div>
       <div class="cluster-col cluster-col-desktop">
-        <h2>🔎 Cluster Intake</h2>
+        <h2>Cluster Intake</h2>
         <div class="cluster-repair"></div>
       </div>
     </div>
     <aside class="side-col">
-      <h2>⚡ Automerge Speed</h2>
+      <h2>Automerge Speed</h2>
       <div id="automerge"></div>
-      <h2>✅ Closed by ClawSweeper</h2>
+      <h2>Closed by ClawSweeper</h2>
       <div id="closed-stats"></div>
       <div id="closed"></div>
-      <h2>🩺 Worker Health</h2>
+      <h2>Worker Health</h2>
       <div id="worker-health"></div>
-      <h2>🧭 Operations</h2>
+      <h2>Operations</h2>
       <div id="operations"></div>
-      <h2>📡 Recent Activity</h2>
+      <h2>Recent Activity</h2>
       <div id="events"></div>
     </aside>
     <div class="cluster-col cluster-col-mobile">
-      <h2>🔎 Cluster Intake</h2>
+      <h2>Cluster Intake</h2>
       <div class="cluster-repair"></div>
     </div>
   </section>
@@ -6131,6 +8690,7 @@ a:hover { color: #89c8ff; text-decoration: underline; }
   </div>
 </dialog>
 <script>
+${dashboardThemeControlScript()}
 const fmt = new Intl.NumberFormat();
 const rel = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 function elapsed(ms) {
@@ -6183,7 +8743,7 @@ function modeLabel(mode) {
   }[mode] || mode;
 }
 function metric(label, value, sub, pct, color) {
-  return '<div class="metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong><div class="muted">' + esc(sub || "") + '</div><div class="band"><i style="width:' + Math.max(0, Math.min(100, pct || 0)) + '%;background:' + (color || "var(--blue)") + '"></i></div></div>';
+  return '<div class="metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong><div class="muted">' + esc(sub || "") + '</div><div class="band"><i style="width:' + Math.max(0, Math.min(100, pct || 0)) + '%;background:' + (color || "var(--claw)") + '"></i></div></div>';
 }
 function ciBadge(ci) {
   if (!ci) return '<span class="pill">ci unknown</span>';
@@ -6256,10 +8816,11 @@ function renderSystemMap(data) {
   const running = workers.filter(worker => worker.status === "in_progress").length;
   const waiting = workers.length - running;
   const budget = Math.max(0, fleet.worker_budget || 0);
-  document.getElementById("capacity-rail").innerHTML = Array.from({ length: budget }, (_, index) => {
-    const state = index < running ? " active" : index < running + waiting ? " waiting" : "";
-    return '<i class="capacity-slot' + state + '"></i>';
-  }).join("");
+  const free = Math.max(0, budget - running - waiting);
+  const share = value => budget ? Math.min(100, (value / budget) * 100) : 0;
+  document.getElementById("capacity-rail").innerHTML =
+    '<div class="capacity-bar"><i class="active" style="width:' + share(running) + '%"></i><i class="waiting" style="width:' + share(waiting) + '%"></i></div>' +
+    '<div class="capacity-meta">' + fmt.format(running) + ' running · ' + fmt.format(waiting) + ' waiting · ' + fmt.format(free) + ' of ' + fmt.format(budget) + ' slots free</div>';
   const fallbacks = fleet.worker_detail_fallbacks || 0;
   document.getElementById("overview-note").textContent = fallbacks
     ? "Live jobs with " + fallbacks + " workflow fallback" + (fallbacks === 1 ? "" : "s")
@@ -6280,11 +8841,24 @@ function renderWorkers(rows) {
     document.getElementById("workers").innerHTML = '<div class="empty">No workers match this view.</div>';
     return;
   }
-  document.getElementById("workers").innerHTML = '<div class="worker-grid">' + visible.map(worker => {
+  document.getElementById("workers").innerHTML = '<div class="worker-list">' + visible.map(worker => {
     const progress = worker.progress?.total ? Math.round((worker.progress.completed / worker.progress.total) * 100) : 0;
     const kind = workerKindLabel(worker.work_kind);
     const targetTitle = workerTargetTitle(worker);
-    return '<button type="button" class="worker-card" data-worker-id="' + esc(worker.id) + '" aria-label="Open details for ' + esc(targetTitle || worker.name) + '"><div class="worker-card-top"><span><span class="pill"><i class="status-dot ' + workerStatusClass(worker.status) + '"></i>' + esc(modeLabel(worker.mode)) + '</span>' + (kind ? ' <span class="pill">' + esc(kind) + '</span>' : '') + '</span><span class="muted mono">' + elapsed(worker.elapsed_ms) + '</span></div><div class="worker-name">' + esc(worker.name) + '</div><div class="worker-card-meta"><span class="worker-target-ref">' + esc(workerTarget(worker)) + '</span></div>' + (targetTitle ? '<div class="worker-target-title" title="' + esc(targetTitle) + '">' + esc(targetTitle) + '</div>' : '') + '<div class="worker-card-step"><span>↳ ' + esc(worker.current_step || worker.stage) + '</span></div><div class="worker-progress"><i style="width:' + progress + '%"></i></div></button>';
+    return '<button type="button" class="worker-row" data-worker-id="' + esc(worker.id) + '" aria-label="Open details for ' + esc(targetTitle || worker.name) + '">' +
+      '<div class="worker-row-main">' +
+      '<i class="status-dot ' + workerStatusClass(worker.status) + '"></i>' +
+      '<span class="pill">' + esc(modeLabel(worker.mode)) + (kind ? " · " + esc(kind) : "") + '</span>' +
+      '<strong class="worker-name" title="' + esc(worker.name) + '">' + esc(worker.name) + '</strong>' +
+      '<span class="worker-step">' + esc(worker.current_step || worker.stage) + '</span>' +
+      '<span class="worker-time mono">' + elapsed(worker.elapsed_ms) + '</span>' +
+      '</div>' +
+      '<div class="worker-row-sub">' +
+      '<span class="worker-target-ref mono">' + esc(workerTarget(worker)) + '</span>' +
+      '<span class="worker-target-title" title="' + esc(targetTitle) + '">' + esc(targetTitle) + '</span>' +
+      '<span class="worker-progress"><i style="width:' + progress + '%"></i></span>' +
+      '</div>' +
+      '</button>';
   }).join("") + '</div>';
 }
 function renderAutomaticWork(rows) {
@@ -6298,18 +8872,22 @@ function renderAutomaticWork(rows) {
     return;
   }
   document.getElementById("automatic-work").innerHTML =
-    '<div class="automatic-grid">' +
+    '<div class="worker-list">' +
     rows.map(row => {
       const phase = compactText(row.phase || row.status || "queued").replaceAll("_", " ");
-      return '<button type="button" class="automatic-card" data-automatic-id="' + esc(row.id) +
+      return '<button type="button" class="worker-row automatic-row" data-automatic-id="' + esc(row.id) +
         '" aria-label="Open automatic build details for ' + esc(row.title) + '">' +
-        '<div class="automatic-card-top"><span class="pill"><i class="status-dot ' +
-        workerStatusClass(row.status) + '"></i>' + esc(phase) + '</span><span class="muted">' +
-        esc(row.updated_at ? since(row.updated_at) : "") + '</span></div>' +
-        '<div class="automatic-title">' + esc(row.title || "Issue #" + row.issue_number) + '</div>' +
-        '<div class="automatic-card-meta"><span>' + esc(row.repository + "#" + row.issue_number) +
-        '</span><span>' + esc(row.pr_url ? "PR opened" : row.active ? "worker active" : row.status) +
-        '</span></div></button>';
+        '<div class="worker-row-main">' +
+        '<i class="status-dot ' + workerStatusClass(row.status) + '"></i>' +
+        '<span class="pill">' + esc(phase) + '</span>' +
+        '<strong class="worker-name">' + esc(row.title || "Issue #" + row.issue_number) + '</strong>' +
+        '<span class="worker-time mono">' + esc(row.updated_at ? since(row.updated_at) : "") + '</span>' +
+        '</div>' +
+        '<div class="worker-row-sub">' +
+        '<span class="worker-target-ref mono">' + esc(row.repository + "#" + row.issue_number) + '</span>' +
+        '<span class="worker-target-title">' + esc(row.pr_url ? "PR opened" : row.active ? "worker active" : row.status) + '</span>' +
+        '</div>' +
+        '</button>';
     }).join("") +
     '</div>';
 }
@@ -6436,18 +9014,31 @@ async function load() {
 }
 
 function renderDashboard(data, note) {
+  const unresolved = data.health?.unresolved_failures || 0;
+  const applyAttention = (data.recent?.apply_health?.items || []).filter(item =>
+    applyHealthNeedsAttention(item.status)
+  ).length;
+  const needsAttention = unresolved || applyAttention;
+  const workerCount = (data.workers || []).length;
+  const repoCount = (data.source.target_repositories || []).length;
+  document.getElementById("hero-dot").className = "hero-dot " + (needsAttention ? "amber" : "ok");
+  document.getElementById("hero-headline").textContent =
+    (needsAttention ? "Needs attention" : "All clear") + " — " +
+    fmt.format(workerCount) + " claw worker" + (workerCount === 1 ? "" : "s") + " sweeping " +
+    fmt.format(repoCount) + " " + (repoCount === 1 ? "repository" : "repositories");
   document.getElementById("subtitle").textContent = data.source.target_repositories.join(", ");
   document.getElementById("updated").textContent = "Updated " + since(data.generated_at) + (note ? " \u00b7 " + note : "");
   const fleet = data.fleet;
   document.getElementById("metrics").innerHTML = [
-    metric("🦾 Claw Workers", fmt.format(fleet.active_codex_jobs), "budget " + fleet.worker_budget, fleet.budget_used_percent, "var(--green)"),
-    metric("🌊 Active Sweeps", fmt.format(fleet.active_workflow_runs), "support " + fmt.format(fleet.support_workflow_runs || 0), Math.min(100, fleet.active_workflow_runs * 3), "var(--blue)"),
-    metric("⏳ Queue Depth", fmt.format(fleet.queued_workflow_runs), "support queue " + fmt.format(fleet.support_queued_workflow_runs || 0), Math.min(100, fleet.queued_workflow_runs * 10), "var(--amber)"),
-    metric("💥 Error Rate", (data.health?.error_rate_percent || 0) + "%", fmt.format(data.health?.failed_attempts || 0) + " failed / " + fmt.format(data.health?.attempts || 0) + " attempts", Math.min(100, data.health?.error_rate_percent || 0), data.health?.failed_attempts ? "var(--red)" : "var(--green)"),
-    metric("🛟 Recovery Rate", data.health?.recovery_rate_percent == null ? "n/a" : data.health.recovery_rate_percent + "%", fmt.format(data.health?.unresolved_failures || 0) + " unresolved", data.health?.recovery_rate_percent == null ? 100 : data.health.recovery_rate_percent, data.health?.unresolved_failures ? "var(--amber)" : "var(--green)"),
-    metric("🎯 Capacity", fleet.budget_used_percent + "%", "fleet utilization", fleet.budget_used_percent, "var(--green)")
+    metric("Claw Workers", fmt.format(fleet.active_codex_jobs), "budget " + fleet.worker_budget, fleet.budget_used_percent, "var(--green)"),
+    metric("Active Sweeps", fmt.format(fleet.active_workflow_runs), "support " + fmt.format(fleet.support_workflow_runs || 0), Math.min(100, fleet.active_workflow_runs * 3), "var(--claw)"),
+    metric("Queue Depth", fmt.format(fleet.queued_workflow_runs), "support queue " + fmt.format(fleet.support_queued_workflow_runs || 0), Math.min(100, fleet.queued_workflow_runs * 10), "var(--amber)"),
+    metric("Error Rate", (data.health?.error_rate_percent || 0) + "%", fmt.format(data.health?.failed_attempts || 0) + " failed / " + fmt.format(data.health?.attempts || 0) + " attempts", Math.min(100, data.health?.error_rate_percent || 0), data.health?.failed_attempts ? "var(--red)" : "var(--green)"),
+    metric("Recovery Rate", data.health?.recovery_rate_percent == null ? "n/a" : data.health.recovery_rate_percent + "%", fmt.format(data.health?.unresolved_failures || 0) + " unresolved", data.health?.recovery_rate_percent == null ? 100 : data.health.recovery_rate_percent, data.health?.unresolved_failures ? "var(--amber)" : "var(--green)"),
+    metric("Capacity", fleet.budget_used_percent + "%", "fleet utilization", fleet.budget_used_percent, "var(--green)")
   ].join("");
   renderSystemMap(data);
+  renderApplyHealth(data);
   renderAutomaticWork(data.automatic_work || []);
   renderWorkers(data.workers || []);
   openWorkerFromHash();
@@ -6459,6 +9050,330 @@ function renderDashboard(data, note) {
   renderWorkerHealth(data.health);
   renderOperations(data.recent.operation_counts);
   renderEvents(data.recent.events || []);
+}
+function renderApplyHealth(data) {
+  const target = document.getElementById("apply-health");
+  if (!target) return;
+  const items = (data.recent?.apply_health?.items || []).filter(item => applyHealthNeedsAttention(item.status));
+  if (!items.length) {
+    target.innerHTML = "";
+    return;
+  }
+  target.innerHTML = items.map(item => {
+    const topReason = applyHealthPrimaryReason(item);
+    const topInfo = applyHealthReasonInfo(topReason, item);
+    const action = applyHealthRecommendedAction(item, topReason);
+    const reasons = applyHealthReasonEntries(item)
+      .slice(0, 4)
+      .map(([reason, count]) => applyHealthReasonPill(reason, count, item))
+      .join("");
+    const showCursor = item.cursor_required || Boolean(item.cursor?.next_after_number);
+    const buckets = applyHealthNextActionBucketPills(item);
+    const cursor = item.cursor?.next_after_number ? "cursor #" + item.cursor.next_after_number : "cursor missing";
+    const cursorTitle = item.cursor?.next_after_number
+      ? "Rotation cursor was recorded; the next pruning run should continue after this item."
+      : "No rotation cursor was recorded. If this was a full scan window, the next pruning run can repeat the same records.";
+    const cursorPill = showCursor
+      ? '<span class="pill" title="' + esc(cursorTitle) + '">' + esc(cursor) + '</span>'
+      : "";
+    const actionRecords = Number.isFinite(item.action_records)
+      ? fmt.format(item.action_records)
+      : Number.isFinite(item.processed)
+        ? fmt.format(item.processed)
+        : "unknown";
+    const hasExamined = Number.isFinite(item.examined);
+    const examined = hasExamined ? fmt.format(item.examined) : null;
+    const activityLabel = hasExamined ? examined + " examined" : actionRecords + " actions";
+    const activityTitle = hasExamined
+      ? examined + " candidates examined; " + actionRecords + " produced action records."
+      : actionRecords + " action records; candidate examined count unavailable for this lane.";
+    const closed = Number.isFinite(item.closed) ? fmt.format(item.closed) : "unknown";
+    const synced = Number.isFinite(item.comment_synced) ? fmt.format(item.comment_synced) : "unknown";
+    const closureProcessed = Number.isFinite(item.lanes?.closure?.processed) ? fmt.format(item.lanes.closure.processed) : actionRecords;
+    const syncProcessed = Number.isFinite(item.lanes?.comment_sync?.processed) ? fmt.format(item.lanes.comment_sync.processed) : actionRecords;
+    const closureSynced = Number.isFinite(item.lanes?.closure?.comment_synced) ? fmt.format(item.lanes.closure.comment_synced) : "0";
+    const syncLaneSynced = Number.isFinite(item.lanes?.comment_sync?.comment_synced) ? fmt.format(item.lanes.comment_sync.comment_synced) : "0";
+    const cycle = applyHealthCyclePill(item.cycle);
+    const candidateMix = applyHealthCandidateMixPill(item.cycle);
+    return '<div class="apply-health-alert" role="status" title="' + esc(topInfo.summary + " Next: " + topInfo.action) + '">' +
+      '<div class="apply-health-heading"><strong>Pruning sweep ' + esc(applyHealthStatusLabel(item.status)) + " - " + esc(item.target_repo || "target repo") + '</strong><span class="pill" title="' + esc("Latest " + applyHealthModeLabel(item.mode) + " status from the sweep-status marker.") + '">' + esc(applyHealthModeLabel(item.mode)) + '</span></div>' +
+      '<p>' + esc(applyHealthOperatorSummary(item, topInfo)) + '</p>' +
+      '<p class="apply-health-next"><strong>Next check:</strong> ' + esc(topInfo.action) + '</p>' +
+      applyHealthActionHtml(action) +
+      '<div class="apply-health-meta"><span class="pill" title="' + esc(activityTitle) + '">' + esc(activityLabel) + '</span><span class="pill" title="' + esc("Closure lane: " + closureProcessed + " action records; " + closed + " closed.") + '">' + esc(closed) + ' closed</span><span class="pill" title="' + esc("Durable review comments refreshed across lanes: " + synced + ". Closure lane refreshed " + closureSynced + "; comment-sync lane refreshed " + syncLaneSynced + " from " + syncProcessed + " action records.") + '">' + esc(synced) + ' comments synced</span>' + cycle + candidateMix + cursorPill + reasons + buckets + linkClass(item.run_url, "workflow run", "pill run-link") + '</div></div>';
+  }).join("");
+}
+function applyHealthCyclePill(cycle) {
+  if (!cycle || cycle.basis !== "scheduled_close_cursor") return "";
+  const windows = Number(cycle.estimated_full_cycle_windows);
+  const label = Number.isFinite(windows)
+    ? "revisit ~" + fmt.format(windows) + " window" + (windows === 1 ? "" : "s")
+    : "revisit estimate";
+  return '<span class="pill" title="' + esc(cycle.label || "Estimated time to revisit the current apply-ready close queue.") + '">' + esc(label) + '</span>';
+}
+function applyHealthCandidateMixPill(cycle) {
+  const counts = cycle?.candidate_counts;
+  if (!counts) return "";
+  const confirmed = Number(counts.confirmed_proposal) || 0;
+  const guarded = Number(counts.guarded_retry) || 0;
+  const proof = Number(counts.proof_required) || 0;
+  const promotions = Number(counts.promotion_total) || 0;
+  const eligiblePromotions = Number(counts.promotion_eligible) || 0;
+  const cooldownEligiblePromotions = Number(counts.promotion_cooldown_eligible) || 0;
+  const cooldownEligibleTotal = Number(counts.cooldown_eligible_total) || 0;
+  const inconsistent = Number(counts.inconsistent_or_stale) || 0;
+  const label = fmt.format(confirmed) + " proposals · " + fmt.format(guarded) + " retries · " + fmt.format(eligiblePromotions) + "/" + fmt.format(promotions) + " promotions admitted";
+  const title = fmt.format(confirmed) + " confirmed proposals; " + fmt.format(guarded) + " guarded retries; " + fmt.format(eligiblePromotions) + " of " + fmt.format(promotions) + " promotion probes scheduler-admitted; " + fmt.format(cooldownEligiblePromotions) + " promotion probes and " + fmt.format(cooldownEligibleTotal) + " total candidates meet cooldown rules; " + fmt.format(proof) + " admitted candidates require close proof; " + fmt.format(inconsistent) + " inconsistent or stale records excluded.";
+  return '<span class="pill" title="' + esc(title) + '">' + esc(label) + '</span>';
+}
+function applyHealthNeedsAttention(status) {
+  return ["attention", "blocked", "degraded", "failed", "needs_attention", "warning"].includes(String(status || "").toLowerCase());
+}
+function applyHealthStatusLabel(status) {
+  const value = String(status || "").toLowerCase();
+  if (value === "failed") return "failed";
+  if (value === "degraded" || value === "warning" || value === "attention") return "degraded";
+  return "blocked";
+}
+function applyHealthModeLabel(mode) {
+  const value = String(mode || "").toLowerCase();
+  if (value === "comment_sync") return "comment-sync lane";
+  if (value === "close") return "close lane";
+  return "pruning lane";
+}
+function applyHealthReasonEntries(item) {
+  const entries = [];
+  const seen = new Set();
+  const skipReasons = item.skip_reasons || {};
+  for (const reason of item.attention_reasons || []) {
+    if (!reason || seen.has(reason)) continue;
+    seen.add(reason);
+    const skipCount = skipReasons[reason];
+    entries.push([reason, Number.isFinite(skipCount) ? skipCount : null]);
+  }
+  for (const entry of Object.entries(skipReasons).sort((left, right) => Number(right[1]) - Number(left[1]))) {
+    if (seen.has(entry[0])) continue;
+    seen.add(entry[0]);
+    entries.push(entry);
+  }
+  return entries;
+}
+function applyHealthPrimaryReason(item) {
+  return applyHealthReasonEntries(item)[0]?.[0] || item.status || "";
+}
+function applyHealthReasonPill(reason, count, item) {
+  const info = applyHealthReasonInfo(reason, item);
+  const countText = Number.isFinite(count) ? " " + fmt.format(count) : "";
+  return '<span class="pill apply-health-reason" title="' + esc(info.summary + " Next: " + info.action) + '">' + esc(info.label + countText) + '</span>';
+}
+function applyHealthNextActionForReason(item, reason) {
+  return (item.next_actions || []).find(action => action.reason === reason) || null;
+}
+function applyHealthNextActionBucketPills(item) {
+  const buckets = item.next_action_buckets || {};
+  const entries = Object.entries(buckets)
+    .filter(([, count]) => Number.isFinite(count) && count > 0)
+    .sort((left, right) => Number(right[1]) - Number(left[1]));
+  if (entries.length < 2) return "";
+  const total = entries.reduce((sum, [, count]) => sum + Number(count), 0);
+  const summary = entries
+    .slice(0, 4)
+    .map(([bucket, count]) => applyHealthBucketLabel(bucket) + " " + fmt.format(Number(count)))
+    .join("; ");
+  return '<span class="pill apply-health-reason" title="' + esc("Follow-up buckets: " + summary) + '">' + esc("follow-ups " + fmt.format(total)) + '</span>';
+}
+function applyHealthBucketLabel(bucket) {
+  const labels = {
+    already_resolved: "already resolved",
+    close_coverage_proof: "needs close proof",
+    conversation_unlock: "unlock conversation",
+    defer_until_closing_pr: "defer for PR state",
+    inspect: "inspect skips",
+    live_state_recovery: "live check recovery",
+    maintainer_review: "maintainer decision",
+    report_quality_repair: "repair review report",
+    review_refresh: "refresh reviews",
+    run_budget: "runtime budget",
+    stable_skip: "stable skips",
+  };
+  return labels[bucket] || applyHealthReasonLabel(bucket);
+}
+function applyHealthActionHtml(action) {
+  if (!action) return "";
+  const command = action.command || "";
+  const commandHtml = command
+    ? '<code class="apply-health-command" title="' + esc(command) + '">' + esc(command) + '</code><button class="filter-button apply-health-copy" type="button" data-copy-command="' + esc(command) + '" title="Copy this maintainer command">Copy command</button>'
+    : '<span class="apply-health-command" title="' + esc(action.detail || "") + '">' + esc(action.detail || "No safe automatic action is available from the dashboard.") + '</span>';
+  return '<div class="apply-health-action" title="' + esc(action.title || "") + '">' + commandHtml + linkClass(action.url, action.linkLabel || "open workflow", "pill run-link") + '</div>';
+}
+function applyHealthRecommendedAction(item, reason) {
+  const targetRepo = String(item.target_repo || "openclaw/openclaw");
+  const mode = String(item.mode || "").toLowerCase();
+  const workflowUrl = "https://github.com/openclaw/clawsweeper/actions/workflows/sweep.yml";
+  const nextAction = applyHealthNextActionForReason(item, reason);
+  if (reason === "cursor_required_but_missing_after_full_window") {
+    return {
+      title: "Maintainer action: inspect the current run before rerunning, because a missing cursor can make the next run repeat the same window.",
+      detail: "Inspect the cursor-write and state-publish steps; rerun only after the cursor write failure is understood.",
+      url: item.run_url || workflowUrl,
+      linkLabel: item.run_url ? "open run" : "open workflow",
+    };
+  }
+  if (reason === "skipped_changed_since_review") {
+    return {
+      title: "Maintainer action: " + (nextAction?.next_step || "refresh review records before trying to close changed items."),
+      command: "gh workflow run sweep.yml --repo openclaw/clawsweeper -f target_repo=" + targetRepo + " -f apply_existing=false",
+      url: workflowUrl,
+      linkLabel: "open workflow",
+    };
+  }
+  if (reason === "skipped_pr_close_coverage_proof") {
+    return {
+      title: "Maintainer action: " + (nextAction?.next_step || "add close-coverage proof before retrying PR pruning."),
+      detail: nextAction?.next_step || "Add or refresh close-coverage proof, then rerun the close lane.",
+      url: item.run_url || workflowUrl,
+      linkLabel: item.run_url ? "open run" : "open workflow",
+    };
+  }
+  if (nextAction && !nextAction.retryable) {
+    return {
+      title: "Maintainer action: " + (nextAction.next_step || "inspect this stable or policy-gated skip before rerunning."),
+      detail: nextAction.next_step || "No automatic rerun is recommended for this skip bucket.",
+      url: item.run_url || workflowUrl,
+      linkLabel: item.run_url ? "open run" : "open workflow",
+    };
+  }
+  if (nextAction && nextAction.bucket === "report_quality_repair") {
+    return {
+      title: "Maintainer action: " + (nextAction.next_step || "repair or refresh the review report."),
+      detail: nextAction.next_step || "Queue report-quality repair or re-review before retrying apply.",
+      url: item.run_url || workflowUrl,
+      linkLabel: item.run_url ? "open run" : "open workflow",
+    };
+  }
+  if (nextAction) {
+    return {
+      title: "Maintainer action: " + (nextAction.next_step || "inspect this follow-up before rerunning."),
+      detail: nextAction.next_step || "Inspect this follow-up bucket before retrying apply.",
+      url: item.run_url || workflowUrl,
+      linkLabel: item.run_url ? "open run" : "open workflow",
+    };
+  }
+  if (mode === "comment_sync") {
+    return {
+      title: "Maintainer action: run the next comment-sync cursor window. GitHub permissions control who can run it.",
+      command: "gh workflow run sweep.yml --repo openclaw/clawsweeper -f target_repo=" + targetRepo + " -f apply_existing=true -f apply_sync_comments_only=true -f apply_item_numbers=__cursor__ -f apply_limit=25",
+      url: workflowUrl,
+      linkLabel: "open workflow",
+    };
+  }
+  const closeLimit = Number.isFinite(item.close_limit) && item.close_limit > 0 ? item.close_limit : 5;
+  return {
+    title: "Maintainer action: rerun the bounded close lane. GitHub permissions control who can run it.",
+    command: "gh workflow run sweep.yml --repo openclaw/clawsweeper -f target_repo=" + targetRepo + " -f apply_existing=true -f apply_limit=" + closeLimit + " -f apply_kind=all -f apply_close_reasons=all",
+    url: workflowUrl,
+    linkLabel: "open workflow",
+  };
+}
+function applyHealthReasonInfo(reason, item) {
+  const nextAction = item ? applyHealthNextActionForReason(item, reason) : null;
+  if (nextAction?.label || nextAction?.summary || nextAction?.next_step) {
+    return {
+      label: nextAction.label || applyHealthReasonLabel(reason),
+      summary: nextAction.summary || "ClawSweeper classified this skip bucket with a deterministic follow-up.",
+      action: nextAction.next_step || "Inspect this follow-up bucket before rerunning.",
+    };
+  }
+  const value = String(reason || "");
+  if (value === "cursor_required_but_missing_after_full_window") {
+    return {
+      label: "Rotation cursor missing",
+      summary: "The pruning sweep processed the full bounded window but did not publish the next cursor.",
+      action: "Open the workflow run and check the cursor-write step; until the cursor is written, the next run can repeat this window.",
+    };
+  }
+  if (value === "skipped_runtime_budget") {
+    return {
+      label: "Runtime budget hit",
+      summary: "The workflow stopped processing because it reached its bounded runtime.",
+      action: "Let the next scheduled sweep continue; if this repeats, reduce the batch size or raise the apply runtime budget.",
+    };
+  }
+  if (value === "skipped_live_fetch_failed") {
+    return {
+      label: "GitHub live check failed",
+      summary: "ClawSweeper could not confirm live GitHub state before mutating an item.",
+      action: "Inspect the workflow run for GitHub API, auth, or rate-limit failures, then rerun after live checks recover.",
+    };
+  }
+  if (value === "skipped_changed_since_review") {
+    return {
+      label: "Changed since review",
+      summary: "The item changed after the ClawSweeper review that proposed the close.",
+      action: "Refresh the ClawSweeper review for those items before closing; this skip is a safety guard.",
+    };
+  }
+  if (value === "skipped_pr_close_coverage_proof") {
+    return {
+      label: "PR close proof needed",
+      summary: "The PR needs coverage proof before ClawSweeper can close it as duplicate or superseded.",
+      action: "Add or refresh close-coverage proof, then rerun the sweep.",
+    };
+  }
+  if (value === "skipped_open_closing_pr") {
+    return {
+      label: "Closing PR still open",
+      summary: "The issue appears covered by an open pull request, so ClawSweeper avoided closing it early.",
+      action: "Review or land the linked closing PR before expecting the issue to close.",
+    };
+  }
+  if (value === "skipped_maintainer_authored") {
+    return {
+      label: "Maintainer-authored item",
+      summary: "Automation will not close this maintainer-authored item without human review.",
+      action: "Have a maintainer decide whether to close it manually or update the review policy.",
+    };
+  }
+  if (value === "skipped_policy_exempt" || value === "skipped_protected_label") {
+    return {
+      label: "Policy-protected item",
+      summary: "A label or policy exemption blocked automated pruning.",
+      action: "Check the policy or label before taking manual action.",
+    };
+  }
+  if (value === "skipped_not_open" || value === "skipped_already_closed" || value === "skipped_closed") {
+    return {
+      label: "Already closed",
+      summary: "The item was no longer open by the time ClawSweeper checked it.",
+      action: "No action is usually needed; investigate only if already-closed records dominate repeated runs.",
+    };
+  }
+  return {
+    label: applyHealthReasonLabel(value || "blocked_condition"),
+    summary: "ClawSweeper reported this skip bucket while checking whether it could safely prune an item.",
+    action: "Open the workflow run and inspect this skip bucket before rerunning or changing limits.",
+  };
+}
+function applyHealthReasonLabel(reason) {
+  return String(reason || "")
+    .replace(/^skipped_/, "")
+    .replace(/_/g, " ")
+    .replace(/\\b\\w/g, letter => letter.toUpperCase());
+}
+function applyHealthOperatorSummary(item, reasonInfo) {
+  const processed = applyHealthCount(item.processed, "record", "records");
+  const skipped = Number.isFinite(item.skipped) ? "; " + applyHealthCount(item.skipped, "record", "records") + " skipped" : "";
+  const closed = Number.isFinite(item.closed) ? item.closed : 0;
+  const synced = Number.isFinite(item.comment_synced) ? item.comment_synced : 0;
+  const useful = closed + synced;
+  const result = useful > 0
+    ? "ClawSweeper processed " + processed + " and completed " + applyHealthCount(useful, "close/comment update", "close/comment updates")
+    : "ClawSweeper processed " + processed + " without closing or syncing anything";
+  return result + skipped + ". Main signal: " + reasonInfo.label + ".";
+}
+function applyHealthCount(value, singular, plural) {
+  if (!Number.isFinite(value)) return "unknown " + plural;
+  return fmt.format(value) + " " + (value === 1 ? singular : plural);
 }
 function renderPipeline(rows) {
   if (!rows.length) {
@@ -6552,6 +9467,21 @@ document.getElementById("automatic-work").addEventListener("click", event => {
   if (!button) return;
   const row = automaticIndex.get(String(button.dataset.automaticId));
   if (row) renderAutomaticDialog(row);
+});
+document.addEventListener("click", event => {
+  const button = event.target.closest("button[data-copy-command]");
+  if (!button) return;
+  const command = String(button.dataset.copyCommand || "");
+  if (!command) return;
+  const copied = navigator.clipboard?.writeText(command);
+  if (!copied) return;
+  copied.then(() => {
+    const original = button.textContent;
+    button.textContent = "Copied";
+    setTimeout(() => {
+      button.textContent = original || "Copy command";
+    }, 1500);
+  }).catch(() => undefined);
 });
 document.getElementById("worker-dialog-close").addEventListener("click", closeWorkerDialog);
 document.getElementById("worker-dialog").addEventListener("click", event => {

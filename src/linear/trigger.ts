@@ -7,7 +7,8 @@
  *   not a local launchd timer. Keeping the schedule gateway-side means it survives
  *   node reinstalls, gets built-in failure alerting, and keeps an audit trail in
  *   `openclaw cron runs`. The cron agent only routes and summarizes; the real logic
- *   lives in the committed review-only runner (`scripts/linear-triage.mjs`). This
+ *   lives in the committed snapshot + review-only runners (`scripts/linear-snapshot.mjs`
+ *   and `scripts/linear-triage.mjs`). This
  *   module builds the cron trigger spec, the on-demand handle, and the run-expectations
  *   contract as pure values — no network, no clock, no I/O.
  *
@@ -47,9 +48,11 @@ export const WEEKLY_TRIAGE_TZ = "America/Chicago";
 
 /** Hub user the cron runs as. Paths must belong to this user, never `ostehost`. */
 export const HUB_USER = "ostemini";
-/** Hub-side OpenClaw config root where the committed runner is deployed. */
-export const HUB_OPENCLAW_ROOT = `/Users/${HUB_USER}/projects/config/openclaw`;
-/** Committed review-only runner, relative to the OpenClaw config root. */
+/** Hub-side ClawSweeper checkout containing the committed runners and compiled imports. */
+export const HUB_CLAWSWEEPER_ROOT = `/Users/${HUB_USER}/projects/clawsweeper`;
+/** Committed read-only snapshot runner, relative to the ClawSweeper root. */
+export const SNAPSHOT_SCRIPT_REL = "scripts/linear-snapshot.mjs";
+/** Committed review-only runner, relative to the ClawSweeper root. */
 export const TRIAGE_SCRIPT_REL = "scripts/linear-triage.mjs";
 
 const MS_PER_DAY = 86_400_000;
@@ -79,7 +82,7 @@ export interface CronTriggerOptions {
   cron?: string;
   tz?: string;
   timeoutSeconds?: number;
-  scriptPath?: string; // absolute hub path the cron message runs
+  projectRoot?: string; // absolute hub ClawSweeper checkout root
 }
 
 /** Shell handles for triggering and observing the same cron entry out of band. */
@@ -130,20 +133,28 @@ export const DEFAULT_SEMANTIC_FAILURE_PATTERNS: readonly string[] = [
   "Error:",
 ];
 
-// Rejects a script path that belongs to the macbook node rather than the hub user.
-function assertHubPath(scriptPath: string): void {
-  if (scriptPath.includes("/Users/ostehost/")) {
+const SAFE_HUB_PROJECT_ROOT = new RegExp(`^/Users/${HUB_USER}/projects/[A-Za-z0-9._/-]+$`);
+
+// The root is interpolated into a shell pipeline, so require the exact hub-user projects
+// prefix and reject traversal, whitespace, and metacharacters.
+function assertHubProjectRoot(projectRoot: string): void {
+  if (
+    !SAFE_HUB_PROJECT_ROOT.test(projectRoot) ||
+    projectRoot.split("/").some((part) => part === "..")
+  ) {
     throw new Error(
-      `cron script path must use the hub user path (/Users/${HUB_USER}/...), not the macbook node path: ${scriptPath}`,
+      `cron project root must be a safe hub user path under /Users/${HUB_USER}/projects/: ${projectRoot}`,
     );
   }
 }
 
-// The cron agent message: route to the review-only runner, then end with a sentinel.
-function triageCronMessage(scriptPath: string): string {
+// The cron agent message: snapshot into the review-only runner, then end with a sentinel.
+function triageCronMessage(projectRoot: string): string {
+  const snapshotPath = `${projectRoot}/${SNAPSHOT_SCRIPT_REL}`;
+  const triagePath = `${projectRoot}/${TRIAGE_SCRIPT_REL}`;
   return [
     "Weekly Linear triage.",
-    `Run: node ${scriptPath} --review-only --json.`,
+    `Run: node ${snapshotPath} | node ${triagePath} --review-only --json.`,
     `Summarize the digest and end your reply with ${TRIAGE_OK_SENTINEL} on a clean run`,
     `or ${TRIAGE_ALERT_SENTINEL} if you escalated.`,
   ].join(" ");
@@ -152,12 +163,12 @@ function triageCronMessage(scriptPath: string): string {
 /**
  * Builds the weekly OpenClaw cron trigger spec. Defaults to the Monday-09:00
  * America/Chicago schedule, the `main` agent with `exec,message` tools, a 600s timeout,
- * and the committed hub-side review-only runner. Throws if the script path is a macbook
- * node path rather than the hub user path.
+ * and the committed hub-side read-only pipeline. Throws unless the project root is a safe
+ * absolute path under the hub user's projects directory.
  */
 export function weeklyTriageCronSpec(options: CronTriggerOptions = {}): CronTriggerSpec {
-  const scriptPath = options.scriptPath ?? `${HUB_OPENCLAW_ROOT}/${TRIAGE_SCRIPT_REL}`;
-  assertHubPath(scriptPath);
+  const projectRoot = options.projectRoot ?? HUB_CLAWSWEEPER_ROOT;
+  assertHubProjectRoot(projectRoot);
   return {
     name: options.name ?? "Linear weekly triage",
     cron: options.cron ?? WEEKLY_TRIAGE_CRON,
@@ -165,7 +176,7 @@ export function weeklyTriageCronSpec(options: CronTriggerOptions = {}): CronTrig
     agent: "main",
     tools: ["exec", "message"],
     timeoutSeconds: options.timeoutSeconds ?? 600,
-    message: triageCronMessage(scriptPath),
+    message: triageCronMessage(projectRoot),
   };
 }
 

@@ -342,6 +342,7 @@ function writeSyntheticRun(context: LooseRecord) {
       repair_strategy: "new_fix_pr",
       allow_no_pr: true,
       branch_update_blockers: [],
+      repair_contract: null,
     },
   };
   fs.writeFileSync(

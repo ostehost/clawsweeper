@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import path from "node:path";
 import test from "node:test";
+
+import { readText } from "../helpers.ts";
 
 const REPAIR_RUNTIME_PATHS = [
   "prompts/pr-close-coverage-proof.md",
@@ -13,6 +14,7 @@ const REPAIR_RUNTIME_PATHS = [
   "src/codex-process.ts",
   "src/codex-spawn.ts",
   "src/codex-transient.ts",
+  "src/github-json.ts",
   "src/pr-close-coverage-proof.ts",
 ] as const;
 
@@ -24,7 +26,7 @@ const SPARSE_REPAIR_BUILD_WORKFLOWS = [
 
 test("sparse repair build workflows include runtime dependencies", () => {
   for (const workflowPath of SPARSE_REPAIR_BUILD_WORKFLOWS) {
-    const workflow = fs.readFileSync(path.join(process.cwd(), workflowPath), "utf8");
+    const workflow = readText(workflowPath);
     assert.match(workflow, /build-script: build:repair/);
 
     const entries = sparseCheckoutEntries(workflow);
@@ -32,6 +34,13 @@ test("sparse repair build workflows include runtime dependencies", () => {
       assert.ok(entries.has(requiredPath), `${workflowPath} missing ${requiredPath}`);
     }
   }
+});
+
+test("sparse CI checkout includes pnpm workspace policy", () => {
+  const workflow = readText(".github/workflows/ci.yml");
+  const entries = sparseCheckoutEntries(workflow);
+
+  assert.ok(entries.has("pnpm-workspace.yaml"));
 });
 
 test("repair build emits the bounded Codex process worker", () => {
@@ -43,10 +52,7 @@ test("repair build emits the bounded Codex process worker", () => {
 });
 
 test("repair comment router workflow preserves repository dispatch target branch", () => {
-  const workflow = fs.readFileSync(
-    path.join(process.cwd(), ".github/workflows/repair-comment-router.yml"),
-    "utf8",
-  );
+  const workflow = readText(".github/workflows/repair-comment-router.yml");
 
   assert.match(workflow, /target_branch:\n\s+description:/);
   assert.match(
@@ -63,16 +69,21 @@ test("repair comment router workflow preserves repository dispatch target branch
   );
 });
 
-test("sweep workflow preserves workflow dispatch target branch", () => {
-  const workflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/sweep.yml"), "utf8");
+test("sweep workflow preserves manual target branches and hydrates exact branches live", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
   const dispatchTargetBranchResolver =
     /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
   const continuationTargetBranch =
     /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
 
   assert.match(workflow, /target_branch:\n\s+description: "Target repository branch to review"/);
-  assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 2);
+  assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
   assert.equal([...workflow.matchAll(continuationTargetBranch)].length, 2);
+  assert.match(
+    workflow,
+    /target_branch="\$\(gh api "repos\/\$TARGET_REPO" --jq \.default_branch\)"/,
+  );
+  assert.match(workflow, /target_branch="\$\{\{ steps\.live-item\.outputs\.target_branch \}\}"/);
 });
 
 function sparseCheckoutEntries(workflow: string): Set<string> {

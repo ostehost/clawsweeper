@@ -6,7 +6,7 @@ inputs:
     default: "24"
   pnpm-version:
     description: pnpm version to activate through Corepack.
-    default: "10.33.2"
+    default: "11.10.0"
   working-directory:
     description: Directory containing package.json.
     default: "."
@@ -50,19 +50,23 @@ runs:
         else
           lock_hash="no-lockfile"
         fi
+        workspace="${{ inputs.working-directory }}/pnpm-workspace.yaml"
+        if [ -f "$workspace" ]; then
+          policy_hash="$(git hash-object "$workspace")"
+        else
+          policy_hash="no-workspace"
+        fi
         {
-          echo "key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-$lock_hash"
-          echo "restore_key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-"
-          echo "fallback_restore_key=${RUNNER_OS:-unknown}-pnpm-"
+          echo "key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-$policy_hash-$lock_hash"
+          echo "restore_key=${RUNNER_OS:-unknown}-pnpm-${{ inputs.pnpm-version }}-$policy_hash-"
         } >> "$GITHUB_OUTPUT"
 
-    - uses: actions/cache@v5
+    - uses: actions/cache@v6
       with:
         path: ${{ steps.pnpm-store.outputs.path }}
         key: ${{ steps.pnpm-cache-key.outputs.key }}
         restore-keys: |
           ${{ steps.pnpm-cache-key.outputs.restore_key }}
-          ${{ steps.pnpm-cache-key.outputs.fallback_restore_key }}
 
     - name: Install dependencies
       shell: bash

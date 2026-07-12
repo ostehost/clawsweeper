@@ -46,10 +46,12 @@ GitHub secret into a temporary Wrangler config as the Worker `INGEST_TOKEN`.
 Its smoke test also verifies the durable exact-review queue binding, not only
 the dashboard response.
 
-When a change updates both the Worker and a GitHub Actions workflow that calls
-a new Worker route, deploy the reviewed Worker branch first and wait for the
-dashboard workflow to pass. Then merge the workflow change. This avoids a
-window where Actions sends events to a route that production has not deployed:
+When a change updates both the Worker and a GitHub Actions workflow, keep the
+cross-component protocol compatible in both deployment orders. The exact-review
+v2 rollout dispatches the immutable lease tuple under `queue_claim` plus a bounded v1 snapshot; the
+Worker accepts v1 claims/finalizers while the workflow can consume either v1 or
+v2 claim responses. Deploying the reviewed Worker first remains the preferred
+order, but this rollout does not require disabling or draining ClawSweeper:
 
 ```bash
 gh workflow run dashboard.yml --repo openclaw/clawsweeper --ref <reviewed-branch>
@@ -125,13 +127,26 @@ is absent or a cache event lands in another Cloudflare colo.
 - recent automerge command-to-merge timing samples
 - explicit workflow status events posted to the ingest API when KV ingest is
   enabled
+- problem-focused pruning alerts from latest sweep status files when apply runs
+  report blocked or degraded progress, with reason tooltips and maintainer
+  workflow commands for safe follow-up
+- lane-level apply health in status JSON so closure processing and durable
+  review-comment sync are reported separately even when they share the same
+  applicator
+- skip next-action buckets in apply health JSON so stale reviews, missing close
+  proof, protected labels, stable skips, invalid reports, and open closing PRs
+  are discoverable without reading individual item records
+- scheduled close-cycle telemetry in apply-health JSON, including current
+  apply-ready candidate count and an estimated number of cursor windows to
+  revisit the close queue; scheduled cadence time is explanatory only because
+  successful windows can dispatch immediate continuations
 
 The Worker fetches job details only for the bounded active-run set, limits that
 GitHub fanout to 12 concurrent requests, and caches each run's jobs for 60
 seconds. It separately samples 20 recent completed worker runs with ten-way
 fanout and caches error/recovery telemetry for 120 seconds. This bounds
-telemetry pressure without reducing the 128-worker fleet budget. Worker details
-paginate up to 300 jobs per workflow run so 128-shard runs remain fully visible,
+telemetry pressure without exceeding the 128-worker fleet budget. Worker details
+paginate up to 300 jobs per workflow run so 89-shard runs remain fully visible,
 then finish before optional pipeline CI and historical
 enrichment begin, so those secondary lookups do not compete with active worker
 telemetry. If GitHub job telemetry is unavailable, the API and UI retain the
@@ -160,6 +175,70 @@ Do not move these into the dashboard:
 
 The dashboard Worker owns durable exact-review admission only: it deduplicates
 webhook deliveries, coalesces each repository/item pair, and leases at most
-four Actions executors. It does not decide review outcomes or perform target
-repository mutations. GitHub Actions remains the executor and the existing
-review/apply safety model remains unchanged.
+28 Actions executors, with up to 24 active leases per target repository. It does
+not decide review outcomes or perform target repository mutations. For
+command-triggered reviews, the queue retains the bounded review prompt and
+command-status identifiers so the leased GitHub Actions executor can update the
+original acknowledgement through completion. GitHub Actions remains the
+executor and the existing review/apply safety model remains unchanged.
+
+The singleton Durable Object stores each delivery receipt and queue item in its
+own SQLite row. Receipt insertion and item coalescing commit in one transaction,
+so a crash cannot record a duplicate-suppression receipt without its queued
+work. Receipts retain the seven-day idempotency window and expire through the
+indexed timestamp path in bounded batches; `/api/exact-review-queue` reports
+`delivery_receipts`, `storage_schema_version`, and
+`legacy_rollback_available` for operational proof. On the first upgraded
+request, the Worker transactionally imports the former `exact-review-queue`
+value. For 24 hours it maintains a generation-marked legacy shadow containing
+the queue and the complete active seven-day receipt set. Receipt timestamps are
+translated by two days so the immediately previous Worker's five-day pruner
+preserves their original seven-day expiry, and the reserved generation marker
+cannot expire. SQL state, its generation, and the synchronous KV shadow update
+in one SQLite transaction, so no committed generation can leave an older shadow
+readable. A later re-upgrade uses the generation plus deterministic timestamp
+translation to distinguish unchanged shadow receipts from receipts accepted or
+refreshed by the rolled-back Worker. It imports authoritative queue and receipt
+changes; a surviving generation is reconciled before deletion even when the
+rollback outlives the ordinary window. A divergent stale generation fails
+closed instead of discarding either side.
+
+The Worker publishes that compatibility shadow only when the complete active
+set stays within 20,000 receipts and 1 MiB. If it cannot publish the complete
+shadow, it deletes any stale copy, reports rollback unavailable, and keeps the
+normalized queue serving; it never emits a lossy rollback state or retries the
+oversized write. The rollback bridge therefore cannot recreate the normalized
+queue's intake failure.
+
+Before each dispatch batch, the queue reads the `sweep.yml` workflow state once.
+If the workflow is disabled, or GitHub cannot confirm its state, due items stay
+pending and retry after `EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS` (60 seconds by
+default). `/api/exact-review-queue` exposes the bounded dispatcher state, reason,
+workflow state, check time, and retry time so an intentional pause cannot look
+like occupied executor capacity. Re-enabling the workflow does not require a
+queue mutation; the next status check resumes normal admission.
+
+Executors report the GitHub job outcome from their finalizer. Failure or
+cancellation clears the lease and requeues the item. Finalizer success remains
+provisional because GitHub can still cancel the run or fail a post-action; only
+the signed terminal-run backstop removes the item after GitHub confirms the
+exact attempt succeeded. A newer revision can requeue immediately. A signed
+`POST /internal/exact-review/reconcile` backstop accepts at most 32 exact run IDs
+and intersects them with currently claimed leases. The Worker checks those IDs
+and attempts with an Actions-read GitHub App token and reconciles only runs
+whose immutable GitHub attempt status is `completed`; queued and in-progress
+runs remain leased. A per-claim generation check prevents a terminal decision
+sampled before a rerun claim from releasing that newer attempt. The request body
+is `{ "runs": [{ "run_id": "<run-id>", "run_attempt": 1 }] }`, signed over the
+exact bytes with `CLAWSWEEPER_WEBHOOK_SECRET` in
+`x-clawsweeper-exact-review-signature: sha256=<hmac>`.
+
+Do not disable or drain the sweep workflow for this protocol rollout. A v2
+Worker sends the strict tuple under `queue_claim` plus the immutable v1 event snapshot, accepts
+legacy lease-id claims/finalizers only for claims recorded as protocol v1, and
+keeps tuple/generation CAS mandatory for protocol v2. A v2 workflow falls back
+to the v1 event snapshot only when the claim response identifies or implies a
+v1 Worker. Keep this mixed-version coverage until every in-flight v1 dispatch
+has drained naturally. The dashboard deployment smoke test must still observe
+HTTP 401 from an unsigned reconciliation request; HTTP 404 means the old Worker
+is serving that route.

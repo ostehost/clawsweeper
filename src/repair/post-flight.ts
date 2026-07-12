@@ -31,7 +31,20 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import { isPassedStagedProofBundle } from "./staged-proof-gates.js";
+import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import { compactText as compactPlainText } from "./text-utils.js";
+import {
+  runVerifiedPublishedPullMutation,
+  verifyPublishedPullContext,
+} from "./execution-handoff.js";
+import {
+  issueImplementationPublishedHeadBlock,
+  postFlightOutcomeExitCode,
+  publicationOnlyPostFlightAction,
+  shouldFinalizePublicationOnlyPostFlight,
+  summarizePostFlightReport,
+} from "./post-flight-report.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const FIX_PR_MERGE_STATES = new Set(["CLEAN", "HAS_HOOKS", "UNSTABLE"]);
@@ -52,6 +65,20 @@ const jobPath = args._[0];
 const resultPathArg = args._[1];
 const latest = Boolean(args.latest);
 const dryRun = Boolean(args["dry-run"] || process.env.CLAWSWEEPER_POST_FLIGHT_DRY_RUN === "1");
+const publicationVerification = args["publication-receipt"]
+  ? {
+      root: requiredOption("handoff-root"),
+      publicationReceiptPath: requiredOption("publication-receipt"),
+      validationReceiptPath: requiredOption("validation-receipt"),
+      expectedAuthorizationSha256: requiredOption("authorization-sha256"),
+      expectedValidationReceiptSha256: requiredOption("validation-receipt-sha256"),
+      expectedPublicationReceiptSha256: requiredOption("publication-receipt-sha256"),
+    }
+  : null;
+const publicationContext = publicationVerification
+  ? verifyPublishedPullContext(publicationVerification)
+  : null;
+const publicationReceipt = publicationContext?.receipt ?? null;
 
 if (!jobPath) {
   console.error("usage: node scripts/post-flight.ts <job.md> [result.json] [--latest] [--dry-run]");
@@ -108,15 +135,17 @@ if (!fixReport) {
     status: "skipped",
     reason: "no fix-execution-report.json",
   });
-  writeReport(report, resultPath);
-  process.exit(0);
+  process.exit(postFlightOutcomeExitCode(writeReport(report, resultPath).outcome));
 }
 
-for (const action of fixReport.actions ?? []) {
+const fixActions = publicationReceipt
+  ? [publishedFixAction(fixReport, publicationReceipt)]
+  : (fixReport.actions ?? []);
+for (const action of fixActions) {
   if (!FIX_PR_ACTIONS.has(String(action.action ?? ""))) continue;
   const finalized = finalizeFixPr(action);
   report.actions.push(finalized);
-  if (finalized.status === "executed") {
+  if (finalized.status === "executed" && !publicationReceipt) {
     report.actions.push(...finalizePostMergeCloseouts(action, finalized));
   }
 }
@@ -129,7 +158,7 @@ if (report.actions.length === 0) {
   });
 }
 
-writeReport(report, resultPath);
+process.exitCode = postFlightOutcomeExitCode(writeReport(report, resultPath).outcome);
 
 function finalizeFixPr(action: LooseRecord) {
   const base = {
@@ -153,9 +182,12 @@ function finalizeFixPr(action: LooseRecord) {
   }
 
   if (isIssueImplementationJob()) {
-    return finalizeIssueImplementationPr({ base, parsed });
+    return finalizeIssueImplementationPr({
+      base,
+      parsed,
+      expectedPublishedHeadSha: publicationReceipt?.published_head_sha ?? null,
+    });
   }
-
   const deadline = Date.now() + POST_FLIGHT_WAIT_MS;
   let pull;
   let view;
@@ -166,11 +198,37 @@ function finalizeFixPr(action: LooseRecord) {
     pull = fetchPullRequest(result.repo, parsed.number);
     view = fetchPullRequestView(result.repo, parsed.number);
     prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    const securityBlock = liveSecurityBlockReason(parsed.number, pull.labels ?? []);
+    if (securityBlock) return { ...prBase, status: "blocked", reason: securityBlock };
+    if (
+      shouldFinalizePublicationOnlyPostFlight({
+        hasPublicationReceipt: Boolean(publicationReceipt),
+        frontmatter: job.frontmatter,
+        automergeReplacement: isAutomergeReplacementMerge(action, pull),
+      })
+    ) {
+      return publicationOnlyPostFlightAction({
+        action,
+        base: prBase,
+        pull,
+        view,
+        publication: publicationContext!.publication,
+        intent: publicationContext!.intent,
+      });
+    }
     const policyBlock = validateMergePolicy(action, pull);
     if (policyBlock) return { ...prBase, status: "blocked", reason: policyBlock };
 
     const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
     if (mergedAt) {
+      const mergedHead = String(pull.head?.sha ?? view.headRefOid ?? "");
+      if (!action.commit || mergedHead !== action.commit) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: "merged pull request head does not match the authorized repair commit",
+        };
+      }
       return {
         ...prBase,
         status: "executed",
@@ -181,9 +239,17 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
 
-    mergeBlock = validateMergeableFixPr({ pull, view, preflight: action.merge_preflight });
+    mergeBlock = validateMergeableFixPr({
+      pull,
+      view,
+      preflight: action.merge_preflight,
+      expectedHeadSha: action.commit,
+      validationProofPlan: fixReport.validation_proof_plan,
+    });
     if (!mergeBlock) break;
-    if (dryRun || !shouldWaitForMergeReadiness({ mergeBlock, view }) || Date.now() >= deadline) {
+    const waitable = shouldWaitForMergeReadiness({ mergeBlock, view });
+    const deadlineExpired = Date.now() >= deadline;
+    if (dryRun || !waitable || deadlineExpired) {
       return {
         ...prBase,
         status: "blocked",
@@ -191,6 +257,7 @@ function finalizeFixPr(action: LooseRecord) {
         mergeable: view.mergeable ?? null,
         merge_state_status: view.mergeStateStatus ?? null,
         review_decision: view.reviewDecision ?? null,
+        ...(!dryRun && waitable && deadlineExpired ? { retry_recommended: true } : {}),
         waited_ms: waitedMs,
       };
     }
@@ -210,11 +277,35 @@ function finalizeFixPr(action: LooseRecord) {
   }
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
-    labelForClawSweeperReview(result.repo, parsed.number);
+    const securityBlock = liveSecurityBlockReason(
+      parsed.number,
+      fetchPullRequest(result.repo, parsed.number).labels ?? [],
+    );
+    if (securityBlock) return { ...prBase, status: "blocked", reason: securityBlock };
+    const mutationBlock = postFlightPullMutationBlock(parsed.number);
+    if (mutationBlock) return { ...prBase, status: "blocked", reason: mutationBlock };
+    runVerifiedPostFlightPullMutation(parsed.number, () =>
+      labelForClawSweeperReview(result.repo, parsed.number),
+    );
     return {
       ...prBase,
       status: "blocked",
       reason: "merge requires CLAWSWEEPER_ALLOW_MERGE=1; labeled clawsweeper",
+      merge_method: "squash",
+      waited_ms: waitedMs,
+    };
+  }
+
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: String(view.baseRefName ?? pull.base?.ref ?? ""),
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) {
+    return {
+      ...prBase,
+      status: "blocked",
+      reason: strictBaseBindingBlock,
       merge_method: "squash",
       waited_ms: waitedMs,
     };
@@ -241,8 +332,34 @@ function finalizeFixPr(action: LooseRecord) {
     bodyFile,
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
+  const securityBlock = liveSecurityBlockReason(
+    parsed.number,
+    fetchPullRequest(result.repo, parsed.number).labels ?? [],
+  );
+  if (securityBlock) return { ...prBase, status: "blocked", reason: securityBlock };
+  const mutationBlock = postFlightPullMutationBlock(parsed.number);
+  if (mutationBlock) return { ...prBase, status: "blocked", reason: mutationBlock };
   try {
-    ghWithRetry(mergeArgs);
+    const mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
+      const finalView = fetchPullRequestView(result.repo, parsed.number);
+      const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+        repo: result.repo,
+        baseBranch: String(finalView.baseRefName ?? ""),
+        policyReadJson: rulesetPolicyReader(),
+      });
+      if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
+      ghWithRetry(mergeArgs);
+      return { policyBlock: "" };
+    });
+    if (mergeAttempt.policyBlock) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: mergeAttempt.policyBlock,
+        merge_method: "squash",
+        waited_ms: waitedMs,
+      };
+    }
   } catch (error) {
     const detail = ghErrorText(error);
     if (isRecoverableMergeRace(detail)) {
@@ -275,13 +392,104 @@ function finalizeFixPr(action: LooseRecord) {
   };
 }
 
-function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
+function publishedFixAction(fixReport: LooseRecord, receipt: LooseRecord): LooseRecord {
+  const expectedAction =
+    receipt.operation === "update_source_pr" ? "repair_contributor_branch" : "open_fix_pr";
+  const prepared = (fixReport.actions ?? []).filter(
+    (action: JsonValue) =>
+      action?.action === expectedAction &&
+      action?.status === "prepared" &&
+      action?.commit === receipt.published_head_sha,
+  );
+  if (prepared.length !== 1) {
+    throw new Error("publication receipt does not match one exact prepared fix action");
+  }
+  return {
+    ...prepared[0],
+    action: expectedAction,
+    status: receipt.operation === "update_source_pr" ? "pushed" : "opened",
+    target: receipt.target_pr_url,
+    pr_url: receipt.target_pr_url,
+    commit: receipt.published_head_sha,
+  };
+}
+
+function requiredOption(name: string): string {
+  const value = String(args[name] ?? "").trim();
+  if (!value) throw new Error(`--${name} is required with --publication-receipt`);
+  return value;
+}
+
+function postFlightPullMutationBlock(number: number): string {
+  if (!publicationVerification || !publicationReceipt) {
+    return "post-flight pull mutation requires a verified publication checkpoint";
+  }
+  if (
+    publicationReceipt.target_repo !== result.repo ||
+    publicationReceipt.target_pr_number !== number
+  ) {
+    return "post-flight pull mutation target differs from the publication checkpoint";
+  }
+  return "";
+}
+
+function runVerifiedPostFlightPullMutation<T>(number: number, mutation: () => T): T {
+  const block = postFlightPullMutationBlock(number);
+  if (block || !publicationVerification) throw new Error(block);
+  return runVerifiedPublishedPullMutation({
+    ...publicationVerification,
+    mutation: ({ receipt, intent }) => {
+      if (
+        receipt.target_repo !== result.repo ||
+        receipt.target_pr_number !== number ||
+        intent.target_repo !== result.repo
+      ) {
+        throw new Error("post-flight pull mutation escaped the verified publication target");
+      }
+      return mutation();
+    },
+  });
+}
+
+function rulesetPolicyReader() {
+  const token = process.env.CLAWSWEEPER_RULESET_GH_TOKEN?.trim();
+  if (!token) return undefined;
+  return (ghArgs: string[]) =>
+    ghJson(ghArgs, {
+      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+    });
+}
+
+function finalizeIssueImplementationPr({ base, parsed, expectedPublishedHeadSha }: LooseRecord) {
   const deadline = Date.now() + POST_FLIGHT_WAIT_MS;
   let waitedMs = 0;
   for (;;) {
     const pull = fetchPullRequest(result.repo, parsed.number);
     const view = fetchPullRequestView(result.repo, parsed.number);
     const prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    const securityBlock = liveSecurityBlockReason(parsed.number, pull.labels ?? []);
+    if (securityBlock) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: securityBlock,
+        waited_ms: waitedMs,
+      };
+    }
+
+    const receiptHeadBlock = issueImplementationPublishedHeadBlock({
+      expectedPublishedHeadSha,
+      pull,
+      view,
+    });
+    if (receiptHeadBlock) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: receiptHeadBlock,
+        waited_ms: waitedMs,
+      };
+    }
 
     if (pull.state !== "open") {
       return {
@@ -302,15 +510,16 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
         mergeable: view.mergeable ?? null,
         merge_state_status: view.mergeStateStatus ?? null,
         review_decision: view.reviewDecision ?? null,
+        ...(expectedPublishedHeadSha
+          ? { published_head_sha: String(expectedPublishedHeadSha) }
+          : {}),
         waited_ms: waitedMs,
       };
     }
 
-    if (
-      dryRun ||
-      !shouldWaitForIssueImplementationChecks(checkBlock, view) ||
-      Date.now() >= deadline
-    ) {
+    const waitable = shouldWaitForIssueImplementationChecks(checkBlock, view);
+    const deadlineExpired = Date.now() >= deadline;
+    if (dryRun || !waitable || deadlineExpired) {
       return {
         ...prBase,
         status: "blocked",
@@ -318,6 +527,7 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
         mergeable: view.mergeable ?? null,
         merge_state_status: view.mergeStateStatus ?? null,
         review_decision: view.reviewDecision ?? null,
+        ...(!dryRun && waitable && deadlineExpired ? { retry_recommended: true } : {}),
         waited_ms: waitedMs,
       };
     }
@@ -396,6 +606,10 @@ function finalizePostMergeCloseout({
     };
   }
 
+  const beforeLabelSecurityBlock = liveSecurityBlockReason(target, live.labels ?? []);
+  if (beforeLabelSecurityBlock) {
+    return { ...base, status: "blocked", reason: beforeLabelSecurityBlock };
+  }
   ghBestEffort([
     "issue",
     "edit",
@@ -405,6 +619,10 @@ function finalizePostMergeCloseout({
     "--add-label",
     "clawsweeper",
   ]);
+  const beforeCommentSecurityBlock = freshLiveSecurityBlockReason(target);
+  if (beforeCommentSecurityBlock) {
+    return { ...base, status: "blocked", reason: beforeCommentSecurityBlock };
+  }
   ghWithRetry([
     "issue",
     "comment",
@@ -421,6 +639,10 @@ function finalizePostMergeCloseout({
       }),
     }),
   ]);
+  const beforeCloseSecurityBlock = freshLiveSecurityBlockReason(target);
+  if (beforeCloseSecurityBlock) {
+    return { ...base, status: "blocked", reason: beforeCloseSecurityBlock };
+  }
   if (live.pull_request) {
     ghWithRetry(["pr", "close", String(target), "--repo", result.repo]);
   } else {
@@ -493,7 +715,24 @@ function hasLiveSecuritySignal(number: JsonValue, labels: LooseRecord[]) {
   return hasDeterministicSecuritySignal({ comments: [bodies] });
 }
 
-function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
+function liveSecurityBlockReason(number: JsonValue, labels: LooseRecord[]) {
+  return hasLiveSecuritySignal(number, labels)
+    ? "security-sensitive target requires central security triage"
+    : "";
+}
+
+function freshLiveSecurityBlockReason(number: JsonValue) {
+  const issue = fetchIssue(result.repo, number);
+  return liveSecurityBlockReason(number, issue.labels ?? []);
+}
+
+function validateMergeableFixPr({
+  pull,
+  view,
+  preflight,
+  expectedHeadSha,
+  validationProofPlan,
+}: LooseRecord) {
   if (pull.state !== "open") return `pull request is ${pull.state}`;
   if (pull.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pull.base?.ref ?? "") !== "main")
@@ -509,7 +748,12 @@ function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
     return `review decision is ${view.reviewDecision}`;
   }
 
-  const preflightBlock = validateMergePreflight(preflight);
+  const preflightBlock = validateMergePreflight(preflight, {
+    expectedHeadSha,
+    liveHeadSha: pull.head?.sha,
+    liveBaseSha: pull.base?.sha,
+    validationProofPlan,
+  });
   if (preflightBlock) return preflightBlock;
 
   const threadBlock = validateResolvedReviewThreads(result.repo, pull.number);
@@ -523,7 +767,20 @@ function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
   return "";
 }
 
-function validateMergePreflight(preflight: LooseRecord) {
+function validateMergePreflight(
+  preflight: LooseRecord,
+  {
+    expectedHeadSha,
+    liveHeadSha,
+    liveBaseSha,
+    validationProofPlan,
+  }: {
+    expectedHeadSha: unknown;
+    liveHeadSha: unknown;
+    liveBaseSha: unknown;
+    validationProofPlan: unknown;
+  },
+) {
   if (!preflight || typeof preflight !== "object") return "merge_preflight is missing";
   if (preflight.security_status !== "cleared") return "security preflight is not cleared";
   if (!Array.isArray(preflight.security_evidence) || preflight.security_evidence.length === 0) {
@@ -543,6 +800,28 @@ function validateMergePreflight(preflight: LooseRecord) {
   if (!Array.isArray(preflight.validation_commands) || preflight.validation_commands.length === 0) {
     return "merge validation commands are missing";
   }
+  const validationProof = preflight.validation_proof;
+  if (!isPassedStagedProofBundle(validationProof, validationProofPlan)) {
+    return "staged validation proof is incomplete or failed";
+  }
+  if (!isFullCommitSha(expectedHeadSha)) return "fix action commit is missing or malformed";
+  if (!isFullCommitSha(liveHeadSha)) return "live pull request head is missing or malformed";
+  if (!isFullCommitSha(liveBaseSha)) return "live pull request base is missing or malformed";
+  if (validationProof.validated_head_sha !== expectedHeadSha) {
+    return "staged validation proof does not match the fix action commit";
+  }
+  if (validationProof.validated_head_sha !== liveHeadSha) {
+    return "staged validation proof does not match the live pull request head";
+  }
+  if (validationProof.validated_base_sha !== liveBaseSha) {
+    return "staged validation proof does not match the live pull request base";
+  }
+  if (
+    preflight.validated_head_sha !== validationProof.validated_head_sha ||
+    preflight.validated_base_sha !== validationProof.validated_base_sha
+  ) {
+    return "merge preflight proof identity is inconsistent";
+  }
   const codexReview = preflight.codex_review;
   if (!codexReview || codexReview.command !== "/review")
     return "Codex /review preflight is missing";
@@ -553,6 +832,10 @@ function validateMergePreflight(preflight: LooseRecord) {
     return "Codex /review evidence is missing";
   }
   return "";
+}
+
+function isFullCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 }
 
 function validateStatusChecks(checks: LooseRecord[]) {
@@ -566,12 +849,17 @@ function validateStatusChecks(checks: LooseRecord[]) {
     considered += 1;
     const status = String(check.status ?? check.state ?? "").toUpperCase();
     const conclusion = String(check.conclusion ?? "").toUpperCase();
-    if (status && !["COMPLETED", "SUCCESS"].includes(status)) {
-      blockers.push(`${name}: ${status}`);
+    if (conclusion) {
+      if (!PASSING_CHECK_CONCLUSIONS.has(conclusion)) blockers.push(`${name}: ${conclusion}`);
       continue;
     }
-    if (conclusion && !PASSING_CHECK_CONCLUSIONS.has(conclusion)) {
-      blockers.push(`${name}: ${conclusion}`);
+    if (!check.status && PASSING_CHECK_CONCLUSIONS.has(String(check.state ?? "").toUpperCase())) {
+      continue;
+    }
+    if (["COMPLETED", "SUCCESS"].includes(status)) {
+      blockers.push(`${name}: UNKNOWN (${status} without conclusion)`);
+    } else {
+      blockers.push(`${name}: ${status || "UNKNOWN"}`);
     }
   }
   if (considered === 0) return "no PR checks found";
@@ -643,9 +931,16 @@ function checkTimestamp(check: LooseRecord) {
 }
 
 function isPendingStatusCheck(check: LooseRecord) {
-  const status = String(check.status ?? check.state ?? "").toUpperCase();
   const conclusion = String(check.conclusion ?? "").toUpperCase();
-  return !conclusion && Boolean(status) && !["COMPLETED", "SUCCESS"].includes(status);
+  if (conclusion) return false;
+  const checkRunStatus = String(check.status ?? "").toUpperCase();
+  const contextState = String(check.state ?? "").toUpperCase();
+  if (!checkRunStatus && PASSING_CHECK_CONCLUSIONS.has(contextState)) return false;
+  if (["QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"].includes(checkRunStatus)) {
+    return true;
+  }
+  if (["EXPECTED", "PENDING"].includes(contextState)) return true;
+  return ["COMPLETED", "SUCCESS"].includes(checkRunStatus);
 }
 
 function ignoredCheckNames() {
@@ -771,9 +1066,21 @@ function readSiblingJson(resultPath: string, name: string) {
 }
 
 function writeReport(report: LooseRecord, resultPath: string) {
+  const summary = summarizePostFlightReport(report);
+  const finalReport = {
+    ...report,
+    ...summary,
+  };
   const reportPath = path.join(path.dirname(resultPath), "post-flight-report.json");
-  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-  console.log(JSON.stringify(report, null, 2));
+  fs.writeFileSync(reportPath, `${JSON.stringify(finalReport, null, 2)}\n`);
+  if (process.env.GITHUB_OUTPUT) {
+    fs.appendFileSync(
+      process.env.GITHUB_OUTPUT,
+      `report_outcome=${summary.outcome}\nreport_detail=${summary.detail}\n`,
+    );
+  }
+  console.log(JSON.stringify(finalReport, null, 2));
+  return summary;
 }
 
 function normalizeIssueRef(value: JsonValue) {

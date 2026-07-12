@@ -4,8 +4,8 @@ import test from "node:test";
 import {
   commandLine,
   parseArgs,
+  recentActiveRuns,
   runListArgs,
-  workflowDisplayName,
   workflowFields,
   workflowRunArgs,
 } from "../scripts/openclaw-dispatch.mjs";
@@ -96,7 +96,22 @@ test("OpenClaw dispatcher exposes status as a read-only gh run list", () => {
     "databaseId,workflowName,displayTitle,status,conclusion,createdAt,updatedAt,url,headBranch,event",
   ]);
   assert.equal(runListArgs(options).includes("--workflow"), true);
-  assert.equal(workflowDisplayName(options.workflow), "ClawSweeper");
+});
+
+test("OpenClaw dispatcher trusts gh workflow scoping for custom workflow display names", () => {
+  const cutoff = Date.parse("2026-07-12T12:00:00Z");
+  const runs = recentActiveRuns(
+    [
+      { workflowName: "Custom Human Name", createdAt: "2026-07-12T12:01:00Z" },
+      { workflowName: "Custom Human Name", createdAt: "2026-07-12T11:59:00Z" },
+      { workflowName: "Custom Human Name", createdAt: "not-a-date" },
+    ],
+    cutoff,
+  );
+  assert.deepEqual(runs, [
+    { workflowName: "Custom Human Name", createdAt: "2026-07-12T12:01:00Z" },
+  ]);
+  assert.throws(() => recentActiveRuns({}, cutoff), /must be an array/);
 });
 
 test("OpenClaw dispatcher shell-quotes receipt commands", () => {

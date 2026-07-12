@@ -3,6 +3,15 @@ import test from "node:test";
 
 import { REPOSITORY_PROFILES, repositoryProfileFor } from "../dist/repository-profiles.js";
 
+test("OpenClaw allows unsponsored feature closes for issues only", () => {
+  const profile = repositoryProfileFor("openclaw/openclaw");
+  assert.equal(profile.applyCloseRules.issue?.includes("unsponsored_feature_request"), true);
+  assert.equal(
+    profile.applyCloseRules.pull_request?.includes("unsponsored_feature_request"),
+    false,
+  );
+});
+
 test("repositoryProfileFor matches mixed-case input against canonical profiles", () => {
   const profile = repositoryProfileFor("OpenClaw/ClawHub");
 

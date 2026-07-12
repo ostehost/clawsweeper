@@ -3,12 +3,16 @@ import test from "node:test";
 
 import {
   authorizeMutation,
+  classifyRecord,
+  evaluateReviewPolicy,
   LABEL_NEEDS_INFO,
   LABEL_NEEDS_MAINTAINER_REVIEW,
   resolveGates,
+  mapWorkspaceItem,
 } from "../dist/linear/index.js";
 import {
   applyLabelChange,
+  applyLabelStep,
   authorizeLabelChange,
   parseArgs,
   planLabelChange,
@@ -181,14 +185,42 @@ test("resolveLabelIds is deterministic: same inputs + stub yield the same ids", 
 // authorizeLabelChange — additive union allowed; a drop is denied
 // ---------------------------------------------------------------------------
 
-test("authorizeLabelChange allows a valid governed label sync (self-approved --apply-labels run)", () => {
+test("authorizeLabelChange requires an independently reviewed label approval", () => {
   const record = fakeRecord({ labels: ["keep"] });
   const change = planLabelChange(record, decision(["clawsweeper:needs-info"]));
-  const { authorization, receipt } = authorizeLabelChange(record, change);
+  const dry = authorizeLabelChange(record, change);
+  assert.equal(dry.authorization.allowed, false);
+  assert.ok(dry.authorization.reasons.some((reason) => /plan hash mismatch/.test(reason)));
+
+  const { authorization, receipt } = authorizeLabelChange(record, change, {
+    approvedLabelPlanHash: dry.receipt.planHash,
+    approvedLabelSnapshotHash: dry.receipt.snapshotHash,
+  });
   assert.equal(authorization.allowed, true);
   assert.equal(authorization.kind, "label-add");
   assert.equal(receipt.gate, "labelWrite");
   assert.equal(receipt.driftDetected, false);
+});
+
+test("authorizeLabelChange rejects stale snapshots and changed label plans", () => {
+  const record = fakeRecord({ labels: ["keep"] });
+  const original = planLabelChange(record, decision([LABEL_NEEDS_INFO]));
+  const dry = authorizeLabelChange(record, original);
+
+  const stale = authorizeLabelChange(record, original, {
+    approvedLabelPlanHash: dry.receipt.planHash,
+    approvedLabelSnapshotHash: "d".repeat(64),
+  });
+  assert.equal(stale.authorization.allowed, false);
+  assert.equal(stale.receipt.driftDetected, true);
+
+  const changed = planLabelChange(record, decision([LABEL_NEEDS_MAINTAINER_REVIEW]));
+  const changedAuth = authorizeLabelChange(record, changed, {
+    approvedLabelPlanHash: dry.receipt.planHash,
+    approvedLabelSnapshotHash: dry.receipt.snapshotHash,
+  });
+  assert.equal(changedAuth.authorization.allowed, false);
+  assert.ok(changedAuth.authorization.reasons.some((reason) => /plan hash mismatch/.test(reason)));
 });
 
 test("authority DENIES a label-add that would DROP an existing label without declaring a removal", () => {
@@ -261,7 +293,11 @@ test("idempotent re-run: a noop change has no additions (and authority would rej
   assert.equal(change.noop, true);
   assert.deepEqual(change.additions, []);
   // authority itself rejects a write with zero additions — belt and suspenders.
-  const { authorization } = authorizeLabelChange(record, change);
+  const dry = authorizeLabelChange(record, change);
+  const { authorization } = authorizeLabelChange(record, change, {
+    approvedLabelPlanHash: dry.receipt.planHash,
+    approvedLabelSnapshotHash: dry.receipt.snapshotHash,
+  });
   assert.equal(authorization.allowed, false);
   assert.ok(authorization.reasons.some((r) => /no additions/.test(r)));
 });
@@ -346,4 +382,136 @@ test("applyLabelChange writes the UNION — preserves existing issue label ids, 
   // union: existing id kept + newly created id; existing label never dropped
   assert.deepEqual(setCall.vars.labelIds, ["il-9", "new-1"]);
   assert.deepEqual(result.labelsApplied, ["clawsweeper:needs-maintainer-review"]);
+});
+
+function hydratedItem(labels = [], updatedAt = "2026-06-24T00:00:00Z") {
+  return {
+    team: { id: "team-1", key: "PAR", name: "Partner" },
+    project: null,
+    issue: {
+      id: "issue-uuid-1",
+      identifier: "PAR-1",
+      title: "Bug report",
+      url: "https://linear.app/issue/PAR-1",
+      createdAt: "2026-06-23T00:00:00Z",
+      updatedAt,
+      teamId: "team-1",
+      projectId: null,
+      stateId: "todo",
+      stateName: "Todo",
+      stateType: "unstarted",
+      priority: 2,
+      labels,
+    },
+    comments: [],
+    description: "",
+    attachments: [],
+    creator: null,
+  };
+}
+
+test("applyLabelStep refetches before a live replace-all write and preserves refreshed labels", async () => {
+  const initial = hydratedItem([]);
+  const refreshed = hydratedItem([{ id: "late-id", name: "team:late" }]);
+  const liveRecord = mapWorkspaceItem(refreshed);
+  const liveClassification = classifyRecord(liveRecord, {
+    nowIso: "2026-06-25T00:00:00Z",
+  });
+  const liveChange = planLabelChange(
+    liveRecord,
+    evaluateReviewPolicy(liveClassification, liveRecord),
+  );
+  const dry = authorizeLabelChange(liveRecord, liveChange);
+  const approval = {
+    approvedLabelPlanHash: dry.receipt.planHash,
+    approvedLabelSnapshotHash: dry.receipt.snapshotHash,
+  };
+  const initialRecord = mapWorkspaceItem(initial);
+  const entry = {
+    identifier: "PAR-1",
+    result: {
+      hydrated: initial,
+      record: initialRecord,
+      classification: classifyRecord(initialRecord, { nowIso: "2026-06-25T00:00:00Z" }),
+      nowIso: "2026-06-25T00:00:00Z",
+    },
+  };
+  const { transport, calls } = recordingTransport([
+    { id: "routing-id", name: liveChange.additions[0] },
+  ]);
+  let fetches = 0;
+  const summary = {};
+
+  await applyLabelStep(entry, summary, { live: true, reason: "live" }, async () => transport, {
+    source: {
+      fetchIssueByIdentifier: async () => {
+        fetches += 1;
+        return refreshed;
+      },
+    },
+    options: {
+      staleDays: 60,
+      requiredLabels: [],
+      exclusionLabels: [],
+      protectedLabels: [],
+    },
+    approval,
+  });
+
+  assert.equal(fetches, 1);
+  assert.equal(summary.labelApplyError, undefined);
+  const setCall = calls.find((call) => call.query.includes("issueUpdate"));
+  assert.ok(setCall);
+  assert.ok(setCall.vars.labelIds.includes("late-id"));
+});
+
+test("applyLabelStep blocks a live write when the refreshed issue drifted", async () => {
+  const initial = hydratedItem([]);
+  const initialRecord = mapWorkspaceItem(initial);
+  const initialClassification = classifyRecord(initialRecord, {
+    nowIso: "2026-06-25T00:00:00Z",
+  });
+  const originalChange = planLabelChange(
+    initialRecord,
+    evaluateReviewPolicy(initialClassification, initialRecord),
+  );
+  const dry = authorizeLabelChange(initialRecord, originalChange);
+  const refreshed = hydratedItem([{ id: "late-id", name: "team:late" }]);
+  let transportRequested = false;
+  const summary = {};
+
+  await applyLabelStep(
+    {
+      identifier: "PAR-1",
+      result: {
+        hydrated: initial,
+        record: initialRecord,
+        classification: initialClassification,
+        nowIso: "2026-06-25T00:00:00Z",
+      },
+    },
+    summary,
+    { live: true, reason: "live" },
+    async () => {
+      transportRequested = true;
+      throw new Error("must not request write transport");
+    },
+    {
+      source: { fetchIssueByIdentifier: async () => refreshed },
+      options: {
+        staleDays: 60,
+        requiredLabels: [],
+        exclusionLabels: [],
+        protectedLabels: [],
+      },
+      approval: {
+        approvedLabelPlanHash: dry.receipt.planHash,
+        approvedLabelSnapshotHash: dry.receipt.snapshotHash,
+      },
+    },
+  );
+
+  assert.equal(transportRequested, false);
+  assert.equal(summary.labelAuthorized, false);
+  assert.match(summary.labelWriteSkipped, /not authorized/);
 });

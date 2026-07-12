@@ -367,8 +367,33 @@ Full review comments:
 });
 
 test("OpenClaw contributor changelog-entry findings are normalized", () => {
+  const maintainerDecision = {
+    required: true,
+    kind: "product_direction",
+    question: "Should this public behavior become the supported contract?",
+    rationale: "The patch is correct, but the behavior still needs an explicit product choice.",
+    options: [
+      {
+        title: "Accept the behavior",
+        body: "Adopt and document this behavior as the supported contract.",
+        recommended: true,
+      },
+      {
+        title: "Keep the existing behavior",
+        body: "Decline this contract change while retaining current behavior.",
+        recommended: false,
+      },
+    ],
+    likelyOwner: {
+      person: "@alice",
+      reason: "Recent implementation history identifies Alice as the likely product owner.",
+      confidence: "high",
+    },
+  } as const;
   const decision = parseDecision(
     changelogReviewDecision({
+      maintainerDecision,
+      requiresProductDecision: true,
       realBehaviorProof: {
         status: "sufficient",
         summary: "Terminal output from a real OpenClaw checkout shows the changed behavior.",
@@ -394,6 +419,7 @@ test("OpenClaw contributor changelog-entry findings are normalized", () => {
   assert.deepEqual(decision.prRating.nextSteps, []);
   assert.equal(decision.workCandidate, "none");
   assert.equal(decision.workReason, "");
+  assert.deepEqual(decision.maintainerDecision, maintainerDecision);
 
   const comment = renderReviewCommentFromReport(
     `${reportFrontMatter({

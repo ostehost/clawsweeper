@@ -1,6 +1,7 @@
 import type { LinearTransport } from "./client.js";
 import { ISSUE_BY_IDENTIFIER_QUERY, ISSUES_QUERY, PROJECTS_QUERY, TEAMS_QUERY } from "./queries.js";
 import type {
+  LinearAttachment,
   HydratedWorkspaceItem,
   LinearConnection,
   LinearIssue,
@@ -125,12 +126,36 @@ function mapComments(raw: unknown): Array<{ id: string; body: string }> {
   });
 }
 
+function mapAttachments(raw: unknown): LinearAttachment[] {
+  const attachments = asConnection<unknown>(raw, "IssueByIdentifier.attachments");
+  if (attachments.pageInfo.hasNextPage) {
+    throw new Error(
+      "IssueByIdentifier returned more than 250 attachments — refusing to analyze incomplete context",
+    );
+  }
+  return attachments.nodes.map((node) => {
+    const attachment = asRecord(node);
+    return {
+      id: str(attachment["id"]),
+      url: str(attachment["url"]),
+      title: str(attachment["title"]),
+    };
+  });
+}
+
 function commentPageInfo(raw: unknown): { hasNextPage: boolean; endCursor: string | null } {
   return asConnection<unknown>(raw, "IssueByIdentifier.comments").pageInfo;
 }
 
 function hydratedIssueFingerprint(item: HydratedWorkspaceItem): string {
-  return JSON.stringify({ team: item.team, project: item.project, issue: item.issue });
+  return JSON.stringify({
+    team: item.team,
+    project: item.project,
+    issue: item.issue,
+    description: item.description,
+    attachments: item.attachments,
+    creator: item.creator,
+  });
 }
 
 function mapIssue(raw: unknown): LinearIssue {
@@ -171,8 +196,26 @@ function mapHydratedItem(raw: unknown): HydratedWorkspaceItem {
   const project = r["project"] != null ? mapProject(r["project"], team.id) : null;
 
   const comments = mapComments(r["comments"]);
+  const creatorRaw = r["creator"] != null ? asRecord(r["creator"]) : null;
+  const creator =
+    creatorRaw === null
+      ? null
+      : {
+          id: str(creatorRaw["id"]),
+          name: str(creatorRaw["name"]),
+          admin: creatorRaw["admin"] === true,
+          owner: creatorRaw["owner"] === true,
+        };
 
-  return { team, project, issue, comments };
+  return {
+    team,
+    project,
+    issue,
+    comments,
+    description: str(r["description"]),
+    attachments: mapAttachments(r["attachments"]),
+    creator,
+  };
 }
 
 export class LinearItemSource {

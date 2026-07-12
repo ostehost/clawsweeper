@@ -6,6 +6,10 @@ import { pathToFileURL } from "node:url";
 import { DEFAULT_TRUSTED_BOTS } from "./config.js";
 import { repoSlug } from "./comment-router-core.js";
 import { isAllowedMutationActor, writePayload } from "./comment-router-utils.js";
+import {
+  runVerifiedPublishedPullMutation,
+  runVerifiedSealedSourceMutation,
+} from "./execution-handoff.js";
 import { ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { parseArgs, parseJob, repoRoot } from "./lib.js";
@@ -49,8 +53,33 @@ async function main() {
   const detail = stringArg(args.detail) || "ClawSweeper is preparing the implementation worker.";
   const runUrl = stringArg(args["run-url"]) || currentActionsRunUrl();
   const prUrl = stringArg(args["pr-url"]);
+  const dashboardOnly = Boolean(args["dashboard-only"]);
   validateRepo(repo);
   validatePrUrl(prUrl, repo);
+
+  if (dashboardOnly) {
+    const options: StatusOptions = {
+      repo,
+      itemNumber,
+      state,
+      detail,
+      runUrl,
+      prUrl,
+      title: stringArg(args.title) || `Issue #${itemNumber}`,
+    };
+    const dashboard = await postDashboardStatus(options);
+    writeStepOutput("dashboard_status", dashboard);
+    console.log(
+      JSON.stringify({
+        status: "dashboard_only",
+        dashboard_status: dashboard,
+        repo,
+        item_number: itemNumber,
+        state,
+      }),
+    );
+    return;
+  }
 
   const issue = ghJsonWithRetry<LooseRecord>(["api", `repos/${repo}/issues/${itemNumber}`]);
   const options: StatusOptions = {
@@ -86,16 +115,18 @@ async function main() {
     { body },
   );
   let commentId = Number(existing?.id ?? 0);
-  if (commentId > 0) {
-    ghText([
-      "api",
-      `repos/${repo}/issues/comments/${commentId}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payload,
-    ]);
-  } else {
+  const mutateComment = () => {
+    if (commentId > 0) {
+      ghText([
+        "api",
+        `repos/${repo}/issues/comments/${commentId}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payload,
+      ]);
+      return;
+    }
     const created = ghJsonWithRetry<LooseRecord>([
       "api",
       `repos/${repo}/issues/${itemNumber}/comments`,
@@ -105,6 +136,60 @@ async function main() {
       payload,
     ]);
     commentId = Number(created.id ?? 0);
+  };
+  if (isTerminalMutationState(state)) {
+    const root = requiredArg(args, "handoff-root");
+    const validationReceiptPath = requiredArg(args, "validation-receipt");
+    const expectedAuthorizationSha256 = requiredArg(args, "authorization-sha256");
+    const expectedValidationReceiptSha256 = requiredArg(args, "validation-receipt-sha256");
+    const publicationReceiptSha256 = stringArg(args["publication-receipt-sha256"]);
+    const assertSealedSource = (intent: LooseRecord) => {
+      if (
+        intent.source?.kind !== "issue" ||
+        intent.source?.repo !== repo ||
+        intent.source?.number !== itemNumber
+      ) {
+        throw new Error("terminal status target differs from the sealed source issue");
+      }
+    };
+    if (publicationReceiptSha256) {
+      runVerifiedPublishedPullMutation({
+        root,
+        publicationReceiptPath: requiredArg(args, "publication-receipt"),
+        validationReceiptPath,
+        expectedAuthorizationSha256,
+        expectedValidationReceiptSha256,
+        expectedPublicationReceiptSha256: publicationReceiptSha256,
+        mutation: ({ receipt, intent }) => {
+          assertSealedSource(intent);
+          if (receipt.target_pr_url !== prUrl) {
+            throw new Error("terminal status pull request differs from the publication receipt");
+          }
+          mutateComment();
+        },
+      });
+    } else {
+      if (!args["sealed-source-only"]) {
+        throw new Error(
+          "terminal status without a publication receipt requires --sealed-source-only",
+        );
+      }
+      if (isSuccessfulTerminalMutationState(state) || prUrl) {
+        throw new Error("successful terminal status requires a verified publication receipt");
+      }
+      runVerifiedSealedSourceMutation({
+        root,
+        validationReceiptPath,
+        expectedAuthorizationSha256,
+        expectedValidationReceiptSha256,
+        mutation: ({ intent }) => {
+          assertSealedSource(intent);
+          mutateComment();
+        },
+      });
+    }
+  } else {
+    mutateComment();
   }
 
   const dashboard = await postDashboardStatus(options).catch((error) => {
@@ -256,6 +341,27 @@ function isTrustedBotComment(comment: LooseRecord) {
 
 function stringArg(value: JsonValue) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function requiredArg(args: LooseRecord, name: string) {
+  const value = stringArg(args[name]);
+  if (!value) throw new Error(`--${name} is required for terminal status publication`);
+  return value;
+}
+
+export function isTerminalMutationState(state: string) {
+  const normalized = state.trim().toLowerCase();
+  return (
+    normalized.includes("complete") ||
+    normalized.includes("open") ||
+    normalized.includes("block") ||
+    normalized.includes("fail")
+  );
+}
+
+export function isSuccessfulTerminalMutationState(state: string) {
+  const normalized = state.trim().toLowerCase();
+  return normalized.includes("complete") || normalized.includes("open");
 }
 
 function positiveInteger(value: JsonValue) {

@@ -55,8 +55,7 @@ async function updateCommandStatus(options: Options) {
 
 async function findCommandStatusComment(options: Options): Promise<LooseRecord | null> {
   const deadline = Date.now() + Math.max(0, options.waitMs);
-  let shouldContinue = true;
-  while (shouldContinue) {
+  while (true) {
     const exact = fetchExactStatusComment(options);
     if (
       exact &&
@@ -81,8 +80,7 @@ async function findCommandStatusComment(options: Options): Promise<LooseRecord |
       return match;
     }
     if (exact && !statusMarkerDiffersFromRequested(exact.body, options.marker)) return exact;
-    shouldContinue = Date.now() < deadline;
-    if (!shouldContinue) break;
+    if (Date.now() >= deadline) break;
     await sleep(5000);
   }
   return null;

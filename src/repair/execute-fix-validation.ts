@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { validateRepairContractShape } from "./repair-contract.js";
 import { GITHUB_PR_TITLE_MAX_LENGTH } from "./pr-title.js";
 import { slug } from "./text-utils.js";
 
@@ -51,6 +52,8 @@ export function validateFixArtifact(fixArtifact: LooseRecord): LooseRecord {
   if (typeof fixArtifact.changelog_required !== "boolean") {
     throw new Error("fix_artifact.changelog_required must be boolean");
   }
+  const contractErrors = validateRepairContractShape(fixArtifact);
+  if (contractErrors.length > 0) throw new Error(contractErrors.join("; "));
   if (!REPAIR_STRATEGIES.has(fixArtifact.repair_strategy)) {
     throw new Error("fix_artifact.repair_strategy is not executable");
   }

@@ -59,7 +59,7 @@ test("Codex process resolves command overrides and escaped Windows launchers", (
       root,
     );
     assert.match(invocation.command, /C:\\Windows[\\/]System32[\\/]cmd\.exe/);
-    assert.match(invocation.args[3] ?? "", /codex\.cmd/);
+    assert.match(invocation.args[3] ?? "", /codex\.cmd/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -72,6 +72,33 @@ test("Codex process resolves command overrides and escaped Windows launchers", (
       ),
     /Unable to resolve Windows Codex command/,
   );
+});
+
+test("Codex process resolves extensionless Windows node shebang shims", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const binDir = join(root, "bin");
+  mkdirSync(binDir);
+  const codexPath = join(binDir, "codex");
+  writeFileSync(codexPath, "#!/usr/bin/env node\r\n");
+  try {
+    const invocation = codexSpawnInvocation(
+      ["exec", "-"],
+      {
+        CODEX_BIN: "codex",
+        Path: binDir,
+        PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        SystemRoot: String.raw`C:\Windows`,
+      },
+      "win32",
+      root,
+    );
+
+    assert.equal(invocation.command, process.execPath);
+    assert.deepEqual(invocation.args, [codexPath, "exec", "-"]);
+    assert.equal(invocation.windowsVerbatimArguments, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Codex process uses CODEX_BIN and preserves argv and stdin delivery", () => {

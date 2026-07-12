@@ -25,6 +25,8 @@ export function buildFixPrompt({
   rebaseResult,
   maxEditAttempts,
   validationCommands,
+  validationProofPlan,
+  targetBaseSha,
   isAutomergeRepair = false,
 }: LooseRecord) {
   return [
@@ -36,10 +38,12 @@ export function buildFixPrompt({
     "- start by inspecting the repository paths below with rg/git ls-files/sed;",
     "- keep shell output bounded: prefer targeted rg/sed/git commands, add --max-count/head/tail where useful, and do not dump broad repo-wide matches or huge files into the transcript;",
     "- if likely_files are stale, missing, or glob-like, discover the real nearby files and edit those;",
-    "- always fetch latest origin/main and rebase or otherwise sync this branch onto that latest main before returning;",
-    "- run local git status/diff/log/rebase/merge commands needed to reconcile this branch with current origin/main;",
+    "- establish one base snapshot for this Codex edit pass: use the supplied deterministic pre-edit rebase when it already succeeded, otherwise fetch origin/main once and rebase or otherwise sync once;",
+    "- pin that base SHA while editing and validating; do not refetch, rebase, or rerun validation solely because origin/main advances during this edit pass;",
+    "- after validation passes against the pinned base, return the repair; ClawSweeper performs one deterministic final base sync, then exact-head review and GitHub checks provide the final proof;",
+    "- run local git status/diff/log/rebase/merge commands needed to reconcile this branch with the pinned base;",
     "- when git conflicts exist, resolve every conflict marker and leave the checkout in a normal non-rebasing state;",
-    "- use one repair loop: rebase to latest main, inspect review comments and failing checks, make the narrowest fix, run validation, and repeat until the branch is merge-ready or a concrete external blocker is proven;",
+    "- use one repair loop against the pinned base: inspect review comments and failing checks, make the narrowest fix, run validation, and repeat only for actionable failures until the branch is merge-ready or a concrete external blocker is proven;",
     "- preserve contributor credit in the PR body or commit history; edit a changelog only when the artifact explicitly requires it and repository policy permits it;",
     "- address review-bot concerns named in the artifact;",
     "- resolve actionable human review comments, bot comments, and requested changes named in the artifact;",
@@ -55,10 +59,16 @@ export function buildFixPrompt({
     "- exec-adjacent bugs are allowed when the fix is ordinary correctness or hardening and does not redefine the security boundary;",
     "- before returning, verify git status/diff/log show a merge-ready branch state.",
     "",
-    renderValidationLoopGuidance({ fixArtifact, validationCommands, isAutomergeRepair }),
+    renderValidationLoopGuidance({
+      fixArtifact,
+      validationCommands,
+      validationProofPlan,
+      isAutomergeRepair,
+    }),
     "",
     `Mode: ${mode}`,
     `Branch: ${branch}`,
+    targetBaseSha ? `Pinned target base SHA: ${targetBaseSha}` : "",
     `Edit attempt: ${attempt ?? 1} of ${maxEditAttempts}`,
     reconcileWithBase
       ? "Existing repair branch detected. Reconcile the existing branch diff with the deterministic pre-edit rebase result before touching new code."
@@ -208,10 +218,10 @@ function renderAutomergeRepairGuidance() {
   return [
     "- automerge repair loop: treat this as direct PR repair work, not a planning exercise;",
     "- inspect the PR comments, review threads, ClawSweeper verdict, and failing check evidence already provided; if read-only `gh` is available, use it to inspect missing PR comments, reviews, checks, and logs;",
-    "- rebase this branch onto latest origin/main yourself and resolve conflicts;",
+    "- if no successful deterministic pre-edit rebase was supplied, fetch origin/main and rebase this branch once, then resolve conflicts;",
     "- address actionable PR comments and review findings;",
     "- fix failing CI/checks for this PR;",
-    "- failed exact-head checks are repair scope for automerge even when the failing file is outside likely_files; first rebase to latest main, then fix the narrow failure or prove it is an external blocker on current main;",
+    "- failed exact-head checks are repair scope for automerge even when the failing file is outside likely_files; fix the narrow failure against the pinned base or prove it is an external blocker there, leaving later origin/main movement to ClawSweeper's deterministic final base sync;",
     "- run the tests/checks needed to prove the PR should go green, then keep iterating until the checkout is merge-ready or a concrete external blocker is proven;",
   ].join("\n");
 }
@@ -219,6 +229,7 @@ function renderAutomergeRepairGuidance() {
 function renderValidationLoopGuidance({
   fixArtifact,
   validationCommands = [],
+  validationProofPlan = null,
   isAutomergeRepair = false,
 }: LooseRecord) {
   const commands = [
@@ -236,6 +247,7 @@ function renderValidationLoopGuidance({
       commands.length > 0
         ? `- validation command hints: ${commands.join(" ; ")}`
         : "- validation command hints: discover the narrow changed-surface command from package scripts, PR comments, check logs, and the artifact;",
+      renderStagedProofPlanGuidance(validationProofPlan),
       "- treat artifact validation commands as hints unless they reproduce or prove the failing PR checks;",
       "- if validation fails, fix the failure and rerun until it passes or an external blocker is proven;",
       "- do not report validation as passed unless it passed after your last edit in this checkout;",
@@ -249,10 +261,21 @@ function renderValidationLoopGuidance({
     commands.length > 0
       ? `- expected validation commands: ${commands.join(" ; ")}`
       : "- expected validation commands: discover the narrow changed-surface command from package scripts and the artifact;",
+    renderStagedProofPlanGuidance(validationProofPlan),
     "- if validation fails, fix the failure and rerun until it passes or an external blocker is proven;",
     "- do not report validation as passed unless it passed after your last edit in this checkout;",
     "- include the exact validation commands and final pass/fail result in your final message.",
   ].join("\n");
+}
+
+function renderStagedProofPlanGuidance(plan: LooseRecord | null) {
+  if (!plan || !Array.isArray(plan.commands)) return "";
+  const stages = [
+    ...new Set(
+      plan.commands.map((command: JsonValue) => String(command?.stage ?? "")).filter(Boolean),
+    ),
+  ];
+  return `- deterministic staged proof plan ${String(plan.plan_id ?? "").slice(0, 12)}: ${plan.commands.length} command(s), risk=${plan.risk?.level ?? "unknown"}, stages=${stages.join(" -> ") || "none"}; execute cheap prerequisites first, fail fast, and do not skip required canonical, review, security, exact-head, or live proof gates;`;
 }
 
 function renderChangelogRule(fixArtifact: LooseRecord) {

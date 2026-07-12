@@ -16,6 +16,19 @@ export interface LinearLabel {
   name: string;
 }
 
+export interface LinearAttachment {
+  id: string;
+  url: string;
+  title: string;
+}
+
+export interface LinearCreator {
+  id: string;
+  name: string;
+  admin: boolean;
+  owner: boolean;
+}
+
 export interface LinearIssue {
   id: string;
   identifier: string;
@@ -60,10 +73,13 @@ export interface WorkspaceItem {
 }
 
 /**
- * A single workspace item hydrated with the issue's current comments — produced by the
- * by-identifier fetch so a comment upsert can be planned against the live comment list
- * in the same read pass (no separate comment fetch, no drift).
+ * A single workspace item hydrated with the issue's current comments and analysis context —
+ * produced by the by-identifier fetch so comment planning and analysis share one consistent
+ * read (no separate source-context fetch and no pagination drift).
  */
 export interface HydratedWorkspaceItem extends WorkspaceItem {
   comments: Array<{ id: string; body: string }>;
+  description: string;
+  attachments: LinearAttachment[];
+  creator: LinearCreator | null;
 }

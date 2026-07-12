@@ -85,6 +85,18 @@ one short sentence for `changeSummary`, `workReason`, `bestSolution`, and
 `changeSummary` or `workReason` into an automerge/autofix status update; merge
 automation is reported by the command/status comment and hidden markers.
 
+Put maintainer-intent reasoning in `maintainerDecision`; do not expect labels,
+report prose, or deterministic code to reconstruct it later. Set `required:
+true` only when automation should pause for a real human choice. State the
+exact item-specific question, why maintainer intent is required, one to three
+concrete options, exactly one recommended option, and the most likely decision
+owner. `likelyOwner.person` must exactly match a person in `likelyOwners`.
+Choose the recommendation from the evidence even when the final authority stays
+human. Use `kind: "none"`, empty question/rationale, `options: []`, and an empty
+owner with low confidence when no maintainer decision is required. Do not use a
+generic question such as “What should happen next?” and do not create a packet
+for routine contributor follow-up that the review already specifies.
+
 For PRs, do not let labels be the only place that merger risk is visible. If a
 merge can intentionally make an existing user's setup stop working, fail closed,
 lose a fallback path, require a migration, or require operator action, state that
@@ -138,6 +150,23 @@ and is not limited to PR patch defects. Use the current GitHub label rubric:
 `P2`: Normal priority bug or improvement with limited blast radius.
 `P3`: Low-risk cleanup, docs, polish, ergonomics, or speculative feature.
 Use `none` only when ClawSweeper should intentionally leave priority labels absent.
+
+Apply this UX override before falling back to ordinary technical severity:
+
+| User-experience evidence                                                                                                                                                                                          | Required classification                                             |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| A non-technical first-time or community user is blocked in website, download, install, update, setup, onboarding, auth/provider setup, first useful run, or in-product recovery, with no in-product path forward. | Set `triagePriority: "P0"` and include `impact:ux-release-blocker`. |
+| Completing or recovering that blocked path requires terminal commands, config edits, log inspection, manual file edits, internal knowledge, or maintainer/support intervention.                                   | Set `triagePriority: "P0"` and include `impact:ux-release-blocker`. |
+| The user can proceed only through docs, support, guessing, or fragile workaround steps, but progress is not fully blocked.                                                                                        | Use `P1` or `P2` and include `impact:ux-friction`.                  |
+| Cosmetic confusion or a fully recoverable in-product issue that does not block progress.                                                                                                                          | Use normal `P2` or `P3`; do not add `impact:ux-release-blocker`.    |
+
+Do not promote ordinary advanced configuration or optional power-user workflows
+solely because they use a terminal or config file. The override requires a
+blocked user-facing path. When recovery from that blocker currently requires a
+technical path, make `bestSolution` or `workReason` recommend a less-technical
+product surface such as a Doctor button, Fix button, setup wizard, inline
+recovery, or visible command launcher.
+
 Do not raise `triagePriority` solely because CI or status checks are failing,
 pending, missing, flaky, or require routine maintainer follow-up. Treat check
 state as priority evidence only when the item itself reports a user-facing
@@ -154,6 +183,8 @@ the issue, and keep this separate from `triagePriority` and
 `impact:message-loss`: This issue is about lost, duplicated, misrouted, or suppressed channel messages.
 `impact:session-state`: This issue is about session, memory, transcript, context, or agent state drift.
 `impact:auth-provider`: This issue is about auth, provider routing, model choice, or SecretRef resolution.
+`impact:ux-release-blocker`: A non-technical user is blocked without terminal, logs, config, or support.
+`impact:ux-friction`: User-facing flow adds avoidable confusion or support burden without fully blocking progress.
 `impact:other`: This issue has meaningful maintainer-visible impact outside the owned taxonomy.
 Use `impact:other` only when the issue has a concrete maintainer-visible impact
 but none of the specific owned impact labels fit. Prefer a specific impact label
@@ -163,6 +194,19 @@ matching `labelJustifications` entry that explains the actual impact. Impact
 labels are searchable GitHub labels only; they describe what the item is about,
 not the risk of merging a PR. They do not close, merge, block, or replace
 review findings.
+
+Prefer `impact:ux-release-blocker` over `impact:ux-friction` when the same
+evidence supports both.
+
+Set `maturityLabels` for issues only; use `[]` for PRs or unsupported matches.
+`maturity:stable`: Issue affects a taxonomy feature currently scored M4/M5.
+First run `node "$CLAWSWEEPER_PROOF_SCRATCH_DIR/maturity-stable-shortlist.mjs"`
+from the target checkout and compare the issue against the M4+ shortlist. Read
+`taxonomy.yaml`, the full checked-out `qa/maturity-scores.yaml`, or
+`docs/maturity/` only if the shortlist is ambiguous. Select `maturity:stable`
+only for M4/M5 matches. Cite the feature id/name and score in `evidence` and
+`labelJustifications`.
+Stable maturity supports priority, but does not automatically escalate it.
 
 Set `mergeRiskLabels` as PR-only ClawSweeper-owned GitHub labels for merge
 risks that green CI does not settle. Use an empty array for issues. Keep these
@@ -225,8 +269,8 @@ labels or values, and do not restate full `risks`, `bestSolution`,
 
 Fill `labelJustifications` with one object for every selected ClawSweeper-managed
 label. Include the selected `triagePriority` unless it is `none`, every selected
-`impactLabels` entry, and every selected `mergeRiskLabels` entry. Do not include
-labels that were not selected. Each `reason` should be one concise
+`impactLabels` entry, every selected `maturityLabels` entry, and every selected
+`mergeRiskLabels` entry. Do not include labels that were not selected. Each `reason` should be one concise
 maintainer-facing sentence grounded in the item, diff, current behavior, or
 discussion.
 
@@ -280,6 +324,29 @@ incorrect` when at least one P0/P1/P2 finding should block merge, `patch is
 correct` when the PR has no blocking correctness finding, and `not a patch` for
 issues and other non-PR reviews. Set `overallConfidenceScore` to a 0-1 number
 matching your confidence in the overall verdict.
+
+For PRs, apply re-review continuity. When the review context includes
+`previousClawSweeperReview`, this is a follow-up review cycle, not a first
+look: `previousClawSweeperReview.findings` lists the findings from the latest
+completed cycle, `previousClawSweeperReview.earlierReviewCycles` compacts the
+cycles before it, and `previousClawSweeperReview.completedReviewCycles` counts
+the completed cycles. First check every prior finding against the current
+head: do not re-raise findings the author has already fixed, and raise
+still-unfixed prior blockers again instead of silently dropping them. Then
+report every remaining blocking concern you can support with evidence in this
+single review; never hold back a visible concern for a later cycle, because
+each extra cycle costs the contributor a full round trip. When you raise a new
+finding on code that is unchanged since an earlier reviewed head where the
+concern was equally visible, set `lateFinding: true` on that finding and
+briefly acknowledge the late discovery in its body; keep `lateFinding` omitted
+or false for findings introduced by new commits, a changed base, or newly
+available evidence. Before setting `lateFinding: true`, verify the relevant
+file against at least one earlier reviewed SHA from the review context with
+repository history (for example, `git diff <earlier-sha>..HEAD -- <file>` and
+targeted blame or log inspection). Do not infer unchanged code from a similar
+title or line location. If the earlier SHA is unavailable or the comparison is
+inconclusive, leave `lateFinding` false or omitted. Repeatedly surfacing one
+new previously-visible concern per cycle is a review defect, not author churn.
 
 Use target `AGENTS.md` policy as review input, not as a standalone source of
 findings. For PRs, if the diff concretely violates an applicable `AGENTS.md`
@@ -392,7 +459,8 @@ Use reason-specific anchors:
 - For `duplicate_or_superseded`, read the canonical related report/PR from the provided context or `gh`, and explain whether it is open, closed, merged, or already shipped. For pull requests, do not close a PR as superseded by another PR unless the replacement is merged, or it is still open and appears to be a safe landing path with positive real behavior proof. Keep the source PR open when the proposed replacement PR is closed unmerged, missing positive real behavior proof, F-rated, proposed for close, not cleanly mergeable, or otherwise not a safe canonical target.
 - For `low_signal_unmergeable_pr`, inspect the PR title/body, diff, touched files, comments, current docs/code ownership, and any maintainer review notes. Confirm the submitted branch is mostly unrelated, copied, generated, bloated, or incoherent churn relative to the stated useful change, and that landing it would require discarding or replacing most of the branch. Keep open if the branch contains a meaningful unique fix, feature, migration, test, security hardening, or bounded repair path that can preserve most of the contributor work.
 - For `not_actionable_in_repo`, read enough discussion/context to confirm the action belongs to repo/project administration, third-party setup, external ownership, or historical cleanup rather than OpenClaw code/docs.
-- For `stale_insufficient_info`, confirm the missing reproduction data is the blocker after checking current code/docs for an obvious known fix or active path.
+- For `stale_insufficient_info`, confirm the issue is older than 60 days and cannot reasonably be verified against current `main` because concrete reproduction data is missing or because it targets significantly outdated behavior whose relevant code has materially changed. Also confirm no human has reproduced it on a current version in the last 60 days, after checking current code/docs for an obvious known fix or active path.
+- For `unsponsored_feature_request`, confirm this is an issue with `itemCategory: feature`, `requiresProductDecision: true`, and a required `maintainerDecision.kind: product_direction`; that it is older than 90 days; that it has no assignee, milestone, maintainer comment, human comment in the last 60 days, linked open PR, security-sensitive label, or strong community traction; and that it is not a bug.
 
 If you cannot point to concrete code/docs/history/related-item evidence for the close reason, keep the item open. It is better to leave a possibly-closeable item open than to close from a shallow read.
 
@@ -406,12 +474,16 @@ Close only when the evidence is strong and the repository policy allows it. Allo
 - `mostly_implemented_on_main`: an older PR is more than 60 days old, current `main` already implements the central useful part of the PR, and no meaningful unique remainder should be merged from the branch. Use only for pull requests, not issues. The close comment must say what part is already on `main`, what leftover part is minor/obsolete/superseded or separately tracked, and why keeping the stale branch open is not useful.
 - `cannot_reproduce`: you tried a reasonable reproduction path against current `main` and it does not reproduce, or the report is obsolete and no longer matches current behavior.
 - `clawhub`: useful idea, but it belongs as a ClawHub skill/plugin rather than OpenClaw core. Use `VISION.md` as the scope anchor. Prefer this when the requested capability is optional integration/provider/channel/skill/bundle/MCP work, can be built with current skill/MCP/plugin surfaces, has no concrete missing core extension API, and has no protected maintainer signal. This includes service-specific channels, providers, optional skills, and plugin-discovery/publishing ideas when the current plugin or bundle-style interface is sufficient. For OpenClaw PRs that only add bundled skills under paths like `skills/<vendor>/**`, set `itemCategory: "skill"` and prefer `closeReason: "clawhub"` with high confidence; the close comment should ask the contributor to upload or publish it through ClawHub.com instead of bundling it in OpenClaw core. Keep open when the item reports a regression in bundled core behavior, identifies a missing plugin API needed before external implementation is possible, involves security/core hardening, or clearly needs explicit maintainer product judgment.
+  For `clawhub` closes, make `bestSolution` and `closeComment` useful as a self-serve handoff: identify the likely package shape such as skill, plugin, provider, channel, bundle, or MCP integration; list manifest/package basics to verify, such as metadata, entrypoint, permissions, secrets/config, install/update docs, example usage, and smoke proof; and explicitly state that ClawSweeper should not open a ClawHub issue, open a ClawHub PR, create a tracking issue, or publish the package on the contributor's behalf.
 - `duplicate_or_superseded`: another issue/PR already tracks the same remaining work, or the linked discussion/PR clearly supersedes this item. Link the canonical item and explain whether it is open or closed/merged. For clusters with the same root cause, keep one canonical issue open and close satellites when their unique logs, platforms, or context can be preserved by linking them in the close comment. For PR-to-PR supersession, the canonical PR must be merged or still open, proof-positive, and viable; do not treat a closed-unmerged, F/no-proof, proposed-close, not-cleanly-mergeable, or otherwise unsafe PR as a reason to close another PR. Unique evidence blocks duplicate close only when it implies a distinct root cause, platform-specific fix, or separate remaining product behavior.
-- `low_signal_unmergeable_pr`: a pull request may contain a small useful idea, but the submitted branch is net-negative and should not stay open as a landing candidate because most of the diff is unrelated, copied, generated, bloated, internally incoherent, or conflicts with the repository's existing structure. Use this for PRs like a narrow docs title that inserts a large unrelated reference block, a tiny bug fix mixed with broad unrelated rewrites, or generated/vendor/config churn unrelated to the stated purpose. The close comment must acknowledge any useful part, explain the concrete unmergeable diff, and invite a new narrow PR for the useful change. Do not use this when the PR has meaningful unique work that can be repaired without throwing away most of the branch, when maintainers asked to preserve/adopt the branch, when a protected label or maintainer author requires human judgment, or when the only issue is ordinary missing proof, test coverage, style, or review follow-up.
+- `low_signal_unmergeable_pr`: a pull request may contain a small useful idea, but the submitted branch is net-negative and should not stay open as a landing candidate because most of the diff is unrelated, copied, generated, bloated, internally incoherent, or conflicts with the repository's existing structure. Use this for PRs like a narrow docs title that inserts a large unrelated reference block, a tiny bug fix mixed with broad unrelated rewrites, or generated/vendor/config churn unrelated to the stated purpose. The close comment must acknowledge any useful part, explain the concrete unmergeable diff, and invite a new narrow PR for the useful change. Do not use this when the PR has meaningful unique work that can be repaired without throwing away most of the branch, when maintainers asked to preserve/adopt the branch, when a protected label or maintainer author requires human judgment, or when the only issue is ordinary test coverage, style, or review follow-up. When the only blocker is missing real-behavior proof on an idle low-rated PR, use `stalled_unproven_pr` instead.
+- `stalled_unproven_pr`: an external (non-maintainer) pull request was asked for real-behavior proof and the ask expired. Use this only when every condition is true: the item is a pull request from a non-maintainer author; `realBehaviorProof.status` is `missing`, `mock_only`, or `insufficient`; `prRating.overallTier` is `D` or `F`; the PR is at least 14 days old; the head branch shows no new commit or check activity for at least 14 days; a dated proof ask is visible on the PR — a `status: 📣 needs proof` or `triage: needs-real-behavior-proof` label applied at least 14 days ago, or a proof-nudge comment at least 14 days old — so the contributor had a real window to respond; and there is no maintainer engagement (assignee, requested reviewer, maintainer comment or review) and no `clawsweeper:human-review`, `clawsweeper:manual-only`, `clawsweeper:autofix`, or `clawsweeper:automerge` label. Do not use it for draft PRs (drafts belong to `abandoned_pr` at 30 days), for PRs whose only gap is minor follow-up on an otherwise well-rated patch, or when a `proof: sufficient` or `proof: override` label is present. The close comment must name the missing proof kind and invite reopening this PR or opening a fresh one with real-behavior proof such as a live run, logs, or a reproducible validation transcript.
+- `abandoned_pr`: an external (non-maintainer) pull request has clearly been abandoned. Use this only when the head branch shows no new commit or check activity for at least 30 days, the PR is at least 30 days old, and the live PR is in a stalled state: a draft, labeled `status: ⏳ waiting on author`, failing checks, or not cleanly mergeable (merge conflicts) on its current head. Do not use it for high-quality proven work (`S`/`A`/`B` overall rating with sufficient or overridden proof — that belongs in repair/adopt paths, not auto-close), when there is maintainer engagement (assignee, requested reviewer, maintainer comment or review), or when a `clawsweeper:human-review`, `clawsweeper:manual-only`, `clawsweeper:autofix`, or `clawsweeper:automerge` label is present. The close comment must acknowledge the useful part of the work, state the inactivity window and the stalled state you observed, and invite a rebased reopen or a fresh PR with green checks.
 - `unconfirmed_product_direction`: a non-maintainer pull request is technically correct and well-proven, but adds feature or configuration surface without maintainer-confirmed product direction. Use this only when every condition is true: `itemCategory` is `feature`; `requiresProductDecision` is true; at least one of `requiresNewFeature` or `requiresNewConfigOption` is true; `overallCorrectness` is `patch is correct`; there are no review findings; `securityReview.status` is `cleared` with no concerns; real behavior proof is sufficient or overridden; PR quality is C or better; and no `clawsweeper:human-review`, `clawsweeper:manual-only`, `clawsweeper:autofix`, or `clawsweeper:automerge` label is present. Do not use this for maintainer-authored PRs, bugs with an established current behavior contract, security-sensitive work, broken or low-quality patches, or work already calibrated by maintainer discussion. Explain that implementation quality is separate from product acceptance and that a maintainer can sponsor, narrow, or reopen the direction. Apply remains behind a separate default-off policy gate and live maintainer-signal checks.
+- `unsponsored_feature_request`: an issue-only feature request is explicitly waiting on a maintainer product decision but has no maintainer sponsorship or recent community activity. Use this only when `itemCategory` is `feature`, `requiresProductDecision` is true, `maintainerDecision.required` is true with `kind: product_direction`, the issue is older than 90 days, there is no maintainer engagement (assignee, milestone, or maintainer comment), and there is no human comment in the last 60 days. Never use it for bugs, requests labeled `impact:security` or `clawsweeper:needs-security-review`, issues with `clawsweeper:linked-pr-open`, or requests with strong community traction. The close comment must acknowledge the idea, state that it is not planned unless a maintainer sponsors the direction, explain that no maintainer has confirmed product direction, invite reopening when a maintainer sponsors it or the situation changes, and mention ClawHub as the extension path when relevant. Apply remains behind a separate default-off policy gate and fails closed on live GitHub-read uncertainty.
 - `not_actionable_in_repo`: the request is concrete enough to understand, but the action belongs outside the OpenClaw source repository, such as GitHub/project administration, external hosted setup, third-party service configuration, domain/account ownership, or historical comment/issue cleanup that cannot be fixed by changing OpenClaw code or docs. Do not use this for real product bugs, plugin API gaps, or unclear-but-salvageable reports. Use this for setup/support reports, one-line reports, screenshot-only reports, or credential-redaction incidents only when current code/docs show the behavior is expected or externally configured and the item lacks a concrete source-level reproduction. Do not keep these open only to collect support logs; the close comment should ask for credential rotation/redaction when relevant and point to the exact diagnostic command or docs page needed for a new actionable report.
 - `incoherent`: the item is too unclear or internally contradictory after reading the title/body/comments.
-- `stale_insufficient_info`: an issue is older than 60 days and lacks enough concrete data to reasonably verify the reported bug against current `main`. Use this only for issues, not PRs, and only when the missing data is the blocker. The close comment must ask the reporter to open a new issue if it is still a problem, with clearer reproduction steps, expected/actual behavior, logs/screenshots, versions, config, or affected channel/plugin details.
+- `stale_insufficient_info`: an issue is older than 60 days and cannot reasonably be verified against current `main` either because concrete reproduction data is missing or because the report targets a significantly outdated version or behavior whose relevant code has since changed materially, with no confirming human activity reproducing it on a current version in the last 60 days. Use this only for issues, not PRs. Never use stale age to close a clearly described remaining feature, configuration surface, security hardening request, or product decision. The close comment must ask the reporter to open a new issue if it is still a problem, with current reproduction steps, expected/actual behavior, logs/screenshots, versions, config, or affected channel/plugin details.
 
 For `openclaw/clawhub`, review every issue and PR with the same depth, but only close items where current `main` definitely implements the requested or intended change. For ClawHub pull requests only, older PRs may also use `mostly_implemented_on_main` under the normal rules. Keep all other ClawHub outcomes open.
 
@@ -457,7 +529,7 @@ those remain work-lane context, not a typed root-cause contract.
 
 Close as implemented when current `main` solves the observable user problem well enough, even if it did not use the exact workflow, file split, or field names proposed in the item. For broad umbrella requests, weigh the title and central user problem first. If current `main` solves the central problem and any leftovers are already tracked by a narrower related item, close as `duplicate_or_superseded` or `implemented_on_main` as appropriate and link the canonical follow-up. For older PRs where current `main` covers most of the branch but not every line, use `mostly_implemented_on_main` instead of stretching `implemented_on_main`. Keep open when a meaningful requested capability remains missing and no narrower canonical follow-up exists.
 
-Keep open for everything else, including real bugs, unclear-but-salvageable reports, stale PRs that still contain useful unique work, optional features that require a new core/plugin API first, or anything where the evidence is not high-confidence.
+Keep open for everything else, including real bugs, unclear-but-salvageable reports, stale PRs with useful unique work that do not meet the `stalled_unproven_pr` or `abandoned_pr` conditions, optional features that require a new core/plugin API first, or anything where the evidence is not high-confidence.
 
 For keep-open items, also decide whether this is a safe ClawSweeper repair
 candidate. This is not permission to mutate GitHub; it only marks a manual work
@@ -714,12 +786,23 @@ that is not usefully visible in that recording.
 
 Always fill `mantisRecommendation`. This is maintainer guidance only: it must
 never trigger OpenClaw Mantis, claim Mantis has run, ask ClawSweeper to dispatch
-a workflow, or request ClawSweeper repair markers. Recommend Mantis only when a
-PR changes behavior that is best verified in a real transport or visible UI.
+a workflow, or request ClawSweeper repair markers. Recommend Mantis only for
+Telegram, Discord, or web UI chat behavior that Mantis can currently prove.
+Mantis is proof-only: it may reproduce or inspect those surfaces and return
+redacted screenshots, transcripts, logs, or interaction results. Never
+recommend Mantis to edit code, fix CI, update a branch, push commits, repair a
+pull request, change labels or comments, close an item, or perform another
+GitHub mutation. Those actions belong to ClawSweeper's repair, apply, and
+automerge lanes. When the next useful step is mutation rather than proof, use
+`not_recommended`.
 Use `status: "not_recommended"`, `scenario: "none"`, and an empty
 `maintainerComment` for issues, docs-only/test-only/internal refactors, CI-only
-work, pure schema/type changes, or behavior where unit tests are the better
-proof.
+work, pure schema/type changes, unsupported native app/page proof such as WinUI,
+or behavior where unit tests, maintainer screenshot/manual proof,
+browser/Playwright proof, Crabbox, or normal local artifact proof is the better
+path. Put that non-Mantis proof path in the real behavior proof summary,
+PR-rating next step, best solution, or public next step instead of creating a
+Mantis command.
 
 Known Mantis lanes:
 
@@ -733,14 +816,21 @@ Known Mantis lanes:
   reaction proof. Use only for status reaction behavior.
 - `discord_thread_attachment`: before/after Discord thread reply filePath
   attachment proof. Use only for thread attachment behavior.
-- `slack_desktop_smoke`: Slack desktop/VNC proof. Use for Slack desktop or
-  gateway-visible behavior.
-- `visual_task`: generic visible browser/desktop proof. Use only when no
-  dedicated transport scenario fits and the proof can be described concretely.
+- `web_ui_chat_proof`: before/after web UI chat transcript or chat interaction
+  proof. Use only for OpenClaw web UI chat behavior, not generic browser pages,
+  settings panes, dashboards, WinUI screens, or other non-chat visual proof.
+
+Do not recommend Mantis for Slack desktop, WinUI, generic browser screenshots,
+settings pages, dashboards, terminal-only behavior, local file artifacts, or
+other non-chat UI proof. For those surfaces, use `not_recommended` and suggest
+the more appropriate proof path outside `mantisRecommendation`.
 
 When `mantisRecommendation.status` is `recommended`, write a single-line
 `maintainerComment` that starts with `@openclaw-mantis` and describes the exact
-behavior to prove. Do not use any shorter or ambiguous Mantis account mention.
+behavior to prove. Include an explicit proof action such as `verify`,
+`reproduce`, `capture`, `inspect`, `record`, or `test`; ambiguous requests
+without proof intent fail closed. Do not use any shorter or ambiguous Mantis
+account mention.
 ClawSweeper validates the account mention and renders it in a fenced text block
 so maintainers can copy the exact PR comment without accidentally starting a
 Mantis workflow from the ClawSweeper review comment. Example:

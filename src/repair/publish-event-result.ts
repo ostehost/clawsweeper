@@ -3,27 +3,36 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   applyEventSnapshot,
+  applyEventSnapshotIfCurrent,
+  captureEventBaseSnapshot,
   captureEventSnapshot,
+  eventSnapshotMatchesCurrent,
   type EventRecordPaths,
   resetEventSnapshot,
 } from "./event-record-store.js";
 import {
+  eventRecordActionTaken,
+  eventApplyAction,
+  exactEventApplyProof,
+  exactEventPublishDisposition,
+  type EventApplyAction,
+} from "./event-apply-proof.js";
+import {
+  captureStatePublishBaseline,
   commitMessageForPublishedPaths,
   configureGitUser,
   hardResetToRemoteMain,
   hasStagedChanges,
   publishRoot,
   pushCommit,
+  refreshSourceAfterStatePublish,
   runGit,
   setTokenOrigin,
   stagePaths,
   syncPublishPaths,
 } from "./git-publish.js";
 import { isJsonObject } from "./json-types.js";
-
-type ApplyAction = {
-  action: string;
-};
+import { RecordTupleError } from "./record-tuple.js";
 
 type EventOptions = {
   targetRepo: string;
@@ -33,6 +42,23 @@ type EventOptions = {
   reportPath: string;
   snapshotDir: string;
 };
+
+type PublishedEventSnapshot = {
+  guardedOpenAction: string | null;
+  policyNoop: boolean;
+  requeueLatest: boolean;
+  remoteTupleVerified: boolean;
+  routableSyncVerified: boolean;
+  routingDeferred: boolean;
+  terminalClosed: boolean;
+  terminalMissing: boolean;
+};
+
+class GuardedOpenPublishRaceError extends Error {}
+class RoutableSyncPublishRaceError extends Error {}
+class SourceDriftPublishRaceError extends Error {}
+class TerminalClosedPublishRaceError extends Error {}
+class TerminalMissingPublishRaceError extends Error {}
 
 const options = eventOptionsFromEnv();
 await publishEventResult(options);
@@ -52,6 +78,7 @@ async function publishEventResult(options: EventOptions): Promise<void> {
   };
 
   resetEventSnapshot(recordStore);
+  captureEventBaseSnapshot(recordStore);
   fs.rmSync(options.reportPath, { force: true });
 
   runStreaming("pnpm", [
@@ -66,6 +93,142 @@ async function publishEventResult(options: EventOptions): Promise<void> {
     "--skip-dashboard",
     "--replay-closed-artifacts",
   ]);
+
+  // Preserve the exact artifact candidate before refreshing the state checkout.
+  // A stale event must be rejected before apply-decisions can comment, label,
+  // or close anything on GitHub.
+  const recordPaths = captureEventSnapshot(recordStore);
+  hardResetToRemoteMain();
+  const stateBaseCommit = captureStatePublishBaseline();
+  const stateRoot = publishRoot();
+  const preflightResult = applyEventSnapshotIfCurrent(
+    recordPaths,
+    stateRoot ? { remoteRoot: stateRoot } : {},
+    () => runApplyDecisions(options),
+  );
+  if (
+    preflightResult === "remote-closed" ||
+    preflightResult === "remote-newer" ||
+    preflightResult === "missing"
+  ) {
+    const detail =
+      preflightResult === "remote-closed"
+        ? "current state is already closed"
+        : preflightResult === "remote-newer"
+          ? "current state has a newer tuple"
+          : "the event produced no record tuple";
+    console.log(
+      `Skipping stale event apply for ${options.targetRepo}#${options.itemNumber}: ${detail}`,
+    );
+    refreshSourceAfterStatePublish(
+      [
+        recordPaths.itemRecord,
+        recordPaths.closedRecord,
+        recordPaths.planRecord,
+        recordPaths.decisionPacket,
+      ],
+      stateBaseCommit,
+    );
+    writeSummary({
+      targetRepo: options.targetRepo,
+      itemNumber: options.itemNumber,
+      syncedCount: 0,
+      closedCount: 0,
+      missingCount: 0,
+      closeReasons: options.closeReasons,
+    });
+    throw new Error(
+      `Event state for ${options.targetRepo}#${options.itemNumber} was not applied because ${detail}; requeue against the latest item revision`,
+    );
+  }
+
+  const actions = readApplyActions(options.reportPath);
+  captureEventSnapshot(recordStore);
+  const snapshotActionTaken = eventRecordActionTaken(
+    fs.existsSync(recordPaths.snapshotItem)
+      ? fs.readFileSync(recordPaths.snapshotItem, "utf8")
+      : null,
+  );
+  const {
+    exactActions,
+    syncedCount,
+    terminalMissingCount: missingCount,
+    terminalCount: closedCount,
+    guardedOpenAction,
+    disposition: applyDisposition,
+  } = exactEventApplyProof(actions, Number(options.itemNumber), snapshotActionTaken);
+  const requeueLatestExpected = applyDisposition === "source_drift";
+  if (
+    syncedCount + closedCount + missingCount === 0 &&
+    guardedOpenAction === null &&
+    !requeueLatestExpected
+  ) {
+    const observed =
+      exactActions
+        .map((entry) => entry.action)
+        .filter(Boolean)
+        .join(", ") || "none";
+    throw new Error(
+      `Event review for ${options.targetRepo}#${options.itemNumber} was not applied; actions: ${observed}`,
+    );
+  }
+  const summary = () =>
+    writeSummary({
+      targetRepo: options.targetRepo,
+      itemNumber: options.itemNumber,
+      syncedCount,
+      closedCount,
+      missingCount,
+      closeReasons: options.closeReasons,
+    });
+  const routableSyncExpected =
+    syncedCount > 0 &&
+    closedCount === 0 &&
+    missingCount === 0 &&
+    guardedOpenAction === null &&
+    !requeueLatestExpected;
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    const published = publishSnapshot({
+      paths: recordPaths,
+      options,
+      summary,
+      stateBaseCommit,
+      guardedOpenAction,
+      requeueLatestExpected,
+      routableSyncExpected,
+      terminalClosedExpected: closedCount > 0,
+      terminalMissingExpected: missingCount > 0,
+    });
+    if (published) {
+      writeEventDispositionOutputs(published);
+      return;
+    }
+    const delaySeconds = attempt * 3 + Math.floor(Math.random() * 11);
+    console.log(
+      `Event publish attempt ${attempt} failed; retrying from origin/main in ${delaySeconds}s`,
+    );
+    await sleep(delaySeconds * 1000);
+  }
+  const published = publishSnapshot({
+    paths: recordPaths,
+    options,
+    summary,
+    stateBaseCommit,
+    guardedOpenAction,
+    requeueLatestExpected,
+    routableSyncExpected,
+    terminalClosedExpected: closedCount > 0,
+    terminalMissingExpected: missingCount > 0,
+  });
+  if (!published) {
+    throw new Error(
+      `Failed to publish event result for ${options.targetRepo}#${options.itemNumber}`,
+    );
+  }
+  writeEventDispositionOutputs(published);
+}
+
+function runApplyDecisions(options: EventOptions): void {
   runStreaming("pnpm", [
     "run",
     "apply-decisions",
@@ -92,85 +255,124 @@ async function publishEventResult(options: EventOptions): Promise<void> {
     "0",
     "--progress-every",
     "1",
+    "--event-apply-proof",
     "--skip-dashboard",
     "--report-path",
     options.reportPath,
   ]);
-
-  const actions = readApplyActions(options.reportPath);
-  const syncedCount = actions.filter((entry) => entry.action === "review_comment_synced").length;
-  const closedCount = actions.filter((entry) => entry.action === "closed").length;
-  const recordPaths = captureEventSnapshot(recordStore);
-
-  const summary = () =>
-    writeSummary({
-      targetRepo: options.targetRepo,
-      itemNumber: options.itemNumber,
-      syncedCount,
-      closedCount,
-      closeReasons: options.closeReasons,
-    });
-
-  for (let attempt = 1; attempt <= 20; attempt += 1) {
-    if (publishSnapshot({ paths: recordPaths, options, summary })) return;
-    const delaySeconds = attempt * 3 + Math.floor(Math.random() * 11);
-    console.log(
-      `Event publish attempt ${attempt} failed; retrying from origin/main in ${delaySeconds}s`,
-    );
-    await sleep(delaySeconds * 1000);
-  }
-  if (!publishSnapshot({ paths: recordPaths, options, summary })) {
-    throw new Error(
-      `Failed to publish event result for ${options.targetRepo}#${options.itemNumber}`,
-    );
-  }
 }
 
 function publishSnapshot({
   paths,
   options,
   summary,
+  stateBaseCommit,
+  guardedOpenAction,
+  requeueLatestExpected,
+  routableSyncExpected,
+  terminalClosedExpected,
+  terminalMissingExpected,
 }: {
   paths: EventRecordPaths;
   options: EventOptions;
   summary: () => void;
-}): boolean {
+  stateBaseCommit: string | null;
+  guardedOpenAction: string | null;
+  requeueLatestExpected: boolean;
+  routableSyncExpected: boolean;
+  terminalClosedExpected: boolean;
+  terminalMissingExpected: boolean;
+}): PublishedEventSnapshot | null {
+  const commitPaths = [
+    paths.itemRecord,
+    paths.closedRecord,
+    paths.planRecord,
+    paths.decisionPacket,
+  ];
   try {
+    const complete = (candidateApplied: boolean): PublishedEventSnapshot => {
+      // The reconciliation push can succeed just before another publisher
+      // advances the same tuple. Refresh from the authoritative remote before
+      // emitting any completion output; the workflow never routes an ordinary
+      // synced verdict inline, so no read-then-route atomicity is implied here.
+      hardResetToRemoteMain();
+      refreshSourceAfterStatePublish(commitPaths, stateBaseCommit);
+      const candidateMatchesCurrentTuple = candidateApplied && eventSnapshotMatchesCurrent(paths);
+      const candidateTupleState = candidateEventTupleState(paths);
+      const disposition = exactEventPublishDisposition({
+        candidateMatchesCurrentTuple,
+        candidateTupleState,
+        terminalClosedExpected,
+        terminalMissingExpected,
+        guardedOpenAction,
+        routableSyncExpected,
+      });
+      const published = {
+        ...disposition,
+        policyNoop: disposition.guardedOpenAction === "skipped_same_author_pair",
+        requeueLatest:
+          requeueLatestExpected && candidateMatchesCurrentTuple && candidateTupleState === "open",
+        remoteTupleVerified: candidateMatchesCurrentTuple,
+        routingDeferred: disposition.routableSyncVerified,
+      };
+      if (routableSyncExpected && !published.routableSyncVerified) {
+        throw new RoutableSyncPublishRaceError(
+          `Durable review sync for ${paths.targetSlug}#${options.itemNumber} lost the publish race; requeue against the latest item revision`,
+        );
+      }
+      if (terminalMissingExpected && !published.terminalMissing) {
+        throw new TerminalMissingPublishRaceError(
+          `Verified missing item ${paths.targetSlug}#${options.itemNumber} lost the publish race; requeue against the latest item revision`,
+        );
+      }
+      if (terminalClosedExpected && !published.terminalClosed) {
+        throw new TerminalClosedPublishRaceError(
+          `Verified terminal close for ${paths.targetSlug}#${options.itemNumber} lost the publish race; requeue against the latest item revision`,
+        );
+      }
+      if (requeueLatestExpected && !published.requeueLatest) {
+        throw new SourceDriftPublishRaceError(
+          `Verified source drift for ${paths.targetSlug}#${options.itemNumber} lost the publish race; requeue against the latest item revision`,
+        );
+      }
+      if (
+        guardedOpenAction !== null &&
+        !published.terminalClosed &&
+        !published.terminalMissing &&
+        published.guardedOpenAction === null
+      ) {
+        throw new GuardedOpenPublishRaceError(
+          `Deterministic remain-open guard for ${paths.targetSlug}#${options.itemNumber} lost the publish race; requeue against the latest item revision`,
+        );
+      }
+      summary();
+      return published;
+    };
     hardResetToRemoteMain();
     const stateRoot = publishRoot();
-    if (
-      stateRoot &&
-      fs.existsSync(paths.snapshotItem) &&
-      !fs.existsSync(paths.snapshotClosed) &&
-      fs.existsSync(`${stateRoot}/${paths.closedRecord}`)
-    ) {
-      console.log(
-        `Remote already has closed record for ${paths.targetSlug}#${options.itemNumber}; skipping open-record publish`,
-      );
-      summary();
-      return true;
-    }
-    const snapshotResult = applyEventSnapshot(paths);
+    const snapshotResult = applyEventSnapshot(paths, stateRoot ? { remoteRoot: stateRoot } : {});
     if (snapshotResult === "remote-closed") {
       console.log(
         `Remote already has closed record for ${paths.targetSlug}#${options.itemNumber}; skipping open-record publish`,
       );
-      summary();
-      return true;
+      return complete(false);
+    }
+    if (snapshotResult === "remote-newer") {
+      console.log(
+        `Remote has newer record tuple for ${paths.targetSlug}#${options.itemNumber}; skipping stale event publish`,
+      );
+      return complete(false);
     }
     if (snapshotResult === "missing") {
       console.log(`No event record snapshot for ${paths.targetSlug}#${options.itemNumber}`);
-      summary();
-      return true;
+      return complete(false);
     }
 
-    const commitPaths = [paths.itemRecord, paths.closedRecord];
     syncPublishPaths(commitPaths);
     stagePaths(commitPaths);
     if (!hasStagedChanges()) {
       console.log("No event result changes");
-      summary();
-      return true;
+      return complete(true);
     }
 
     runGit([
@@ -181,13 +383,29 @@ function publishSnapshot({
         commitPaths,
       ),
     ]);
-    if (!pushCommit({ pushAttempts: 3 })) return false;
-    summary();
-    return true;
+    if (!pushCommit({ pushAttempts: 3, rebaseStrategy: "reconcile-records" })) return null;
+    return complete(true);
   } catch (error) {
+    if (
+      error instanceof RecordTupleError ||
+      error instanceof GuardedOpenPublishRaceError ||
+      error instanceof RoutableSyncPublishRaceError ||
+      error instanceof SourceDriftPublishRaceError ||
+      error instanceof TerminalClosedPublishRaceError ||
+      error instanceof TerminalMissingPublishRaceError
+    )
+      throw error;
     console.error(error instanceof Error ? error.message : String(error));
-    return false;
+    return null;
   }
+}
+
+function candidateEventTupleState(paths: EventRecordPaths): "closed" | "open" | "invalid" {
+  const hasOpenRecord = fs.existsSync(paths.snapshotItem);
+  const hasClosedRecord = fs.existsSync(paths.snapshotClosed);
+  if (hasClosedRecord && !hasOpenRecord) return "closed";
+  if (hasOpenRecord && !hasClosedRecord) return "open";
+  return "invalid";
 }
 
 function eventOptionsFromEnv(): EventOptions {
@@ -203,12 +421,11 @@ function eventOptionsFromEnv(): EventOptions {
   };
 }
 
-function readApplyActions(reportPath: string): ApplyAction[] {
+function readApplyActions(reportPath: string): EventApplyAction[] {
   const parsed: unknown = JSON.parse(fs.readFileSync(reportPath, "utf8"));
   if (!Array.isArray(parsed)) throw new Error(`${reportPath} must contain an array`);
   return parsed.map((entry) => {
-    if (!isJsonObject(entry) || typeof entry.action !== "string") return { action: "" };
-    return { action: entry.action };
+    return eventApplyAction(isJsonObject(entry) ? entry : {});
   });
 }
 
@@ -217,12 +434,14 @@ function writeSummary({
   itemNumber,
   syncedCount,
   closedCount,
+  missingCount,
   closeReasons,
 }: {
   targetRepo: string;
   itemNumber: string;
   syncedCount: number;
   closedCount: number;
+  missingCount: number;
   closeReasons: string;
 }): void {
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
@@ -234,7 +453,28 @@ function writeSummary({
       `- Item: ${targetRepo}#${itemNumber}`,
       `- Synced durable comments: ${syncedCount}`,
       `- Closed safe proposals: ${closedCount}`,
+      `- Confirmed missing items: ${missingCount}`,
       `- Close reasons enabled: ${closeReasons}`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+function writeEventDispositionOutputs(published: PublishedEventSnapshot): void {
+  const outputPath = process.env.GITHUB_OUTPUT;
+  if (!outputPath) return;
+  fs.appendFileSync(
+    outputPath,
+    [
+      `remote_tuple_verified=${published.remoteTupleVerified ? "true" : "false"}`,
+      `terminal_missing=${published.terminalMissing ? "true" : "false"}`,
+      `terminal_closed=${published.terminalClosed ? "true" : "false"}`,
+      `guarded_open=${published.guardedOpenAction === null ? "false" : "true"}`,
+      `guarded_open_action=${published.guardedOpenAction ?? ""}`,
+      `policy_noop=${published.policyNoop ? "true" : "false"}`,
+      `requeue_latest=${published.requeueLatest ? "true" : "false"}`,
+      `routing_deferred=${published.routingDeferred ? "true" : "false"}`,
       "",
     ].join("\n"),
     "utf8",

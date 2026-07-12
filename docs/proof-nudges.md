@@ -40,6 +40,12 @@ posts a durable Mantis proof request comment. Otherwise it updates one durable
 status comment asking maintainers to choose proof capture, proof override, or
 pause. It does not post contributor reminders.
 
+Mantis requests are proof-only. They may ask Mantis to reproduce or inspect
+supported Telegram, Discord, or web UI chat behavior and return redacted
+screenshots, transcripts, logs, or interaction results. Code changes, CI fixes,
+branch updates, commits, PR repair, labels, comments, closes, and merges stay in
+ClawSweeper's deterministic repair, apply, and automerge lanes.
+
 For dashboard accounting, status-only maintainer requests use
 `bot_proof_decision_planned` or `bot_proof_decision_posted`. Mantis proof
 requests use `bot_proof_mantis_request_planned` or
@@ -73,7 +79,8 @@ pnpm run proof-nudges -- --target-repo openclaw/openclaw --execute --limit 10
 Useful options:
 
 - `--limit`: maximum nudges to plan or post, default `10`.
-- `--processed-limit`: maximum records to inspect in one run.
+- `--processed-limit`: maximum records to inspect in one run, minimum `1`.
+- `--cursor-path`: optional JSON cursor path used to rotate untargeted candidate scans after execute runs.
 - `--min-age-days`: first-nudge age gate, default `5`.
 - `--cooldown-days`: same-head cooldown, default `7`.
 - `--item-numbers`: comma-separated pull request numbers for a targeted dry-run or execute run.
@@ -92,10 +99,23 @@ Scheduled operation uses repository variables:
 - `CLAWSWEEPER_PROOF_NUDGES_EXECUTE=1`: allow the scheduled lane to post comments. Without this, scheduled runs remain dry-run only.
 - `CLAWSWEEPER_PROOF_NUDGES_TARGET_REPO`: optional target repo, default `openclaw/openclaw`.
 - `CLAWSWEEPER_PROOF_NUDGES_LIMIT`: optional scheduled batch size, default `10`.
+- `CLAWSWEEPER_PROOF_NUDGES_PROCESSED_LIMIT`: optional positive scheduled scan size before the cursor advances; the CLI default is `max(limit * 20, 50)`.
 - `CLAWSWEEPER_PROOF_NUDGES_MIN_AGE_DAYS`: optional first-nudge age gate, default `5`.
 - `CLAWSWEEPER_PROOF_NUDGES_COOLDOWN_DAYS`: optional same-head cooldown, default `7`.
 - `CLAWSWEEPER_BOT_PROOF_SCHEDULED=1`: include the bot-owned proof lane in scheduled runs.
 - `CLAWSWEEPER_BOT_PROOF_EXECUTE=1`: allow scheduled bot-owned proof runs to post status comments and labels. Without this, scheduled bot-proof runs remain dry-run only.
+
+Untargeted scheduled runs rotate through durable cursor files under
+`results/proof-nudge-cursors/` and `results/bot-proof-cursors/`. A skip-heavy
+run that spends its processed-record budget advances the cursor to the last
+processed candidate, so later runs inspect the next bounded window instead of
+repeating the same prefix. Targeted `--item-numbers` runs do not use or update
+those cursors.
+
+The workflow publishes only the exact target cursor files, for example
+`results/proof-nudge-cursors/openclaw-openclaw.json`, and only after the
+corresponding lane executed and wrote that file. Dry-runs do not publish cursor
+paths, and one target repo run does not replace another target's cursor file.
 
 Suggested rollout:
 

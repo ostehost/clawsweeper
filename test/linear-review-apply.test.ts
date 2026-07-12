@@ -6,6 +6,7 @@ import {
   buildScopeSpec,
   loadApprovals,
   parseArgs,
+  reportExitCode,
   summarizeItem,
 } from "../scripts/linear-review-apply.mjs";
 
@@ -100,6 +101,7 @@ test("loadApprovals builds a map from a reviewed dry-run report", () => {
         identifier: "PAR-1",
         planHash: HASH_A,
         snapshotHash: HASH_B,
+        labelReceipt: { planHash: HASH_B, snapshotHash: HASH_A },
         nowIso: "2026-06-24T00:00:00Z",
       },
       { identifier: "par-2", planHash: HASH_B, snapshotHash: HASH_A },
@@ -110,6 +112,8 @@ test("loadApprovals builds a map from a reviewed dry-run report", () => {
   assert.deepEqual(map.get("PAR-1"), {
     approvedPlanHash: HASH_A,
     approvedSnapshotHash: HASH_B,
+    approvedLabelPlanHash: HASH_B,
+    approvedLabelSnapshotHash: HASH_A,
     nowIso: "2026-06-24T00:00:00Z",
     source: "approvals-file",
   });
@@ -124,6 +128,30 @@ test("loadApprovals reads hashes nested under receipt and skips incomplete entri
   ];
   const map = loadApprovals(list);
   assert.deepEqual([...map.keys()], ["PAR-1"]);
+});
+
+test("loadApprovals keeps comment and label approvals independent", () => {
+  const map = loadApprovals([
+    {
+      identifier: "PAR-1",
+      receipt: { planHash: HASH_A, snapshotHash: HASH_B },
+      labelReceipt: { planHash: HASH_B, snapshotHash: HASH_A },
+    },
+    {
+      identifier: "PAR-2",
+      planHash: HASH_A,
+      snapshotHash: HASH_B,
+      labelReceipt: { planHash: HASH_B },
+    },
+    {
+      identifier: "PAR-3",
+      labelReceipt: { planHash: HASH_A, snapshotHash: HASH_B },
+    },
+  ]);
+  assert.equal(map.get("PAR-1")?.approvedLabelPlanHash, HASH_B);
+  assert.equal(map.get("PAR-2")?.approvedLabelPlanHash, undefined);
+  assert.equal(map.get("PAR-3")?.approvedPlanHash, undefined);
+  assert.equal(map.get("PAR-3")?.approvedLabelSnapshotHash, HASH_B);
 });
 
 test("loadApprovals rejects a malformed hash", () => {
@@ -235,4 +263,9 @@ test("aggregate tallies dispositions, intent, outcomes, and errors", () => {
   assert.equal(report.counts.applied, 1);
   assert.equal(report.counts.errors, 1);
   assert.deepEqual(report.counts.byDisposition, { review: 2, closed: 1 });
+  assert.equal(reportExitCode(report), 1);
+});
+
+test("reportExitCode returns zero for an error-free report", () => {
+  assert.equal(reportExitCode({ counts: { errors: 0 } }), 0);
 });

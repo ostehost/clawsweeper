@@ -5,6 +5,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
 
+import { mockGhBinEnv } from "../helpers.ts";
+
 const scriptPath = path.resolve("dist/repair/pr-repair-intake.js");
 
 test("pr repair intake ignores cancelled-only checks", () => {
@@ -90,7 +92,7 @@ test("pr repair intake supports author-wide open PR discovery", () => {
       cwd: process.cwd(),
       env: {
         ...process.env,
-        PATH: `${path.join(root, "bin")}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(bin, "gh"), bin),
       },
       encoding: "utf8",
     },
@@ -139,7 +141,7 @@ function runIntake(root: string, extraArgs: string[]): string {
       cwd: process.cwd(),
       env: {
         ...process.env,
-        PATH: `${path.join(root, "bin")}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...mockGhBinEnv(path.join(root, "bin", "gh"), path.join(root, "bin")),
       },
       encoding: "utf8",
     },

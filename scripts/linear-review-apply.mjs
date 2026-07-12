@@ -20,8 +20,9 @@
  *
  * Gating is identical to the single-item path and just as conservative:
  *   - DRY-RUN by default: plans every item, writes nothing, mints no token. The --json
- *     output doubles as the operator-approval artifact (it carries planHash/snapshotHash/
- *     nowIso per item) that can be fed straight back via --approvals for a live apply.
+ *     output doubles as the operator-approval artifact (it carries independent comment and
+ *     label plan/snapshot hashes plus nowIso per item) that can be fed straight back via
+ *     --approvals for a live apply.
  *   - A live write requires BOTH --apply AND OPENCLAW_NOTIFY_LINEAR=1, AND per-item
  *     authorization: each item is only written if its approved planHash/snapshotHash
  *     (from --approvals) still match the live snapshot (drift gate) and the issue is
@@ -40,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import {
   authorizeMutation,
   buildMutationReceipt,
+  classifyRecord,
   chooseScope,
   createLinearTransport,
   evaluateReviewPolicy,
@@ -49,6 +51,7 @@ import {
   ISSUE_LABELS_QUERY,
   ISSUE_SET_LABELS_MUTATION,
   LinearItemSource,
+  mapWorkspaceItem,
   matchIdentifier,
   mintLinearAppToken,
   nextReviewLabels,
@@ -220,8 +223,9 @@ function validateHash(hash, label) {
 /**
  * Loads a per-item approvals map (identifier -> approved fingerprints) from a reviewed
  * dry-run. Accepts this runner's own --json output (an object with `items`) or a bare
- * array of per-item summaries / receipts. An entry needs identifier + planHash +
- * snapshotHash; nowIso is carried through so the live plan recomputes identically.
+ * array of per-item summaries / receipts. Comment and label approvals are independent;
+ * each complete plan/snapshot pair is carried through with nowIso so the live plan
+ * recomputes identically.
  */
 export function loadApprovals(raw) {
   const list = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? raw?.entries ?? []);
@@ -230,15 +234,32 @@ export function loadApprovals(raw) {
     if (typeof entry !== "object" || entry === null) continue;
     const id = matchIdentifier(entry.identifier ?? entry.key ?? "");
     if (id === null) continue;
-    const planHash = pickHash(entry, "planHash");
-    const snapshotHash = pickHash(entry, "snapshotHash");
-    if (planHash === "" || snapshotHash === "") continue;
-    validateHash(planHash, `approvals planHash for ${id}`);
-    validateHash(snapshotHash, `approvals snapshotHash for ${id}`);
+    const planHash = pickHash(entry, "planHash", "receipt");
+    const snapshotHash = pickHash(entry, "snapshotHash", "receipt");
+    const labelPlanHash = pickHash(entry, "labelPlanHash", "labelReceipt", "planHash");
+    const labelSnapshotHash = pickHash(entry, "labelSnapshotHash", "labelReceipt", "snapshotHash");
+    const commentApproved = planHash !== "" && snapshotHash !== "";
+    const labelApproved = labelPlanHash !== "" && labelSnapshotHash !== "";
+    if (!commentApproved && !labelApproved) continue;
+    if (commentApproved) {
+      validateHash(planHash, `approvals planHash for ${id}`);
+      validateHash(snapshotHash, `approvals snapshotHash for ${id}`);
+    }
+    if (labelApproved) {
+      validateHash(labelPlanHash, `approvals labelPlanHash for ${id}`);
+      validateHash(labelSnapshotHash, `approvals labelSnapshotHash for ${id}`);
+    }
     const nowIso = typeof entry.nowIso === "string" ? entry.nowIso.trim() : "";
     map.set(id, {
-      approvedPlanHash: planHash,
-      approvedSnapshotHash: snapshotHash,
+      ...(commentApproved
+        ? { approvedPlanHash: planHash, approvedSnapshotHash: snapshotHash }
+        : {}),
+      ...(labelApproved
+        ? {
+            approvedLabelPlanHash: labelPlanHash,
+            approvedLabelSnapshotHash: labelSnapshotHash,
+          }
+        : {}),
       ...(nowIso !== "" ? { nowIso } : {}),
       source: "approvals-file",
     });
@@ -246,12 +267,12 @@ export function loadApprovals(raw) {
   return map;
 }
 
-function pickHash(entry, key) {
+function pickHash(entry, key, receiptKey, nestedKey = key) {
   const direct = entry[key];
   if (typeof direct === "string" && direct.trim() !== "") return direct.trim().toLowerCase();
-  const receipt = entry.receipt;
+  const receipt = entry[receiptKey];
   if (typeof receipt === "object" && receipt !== null) {
-    const value = receipt[key];
+    const value = receipt[nestedKey];
     if (typeof value === "string" && value.trim() !== "") return value.trim().toLowerCase();
   }
   return "";
@@ -291,7 +312,10 @@ export function resolveLabelWriteMode(options, env = process.env) {
       reason: `--apply-labels given but ${NOTIFY_ENV} is not set to 1 — staying label dry-run`,
     };
   }
-  return { live: true, reason: `live label write authorized by --apply-labels + ${NOTIFY_ENV}` };
+  return {
+    live: true,
+    reason: `live label mode enabled by --apply-labels + ${NOTIFY_ENV}; per-item approval still required`,
+  };
 }
 
 /**
@@ -379,17 +403,17 @@ function labelPlanHash(proposed, issueId) {
 
 /**
  * Authorizes one additive label write through authority.authorizeMutation (kind "label-add",
- * labelWrite gate opened). The plan is self-approved for an explicit --apply-labels run: the
- * approved plan/snapshot hashes are recomputed from the same live record, so authorization
- * checks the additive-union invariant (never drops a label) rather than an operator handshake.
+ * labelWrite gate opened). The current plan and live snapshot must match the independent
+ * label fingerprints loaded from a reviewed dry-run artifact. Without that approval pair,
+ * authorization stays denied while still emitting a feedable receipt.
  * Returns { authorization, receipt, request, planHash }. Pure (no network).
  */
-export function authorizeLabelChange(record, change) {
+export function authorizeLabelChange(record, change, approval = null) {
   const planHash = labelPlanHash(change.proposed, record.id);
   const request = {
     kind: "label-add",
     key: record.key,
-    snapshotHash: record.snapshotHash,
+    snapshotHash: approval?.approvedLabelSnapshotHash ?? record.snapshotHash,
     planHash,
     labelChange: {
       existing: change.existing,
@@ -399,7 +423,10 @@ export function authorizeLabelChange(record, change) {
     },
   };
   const gates = resolveGates({ labelWrite: true });
-  const drift = { liveSnapshotHash: record.snapshotHash, approvedPlanHash: planHash };
+  const drift = {
+    liveSnapshotHash: record.snapshotHash,
+    approvedPlanHash: approval?.approvedLabelPlanHash ?? "",
+  };
   return {
     authorization: authorizeMutation(request, gates, drift),
     receipt: buildMutationReceipt(request, gates, drift),
@@ -533,6 +560,11 @@ export function aggregate(items, resolution, mode) {
   };
 }
 
+/** A report containing any planning error is a failed run, even when other items succeeded. */
+export function reportExitCode(report) {
+  return report.counts.errors > 0 ? 1 : 0;
+}
+
 // Runs `worker` over `inputs` with at most `limit` in flight; preserves input order.
 async function mapPool(inputs, limit, worker) {
   const results = Array.from({ length: inputs.length });
@@ -637,48 +669,71 @@ function printHuman(report) {
  *   - authorization     (authority.authorizeMutation allowed — additive union, no drop)
  * Additive only; never drops a label; protected action labels are denylist-asserted upstream.
  */
-async function applyLabelStep(entry, summary, labelMode, ensureWriteTransport) {
-  const { record, classification } = entry.result;
-  const decision = evaluateReviewPolicy(classification, record);
-  const change = planLabelChange(record, decision);
-  const { authorization, receipt } = authorizeLabelChange(record, change);
-
-  summary.labelChange = {
-    existing: change.existing,
-    additions: change.additions,
-    removals: change.removals,
-    proposed: change.proposed,
-  };
-  summary.labelAuthorized = authorization.allowed;
-  summary.labelReceipt = receipt;
-
-  const eligible = classification.eligible;
-  const wouldWriteLabels = eligible && !change.noop && authorization.allowed;
-  summary.labelWouldWrite = wouldWriteLabels;
-
-  if (change.noop) {
-    summary.labelAction = "noop";
-    summary.labelsApplied = [];
-    summary.labelsCreated = [];
-    return;
-  }
-  if (!labelMode.live || !wouldWriteLabels) {
-    // Dry-run, ineligible, or unauthorized — record the plan, write nothing.
-    summary.labelAction = "noop";
-    summary.labelsApplied = [];
-    summary.labelsCreated = [];
-    summary.labelWriteSkipped = !labelMode.live
-      ? labelMode.reason
-      : !eligible
-        ? "skipped: item not eligible for review"
-        : "skipped: label-add not authorized";
-    return;
-  }
-
+export async function applyLabelStep(entry, summary, labelMode, ensureWriteTransport, deps = {}) {
   try {
+    let hydrated = entry.result.hydrated;
+    let record = entry.result.record;
+    let classification = entry.result.classification;
+
+    // A replace-all labelIds mutation must be planned from an immediate live read. This
+    // preserves unrelated labels added after the batch planning phase and makes snapshot or
+    // plan drift deny the write against the separately reviewed label approval.
+    if (labelMode.live) {
+      hydrated = await deps.source.fetchIssueByIdentifier(entry.identifier);
+      if (hydrated === null) {
+        throw new Error(`no Linear issue found for identifier "${entry.identifier}"`);
+      }
+      record = mapWorkspaceItem(hydrated);
+      classification = classifyRecord(record, {
+        nowIso: entry.result.nowIso,
+        staleDays: deps.options.staleDays,
+        requiredLabels: deps.options.requiredLabels,
+        exclusionLabels: deps.options.exclusionLabels,
+        protectedLabels: deps.options.protectedLabels,
+      });
+    }
+
+    const decision = evaluateReviewPolicy(classification, record);
+    const change = planLabelChange(record, decision);
+    const { authorization, receipt } = authorizeLabelChange(record, change, deps.approval ?? null);
+
+    summary.labelChange = {
+      existing: change.existing,
+      additions: change.additions,
+      removals: change.removals,
+      proposed: change.proposed,
+    };
+    summary.labelAuthorized = authorization.allowed;
+    summary.labelPlanHash = receipt.planHash;
+    summary.labelSnapshotHash = receipt.snapshotHash;
+    summary.labelReceipt = receipt;
+
+    const eligible = classification.eligible;
+    const wouldWriteLabels = eligible && !change.noop && authorization.allowed;
+    summary.labelWouldWrite = wouldWriteLabels;
+
+    if (change.noop) {
+      summary.labelAction = "noop";
+      summary.labelsApplied = [];
+      summary.labelsCreated = [];
+      return;
+    }
+    if (!labelMode.live || !wouldWriteLabels) {
+      // Dry-run, ineligible, or unauthorized — record the plan, write nothing.
+      summary.labelAction = "noop";
+      summary.labelsApplied = [];
+      summary.labelsCreated = [];
+      summary.labelWriteSkipped = !labelMode.live
+        ? labelMode.reason
+        : !eligible
+          ? "skipped: item not eligible for review"
+          : "skipped: label-add not authorized";
+      return;
+    }
+
     const transport = await ensureWriteTransport();
     const result = await applyLabelChange(record, change, transport, {
-      issueLabelsOnIssue: entry.result.hydrated.issue.labels ?? [],
+      issueLabelsOnIssue: hydrated.issue.labels ?? [],
     });
     summary.labelAction = result.labelAction;
     summary.labelsApplied = result.labelsApplied;
@@ -797,7 +852,11 @@ async function main() {
 
     // Label write — independent of the comment write, same triple gate (--apply-labels +
     // OPENCLAW_NOTIFY_LINEAR=1 + authority allowed) + eligible + not a noop. Additive only.
-    await applyLabelStep(entry, summary, labelMode, ensureWriteTransport);
+    await applyLabelStep(entry, summary, labelMode, ensureWriteTransport, {
+      source,
+      options,
+      approval: approvals.get(entry.identifier) ?? null,
+    });
     if (summary.labelApplyError) process.exitCode = 1;
 
     if (didWrite || summary.labelAction === "create" || summary.labelAction === "add") {
@@ -807,6 +866,7 @@ async function main() {
   }
 
   const report = aggregate(items, resolution, mode);
+  if (reportExitCode(report) !== 0) process.exitCode = 1;
   if (options.json) {
     console.log(JSON.stringify(report, null, 2));
   } else {
@@ -865,7 +925,7 @@ Apply options (live write — review-only unless ALL hold):
   --apply-labels             Opt in to LIVE additive label writes (also needs ${NOTIFY_ENV}=1);
                              applies the policy's ONE proposed routing label, additive only
                              (never drops a label), creating a missing clawsweeper:* label
-  --approvals <path>         Per-item approved hashes from a reviewed dry-run (--json output)
+  --approvals <path>         Per-item comment + label hashes from a reviewed dry-run (--json)
   --rate-ms <n>              Delay between live writes in ms (default: 0)
   --json                     Emit the JSON run report (feedable as --approvals)
   --keychain-account <a>     Keychain account for credentials (default: ${DEFAULT_KEYCHAIN_ACCOUNT})

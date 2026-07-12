@@ -28,10 +28,14 @@ inputs:
     description: Optional newline-separated state paths to hydrate.
     required: false
     default: ""
+  persist-credentials:
+    description: Persist the checkout token in local git config for later state publication.
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         repository: openclaw/clawsweeper-state
         ref: state
@@ -40,6 +44,7 @@ runs:
         filter: ${{ inputs.filter }}
         fetch-depth: ${{ inputs.fetch-depth }}
         sparse-checkout: ${{ inputs.sparse-checkout }}
+        persist-credentials: ${{ inputs.persist-credentials }}
 
     - name: Export state root
       shell: bash

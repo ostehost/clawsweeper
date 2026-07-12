@@ -67,15 +67,16 @@ changing GitHub state.
 
 Impact groups are a read-only projection of existing `impact:*` labels:
 
-| Group            | Labels                                    |
-| ---------------- | ----------------------------------------- |
-| Message delivery | `impact:message-loss`                     |
-| Auth providers   | `impact:auth-provider`                    |
-| State and data   | `impact:session-state`, `impact:data-loss` |
-| Reliability      | `impact:crash-loop`                       |
-| Security         | `impact:security`                         |
-| Other impact     | `impact:other`                            |
-| Unclassified     | no recognized impact label                |
+| Group            | Labels                                            |
+| ---------------- | ------------------------------------------------- |
+| Message delivery | `impact:message-loss`                             |
+| Auth providers   | `impact:auth-provider`                            |
+| State and data   | `impact:session-state`, `impact:data-loss`        |
+| Reliability      | `impact:crash-loop`                               |
+| Security         | `impact:security`                                 |
+| User experience  | `impact:ux-release-blocker`, `impact:ux-friction` |
+| Other impact     | `impact:other`                                    |
+| Unclassified     | no recognized impact label                        |
 
 An issue may appear in multiple groups. The dashboard does not pick a primary
 group, create labels, assign maintainers, or route work. Group filters operate
