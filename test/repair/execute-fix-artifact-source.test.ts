@@ -312,6 +312,10 @@ test("repair workflow binds one run through no-credential proof and token-only m
   const validateIndex = workflow.indexOf("\n  validate:");
   const reportIndex = workflow.indexOf("\n  report:");
   const mutateIndex = workflow.indexOf("\n  mutate:");
+  const publishActionLedgerIndex = workflow.indexOf(
+    "\n  publish-repair-action-ledger:",
+    mutateIndex,
+  );
   const receiptIndex = workflow.indexOf(
     "- name: Verify immutable mutation authorization",
     mutateIndex,
@@ -331,6 +335,7 @@ test("repair workflow binds one run through no-credential proof and token-only m
       handoffIndex < validateIndex &&
       validateIndex < reportIndex &&
       reportIndex < mutateIndex &&
+      mutateIndex < publishActionLedgerIndex &&
       mutateIndex < receiptIndex &&
       receiptIndex < mutationTokenIndex &&
       mutationTokenIndex < verifierTokenIndex,
@@ -342,7 +347,7 @@ test("repair workflow binds one run through no-credential proof and token-only m
   const execute = workflow.slice(workflow.indexOf("\n  execute:"), validateIndex);
   const validate = workflow.slice(validateIndex, reportIndex);
   const report = workflow.slice(reportIndex, mutateIndex);
-  const mutate = workflow.slice(mutateIndex);
+  const mutate = workflow.slice(mutateIndex, publishActionLedgerIndex);
 
   assert.match(
     workflow.slice(workflow.indexOf("\n  cluster:"), authorizeIndex),
