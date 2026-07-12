@@ -9,6 +9,7 @@ import {
   serializeCommandActionLedgerManifest,
 } from "./command-action-ledger-manifest.js";
 import { repoRoot } from "./paths.js";
+import { repairActionLedgerRoot } from "./repair-action-ledger.js";
 
 const rawArgv = process.argv.slice(2);
 const [command, ...argv] = rawArgv[0] === "--" ? rawArgv.slice(1) : rawArgv;
@@ -21,7 +22,7 @@ if (command === "finalize") {
     });
     if (manifest) process.stdout.write(serializeCommandActionLedgerManifest(manifest));
   } else {
-    const paths = await flushWorkflowActionEvents(repoRoot());
+    const paths = await flushWorkflowActionEvents(repairActionLedgerRoot());
     console.log(JSON.stringify({ paths }, null, 2));
   }
 } else if (command === "publish") {

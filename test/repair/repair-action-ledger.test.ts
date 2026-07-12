@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,8 @@ import {
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
+  recordRepairLifecycleFailureSafely,
+  repairSourceRevision,
 } from "../../dist/repair/repair-action-ledger.js";
 
 test("repair receipts preserve operation and mutation identity across workflow retries", async () => {
@@ -103,9 +106,23 @@ test("repair receipts reconstruct one causal chain across workflow processes and
 
     Object.assign(process.env, workflowEnv(planRoot, planOutput), {
       GITHUB_ACTION: "record_planning_completion",
-      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: queueOutput,
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: [queueOutput, queueOutput].join(path.delimiter),
       CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "plan",
     });
+    assert.throws(
+      () =>
+        recordRepairLifecycleEvent(lifecycle, {
+          type: ACTION_EVENT_TYPES.repairPlan,
+          status: ACTION_EVENT_STATUSES.completed,
+          reasonCode: ACTION_EVENT_REASON_CODES.completed,
+          mutation: false,
+          component: "action_session",
+          state: "planned",
+          phase: "planned",
+        }),
+      /duplicate event/,
+    );
+    process.env.CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS = queueOutput;
     recordRepairLifecycleEvent(lifecycle, {
       type: ACTION_EVENT_TYPES.repairPlan,
       status: ACTION_EVENT_STATUSES.completed,
@@ -165,6 +182,201 @@ test("repair receipts reconstruct one causal chain across workflow processes and
     for (const root of [queueRoot, planRoot, retryRoot]) {
       fs.rmSync(root, { force: true, recursive: true });
     }
+  }
+});
+
+test("repair causal context rejects noncanonical shard paths before sequencing", async () => {
+  const queueRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-canonical-")),
+  );
+  const nextRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-next-")),
+  );
+  const queueOutput = path.join(queueRoot, "output");
+  const nextOutput = path.join(nextRoot, "output");
+  fs.mkdirSync(queueOutput);
+  fs.mkdirSync(nextOutput);
+  const previous = { ...process.env };
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    workKey: "openclaw/openclaw:repair-pr-42",
+    clusterId: "repair-pr-42",
+    number: 42,
+    sourceRevision: "source-head-42",
+  };
+
+  try {
+    Object.assign(process.env, workflowEnv(queueRoot, queueOutput));
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+    });
+    await flushRepairActionEvents();
+    const shardPath = walk(queueOutput).find((file) => file.endsWith(".jsonl"));
+    assert.ok(shardPath);
+    fs.renameSync(shardPath, path.join(path.dirname(shardPath), "forged.jsonl"));
+
+    Object.assign(process.env, workflowEnv(nextRoot, nextOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: queueOutput,
+    });
+    assert.throws(
+      () =>
+        recordRepairLifecycleEvent(lifecycle, {
+          type: ACTION_EVENT_TYPES.repairPlan,
+          status: ACTION_EVENT_STATUSES.completed,
+          reasonCode: ACTION_EVENT_REASON_CODES.completed,
+          mutation: false,
+          component: "action_session",
+          state: "planned",
+        }),
+      /action event shard|canonical/,
+    );
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    for (const root of [queueRoot, nextRoot]) {
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  }
+});
+
+test("repair publication replay identity distinguishes workflow runs", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-publication-run-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    workKey: "openclaw/openclaw:cluster-42",
+    clusterId: "cluster-42",
+    sourceRevision: "source-head-42",
+  };
+
+  try {
+    for (const runId of ["100", "101"]) {
+      recordRepairLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.repairPublish,
+        status: ACTION_EVENT_STATUSES.completed,
+        reasonCode: ACTION_EVENT_REASON_CODES.published,
+        mutation: true,
+        component: "publish_result",
+        operation: "publication",
+        state: "published",
+        publicationKind: "cluster_result",
+        eventIdentity: { publicationKind: "cluster_result", runId },
+        idempotencySlot: `cluster_result:${runId}`,
+      });
+    }
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.equal(events.length, 2);
+    assert.equal(new Set(events.map((event) => event.event_id)).size, 2);
+    assert.equal(new Set(events.map((event) => event.idempotency_key_sha256)).size, 2);
+    assert.deepEqual(
+      events.map((event) => event.phase_seq).sort((left, right) => left - right),
+      [1, 2],
+    );
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair failure receipt recording never masks the primary failure", () => {
+  const previous = { ...process.env };
+  const reports: string[] = [];
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: "relative-ledger-root",
+  });
+
+  try {
+    assert.doesNotThrow(() =>
+      recordRepairLifecycleFailureSafely(
+        {
+          repository: "openclaw/openclaw",
+          workKey: "openclaw/openclaw:repair-pr-42",
+          sourceRevision: "source-head-42",
+        },
+        {
+          component: "repair_worker",
+          error: new Error("primary failure"),
+        },
+        (message) => reports.push(message),
+      ),
+    );
+    assert.equal(reports.length, 1);
+    assert.match(reports[0]!, /failed to record repair failure receipt after the primary failure/);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  }
+});
+
+test("repair source revision selects the sealed repaired source", () => {
+  assert.equal(
+    repairSourceRevision({
+      source_issue_revision_sha256: "a".repeat(64),
+      expected_head_sha: "b".repeat(40),
+    }),
+    "a".repeat(64),
+  );
+  assert.equal(repairSourceRevision({ expected_head_sha: "b".repeat(40) }), "b".repeat(40));
+  assert.equal(repairSourceRevision({ commit_sha: "c".repeat(40) }), "c".repeat(40));
+  assert.equal(repairSourceRevision({}), null);
+});
+
+test("repair action ledger CLI finalizes the configured ledger root", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-cli-root-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    recordRepairLifecycleEvent(
+      {
+        repository: "openclaw/openclaw",
+        workKey: "openclaw/openclaw:repair-pr-42",
+        sourceRevision: "source-head-42",
+      },
+      {
+        type: ACTION_EVENT_TYPES.repairQueue,
+        status: ACTION_EVENT_STATUSES.queued,
+        reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+        mutation: false,
+        component: "repair_worker",
+        state: "queued",
+      },
+    );
+    const result = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [path.join(process.cwd(), "dist", "repair", "action-ledger-cli.js"), "finalize"],
+        { encoding: "utf8", env: { ...process.env } },
+      ),
+    );
+    assert.equal(result.paths.length, 1);
+    assert.equal(readEvents(outputRoot).length, 1);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
   }
 });
 

@@ -236,11 +236,12 @@ confidential-identifier checks as every other durable machine-text field.
   first numbered part cannot expose a partial run. Sequential imports therefore
   cannot move a run, replace a reserved numbered set with a different part
   count, or advertise completion before payload publication finishes.
-- The importer returns one sorted publication manifest containing every event
-  shard plus its producer-run, event, shard-set, and completion binding. Workflow
-  publishers stage and commit that complete bounded manifest, so a fresh state
-  clone retains the same cross-import conflict and causal protections instead
-  of receiving payload files alone.
+- Import results expose `eventPaths`, `reservationPaths`, and `completionPaths`
+  separately. Their sorted, bounded `paths` union is the publication contract,
+  containing every event shard plus its producer-run, event, shard-set, and
+  completion binding. Workflow publishers stage and commit every returned path
+  so replay identity, crash recovery, completion visibility, cross-import
+  conflict detection, and causal protections survive in a fresh state checkout.
 
 ## Privacy Boundary
 
@@ -303,17 +304,19 @@ The shared taxonomy defines six families:
 
 Review, apply, command-router, repair-session, issue-status, result-publication,
 and dashboard-publication lanes now emit this taxonomy. Repair receipts keep the
-logical work key and source revision stable across retries. Workflow run and run
-attempt define the repair execution attempt; job, step, and invocation remain
-producer identity. Each process reconstructs the latest parent and phase
-sequence from the canonical local spool plus any exact prior-job shard artifact,
-so queue, plan, and post-flight events remain one monotonic chain without
-reusing a finalized producer. Session writes record both the optional
-operator-facing CrabFleet transition and the corresponding repair phase. GitHub
-status comments are receipted only after the mutation returns, while dashboard
-delivery records sent, skipped, and failed outcomes. Local result, aggregate
-apply-report, and dashboard writes use `completed`; their later immutable shard
-import is the durable publication boundary.
+logical work key and sealed repaired-source revision stable across retries;
+ClawSweeper's workflow checkout SHA is not target provenance. Workflow run and
+run attempt define the repair execution attempt; job, step, and invocation
+remain producer identity. Each process reconstructs the latest parent and phase
+sequence from the canonical local spool plus prior-job shard artifacts accepted
+by the same bounded path, shard, packing, and topology validator used for state
+imports. Queue, plan, and post-flight events therefore remain one monotonic
+chain without reusing a finalized producer. Session writes record both the
+optional operator-facing CrabFleet transition and the corresponding repair
+phase. GitHub status comments are receipted only after the mutation returns,
+while dashboard delivery records sent, skipped, and failed outcomes. Local
+result, aggregate apply-report, and dashboard writes use `completed`; their
+later immutable shard import is the durable publication boundary.
 
 Credential-isolated repair jobs never receive state-repository credentials just
 to publish receipts. Cluster and mutation jobs finalize local immutable shards

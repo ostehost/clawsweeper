@@ -21,7 +21,8 @@ import { parseArgs, parseJob, repoRoot } from "./lib.js";
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
-  recordRepairLifecycleFailure,
+  recordRepairLifecycleFailureSafely,
+  repairSourceRevision,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -36,6 +37,7 @@ type StatusOptions = {
   runUrl: string;
   prUrl: string;
   title: string;
+  sourceRevision?: string;
 };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
@@ -65,6 +67,13 @@ async function main() {
   const runUrl = stringArg(args["run-url"]) || currentActionsRunUrl();
   const prUrl = stringArg(args["pr-url"]);
   const dashboardOnly = Boolean(args["dashboard-only"]);
+  const explicitSourceRevision = stringArg(args["source-revision"]);
+  const sourceRevision = explicitSourceRevision
+    ? repairSourceRevision({ source_issue_revision_sha256: explicitSourceRevision })
+    : repairSourceRevision(job?.frontmatter ?? {});
+  if (explicitSourceRevision && !sourceRevision) {
+    throw new Error("invalid source revision");
+  }
   validateRepo(repo);
   validatePrUrl(prUrl, repo);
 
@@ -77,6 +86,7 @@ async function main() {
       runUrl,
       prUrl,
       title: stringArg(args.title) || `Issue #${itemNumber}`,
+      sourceRevision: sourceRevision ?? "",
     };
     const dashboard = await postDashboardStatus(options);
     recordDashboardStatus(options, dashboard);
@@ -102,6 +112,7 @@ async function main() {
     runUrl,
     prUrl,
     title: stringArg(args.title) || String(issue.title ?? `Issue #${itemNumber}`),
+    sourceRevision: sourceRevision ?? "",
   };
   const comments = ghPagedWithRetry<LooseRecord>(
     `repos/${repo}/issues/${itemNumber}/comments?per_page=100`,
@@ -226,7 +237,7 @@ async function main() {
   });
 
   const dashboard = await postDashboardStatus(options).catch((error) => {
-    recordRepairLifecycleFailure(issueStatusLifecycle(options), {
+    recordRepairLifecycleFailureSafely(issueStatusLifecycle(options), {
       component: "issue_implementation_status",
       operation: "dashboard",
       phase: state,
@@ -259,7 +270,7 @@ async function runIssueImplementationStatus() {
     commandError = error;
     const lifecycle = issueStatusLifecycleFromArgs();
     if (lifecycle) {
-      recordRepairLifecycleFailure(lifecycle, {
+      recordRepairLifecycleFailureSafely(lifecycle, {
         component: "issue_implementation_status",
         operation: "status",
         error,
@@ -282,13 +293,15 @@ async function runIssueImplementationStatus() {
   if (commandError) throw commandError;
 }
 
-function issueStatusLifecycle(options: Pick<StatusOptions, "repo" | "itemNumber">) {
+function issueStatusLifecycle(
+  options: Pick<StatusOptions, "repo" | "itemNumber" | "sourceRevision">,
+) {
   return {
     repository: options.repo,
     workKey: `issue-implementation:${options.repo}#${options.itemNumber}`,
     clusterId: `issue-${repoSlug(options.repo)}-${options.itemNumber}`,
     number: options.itemNumber,
-    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+    sourceRevision: options.sourceRevision ?? null,
   } satisfies RepairLifecycleInput;
 }
 
@@ -301,7 +314,11 @@ function issueStatusLifecycleFromArgs(): RepairLifecycleInput | null {
     const itemNumber = positiveInteger(
       stringArg(args["item-number"]) || String(job?.frontmatter.source_issue_number ?? ""),
     );
-    return issueStatusLifecycle({ repo, itemNumber });
+    const explicitSourceRevision = stringArg(args["source-revision"]);
+    const sourceRevision = explicitSourceRevision
+      ? repairSourceRevision({ source_issue_revision_sha256: explicitSourceRevision })
+      : repairSourceRevision(job?.frontmatter ?? {});
+    return issueStatusLifecycle({ repo, itemNumber, sourceRevision: sourceRevision ?? "" });
   } catch {
     return null;
   }

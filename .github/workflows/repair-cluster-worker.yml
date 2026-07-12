@@ -124,6 +124,9 @@ jobs:
     if: ${{ needs.receipt.outputs.proceed == 'true' }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
     outputs:
       allow_execute: ${{ steps.capture_gates.outputs.allow_execute }}
       allow_fix_pr: ${{ steps.capture_gates.outputs.allow_fix_pr }}
@@ -281,7 +284,7 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
           CLAWSWEEPER_ACTION_SESSION_REMOTE: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs.dry_run && '1' || '0' }}
-          CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
+          CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs.dry_run && secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN || '' }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
         run: pnpm run repair:action-session -- register "${{ inputs.job }}"
 
@@ -1367,7 +1370,7 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
           CLAWSWEEPER_ACTION_SESSION_REMOTE: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && '1' || '0' }}
-          CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
+          CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN || '' }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
         run: pnpm run repair:action-session -- register .clawsweeper-repair/execution/job.md --skip-repair-receipt
 
@@ -1915,8 +1918,8 @@ jobs:
             jq -r '.paths[]?' |
             sort -u > "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "No repair action event shards were imported."
-            exit 0
+            echo "Repair action ledger artifacts were selected but no paths were imported." >&2
+            exit 1
           fi
           action_ledger_args=()
           while IFS= read -r event_path; do

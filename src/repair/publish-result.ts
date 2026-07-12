@@ -38,7 +38,7 @@ import {
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
-  recordRepairLifecycleFailure,
+  recordRepairLifecycleFailureSafely,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -85,7 +85,7 @@ async function runPublishResult() {
     console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
   } catch (error) {
     commandError = error;
-    recordRepairLifecycleFailure(aggregateLifecycle("publish_result"), {
+    recordRepairLifecycleFailureSafely(aggregateLifecycle("publish_result"), {
       component: "publish_result",
       operation: "publication",
       phase: "publish",
@@ -219,6 +219,10 @@ function publishResult(resultPath: string) {
       operation: "publication",
       state: "published",
       publicationKind: "cluster_result",
+      eventIdentity: {
+        publicationKind: "cluster_result",
+        runId: runId || clusterId,
+      },
       idempotencySlot: `cluster_result:${runId || clusterId}`,
     },
   );

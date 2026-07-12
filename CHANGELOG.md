@@ -89,12 +89,17 @@ checkpoint, and status-only commits are intentionally omitted.
   session, GitHub status-comment, dashboard-delivery, cluster-result,
   aggregate-report, and finalizer transitions into immutable per-attempt action
   chains in normal and steerable repairs. Separate processes reconstruct
-  monotonic causal parents from exact prior-job shards, publication commands use
-  distinct finalized producer identities, secondary receipt-finalization errors
-  preserve the primary failure, and artifact discovery distinguishes an empty
-  run from genuine API or download failure. Credential-isolated worker jobs
-  upload finalized shards for one state-authorized collector, while existing
-  state-authorized publishers import their own shards directly.
+  monotonic causal parents from canonically validated prior-job shards,
+  publication commands use distinct finalized producer and run identities,
+  imported reservation and completion bindings are published with their event
+  shards, secondary receipt-recording and finalization errors preserve the
+  primary failure, and selected artifacts that import no paths fail closed.
+  Repair receipts bind the sealed target source revision instead of the
+  ClawSweeper workflow SHA, issue-implementation intake publishes its status
+  receipts before dispatch, and local-only lifecycle steps do not receive the
+  CrabFleet service token. Credential-isolated worker jobs upload finalized
+  shards for one state-authorized collector, while existing state-authorized
+  publishers import their own shards directly.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.

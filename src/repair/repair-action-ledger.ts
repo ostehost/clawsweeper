@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 
 import {
@@ -9,7 +8,6 @@ import {
   actionEventKey,
   actionLedgerJson,
   actionOperationId,
-  parseActionEventShardContent,
   readSpooledActionEvents,
   type ActionEventReasonCode,
   type ActionEventStatus,
@@ -17,6 +15,7 @@ import {
 } from "../action-ledger.js";
 import {
   flushWorkflowActionEvents,
+  readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
   workflowActionProducer,
   workflowActionEventsEnabled,
@@ -49,12 +48,13 @@ export type RepairLifecycleEvent = {
   idempotencySlot?: string;
 };
 
-const CAUSAL_CONTEXT_MAX_DEPTH = 8;
-const CAUSAL_CONTEXT_MAX_ENTRIES_PER_DIRECTORY = 512;
-const CAUSAL_CONTEXT_MAX_FILES = 256;
-const CAUSAL_CONTEXT_MAX_FILE_BYTES = 2 * 1024 * 1024;
-const CAUSAL_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
-const CAUSAL_CONTEXT_MAX_EVENTS = 256 * 2_048;
+export type RepairLifecycleFailureOptions = {
+  component: string;
+  operation?: string;
+  phase?: string;
+  workKind?: string;
+  error: unknown;
+};
 
 export function recordRepairLifecycleEvent(
   input: RepairLifecycleInput,
@@ -140,13 +140,7 @@ export function recordRepairLifecycleEvent(
 
 export function recordRepairLifecycleFailure(
   input: RepairLifecycleInput,
-  options: {
-    component: string;
-    operation?: string;
-    phase?: string;
-    workKind?: string;
-    error: unknown;
-  },
+  options: RepairLifecycleFailureOptions,
 ): void {
   recordRepairLifecycleEvent(input, {
     type: "repair.failed",
@@ -162,6 +156,20 @@ export function recordRepairLifecycleFailure(
       errorKind: options.error instanceof Error ? options.error.name : typeof options.error,
     },
   });
+}
+
+export function recordRepairLifecycleFailureSafely(
+  input: RepairLifecycleInput,
+  options: RepairLifecycleFailureOptions,
+  report: (message: string) => void = console.error,
+): void {
+  try {
+    recordRepairLifecycleFailure(input, options);
+  } catch (error) {
+    report(
+      `[action-ledger] failed to record repair failure receipt after the primary failure: ${errorText(error)}`,
+    );
+  }
 }
 
 export async function flushRepairActionEvents(): Promise<string[]> {
@@ -215,8 +223,22 @@ function workflowAttemptIdentity() {
   };
 }
 
-function repairActionLedgerRoot(): string {
+export function repairActionLedgerRoot(): string {
   return process.env.CLAWSWEEPER_ACTION_LEDGER_ROOT?.trim() || repoRoot();
+}
+
+export function repairSourceRevision(frontmatter: Record<string, unknown>): string | null {
+  for (const key of [
+    "source_issue_revision_sha256",
+    "expected_head_sha",
+    "commit_sha",
+    "expected_source_revision",
+    "reviewed_sha",
+  ]) {
+    const revision = machineRevision(frontmatter[key]);
+    if (revision) return revision;
+  }
+  return null;
 }
 
 function repairChainEvents(root: string, repository: string): ActionEvent[] {
@@ -267,68 +289,7 @@ function readRepairCausalContextEvents(): ActionEvent[] {
     .split(path.delimiter)
     .map((value) => value.trim())
     .filter(Boolean);
-  const events: ActionEvent[] = [];
-  let totalFiles = 0;
-  let totalBytes = 0;
-
-  for (const root of roots) {
-    const eventsRoot = path.join(path.resolve(root), "ledger", "v1", "events");
-    if (!fs.existsSync(eventsRoot)) continue;
-    for (const filePath of causalContextShardFiles(eventsRoot)) {
-      totalFiles += 1;
-      if (totalFiles > CAUSAL_CONTEXT_MAX_FILES) {
-        throw new Error("repair causal context exceeds file limit");
-      }
-      const stat = fs.lstatSync(filePath);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error(`refusing unsafe repair causal context entry: ${filePath}`);
-      }
-      if (stat.size > CAUSAL_CONTEXT_MAX_FILE_BYTES) {
-        throw new Error(`repair causal context shard exceeds byte limit: ${filePath}`);
-      }
-      totalBytes += stat.size;
-      if (totalBytes > CAUSAL_CONTEXT_MAX_TOTAL_BYTES) {
-        throw new Error("repair causal context exceeds total byte limit");
-      }
-      events.push(...parseActionEventShardContent(fs.readFileSync(filePath, "utf8"), filePath));
-      if (events.length > CAUSAL_CONTEXT_MAX_EVENTS) {
-        throw new Error("repair causal context exceeds event limit");
-      }
-    }
-  }
-  return events;
-}
-
-function causalContextShardFiles(root: string): string[] {
-  const files: string[] = [];
-  const visit = (directory: string, depth: number) => {
-    if (depth > CAUSAL_CONTEXT_MAX_DEPTH) {
-      throw new Error("repair causal context exceeds directory depth");
-    }
-    const stat = fs.lstatSync(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      throw new Error(`refusing unsafe repair causal context directory: ${directory}`);
-    }
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
-    if (entries.length > CAUSAL_CONTEXT_MAX_ENTRIES_PER_DIRECTORY) {
-      throw new Error(`repair causal context directory exceeds entry limit: ${directory}`);
-    }
-    for (const entry of entries) {
-      const target = path.join(directory, entry.name);
-      if (entry.isSymbolicLink()) {
-        throw new Error(`refusing unsafe repair causal context entry: ${target}`);
-      }
-      if (entry.isDirectory()) {
-        visit(target, depth + 1);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        files.push(target);
-      } else {
-        throw new Error(`unexpected repair causal context entry: ${target}`);
-      }
-    }
-  };
-  visit(root, 0);
-  return files.sort();
+  return readValidatedActionEventShardBatch(roots.map((root) => path.resolve(root))).events;
 }
 
 function machineRevision(value: unknown): string | null {
@@ -351,4 +312,8 @@ function positiveInteger(value: unknown): number | null {
 
 function stableDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

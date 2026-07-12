@@ -12,7 +12,8 @@ import { parseArgs, parseJob } from "./lib.js";
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
-  recordRepairLifecycleFailure,
+  recordRepairLifecycleFailureSafely,
+  repairSourceRevision,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -233,7 +234,7 @@ async function registerActionSession(
         console.log(`CrabFleet action session: ${browserUrl}`);
       }
     } catch (error) {
-      recordRepairLifecycleFailure(lifecycle, {
+      recordRepairLifecycleFailureSafely(lifecycle, {
         component: "action_session",
         operation: "session",
         phase: "register",
@@ -306,7 +307,7 @@ async function updateActionSession({
         });
       }
     } catch (error) {
-      recordRepairLifecycleFailure(lifecycle, {
+      recordRepairLifecycleFailureSafely(lifecycle, {
         component: "action_session",
         operation: "session",
         phase,
@@ -323,7 +324,7 @@ function actionSessionLifecycle(job: ReturnType<typeof parseJob>): RepairLifecyc
     repository: String(job.frontmatter.repo ?? ""),
     workKey: actionWorkKey(job.frontmatter),
     clusterId: String(job.frontmatter.cluster_id ?? ""),
-    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+    sourceRevision: repairSourceRevision(job.frontmatter),
   };
 }
 
@@ -332,7 +333,7 @@ function actionSessionLifecycleFromMetadata(metadata: LooseRecord): RepairLifecy
     repository: String(metadata.repository ?? ""),
     workKey: String(metadata.workKey ?? ""),
     clusterId: String(metadata.clusterId ?? ""),
-    sourceRevision: String(metadata.sourceRevision ?? process.env.GITHUB_SHA ?? ""),
+    sourceRevision: String(metadata.sourceRevision ?? ""),
   };
 }
 

@@ -161,6 +161,12 @@ export type ExpectedActionEventProducer = {
   runAttempt: number;
 };
 
+export type ValidatedActionEventShardBatch = {
+  eventPaths: string[];
+  events: ActionEvent[];
+  totalBytes: number;
+};
+
 type ImportedActionEventShard = {
   relativePath: string;
   content: string;
@@ -1129,6 +1135,72 @@ function validateImportedActionEventProducer(
       );
     }
   }
+}
+
+export function readValidatedActionEventShardBatch(
+  sourceRoots: string | readonly string[],
+): ValidatedActionEventShardBatch {
+  const roots = typeof sourceRoots === "string" ? [sourceRoots] : [...sourceRoots];
+  if (roots.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
+    throw new Error(
+      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} source root limit`,
+    );
+  }
+  const sources = roots
+    .map((sourceRoot) => readActionEventShardSource(sourceRoot))
+    .filter((source): source is NonNullable<typeof source> => source !== null);
+  const eventPaths = sources.flatMap((source) => source.relativePaths);
+  if (eventPaths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+    throw new Error(
+      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} file limit`,
+    );
+  }
+  const shards = sources.flatMap((source) => source.shards);
+  const events = shards.flatMap((shard) => shard.events);
+  if (events.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents) {
+    throw new Error(
+      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
+    );
+  }
+  const totalBytes = shards.reduce(
+    (total, shard) => total + Buffer.byteLength(shard.content, "utf8"),
+    0,
+  );
+  if (totalBytes > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes) {
+    throw new Error(
+      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
+    );
+  }
+  validateCanonicalImportedShardBatch(shards);
+  return {
+    eventPaths: eventPaths.sort(),
+    events,
+    totalBytes,
+  };
+}
+
+function readActionEventShardSource(sourceRoot: string): {
+  relativePaths: string[];
+  shards: ImportedActionEventShard[];
+} | null {
+  let safeSource: SafeReadRoot;
+  try {
+    safeSource = prepareSafeReadRoot(sourceRoot, "action event shard import source");
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  let relativePaths: string[];
+  try {
+    relativePaths = collectActionEventShardFiles(safeSource);
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  return {
+    relativePaths,
+    shards: readImportedActionEventShards(safeSource, relativePaths),
+  };
 }
 
 function prepareActionEventShardImportBindings(

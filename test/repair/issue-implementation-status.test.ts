@@ -60,6 +60,8 @@ test("blocked and failed status comments require the terminal mutation guard", (
     source,
     /isSuccessfulTerminalMutationState\(state\) \|\| prUrl[\s\S]*requires a verified publication receipt/,
   );
+  assert.match(source, /repairSourceRevision\(job\?\.frontmatter \?\? \{\}\)/);
+  assert.doesNotMatch(source, /sourceRevision: String\(process\.env\.GITHUB_SHA/);
 });
 
 test("issue implementation status updates progress without replacing worker results", () => {

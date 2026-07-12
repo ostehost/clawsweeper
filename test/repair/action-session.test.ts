@@ -122,6 +122,7 @@ test("normal repair sessions emit queue and plan receipts without CrabFleet cred
       "cluster_id: repair-pr-42",
       "mode: execute",
       "job_intent: pr_repair",
+      `expected_head_sha: ${"b".repeat(40)}`,
       "allowed_actions: [fix]",
       "candidates: [#42]",
       "---",
@@ -203,6 +204,8 @@ test("normal repair sessions emit queue and plan receipts without CrabFleet cred
       [1, 2],
     );
     assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+    assert.ok(events.every((event) => event.subject.source_revision === "b".repeat(40)));
+    assert.ok(events.every((event) => event.subject.source_revision !== baseEnv.GITHUB_SHA));
     assert.equal(
       events.some((event) => event.event_type === "session.registered"),
       false,

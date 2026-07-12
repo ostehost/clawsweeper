@@ -118,6 +118,12 @@ function prepare() {
     `${itemNumber}.md`,
   );
   const preparedAt = new Date().toISOString();
+  const sourceRevision = decision.shouldRepair
+    ? issueSourceRevisionSha256(
+        asRecord(live.issue),
+        Array.isArray(live.comments) ? live.comments : [],
+      )
+    : "";
   const context = {
     targetRepo,
     reportRepo,
@@ -134,6 +140,7 @@ function prepare() {
     preparedAt,
     operatorOverride,
     overrideRequestedBy,
+    sourceRevision,
   };
 
   if (decision.shouldRepair) writeJob(context);
@@ -153,6 +160,7 @@ function prepare() {
     report_url: reportUrl,
     audit_path: relative(auditPath),
     job_path: decision.shouldRepair ? relative(jobPath) : "",
+    source_revision: sourceRevision,
   };
   writeStepOutputs(out);
   console.log(JSON.stringify(out, null, 2));
@@ -522,10 +530,7 @@ function writeJob(context: LooseRecord) {
       context.operatorOverride === true
         ? issueImplementationOverrideAction(context.decision.reason)
         : null,
-    sourceIssueRevision: issueSourceRevisionSha256(
-      issue,
-      Array.isArray(context.live.comments) ? context.live.comments : [],
-    ),
+    sourceIssueRevision: context.sourceRevision,
   });
   fs.mkdirSync(path.dirname(context.jobPath), { recursive: true });
   fs.writeFileSync(context.jobPath, body, "utf8");

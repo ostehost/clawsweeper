@@ -12,6 +12,8 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(session, /ACTION_EVENT_TYPES\.repairQueue/);
   assert.match(session, /repairEventType\(state, phase, completionReason\)/);
   assert.match(session, /withActionSessionReceiptFinalization/);
+  assert.match(session, /recordRepairLifecycleFailureSafely/);
+  assert.match(session, /repairSourceRevision\(job\.frontmatter\)/);
   assert.match(session, /metadata\.remoteEnabled === true/);
   const registration = session.slice(
     session.indexOf("async function registerActionSession"),
@@ -36,6 +38,7 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.ok(statusReceipt > statusMutation);
   assert.match(status, /ACTION_EVENT_TYPES\.dashboardLifecycle/);
   assert.match(status, /await flushRepairActionEvents\(\)/);
+  assert.match(status, /recordRepairLifecycleFailureSafely/);
 
   const resultWrite = publisher.indexOf("writeClosedRecord");
   const resultReceipt = publisher.indexOf("type: ACTION_EVENT_TYPES.repairPublish", resultWrite);
@@ -44,6 +47,11 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /ACTION_EVENT_TYPES\.publicationLifecycle/);
   assert.match(publisher, /ACTION_EVENT_TYPES\.dashboardLifecycle/);
   assert.match(publisher, /await flushRepairActionEvents\(\)/);
+  assert.match(publisher, /recordRepairLifecycleFailureSafely/);
+  assert.match(
+    publisher,
+    /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId/,
+  );
   assert.doesNotMatch(publisher, /recordAggregatePublication\([^)]*,/);
 });
 
@@ -67,15 +75,32 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     mutate.indexOf("- name: Create exact-repository mutation token"),
   );
 
+  assert.match(cluster, /permissions:\s+actions: read\s+contents: read/);
   assert.match(cluster, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(cluster, /Finalize cluster repair action ledger/);
   assert.match(cluster, /clawsweeper-repair-action-ledger-cluster-/);
   assert.match(clusterRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
+  assert.match(
+    clusterRegistration,
+    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ env\.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs\.dry_run && secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \|\| '' \}\}/,
+  );
+  assert.doesNotMatch(
+    clusterRegistration,
+    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \}\}/,
+  );
   assert.doesNotMatch(clusterRegistration, /if:.*CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(mutate, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(mutate, /Finalize mutation repair action ledger/);
   assert.match(mutate, /clawsweeper-repair-action-ledger-mutate-/);
   assert.match(mutationRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
+  assert.match(
+    mutationRegistration,
+    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ env\.CLAWSWEEPER_STEERABLE_CODEX == '1' && secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \|\| '' \}\}/,
+  );
+  assert.doesNotMatch(
+    mutationRegistration,
+    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \}\}/,
+  );
   assert.match(mutationRegistration, /--skip-repair-receipt/);
   assert.doesNotMatch(mutationRegistration, /if:.*CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(
@@ -98,7 +123,32 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     /continue-on-error: true[\s\S]*Download repair action ledger shards/,
   );
   assert.match(publisher, /repair:action-ledger -- publish/);
+  assert.match(
+    publisher,
+    /Repair action ledger artifacts were selected but no paths were imported\." >&2\s+exit 1/,
+  );
   assert.match(publisher, /--message "chore: append repair action ledger"/);
+});
+
+test("issue implementation intake finalizes and publishes source-bound status receipts", () => {
+  const workflow = readText(".github/workflows/repair-issue-implementation-intake.yml");
+
+  assert.match(workflow, /permissions:\s+contents: write\s+actions: read/);
+  assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(
+    workflow,
+    /--source-revision "\$\{\{ steps\.prepare\.outputs\.source_revision \}\}"/,
+  );
+  assert.match(workflow, /Finalize issue implementation intake action ledger/);
+  assert.match(workflow, /repair:action-ledger -- finalize/);
+  assert.match(workflow, /Publish immutable issue implementation intake action ledger/);
+  assert.match(workflow, /repair:action-ledger -- publish/);
+  assert.match(workflow, /jq -r '\.paths\[\]\?'/);
+  assert.match(workflow, /append issue implementation intake action ledger/);
+  assert.ok(
+    workflow.indexOf("Publish immutable issue implementation intake action ledger") <
+      workflow.indexOf("Dispatch repair worker"),
+  );
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {
@@ -121,6 +171,7 @@ test("result and finalizer workflows publish their repair operation receipts", (
 test("the shared action ledger finalizer is operation-family agnostic", () => {
   const source = readText("src/repair/action-ledger-cli.ts");
 
-  assert.match(source, /flushWorkflowActionEvents\(repoRoot\(\)\)/);
+  assert.match(source, /flushWorkflowActionEvents\(repairActionLedgerRoot\(\)\)/);
+  assert.doesNotMatch(source, /flushWorkflowActionEvents\(repoRoot\(\)\)/);
   assert.doesNotMatch(source, /flushCommandActionEvents/);
 });
