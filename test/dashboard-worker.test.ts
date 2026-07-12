@@ -59,6 +59,19 @@ test("issue triage exposes impact-group controls without changing PR proof triag
   assert.doesNotMatch(await proofPage.text(), /id="routing-group"/);
 });
 
+test("dashboard health identifies the deployed revision", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/api/health"), {
+    CLAWSWEEPER_DEPLOY_SHA: "abc123",
+  });
+
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    service: "clawsweeper-status",
+    deployment_sha: "abc123",
+  });
+  assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
 test("OpenClaw Bay is an unlisted, hardened demo route", async () => {
   const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/bay-demo"), {});
   assert.equal(response.status, 200);

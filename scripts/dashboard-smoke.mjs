@@ -4,9 +4,25 @@ import { pathToFileURL } from "node:url";
 
 const cliUrl = process.argv.find((arg, index) => index > 1 && arg !== "--");
 const baseUrl = cliUrl || process.env.CLAWSWEEPER_STATUS_URL || "http://127.0.0.1:8787";
+const expectedDeploySha = String(process.env.CLAWSWEEPER_EXPECTED_DEPLOY_SHA || "").trim();
+const deploymentReadyTimeoutMs = positiveInteger(
+  process.env.CLAWSWEEPER_DEPLOY_READY_TIMEOUT_MS,
+  180_000,
+);
+const deploymentReadyIntervalMs = positiveInteger(
+  process.env.CLAWSWEEPER_DEPLOY_READY_INTERVAL_MS,
+  5_000,
+);
 
 async function main() {
-  const health = await fetchJson(`${baseUrl}/api/health`);
+  const health = expectedDeploySha
+    ? await waitForDashboardDeployment({
+        baseUrl,
+        expectedSha: expectedDeploySha,
+        timeoutMs: deploymentReadyTimeoutMs,
+        intervalMs: deploymentReadyIntervalMs,
+      })
+    : await fetchJson(`${baseUrl}/api/health`);
   if (health.ok !== true) throw new Error("health endpoint did not return ok");
 
   const statusStartedAt = Date.now();
@@ -107,6 +123,7 @@ async function main() {
       {
         ok: true,
         url: baseUrl,
+        deployment_sha: health.deployment_sha || null,
         active_workflow_runs: status.fleet.active_workflow_runs,
         active_codex_jobs: status.fleet.active_codex_jobs,
         worker_details: status.workers.length,
@@ -129,6 +146,46 @@ async function main() {
   );
 }
 
+export async function waitForDashboardDeployment({
+  baseUrl,
+  expectedSha,
+  timeoutMs = 180_000,
+  intervalMs = 5_000,
+  fetchImpl = fetch,
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  now = Date.now,
+}) {
+  const deadline = now() + timeoutMs;
+  let lastObserved = "no response";
+
+  while (true) {
+    const remainingMs = Math.max(1, deadline - now());
+    try {
+      const response = await fetchImpl(`${baseUrl}/api/health`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(Math.min(10_000, remainingMs)),
+      });
+      if (!response.ok) {
+        lastObserved = `HTTP ${response.status}`;
+      } else {
+        const health = await response.json();
+        if (health.ok === true && health.deployment_sha === expectedSha) return health;
+        lastObserved = `deployment ${String(health.deployment_sha || "unknown")}`;
+      }
+    } catch (error) {
+      lastObserved = error instanceof Error ? error.message : String(error);
+    }
+
+    const afterAttempt = now();
+    if (afterAttempt >= deadline) {
+      throw new Error(
+        `dashboard deployment ${expectedSha} was not ready within ${timeoutMs}ms (${lastObserved})`,
+      );
+    }
+    await sleep(Math.min(intervalMs, deadline - afterAttempt));
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url} returned ${response.status}`);
@@ -143,6 +200,11 @@ async function fetchText(url) {
 
 export function containsDirectGitHubApiUrl(html) {
   return /(?:^|[^a-z0-9.-])api\.github\.com\.?(?=$|[^a-z0-9.-])/iu.test(html);
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -40,6 +40,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.
 - Separated review publication from apply/comment-sync concurrency so long
   mutation runs no longer block completed reviews from publishing, and retried
   GitHub CLI commands whose jq process reports truncated JSON.

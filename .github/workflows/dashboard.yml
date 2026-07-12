@@ -30,6 +30,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN || secrets.OPENCLAW_CLOUDFLARE_API_TOKEN }}
       CF_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN || secrets.OPENCLAW_CLOUDFLARE_API_TOKEN }}
       CLAWSWEEPER_STATUS_URL: https://clawsweeper.openclaw.ai
+      CLAWSWEEPER_EXPECTED_DEPLOY_SHA: ${{ github.sha }}
       CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
       CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
       CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -47,6 +48,7 @@ jobs:
           test -n "$CLAWSWEEPER_STATUS_INGEST_TOKEN"
           cp dashboard/wrangler.toml dashboard/wrangler.deploy.toml
           printf 'INGEST_TOKEN = "%s"\n' "$CLAWSWEEPER_STATUS_INGEST_TOKEN" >> dashboard/wrangler.deploy.toml
+          printf 'CLAWSWEEPER_DEPLOY_SHA = "%s"\n' "$GITHUB_SHA" >> dashboard/wrangler.deploy.toml
           echo "config=dashboard/wrangler.deploy.toml" >> "$GITHUB_OUTPUT"
 
       - name: Sync Worker secrets

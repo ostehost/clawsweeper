@@ -484,6 +484,10 @@ test("dashboard syncs Worker secrets with durable lifecycle storage", () => {
   assert.match(workflow, /Content-Type: application\/merge-patch\+json/);
   assert.match(workflow, /jq -e '\.success == true'/);
   assert.doesNotMatch(workflow, /wrangler@[^\s]+ secret bulk/);
+  assert.match(workflow, /CLAWSWEEPER_EXPECTED_DEPLOY_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(workflow, /CLAWSWEEPER_DEPLOY_SHA = "%s"/);
+  assert.match(workflow, /"\$GITHUB_SHA"/);
+  assert.match(smoke, /waitForDashboardDeployment/);
   assert.match(smoke, /\/internal\/exact-review\/reconcile/);
   assert.match(smoke, /method: "POST"/);
   assert.match(smoke, /reconcileResponse\.status !== 401/);

@@ -899,7 +899,13 @@ export default {
       return json({ error: "not_found" }, 404);
     }
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-    if (url.pathname === "/api/health") return json({ ok: true, service: "clawsweeper-status" });
+    if (url.pathname === "/api/health") {
+      return json({
+        ok: true,
+        service: "clawsweeper-status",
+        deployment_sha: nullableString(env.CLAWSWEEPER_DEPLOY_SHA),
+      });
+    }
     if (url.pathname === "/api/events" && request.method === "POST")
       return ingestEvent(request, env);
     if (url.pathname === "/github/webhook" && request.method === "GET")
