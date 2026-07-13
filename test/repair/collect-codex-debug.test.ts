@@ -207,17 +207,19 @@ test("redactSecrets masks common token shapes", () => {
 });
 
 test("redactSecrets masks multiline credentials and private keys", () => {
-  const redacted = redactSecrets(
-    [
-      "private_key: |",
-      "  -----BEGIN PRIVATE KEY-----",
-      "  sensitive-key-material",
-      "  -----END PRIVATE KEY-----",
-    ].join("\n"),
-  );
+  for (const indicator of ["|", "|2", "|2-", "|-2", ">2-"]) {
+    const redacted = redactSecrets(
+      [
+        `private_key: ${indicator}`,
+        "  -----BEGIN PRIVATE KEY-----",
+        "  sensitive-key-material",
+        "  -----END PRIVATE KEY-----",
+      ].join("\n"),
+    );
 
-  assert.doesNotMatch(redacted, /BEGIN PRIVATE KEY|sensitive-key-material|END PRIVATE KEY/);
-  assert.match(redacted, /private_key: \[REDACTED\]\n  \[REDACTED_MULTILINE\]/);
+    assert.doesNotMatch(redacted, /BEGIN PRIVATE KEY|sensitive-key-material|END PRIVATE KEY/);
+    assert.match(redacted, /private_key: \[REDACTED\]\n  \[REDACTED_MULTILINE\]/);
+  }
 });
 
 test("collectCodexDebug redacts file-sourced credentials absent from the current environment", () => {
@@ -263,7 +265,7 @@ test("collectCodexDebug redacts retained multiline private keys", () => {
   fs.writeFileSync(
     path.join(codexHome, "sessions", "private-key.jsonl"),
     [
-      "private_key: |",
+      "private_key: >2-",
       "  -----BEGIN PRIVATE KEY-----",
       "  sensitive-key-material",
       "  -----END PRIVATE KEY-----",

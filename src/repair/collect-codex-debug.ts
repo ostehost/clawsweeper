@@ -125,7 +125,7 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
     .replace(PRIVATE_KEY_PEM_PATTERN, "[REDACTED_PRIVATE_KEY]")
     .replace(
       new RegExp(
-        `^(\\s*${SENSITIVE_FIELD_NAME}\\s*:\\s*[>|][+-]?\\s*)\\r?\\n(?:[ \\t]+.*(?:\\r?\\n|$))+`,
+        `^(\\s*${SENSITIVE_FIELD_NAME}\\s*:\\s*[>|](?:[+-][1-9]?|[1-9][+-]?)?\\s*)\\r?\\n(?:[ \\t]+.*(?:\\r?\\n|$))+`,
         "gim",
       ),
       "$1\n  [REDACTED_MULTILINE]\n",
