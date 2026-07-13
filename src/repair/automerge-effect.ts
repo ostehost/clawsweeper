@@ -184,11 +184,15 @@ export function automergeEffectDefinitelyAbsent(
     requireSquashMethod: false,
   });
   const view = snapshot.view ?? {};
+  const expected = normalizeSha(expectedHeadSha);
+  const graphHead = normalizeSha(view.headRefOid);
   const graphMergedAt = String(view.mergedAt ?? "").trim();
   const graphState = String(view.state ?? "")
     .trim()
     .toUpperCase();
   return Boolean(
+    expected &&
+    graphHead === expected &&
     !graphMergedAt &&
     graphState !== "MERGED" &&
     !confirmation.block &&

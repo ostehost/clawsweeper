@@ -232,6 +232,18 @@ test("automerge effect absence requires REST and GraphQL to agree no effect exis
       ...emptySnapshot,
       view: { ...emptySnapshot.view, headRefOid: "c".repeat(40) },
     },
+    {
+      ...emptySnapshot,
+      view: { ...emptySnapshot.view, headRefOid: null },
+    },
+    {
+      ...emptySnapshot,
+      view: {
+        ...emptySnapshot.view,
+        headRefOid: null,
+        autoMergeRequest: { mergeMethod: "SQUASH" },
+      },
+    },
   ]) {
     assert.equal(automergeEffectDefinitelyAbsent(snapshot, headSha), false);
   }
