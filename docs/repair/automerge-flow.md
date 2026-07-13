@@ -109,13 +109,12 @@ repair, with the local gate driven by each target repository's
 `config/target-repositories.json#changed_gate`: `pnpm check:changed` for
 `openclaw/openclaw`, and the project's own commands (e.g. `bun run check` for
 `openclaw/clawhub`) when `changed_gate` is `null`. Adopted
-OpenClaw automerge repairs strengthen that local gate to strict validation and
-also require `pnpm lint` plus `pnpm check:test-types` before push, because
-maintainer automerge opt-in means ClawSweeper should keep fixing terminal CI
-failures rather than handing back another red head. The executor still re-runs
-the normalized gate as the authority before push; if anything remains, it feeds
-the full failure back into a dedicated validation-fix pass before spending the
-next review attempt.
+OpenClaw automerge repairs make that changed-surface command mandatory without
+adding full-repository lint or typecheck gates. Exact-head hosted CI remains the
+authority for broader repository health, so unrelated baseline failures cannot
+expand or block a narrow repair. The executor re-runs the normalized gate before
+push; if it fails, it feeds the full failure back into a dedicated validation-fix
+pass before spending the next review attempt.
 
 ## Exact-Head Rule
 

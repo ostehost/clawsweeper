@@ -114,7 +114,7 @@ test("validation preflight blocks targets without any validation command", () =>
   );
 });
 
-test("OpenClaw automerge repairs can require CI-parity validation commands", () => {
+test("OpenClaw automerge repairs keep strict validation scoped to the repair command", () => {
   const cwd = packageFixture({
     "check:changed": "node check.js",
     "check:test-types": "node types.js",
@@ -122,14 +122,11 @@ test("OpenClaw automerge repairs can require CI-parity validation commands", () 
   });
   const options = {
     ...validationOptions("openclaw/openclaw"),
-    additionalValidationCommands: ["pnpm lint", "pnpm check:test-types"],
     strictTargetValidation: true,
   };
 
   assert.deepEqual(requiredValidationCommands(["pnpm check:changed"], cwd, options), [
     "pnpm check:changed",
-    "pnpm lint",
-    "pnpm check:test-types",
   ]);
   assert.deepEqual(
     preflightTargetValidationPlan(
@@ -138,7 +135,7 @@ test("OpenClaw automerge repairs can require CI-parity validation commands", () 
     ),
     {
       status: "passed",
-      resolved_commands: ["pnpm check:changed", "pnpm lint", "pnpm check:test-types"],
+      resolved_commands: ["pnpm check:changed"],
       available_scripts: ["check:changed", "check:test-types", "lint"],
     },
   );

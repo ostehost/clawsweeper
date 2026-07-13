@@ -2133,6 +2133,7 @@ test("viable issue implementation stays in the broad durable backfill lane", () 
 
 test("sweep workflow executes only durable queue leases without runner-side admission", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const exactReviewQueue = readText("src/repair/exact-review-action-ledger.ts");
   const legacyIntakeBlock = workflow.slice(
     workflow.indexOf("\n  legacy-event-queue-intake:"),
     workflow.indexOf("\n  event-review-apply:"),
@@ -2171,32 +2172,39 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   assert.match(eventReviewBlock, /github\.event\.client_payload\.queue_lease_id != ''/);
   assert.match(legacyIntakeBlock, /Queue legacy exact-review event/);
-  assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
-  assert.match(legacyIntakeBlock, /x-clawsweeper-exact-review-signature/);
+  assert.match(legacyIntakeBlock, /exact-review-action-ledger-cli\.js enqueue/);
   assert.match(legacyIntakeBlock, /CLAWSWEEPER_WEBHOOK_SECRET/);
-  assert.match(legacyIntakeBlock, /commandStatusMarker: payload\.command_status_marker/);
-  assert.match(legacyIntakeBlock, /statusCommentId: payload\.status_comment_id/);
-  assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
+  assert.match(exactReviewQueue, /\/internal\/exact-review\/\$\{command\}/);
+  assert.match(exactReviewQueue, /x-clawsweeper-exact-review-signature/);
+  assert.match(
+    exactReviewQueue,
+    /copyPresent\(dispatch, decision, "command_status_marker", "commandStatusMarker"\)/,
+  );
+  assert.match(
+    exactReviewQueue,
+    /copyPresent\(dispatch, decision, "status_comment_id", "statusCommentId"\)/,
+  );
+  assert.match(
+    exactReviewQueue,
+    /copyPresent\(dispatch, decision, "additional_prompt", "additionalPrompt"\)/,
+  );
   assert.match(eventReviewBlock, /cancel-in-progress: false/);
   assert.ok(claimIndex >= 0);
-  assert.ok(setupPnpmIndex > claimIndex);
-  assert.ok(inProgressStatusIndex > setupPnpmIndex);
+  assert.ok(setupPnpmIndex >= 0 && setupPnpmIndex < claimIndex);
+  assert.ok(inProgressStatusIndex > claimIndex);
   assert.ok(setupCodexIndex > inProgressStatusIndex);
   assert.ok(exactReviewIndex > setupCodexIndex);
   assert.ok(primaryResultIndex > exactReviewIndex);
   assert.equal(eventReviewBlock.match(/- name: Fail unsuccessful exact review/g)?.length, 1);
   assert.ok(failReviewIndex > primaryResultIndex);
   assert.ok(completeLeaseIndex > failReviewIndex);
-  assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
-  assert.match(eventReviewBlock, /\/internal\/exact-review\/complete/);
+  assert.match(eventReviewBlock, /exact-review-action-ledger-cli\.js claim/);
+  assert.match(eventReviewBlock, /exact-review-action-ledger-cli\.js complete/);
   assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
-  assert.match(
-    claimStep,
-    /hasTuple \? \{ item_key: itemKey, lease_revision: leaseRevision \} : \{\}/,
-  );
-  assert.match(claimStep, /response\.protocol_version \|\| 1/);
-  assert.match(claimStep, /const legacyDecision = \{/);
-  assert.match(claimStep, /run_attempt: runAttempt/);
+  assert.match(exactReviewQueue, /const hasTuple = Boolean\(requestedItemKey \|\| rawLeaseRevision\)/);
+  assert.match(exactReviewQueue, /const responseProtocol = Number\(parsed\.protocol_version \|\| 1\)/);
+  assert.match(exactReviewQueue, /const legacyDecision: JsonObject = \{/);
+  assert.match(exactReviewQueue, /run_attempt: runAttempt/);
   assert.match(
     eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
     /steps\.review-exact-event-item\.outcome != 'success'/,
@@ -2225,13 +2233,13 @@ test("sweep workflow executes only durable queue leases without runner-side admi
     completeLeaseStep,
     /PROTOCOL_VERSION: \$\{\{ steps\.claim-exact-review-queue\.outputs\.protocol_version \}\}/,
   );
-  assert.match(completeLeaseStep, /const primaryOutcome = String\(process\.env\.PRIMARY_OUTCOME/);
-  assert.match(completeLeaseStep, /\["success", "cancelled", "failure"\]\.includes/);
-  assert.match(completeLeaseStep, /claim_generation: claimGeneration/);
-  assert.match(completeLeaseStep, /item_key: process\.env\.ITEM_KEY/);
-  assert.match(completeLeaseStep, /lease_revision: leaseRevision/);
-  assert.match(completeLeaseStep, /run_attempt: runAttempt/);
-  assert.match(completeLeaseStep, /outcome,/);
+  assert.match(exactReviewQueue, /const primaryOutcome = stringValue\(env\.PRIMARY_OUTCOME\)/);
+  assert.match(exactReviewQueue, /\["success", "cancelled", "failure"\]\.includes/);
+  assert.match(exactReviewQueue, /claim_generation: claimGeneration/);
+  assert.match(exactReviewQueue, /item_key: itemKey/);
+  assert.match(exactReviewQueue, /lease_revision: leaseRevision/);
+  assert.match(exactReviewQueue, /run_attempt: runAttempt/);
+  assert.match(exactReviewQueue, /outcome,/);
   assert.match(eventReviewBlock, /exact-review queue leased this run/);
   assert.doesNotMatch(eventReviewBlock, /repair:codex-capacity/);
   assert.doesNotMatch(eventReviewBlock, /capacity-requeue/);

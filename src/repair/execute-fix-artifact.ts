@@ -311,10 +311,6 @@ const automergeTargetValidation =
   String(job.frontmatter.source ?? "") === "pr_automerge" ||
   String(job.frontmatter.cluster_id ?? "").startsWith("automerge-");
 const targetValidationOptions: TargetValidationOptions = {
-  additionalValidationCommands:
-    automergeTargetValidation && result.repo === "openclaw/openclaw"
-      ? ["pnpm lint", "pnpm check:test-types"]
-      : [],
   allowExpensiveValidation,
   installTargetDeps,
   strictTargetValidation: configuredStrictTargetValidation || automergeTargetValidation,
