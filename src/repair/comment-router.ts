@@ -4069,7 +4069,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     const finalDigest = stableJson(finalState);
     if (finalDigest !== stableJson(postPolicyState) || finalDigest !== stableJson(terminalState)) {
       return {
-        reason: "pull request state changed during final strict-base policy verification",
+        reason: "pull request state changed during final merge safety verification",
         retryable: true,
       };
     }
@@ -4109,7 +4109,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
                 expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
               ),
             reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
-            strictBaseBindingBlock: liveDispatchStateBlock,
+            dispatchStateBlock: liveDispatchStateBlock,
             finalSafetyBlock: finalDispatchSafetyBlock,
             rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
           });

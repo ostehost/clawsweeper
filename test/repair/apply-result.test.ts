@@ -1522,7 +1522,6 @@ for (const postClaimContentDrift of ["body", "title", "label", "reaction"] as co
 for (const [postDispatchGuardDrift, reason] of [
   ["timeline", /target changed at the merge dispatch boundary/],
   ["security", /security-sensitive target/],
-  ["strict_base", /lacks server-enforced strict base binding/],
 ] as const) {
   test(`repair apply retires post-marker ${postDispatchGuardDrift} drift before merge`, () => {
     const fixture = writeMergeApplyFixture({ postDispatchGuardDrift });
@@ -1545,9 +1544,8 @@ for (const [postDispatchGuardDrift, reason] of [
 for (const [postPolicyDrift, reason] of [
   ["rest_head", /REST head changed/],
   ["view_head", /head changed during merge preflight/],
-  ["base", /base is not main|base changed after strict-base/],
+  ["base", /base is not main|base changed during final merge preflight/],
   ["readiness", /merge state status is BLOCKED/],
-  ["strict_base", /lacks server-enforced strict base binding/],
 ] as const) {
   test(`repair apply catches absolute-final ${postPolicyDrift} drift before merge`, () => {
     const fixture = writeMergeApplyFixture({ postPolicyDrift });
@@ -1588,26 +1586,6 @@ test("repair apply reconstructs durable squash proof in a fresh process", () => 
           call.args[1] === `repos/openclaw/openclaw/commits/${"c".repeat(40)}`,
       ).length >= 2,
     );
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test("repair apply reports strict-base failure before UNKNOWN mergeability", () => {
-  const fixture = writeMergeApplyFixture({
-    mergeable: "UNKNOWN",
-    strictBaseBinding: false,
-  });
-  try {
-    runMergeApplyResult(fixture);
-
-    const report = readApplyReport(fixture.reportPath);
-    assert.equal(report.actions[0].status, "blocked");
-    assert.equal(
-      report.actions[0].reason,
-      "automerge disabled: main lacks server-enforced strict base binding",
-    );
-    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
   } finally {
     fixture.cleanup();
   }
@@ -2178,7 +2156,6 @@ function writeMergeApplyFixture(
       | "wrong_head_merged";
     pendingKind?: "queue" | "auto_merge";
     mergeable?: "MERGEABLE" | "UNKNOWN";
-    strictBaseBinding?: boolean;
     securityOnFinalIssueFetch?: boolean;
     securityOnPostClaimIssueFetchOnce?: boolean;
     terminalCheckFailure?: boolean;
@@ -2188,8 +2165,8 @@ function writeMergeApplyFixture(
     mergeCommitMode?: "exact" | "message_mismatch" | "two_parents";
     foreignActivityBeyondTimelineCap?: boolean;
     postClaimContentDrift?: "body" | "title" | "label" | "reaction";
-    postDispatchGuardDrift?: "timeline" | "security" | "strict_base";
-    postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness" | "strict_base";
+    postDispatchGuardDrift?: "timeline" | "security";
+    postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness";
     priorWorkflowConclusion?: "failure";
   } = {},
 ): MergeFixture {
@@ -2207,7 +2184,6 @@ function writeMergeApplyFixture(
   const unrelatedDriftPath = path.join(root, "unrelated-drift");
   const mergeMessagePath = path.join(root, "merge-message");
   const issueCountPath = path.join(root, "issue-count");
-  const policyReadPath = path.join(root, "policy-read");
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
   const headSha = "a".repeat(40);
@@ -2297,7 +2273,6 @@ function writeMergeApplyFixture(
     mergeMode: options.mergeMode ?? "success_exact",
     pendingKind: options.pendingKind ?? null,
     mergeable: options.mergeable ?? "MERGEABLE",
-    strictBaseBinding: options.strictBaseBinding ?? true,
     securityOnFinalIssueFetch: options.securityOnFinalIssueFetch ?? false,
     securityOnPostClaimIssueFetchOnce: options.securityOnPostClaimIssueFetchOnce ?? false,
     terminalCheckFailure: options.terminalCheckFailure ?? false,
@@ -2312,7 +2287,6 @@ function writeMergeApplyFixture(
     postPolicyDrift: options.postPolicyDrift ?? null,
     priorWorkflowConclusion: options.priorWorkflowConclusion ?? null,
     issueCountPath,
-    policyReadPath,
   };
   fs.writeFileSync(
     path.join(binDir, "gh.js"),
@@ -2350,14 +2324,29 @@ function dispatchRecorded(comments = mergeComments()) {
   );
 }
 
-function policyReadCompleted() {
-  return fs.existsSync(data.policyReadPath);
+function loggedCallCount(predicate) {
+  if (!fs.existsSync(data.ghLogPath)) return 0;
+  return fs
+    .readFileSync(data.ghLogPath, "utf8")
+    .trim()
+    .split("\\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line).args)
+    .filter(predicate).length;
 }
 
-function policyReadCount() {
-  return policyReadCompleted()
-    ? Number(fs.readFileSync(data.policyReadPath, "utf8").trim() || "0")
-    : 0;
+function pullSnapshotReadCount() {
+  return loggedCallCount(
+    (callArgs) =>
+      callArgs[0] === "api" && callArgs[1] === "repos/openclaw/openclaw/pulls/101",
+  );
+}
+
+function pullViewReadCount() {
+  return loggedCallCount(
+    (callArgs) =>
+      callArgs[0] === "pr" && callArgs[1] === "view" && callArgs[2] === "101",
+  );
 }
 
 if (args[0] === "api") {
@@ -2485,13 +2474,14 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (apiPath === "repos/openclaw/openclaw/pulls/101") {
+    const absoluteFinalSnapshot = dispatchRecorded() && pullSnapshotReadCount() >= 4;
     const attempted = mergeCount() > 0;
     const merged =
       attempted &&
       ["success_exact", "ambiguous_exact", "wrong_head_merged"].includes(data.mergeMode);
     const snapshotHead =
       (attempted && data.mergeMode === "wrong_head_merged") ||
-      (policyReadCompleted() && data.postPolicyDrift === "rest_head")
+      (absoluteFinalSnapshot && data.postPolicyDrift === "rest_head")
         ? data.wrongHeadSha
         : data.headSha;
     write({
@@ -2506,7 +2496,7 @@ if (args[0] === "api") {
       auto_merge: null,
       mergeable_state: "clean",
       base: {
-        ref: policyReadCompleted() && data.postPolicyDrift === "base" ? "release" : "main",
+        ref: absoluteFinalSnapshot && data.postPolicyDrift === "base" ? "release" : "main",
       },
       head: { sha: snapshotHead },
     });
@@ -2531,29 +2521,6 @@ if (args[0] === "api") {
     });
     process.exit(0);
   }
-  if (apiPath.startsWith("repos/openclaw/openclaw/rules/branches/")) {
-    write([]);
-    process.exit(0);
-  }
-  if (apiPath.startsWith("repos/openclaw/openclaw/branches/") && apiPath.endsWith("/protection")) {
-    const comments = mergeComments();
-    const dispatched = dispatchRecorded(comments);
-    const dispatchedPolicyReads = policyReadCount();
-    write({
-      required_status_checks:
-        data.strictBaseBinding &&
-        !(data.postDispatchGuardDrift === "strict_base" && dispatched) &&
-        !(
-          data.postPolicyDrift === "strict_base" &&
-          dispatched &&
-          dispatchedPolicyReads >= 1
-        )
-          ? { strict: true, contexts: ["required-ci/exact-merge"] }
-          : null,
-    });
-    if (dispatched) fs.writeFileSync(data.policyReadPath, String(dispatchedPolicyReads + 1));
-    process.exit(0);
-  }
   if (args[1] === "graphql") {
     write({
       data: {
@@ -2570,7 +2537,7 @@ if (args[0] === "api") {
 
 if (args[0] === "pr" && args[1] === "view") {
   const pending = mergeCount() > 0 && data.mergeMode === "pending_after_command";
-  const postPolicy = policyReadCompleted();
+  const absoluteFinalSnapshot = dispatchRecorded() && pullViewReadCount() >= 5;
   const terminalCheckFailure =
     data.terminalCheckFailure || (data.terminalCheckFailureAfterCommand && mergeCount() > 0);
   write({
@@ -2578,15 +2545,18 @@ if (args[0] === "pr" && args[1] === "view") {
       pending && (data.pendingKind === "auto_merge" || data.pendingKind === "queue")
         ? { enabledAt: "2026-07-13T07:30:00Z", mergeMethod: "SQUASH" }
         : null,
-    baseRefName: postPolicy && data.postPolicyDrift === "base" ? "release" : "main",
+    baseRefName:
+      absoluteFinalSnapshot && data.postPolicyDrift === "base" ? "release" : "main",
     headRefOid:
-      postPolicy && data.postPolicyDrift === "view_head" ? data.wrongHeadSha : data.headSha,
+      absoluteFinalSnapshot && data.postPolicyDrift === "view_head"
+        ? data.wrongHeadSha
+        : data.headSha,
     isDraft: false,
     isInMergeQueue: pending && data.pendingKind === "queue",
     mergeable: data.mergeable,
     mergeCommit: null,
     mergeStateStatus:
-      postPolicy && data.postPolicyDrift === "readiness" ? "BLOCKED" : "CLEAN",
+      absoluteFinalSnapshot && data.postPolicyDrift === "readiness" ? "BLOCKED" : "CLEAN",
     mergedAt: null,
     reviewDecision: null,
     state: "OPEN",

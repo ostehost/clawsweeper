@@ -25,8 +25,8 @@ test("review activity arriving after dispatch marking retires the claim without 
         retryable: false,
       };
     },
-    strictBaseBindingBlock: () => {
-      calls.push("policy");
+    dispatchStateBlock: () => {
+      calls.push("state");
       return null;
     },
     finalSafetyBlock: () => {
@@ -74,7 +74,7 @@ test("review activity refresh failure waits after retiring the dispatched claim"
       reason: "pull request review activity could not be refreshed: HTTP 503",
       retryable: true,
     }),
-    strictBaseBindingBlock: () => null,
+    dispatchStateBlock: () => null,
     finalSafetyBlock: () => null,
     rejectDispatched: () => ({ status: "rejected", reason: "", claimId: 1301 }),
   });
@@ -87,7 +87,7 @@ test("review activity refresh failure waits after retiring the dispatched claim"
   });
 });
 
-test("strict-base drift after activity validation retires the claim without merging", () => {
+test("live state drift after activity validation retires the claim without merging", () => {
   const calls: string[] = [];
   let mergeCalls = 0;
   const result = guardAutomergeMergeDispatch({
@@ -106,10 +106,10 @@ test("strict-base drift after activity validation retires the claim without merg
       calls.push("activity");
       return null;
     },
-    strictBaseBindingBlock: () => {
-      calls.push("policy");
+    dispatchStateBlock: () => {
+      calls.push("state");
       return {
-        reason: "automerge disabled: main lacks server-enforced strict base binding",
+        reason: "pull request base is not main",
         retryable: false,
       };
     },
@@ -122,17 +122,17 @@ test("strict-base drift after activity validation retires the claim without merg
 
   if (result.status === "ready") mergeCalls += 1;
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "reject"]);
+  assert.deepEqual(calls, ["mark", "activity", "state", "reject"]);
   assert.equal(mergeCalls, 0);
   assert.equal(result.status, "aborted");
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {
     status: "blocked",
-    reason: "automerge disabled: main lacks server-enforced strict base binding",
+    reason: "pull request base is not main",
   });
 });
 
-test("strict-base refresh failure retires the claim as a retryable no-op", () => {
+test("live state refresh failure retires the claim as a retryable no-op", () => {
   let mergeCalls = 0;
   const result = guardAutomergeMergeDispatch({
     markDispatched: () => ({
@@ -144,8 +144,8 @@ test("strict-base refresh failure retires the claim as a retryable no-op", () =>
       lastClaimMutationAt: null,
     }),
     reviewActivityBlock: () => null,
-    strictBaseBindingBlock: () => ({
-      reason: "pre-dispatch strict-base policy could not be refreshed: HTTP 503",
+    dispatchStateBlock: () => ({
+      reason: "pre-dispatch automerge state could not be refreshed: HTTP 503",
       retryable: true,
     }),
     finalSafetyBlock: () => null,
@@ -159,11 +159,11 @@ test("strict-base refresh failure retires the claim as a retryable no-op", () =>
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {
     status: "waiting",
-    reason: "pre-dispatch strict-base policy could not be refreshed: HTTP 503",
+    reason: "pre-dispatch automerge state could not be refreshed: HTTP 503",
   });
 });
 
-test("merge becomes ready only after activity and strict-base checks pass", () => {
+test("merge becomes ready only after activity and live state checks pass", () => {
   const calls: string[] = [];
   const result = guardAutomergeMergeDispatch({
     markDispatched: () => {
@@ -181,8 +181,8 @@ test("merge becomes ready only after activity and strict-base checks pass", () =
       calls.push("activity");
       return null;
     },
-    strictBaseBindingBlock: () => {
-      calls.push("policy");
+    dispatchStateBlock: () => {
+      calls.push("state");
       return null;
     },
     finalSafetyBlock: () => {
@@ -195,11 +195,11 @@ test("merge becomes ready only after activity and strict-base checks pass", () =
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "safety"]);
+  assert.deepEqual(calls, ["mark", "activity", "state", "safety"]);
   assert.equal(result.status, "ready");
 });
 
-test("review activity arriving during policy refresh retires the dispatched claim", () => {
+test("review activity arriving during final safety refresh retires the dispatched claim", () => {
   const calls: string[] = [];
   const result = guardAutomergeMergeDispatch({
     markDispatched: () => {
@@ -217,14 +217,14 @@ test("review activity arriving during policy refresh retires the dispatched clai
       calls.push("activity");
       return null;
     },
-    strictBaseBindingBlock: () => {
-      calls.push("policy");
+    dispatchStateBlock: () => {
+      calls.push("state");
       return null;
     },
     finalSafetyBlock: () => {
       calls.push("safety");
       return {
-        reason: "pull request review activity changed during policy refresh",
+        reason: "pull request review activity changed during final safety refresh",
         retryable: false,
       };
     },
@@ -234,16 +234,16 @@ test("review activity arriving during policy refresh retires the dispatched clai
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "safety", "reject"]);
+  assert.deepEqual(calls, ["mark", "activity", "state", "safety", "reject"]);
   assert.equal(result.status, "aborted");
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {
     status: "blocked",
-    reason: "pull request review activity changed during policy refresh",
+    reason: "pull request review activity changed during final safety refresh",
   });
 });
 
-test("base retarget arriving during policy refresh retires the dispatched claim", () => {
+test("base retarget arriving during final safety refresh retires the dispatched claim", () => {
   const calls: string[] = [];
   const result = guardAutomergeMergeDispatch({
     markDispatched: () => {
@@ -261,8 +261,8 @@ test("base retarget arriving during policy refresh retires the dispatched claim"
       calls.push("activity");
       return null;
     },
-    strictBaseBindingBlock: () => {
-      calls.push("policy");
+    dispatchStateBlock: () => {
+      calls.push("state");
       return null;
     },
     finalSafetyBlock: () => {
@@ -275,7 +275,7 @@ test("base retarget arriving during policy refresh retires the dispatched claim"
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "safety", "reject"]);
+  assert.deepEqual(calls, ["mark", "activity", "state", "safety", "reject"]);
   assert.equal(result.status, "aborted");
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {

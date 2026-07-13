@@ -198,24 +198,20 @@ test("automerge observes exact-head queue state before issuing another merge", (
     source.indexOf("function automergeReadinessAction("),
   );
   const hardCheck = executeAutomerge.indexOf("validateAutomergeHardReadiness({");
-  const strictBaseCheck = executeAutomerge.indexOf("runtimeStrictBaseBindingBlock({");
   const pendingCheck = executeAutomerge.indexOf("exactHeadAutomergePendingReason(command, view)");
   const readinessCheck = executeAutomerge.indexOf("validateAutomergeReadiness({");
   const gateAction = executeAutomerge.indexOf("if (gateBlock) {");
   const mergeCall = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
 
   assert.ok(hardCheck >= 0);
-  assert.ok(strictBaseCheck > hardCheck);
-  assert.ok(pendingCheck > strictBaseCheck);
+  assert.ok(pendingCheck > hardCheck);
   assert.ok(readinessCheck > pendingCheck);
   assert.ok(gateAction > readinessCheck);
   assert.ok(mergeCall > pendingCheck);
   const finalHardCheck = executeAutomerge.indexOf("const finalHardBlock");
-  const finalStrictBaseCheck = executeAutomerge.indexOf("const finalStrictBaseBindingBlock");
   const finalPendingCheck = executeAutomerge.indexOf("const finalPendingReason");
   const finalReadinessCheck = executeAutomerge.indexOf("const finalReadinessBlock");
-  assert.ok(finalStrictBaseCheck > finalHardCheck);
-  assert.ok(finalPendingCheck > finalStrictBaseCheck);
+  assert.ok(finalPendingCheck > finalHardCheck);
   assert.ok(finalReadinessCheck > finalPendingCheck);
   assert.match(
     source,
@@ -290,7 +286,7 @@ test("trusted verdict automerge rechecks reviewed PR activity around the merge c
   assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
 });
 
-test("activity and strict-base policy are checked after durable dispatch marking", () => {
+test("activity and live state are checked after durable dispatch marking", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(
     source.indexOf("function executeAutomerge("),
@@ -321,8 +317,8 @@ test("activity and strict-base policy are checked after durable dispatch marking
   const postMarkerActivityCheck = dispatchBoundary.indexOf(
     "reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command)",
   );
-  const postMarkerStrictBaseCheck = dispatchBoundary.indexOf(
-    "strictBaseBindingBlock: () => liveDispatchStateBlock(true)",
+  const postMarkerStateCheck = dispatchBoundary.indexOf(
+    "dispatchStateBlock: liveDispatchStateBlock",
   );
   const finalSafetyCheck = dispatchBoundary.indexOf("finalSafetyBlock: finalDispatchSafetyBlock");
   const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
@@ -331,8 +327,8 @@ test("activity and strict-base policy are checked after durable dispatch marking
   assert.ok(guard > preMarkerActivityCheck);
   assert.ok(claimDispatch > guard);
   assert.ok(postMarkerActivityCheck > claimDispatch);
-  assert.ok(postMarkerStrictBaseCheck > postMarkerActivityCheck);
-  assert.ok(finalSafetyCheck > postMarkerStrictBaseCheck);
+  assert.ok(postMarkerStateCheck > postMarkerActivityCheck);
+  assert.ok(finalSafetyCheck > postMarkerStateCheck);
   assert.ok(reject > finalSafetyCheck);
   assert.match(
     executeAutomerge,
@@ -344,15 +340,15 @@ test("activity and strict-base policy are checked after durable dispatch marking
   );
   assert.match(
     liveDispatchState,
-    /readDispatchState\(\)[\s\S]*dispatchStateBlock\(state\)[\s\S]*runtimeStrictBaseBindingBlock\([\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+    /readDispatchState\(\)[\s\S]*dispatchStateBlock\(state\)[\s\S]*verifiedBaseBranch/,
   );
   assert.match(
     liveDispatchState,
-    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*policyVerifiedBaseBranch/,
+    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*verifiedBaseBranch/,
   );
   assert.match(
     liveDispatchState,
-    /const reverifyStrictBase[\s\S]*middleState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(middleBaseBranch\)[\s\S]*finalState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(finalBaseBranch\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
+    /firstState = readDispatchState\(\)[\s\S]*middleState = readDispatchState\(\)[\s\S]*verifiedBaseBranch = middleBaseBranch[\s\S]*finalState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
   );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
