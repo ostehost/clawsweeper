@@ -78,8 +78,8 @@ test("run-id requeue prefers the newest early-input producer attempt", () => {
   }
 });
 
-test("run-id requeue preserves a later plan downgrade over a published autonomous result", () => {
-  const fixture = createFixture("published-downgrade", "910106");
+test("run-id requeue uses complete published provenance after Actions artifacts expire", () => {
+  const fixture = createFixture("published-expired", "910106");
   try {
     writeRunRecord(fixture, {
       source_job: fixture.jobPath,
@@ -87,24 +87,54 @@ test("run-id requeue preserves a later plan downgrade over a published autonomou
       source_job_sha256: fixture.replacementDigest,
       mode: "autonomous",
     });
-    writeArtifactCohort(fixture, 1, {
-      stateRevision: fixture.replacementRevision,
-      jobSha256: fixture.replacementDigest,
-      mode: "autonomous",
-    });
-    writeWorkflowInputs(fixture, 2, {
-      stateRevision: fixture.replacementRevision,
-      jobSha256: fixture.replacementDigest,
-      requestedMode: "autonomous",
-      effectiveMode: "plan",
-    });
 
-    const result = runRequeue(fixture);
+    const result = runRequeue(fixture, { GH_ARTIFACT_EXPIRED: "1" });
     assert.equal(result.status, 0, result.stderr);
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.source_state_revision, fixture.replacementRevision);
     assert.equal(summary.source_job_sha256, fixture.replacementDigest);
-    assert.equal(summary.mode, "plan");
+    assert.equal(summary.mode, "autonomous");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("run-id requeue rejects published provenance whose digest does not match state bytes", () => {
+  const fixture = createFixture("published-digest-mismatch", "910107");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: "f".repeat(64),
+      mode: "autonomous",
+    });
+
+    const result = runRequeue(fixture, { GH_ARTIFACT_EXPIRED: "1" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /immutable job SHA-256 mismatch/);
+    assert.doesNotMatch(result.stderr, /Actions artifacts expired/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("run-id requeue rejects published effective mode that conflicts with job bytes", () => {
+  const fixture = createFixture("published-mode-mismatch", "910108");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "autonomous",
+    });
+
+    const result = runRequeue(fixture, { GH_ARTIFACT_EXPIRED: "1" });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /recovered effective mode autonomous conflicts with immutable job mode plan/,
+    );
+    assert.doesNotMatch(result.stderr, /Actions artifacts expired/);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -195,7 +225,7 @@ function createFixture(label: string, runId: string) {
   };
 }
 
-function runRequeue(fixture: ReturnType<typeof createFixture>) {
+function runRequeue(fixture: ReturnType<typeof createFixture>, extraEnv: NodeJS.ProcessEnv = {}) {
   return spawnSync(
     process.execPath,
     [path.resolve("dist/repair/requeue-job.js"), fixture.runId, "--runs-dir", fixture.runsDir],
@@ -208,6 +238,8 @@ function runRequeue(fixture: ReturnType<typeof createFixture>) {
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
         CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
+        GH_ARTIFACT_EXPIRED: "0",
+        ...extraEnv,
       },
     },
   );
@@ -342,6 +374,10 @@ function writeFakeGh(binDir: string): void {
     `#!/bin/sh
 set -eu
 if [ "$1" = "run" ] && [ "$2" = "download" ]; then
+  if [ "$GH_ARTIFACT_EXPIRED" = "1" ]; then
+    echo "Actions artifacts expired" >&2
+    exit 1
+  fi
   while [ "$#" -gt 0 ]; do
     if [ "$1" = "--dir" ]; then
       shift

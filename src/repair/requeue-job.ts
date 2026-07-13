@@ -100,6 +100,17 @@ const immutableJob = resolveStateJobIdentity({
 });
 const job = immutableJob.job;
 const authorizationSha256 = immutableJob.jobSha256;
+if (
+  resolved.mode &&
+  resolved.mode !== "plan" &&
+  resolved.mode !== String(job.frontmatter.mode ?? "").trim()
+) {
+  throw new Error(
+    `recovered effective mode ${resolved.mode} conflicts with immutable job mode ${
+      job.frontmatter.mode
+    }`,
+  );
+}
 
 const mode = requestedMode ?? resolved.mode ?? job.frontmatter.mode;
 if (!["plan", "execute", "autonomous"].includes(mode)) {
@@ -222,9 +233,36 @@ if (commandError) throw commandError;
 
 function resolveFromRunId(runId: string) {
   const fromLedger = readPublishedRunRecord(runId);
-  const ledgerSourceJob = String(fromLedger?.source_job ?? "").trim();
-  const ledgerStateRevision = String(fromLedger?.source_state_revision ?? "").trim();
-  const ledgerJobSha256 = String(fromLedger?.source_job_sha256 ?? "").trim();
+  const ledgerSourceJob = publishedRecordField(
+    fromLedger,
+    "source_job",
+    SOURCE_JOB_PATH,
+    runId,
+    "source job",
+  );
+  const ledgerStateRevision = publishedRecordField(
+    fromLedger,
+    "source_state_revision",
+    STATE_REVISION,
+    runId,
+    "state revision",
+  );
+  const ledgerJobSha256 = publishedRecordField(
+    fromLedger,
+    "source_job_sha256",
+    JOB_SHA256,
+    runId,
+    "job digest",
+  );
+  const ledgerMode = publishedRecordMode(fromLedger, runId);
+  if (ledgerSourceJob && ledgerStateRevision && ledgerJobSha256 && ledgerMode) {
+    return {
+      source_job: ledgerSourceJob,
+      mode: ledgerMode,
+      state_revision: ledgerStateRevision,
+      job_sha256: ledgerJobSha256,
+    };
+  }
 
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
@@ -245,16 +283,51 @@ function resolveFromRunId(runId: string) {
     if (ledgerJobSha256 && ledgerJobSha256 !== recovered.job_sha256) {
       throw new Error(`run ${runId} record job digest conflicts with its artifact cohort`);
     }
+    if (ledgerMode && ledgerMode !== recovered.mode) {
+      throw new Error(`run ${runId} record effective mode conflicts with its artifact cohort`);
+    }
     return recovered;
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
 }
 
-function readPublishedRunRecord(runId: string) {
+function readPublishedRunRecord(runId: string): LooseRecord | null {
   const file = path.join(runRecordsDir, `${runId}.json`);
   if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+  const record = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    throw new Error(`run ${runId} record must be a JSON object`);
+  }
+  const recordedRunId = String(record.run_id ?? "").trim();
+  if (recordedRunId && recordedRunId !== runId) {
+    throw new Error(`run ${runId} record identity conflicts with its filename`);
+  }
+  return record;
+}
+
+function publishedRecordField(
+  record: LooseRecord | null,
+  field: string,
+  pattern: RegExp,
+  runId: string,
+  label: string,
+): string | null {
+  const value = String(record?.[field] ?? "").trim();
+  if (!value) return null;
+  if (!pattern.test(value)) {
+    throw new Error(`run ${runId} record has invalid ${label}`);
+  }
+  return value;
+}
+
+function publishedRecordMode(record: LooseRecord | null, runId: string): string | null {
+  const mode = String(record?.mode ?? "").trim();
+  if (!mode) return null;
+  if (!REPAIR_MODES.has(mode)) {
+    throw new Error(`run ${runId} record has invalid effective mode`);
+  }
+  return mode;
 }
 
 function resolveDownloadedRunCohort(
