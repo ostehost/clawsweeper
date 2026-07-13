@@ -287,6 +287,62 @@ test("redactSecrets preserves JSON when a sensitive value ends with a backslash"
   assert.equal(containsSensitiveValue(redacted, []), false);
 });
 
+test("redactSecrets replaces every JSON value type for sensitive fields", () => {
+  const payload = JSON.stringify({
+    token: { value: "object-secret" },
+    credentials: ["array-secret"],
+    password: 123456,
+    api_key: true,
+    private_key: null,
+    visible: { value: "safe" },
+  });
+
+  for (let depth = 0; depth <= 3; depth += 1) {
+    const input = encodeJsonDepth(payload, depth);
+    assert.equal(containsSensitiveValue(input, []), true);
+    const redacted = redactSecrets(input);
+    const retained = JSON.parse(decodeJsonDepth(redacted, depth));
+
+    assert.deepEqual(retained, {
+      token: "[REDACTED]",
+      credentials: "[REDACTED]",
+      password: "[REDACTED]",
+      api_key: "[REDACTED]",
+      private_key: "[REDACTED]",
+      visible: { value: "safe" },
+    });
+    assert.doesNotMatch(redacted, /object-secret|array-secret|123456/);
+    assert.equal(containsSensitiveValue(redacted, []), false);
+  }
+});
+
+test("redactSecrets decodes JSON whitespace at every escape depth", () => {
+  const payload = [
+    "{",
+    '"token"',
+    ":",
+    '{"value":"newline-secret"},',
+    '"credential":\t["tab-secret"],',
+    '"visible": {"value":"safe"}',
+    "}",
+  ].join("\n");
+
+  for (let depth = 0; depth <= 3; depth += 1) {
+    const input = encodeJsonDepth(payload, depth);
+    assert.equal(containsSensitiveValue(input, []), true);
+    const redacted = redactSecrets(input);
+    const retained = JSON.parse(decodeJsonDepth(redacted, depth));
+
+    assert.deepEqual(retained, {
+      token: "[REDACTED]",
+      credential: "[REDACTED]",
+      visible: { value: "safe" },
+    });
+    assert.doesNotMatch(redacted, /newline-secret|tab-secret/);
+    assert.equal(containsSensitiveValue(redacted, []), false);
+  }
+});
+
 test("escaped named credential detection fails closed on incomplete JSONL fields", () => {
   const incomplete = String.raw`{\"token\":\"historical-secret`;
   const followingRecord = String.raw`{\"visible\":\"safe\"}`;
@@ -294,6 +350,21 @@ test("escaped named credential detection fails closed on incomplete JSONL fields
 
   assert.equal(redactSecrets(input), input);
   assert.equal(containsSensitiveValue(input, []), true);
+});
+
+test("escaped named credential detection fails closed on incomplete JSON containers", () => {
+  for (const payload of [
+    '{"token":{"value":"object-secret"',
+    '{"credential":["array-secret"',
+    '{"password":tru',
+    '{"api_key":12e',
+  ]) {
+    for (let depth = 0; depth <= 3; depth += 1) {
+      const input = encodeJsonDepth(payload, depth);
+      assert.equal(redactSecrets(input), input);
+      assert.equal(containsSensitiveValue(input, []), true);
+    }
+  }
 });
 
 test("redactSecrets masks multiline credentials and private keys", () => {
@@ -403,10 +474,7 @@ test("collectCodexDebug redacts nested JSONL credential representations before p
     const event = JSON.parse(artifact);
     const retained = JSON.parse(JSON.parse(event.item.text));
     assert.deepEqual(retained, {
-      credentials: {
-        access_token: "[REDACTED]",
-        private_key: "[REDACTED]",
-      },
+      credentials: "[REDACTED]",
     });
     assert.doesNotMatch(artifact, /nested-historical-secret|nested-private-material/);
     assert.equal(containsSensitiveValue(artifact, []), false);
@@ -557,3 +625,15 @@ test("collectCodexDebug redacts current Actions credentials by default", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+function encodeJsonDepth(value: string, depth: number): string {
+  let encoded = value;
+  for (let index = 0; index < depth; index += 1) encoded = JSON.stringify(encoded);
+  return encoded;
+}
+
+function decodeJsonDepth(value: string, depth: number): string {
+  let decoded = value;
+  for (let index = 0; index < depth; index += 1) decoded = JSON.parse(decoded);
+  return decoded;
+}

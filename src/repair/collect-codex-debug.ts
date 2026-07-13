@@ -39,22 +39,36 @@ const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_PEM_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
+const JSON_NUMBER_PATTERN = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 const REDACTED_VALUE = "[REDACTED]";
 const SENSITIVE_FIELD_NAME_PATTERN = new RegExp(`^${SENSITIVE_FIELD_NAME}$`, "i");
 
 type EncodedJsonStringToken = {
   depth: number;
   start: number;
-  openQuote: number;
   closeQuote: number;
   value: string;
 };
 
 type StructuredSensitiveValueMatch = {
-  value: string;
+  depth: number;
+  isRedacted: boolean;
   valueStart: number;
   valueEnd: number;
 };
+
+type ParsedEncodedJsonValue = {
+  end: number;
+  stringValue?: string;
+};
+
+type EncodedJsonWhitespace = {
+  all: string[];
+  horizontal: string[];
+  lineBreaks: string[];
+};
+
+const ENCODED_JSON_WHITESPACE = new Map<number, EncodedJsonWhitespace>();
 
 export function collectCodexDebug(options: CollectOptions) {
   const codexHome = resolveCodexHome(options);
@@ -190,7 +204,7 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
     return true;
   }
   const structured = scanStructuredSensitiveValues(text);
-  if (structured.matches.some((match) => !isRedactedValue(match.value))) {
+  if (structured.matches.some((match) => !match.isRedacted)) {
     return true;
   }
   return structured.hasIncompleteValue;
@@ -207,7 +221,9 @@ function redactStructuredSensitiveValues(text: string): string {
   let redacted = text;
   for (const range of ranges.reverse()) {
     redacted =
-      redacted.slice(0, range.valueStart) + REDACTED_VALUE + redacted.slice(range.valueEnd);
+      redacted.slice(0, range.valueStart) +
+      encodeJsonStringLiteral(REDACTED_VALUE, range.depth) +
+      redacted.slice(range.valueEnd);
   }
   return redacted;
 }
@@ -216,30 +232,36 @@ function scanStructuredSensitiveValues(text: string): {
   matches: StructuredSensitiveValueMatch[];
   hasIncompleteValue: boolean;
 } {
-  const { tokens, possibleStarts } = scanEncodedJsonStrings(text);
+  const { tokens } = scanEncodedJsonStrings(text);
   const tokenByStart = new Map(
     tokens.map((token) => [encodedTokenKey(token.depth, token.start), token]),
   );
+  const parsedValues = new Map<string, ParsedEncodedJsonValue | null>();
   const matches: StructuredSensitiveValueMatch[] = [];
   let hasIncompleteValue = false;
 
   for (const keyToken of tokens) {
     if (!SENSITIVE_FIELD_NAME_PATTERN.test(keyToken.value)) continue;
-    let cursor = skipJsonWhitespace(text, keyToken.closeQuote + 1);
+    let cursor = skipEncodedJsonWhitespace(text, keyToken.closeQuote + 1, keyToken.depth);
     if (text[cursor] !== ":") continue;
-    cursor = skipJsonWhitespace(text, cursor + 1);
-    const valueToken = tokenByStart.get(encodedTokenKey(keyToken.depth, cursor));
-    if (!valueToken) {
-      if (possibleStarts.has(encodedTokenKey(keyToken.depth, cursor))) {
-        hasIncompleteValue = true;
-      }
+    cursor = skipEncodedJsonWhitespace(text, cursor + 1, keyToken.depth);
+    const value = parseEncodedJsonValue({
+      text,
+      start: cursor,
+      depth: keyToken.depth,
+      tokenByStart,
+      parsedValues,
+      nesting: 0,
+    });
+    if (!value) {
+      hasIncompleteValue = true;
       continue;
     }
-    const delimiterBackslashes = 2 ** keyToken.depth - 1;
     matches.push({
-      value: valueToken.value,
-      valueStart: valueToken.openQuote + 1,
-      valueEnd: valueToken.closeQuote - delimiterBackslashes,
+      depth: keyToken.depth,
+      isRedacted: value.stringValue === REDACTED_VALUE,
+      valueStart: cursor,
+      valueEnd: value.end,
     });
   }
 
@@ -248,7 +270,6 @@ function scanStructuredSensitiveValues(text: string): {
 
 function scanEncodedJsonStrings(text: string): {
   tokens: EncodedJsonStringToken[];
-  possibleStarts: Set<string>;
 } {
   const quotesByDepth = new Map<
     number,
@@ -270,14 +291,8 @@ function scanEncodedJsonStrings(text: string): {
   }
 
   const tokens: EncodedJsonStringToken[] = [];
-  const possibleStarts = new Set<string>();
   for (const [depth, quotes] of quotesByDepth) {
     const delimiterBackslashes = 2 ** depth - 1;
-    for (const quote of quotes) {
-      if (quote.backslashes === delimiterBackslashes) {
-        possibleStarts.add(encodedTokenKey(depth, quote.index - delimiterBackslashes));
-      }
-    }
     for (let index = 0; index + 1 < quotes.length; index += 1) {
       const opening = quotes[index]!;
       const closing = quotes[index + 1]!;
@@ -288,14 +303,176 @@ function scanEncodedJsonStrings(text: string): {
       tokens.push({
         depth,
         start,
-        openQuote: opening.index,
         closeQuote: closing.index,
         value,
       });
     }
   }
 
-  return { tokens, possibleStarts };
+  return { tokens };
+}
+
+function parseEncodedJsonValue({
+  text,
+  start,
+  depth,
+  tokenByStart,
+  parsedValues,
+  nesting,
+}: {
+  text: string;
+  start: number;
+  depth: number;
+  tokenByStart: Map<string, EncodedJsonStringToken>;
+  parsedValues: Map<string, ParsedEncodedJsonValue | null>;
+  nesting: number;
+}): ParsedEncodedJsonValue | null {
+  const cursor = skipEncodedJsonWhitespace(text, start, depth);
+  const cacheKey = encodedTokenKey(depth, cursor);
+  if (parsedValues.has(cacheKey)) return parsedValues.get(cacheKey) ?? null;
+  if (nesting > 256) {
+    parsedValues.set(cacheKey, null);
+    return null;
+  }
+
+  const stringToken = tokenByStart.get(cacheKey);
+  if (stringToken) {
+    const parsed = encodedJsonScalarEnd(text, stringToken.closeQuote + 1, depth, {
+      stringValue: stringToken.value,
+    });
+    parsedValues.set(cacheKey, parsed);
+    return parsed;
+  }
+
+  const character = text[cursor];
+  let parsed: ParsedEncodedJsonValue | null;
+  if (character === "{") {
+    parsed = parseEncodedJsonObject({
+      text,
+      start: cursor,
+      depth,
+      tokenByStart,
+      parsedValues,
+      nesting,
+    });
+  } else if (character === "[") {
+    parsed = parseEncodedJsonArray({
+      text,
+      start: cursor,
+      depth,
+      tokenByStart,
+      parsedValues,
+      nesting,
+    });
+  } else if (text.startsWith("true", cursor)) {
+    parsed = encodedJsonScalarEnd(text, cursor + 4, depth);
+  } else if (text.startsWith("false", cursor)) {
+    parsed = encodedJsonScalarEnd(text, cursor + 5, depth);
+  } else if (text.startsWith("null", cursor)) {
+    parsed = encodedJsonScalarEnd(text, cursor + 4, depth);
+  } else {
+    JSON_NUMBER_PATTERN.lastIndex = cursor;
+    const number = JSON_NUMBER_PATTERN.exec(text);
+    parsed = number ? encodedJsonScalarEnd(text, JSON_NUMBER_PATTERN.lastIndex, depth) : null;
+  }
+  parsedValues.set(cacheKey, parsed);
+  return parsed;
+}
+
+function parseEncodedJsonObject({
+  text,
+  start,
+  depth,
+  tokenByStart,
+  parsedValues,
+  nesting,
+}: {
+  text: string;
+  start: number;
+  depth: number;
+  tokenByStart: Map<string, EncodedJsonStringToken>;
+  parsedValues: Map<string, ParsedEncodedJsonValue | null>;
+  nesting: number;
+}): ParsedEncodedJsonValue | null {
+  let cursor = skipEncodedJsonWhitespace(text, start + 1, depth);
+  if (text[cursor] === "}") return { end: cursor + 1 };
+
+  while (cursor < text.length) {
+    const key = tokenByStart.get(encodedTokenKey(depth, cursor));
+    if (!key) return null;
+    cursor = skipEncodedJsonWhitespace(text, key.closeQuote + 1, depth);
+    if (text[cursor] !== ":") return null;
+    const value = parseEncodedJsonValue({
+      text,
+      start: cursor + 1,
+      depth,
+      tokenByStart,
+      parsedValues,
+      nesting: nesting + 1,
+    });
+    if (!value) return null;
+    cursor = skipEncodedJsonWhitespace(text, value.end, depth);
+    if (text[cursor] === "}") return { end: cursor + 1 };
+    if (text[cursor] !== ",") return null;
+    cursor = skipEncodedJsonWhitespace(text, cursor + 1, depth);
+  }
+  return null;
+}
+
+function parseEncodedJsonArray({
+  text,
+  start,
+  depth,
+  tokenByStart,
+  parsedValues,
+  nesting,
+}: {
+  text: string;
+  start: number;
+  depth: number;
+  tokenByStart: Map<string, EncodedJsonStringToken>;
+  parsedValues: Map<string, ParsedEncodedJsonValue | null>;
+  nesting: number;
+}): ParsedEncodedJsonValue | null {
+  let cursor = skipEncodedJsonWhitespace(text, start + 1, depth);
+  if (text[cursor] === "]") return { end: cursor + 1 };
+
+  while (cursor < text.length) {
+    const value = parseEncodedJsonValue({
+      text,
+      start: cursor,
+      depth,
+      tokenByStart,
+      parsedValues,
+      nesting: nesting + 1,
+    });
+    if (!value) return null;
+    cursor = skipEncodedJsonWhitespace(text, value.end, depth);
+    if (text[cursor] === "]") return { end: cursor + 1 };
+    if (text[cursor] !== ",") return null;
+    cursor = skipEncodedJsonWhitespace(text, cursor + 1, depth);
+  }
+  return null;
+}
+
+function encodedJsonScalarEnd(
+  text: string,
+  end: number,
+  depth: number,
+  value: Omit<ParsedEncodedJsonValue, "end"> = {},
+): ParsedEncodedJsonValue | null {
+  let cursor = end;
+  const whitespace = encodedJsonWhitespace(depth);
+  while (cursor < text.length) {
+    const match = whitespace.horizontal.find((entry) => text.startsWith(entry, cursor));
+    if (!match) break;
+    cursor += match.length;
+  }
+  if (whitespace.lineBreaks.some((entry) => text.startsWith(entry, cursor))) {
+    return { end, ...value };
+  }
+  const boundary = skipEncodedJsonWhitespace(text, end, depth);
+  return boundary === text.length || /[,}\]]/.test(text[boundary] ?? "") ? { end, ...value } : null;
 }
 
 function decodeEncodedJsonString(segment: string, depth: number): string | null {
@@ -336,10 +513,37 @@ function encodedTokenKey(depth: number, start: number): string {
   return `${depth}:${start}`;
 }
 
-function skipJsonWhitespace(text: string, start: number): number {
+function skipEncodedJsonWhitespace(text: string, start: number, depth: number): number {
+  const whitespace = encodedJsonWhitespace(depth);
   let cursor = start;
-  while (cursor < text.length && /[\t\n\r ]/.test(text[cursor]!)) cursor += 1;
+  while (cursor < text.length) {
+    const match = whitespace.all.find((entry) => text.startsWith(entry, cursor));
+    if (!match) break;
+    cursor += match.length;
+  }
   return cursor;
+}
+
+function encodedJsonWhitespace(depth: number): EncodedJsonWhitespace {
+  const cached = ENCODED_JSON_WHITESPACE.get(depth);
+  if (cached) return cached;
+  const horizontal = [" ", "\t"].map((value) => encodeJsonStringContent(value, depth));
+  const lineBreaks = ["\n", "\r"].map((value) => encodeJsonStringContent(value, depth));
+  const whitespace = { all: [...horizontal, ...lineBreaks], horizontal, lineBreaks };
+  ENCODED_JSON_WHITESPACE.set(depth, whitespace);
+  return whitespace;
+}
+
+function encodeJsonStringLiteral(value: string, depth: number): string {
+  return encodeJsonStringContent(JSON.stringify(value), depth);
+}
+
+function encodeJsonStringContent(value: string, depth: number): string {
+  let encoded = value;
+  for (let index = 0; index < depth; index += 1) {
+    encoded = JSON.stringify(encoded).slice(1, -1);
+  }
+  return encoded;
 }
 
 function isRedactedValue(value: string): boolean {
