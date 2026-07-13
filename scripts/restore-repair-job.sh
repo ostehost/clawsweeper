@@ -9,6 +9,11 @@ if [ -z "$JOB_PATH" ]; then
   exit 1
 fi
 
+if [[ ! "$JOB_PATH" =~ ^jobs/[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9][A-Za-z0-9_.-]*)*\.md$ ]]; then
+  echo "Invalid job path: $JOB_PATH" >&2
+  exit 1
+fi
+
 write_output() {
   local key="$1"
   local value="$2"

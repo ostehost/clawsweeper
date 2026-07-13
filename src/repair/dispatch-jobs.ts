@@ -2,7 +2,6 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import {
   activeRepairWorkflowRunForJob,
   assertLiveWorkerCapacity,
@@ -16,6 +15,7 @@ import {
 } from "./lib.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
+import { ghSpawn } from "./github-cli.js";
 import { AUTOMATION_LIMITS, workerLimit, type WorkerLane } from "./limits.js";
 import {
   repairJobIntentForFrontmatter,
@@ -114,8 +114,7 @@ while (!failed && index < jobs.length) {
 }
 
 function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue) {
-  const result = spawnSync(
-    "gh",
+  const result = ghSpawn(
     [
       "workflow",
       "run",
@@ -134,7 +133,7 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
       "-f",
       `model=${model}`,
     ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    { cwd: repoRoot() },
   );
   if (result.status !== 0) {
     failed = true;

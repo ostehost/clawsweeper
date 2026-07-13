@@ -18,7 +18,7 @@ import {
   defaultReviewArtifactDirForTest,
   prepareManagedLocalReviewCheckoutForTest,
 } from "../dist/clawsweeper.js";
-import { runText, UserFacingCommandError } from "../dist/command.js";
+import { resolveCommand, runText, UserFacingCommandError } from "../dist/command.js";
 import { mockGhBinEnv } from "./helpers.ts";
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
@@ -55,6 +55,58 @@ test("runText explains missing executables", () => {
       return true;
     },
   );
+});
+
+test("runText uses trusted git default on POSIX when GIT_BIN is unset", () => {
+  if (process.platform === "win32") return;
+  const env = { PATH: "", GIT_BIN: "", GIT_BIN_ARGS: "" };
+  assert.deepEqual(resolveCommand("git", ["status"], env), {
+    command: "/usr/bin/git",
+    args: ["status"],
+  });
+  assert.equal(runText("git", ["--version"], { env }).startsWith("git version "), true);
+});
+
+test("gh command resolution fails closed to an absolute path on POSIX", () => {
+  if (process.platform === "win32") return;
+  assert.deepEqual(resolveCommand("gh", ["api", "user"], { PATH: "" }), {
+    command: "/usr/bin/gh",
+    args: ["api", "user"],
+  });
+});
+
+test("git command resolution preserves overrides and Windows PATH lookup", () => {
+  assert.deepEqual(resolveCommand("git", ["status"], { GIT_BIN: "/trusted/git" }, "linux"), {
+    command: "/trusted/git",
+    args: ["status"],
+  });
+  assert.deepEqual(resolveCommand("git", ["status"], {}, "win32"), {
+    command: "git",
+    args: ["status"],
+  });
+});
+
+test("protected command resolution uses only executable absolute PATH entries on POSIX", () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-git-bin-"));
+  const binDir = join(root, "bin");
+  const gitPath = join(binDir, "git");
+  try {
+    mkdirSync(binDir);
+    writeFileSync(gitPath, "#!/bin/sh\nexit 0\n");
+    chmodSync(gitPath, 0o755);
+
+    assert.equal(
+      resolveCommand("git", ["status"], { PATH: `relative-bin${delimiter}${binDir}` }).command,
+      gitPath,
+    );
+    assert.equal(
+      resolveCommand("gh", ["api", "user"], { PATH: `relative-bin${delimiter}${binDir}` }).command,
+      "/usr/bin/gh",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("review CLI suppresses stack traces for missing local target checkout", () => {

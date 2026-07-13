@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 
 export type RunTextOptions = {
   cwd?: string | undefined;
@@ -27,6 +27,7 @@ export type ResolveSpawnCommandOptions = {
 const windowsExecutablePattern = /\.(?:com|exe)$/i;
 const windowsBatchLauncherPattern = /\.(?:bat|cmd)$/i;
 const windowsMetaCharacterPattern = /([()\][%!^"`<>&|;, *?])/g;
+const protectedCommands = new Set(["git", "gh"]);
 
 export class UserFacingCommandError extends Error {
   constructor(message: string) {
@@ -52,9 +53,12 @@ export function runText(
   }: RunTextOptions = {},
 ): string {
   const childEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...env };
-  const resolved = resolveCommand(command, args, childEnv);
   let text: string;
   try {
+    const resolved = resolveSpawnCommand(command, args, {
+      ...(cwd ? { cwd } : {}),
+      env: childEnv,
+    });
     text = execFileSync(resolved.command, resolved.args, {
       cwd,
       encoding: "utf8",
@@ -62,9 +66,10 @@ export function runText(
       maxBuffer,
       stdio,
       timeout: timeoutMs,
+      ...(resolved.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
   } catch (error) {
-    throw explainSpawnFailure(error, resolved.command, cwd);
+    throw explainSpawnFailure(error, command, cwd);
   }
   if (trim === "both") return text.trim();
   if (trim === "end") return text.trimEnd();
@@ -89,6 +94,7 @@ export function resolveCommand(
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): CommandInvocation {
   const key = commandBinKey(command);
   const configured = env[`${key}_BIN`]?.trim();
@@ -98,7 +104,33 @@ export function resolveCommand(
       args: [...envArgs(`${key}_BIN_ARGS`, env), ...args],
     };
   }
-  return { command, args: [...args] };
+  return { command: defaultCommand(command, env, platform), args: [...args] };
+}
+
+function defaultCommand(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): string {
+  if (platform !== "win32" && protectedCommands.has(command)) {
+    return trustedPosixCommand(command, env);
+  }
+  return command;
+}
+
+function trustedPosixCommand(command: string, env: NodeJS.ProcessEnv): string {
+  for (const directory of (env.PATH ?? "").split(":")) {
+    // Relative and empty PATH entries could resolve inside an untrusted target checkout.
+    if (!isAbsolute(directory)) continue;
+    const candidate = join(directory, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Try the next absolute PATH entry before using the controlled-runner default.
+    }
+  }
+  return join("/usr/bin", command);
 }
 
 export function resolveSpawnCommand(
@@ -111,12 +143,18 @@ export function resolveSpawnCommand(
     platform = process.platform,
   }: ResolveSpawnCommandOptions = {},
 ): CommandInvocation {
-  const resolved = resolveCommand(command, args, env);
+  const resolved = resolveCommand(command, args, env, platform);
   if (platform !== "win32") return resolved;
 
-  const windowsCommand = resolveWindowsCommand(resolved.command, env, cwd);
+  const protectedLookup = protectedCommands.has(command) && !configuredCommand(command, env);
+  const windowsCommand = resolveWindowsCommand(resolved.command, env, cwd, protectedLookup);
   if (!windowsCommand) {
     if (missingCommandMessage) throw new Error(missingCommandMessage);
+    if (protectedLookup) {
+      throw new UserFacingCommandError(
+        `Command not found while running ${command}. Ensure ${command} is installed in an absolute PATH directory, or set the appropriate *_BIN override.`,
+      );
+    }
     return resolved;
   }
   if (nodeShebangScript(windowsCommand)) {
@@ -144,6 +182,10 @@ function commandBinKey(command: string): string {
   return command.replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
 }
 
+function configuredCommand(command: string, env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env[`${commandBinKey(command)}_BIN`]?.trim());
+}
+
 export function envArgs(name: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const value = env[name];
   if (!value) return [];
@@ -158,15 +200,15 @@ function resolveWindowsCommand(
   command: string,
   env: NodeJS.ProcessEnv,
   cwd: string,
+  absolutePathEntriesOnly = false,
 ): string | undefined {
   if (isAbsolute(command) || /[\\/]/.test(command)) return resolve(cwd, command);
   const extensions = (windowsEnvironmentValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .filter(Boolean);
   const candidates = [command, ...extensions.map((extension) => `${command}${extension}`)];
-  for (const directory of (windowsEnvironmentValue(env, "PATH") || "")
-    .split(delimiter)
-    .filter(Boolean)) {
+  for (const directory of (windowsEnvironmentValue(env, "PATH") || "").split(";").filter(Boolean)) {
+    if (absolutePathEntriesOnly && !isAbsolute(directory)) continue;
     for (const candidate of candidates) {
       const parent = resolve(cwd, directory);
       const filePath = resolve(parent, candidate);

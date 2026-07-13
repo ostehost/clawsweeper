@@ -2,7 +2,7 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { runText } from "../command.js";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
@@ -13,7 +13,7 @@ import {
   validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
-import { ghErrorText, ghJson, ghText } from "./github-cli.js";
+import { ghErrorText, ghJson, ghSpawn, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
@@ -281,8 +281,7 @@ function sourceJobFromRunTitle(title: string) {
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
-  const result = spawnSync(
-    "gh",
+  const result = ghSpawn(
     [
       "workflow",
       "run",
@@ -300,7 +299,7 @@ function dispatchCandidate(candidate: LooseRecord) {
       "-f",
       `model=${model}`,
     ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    { cwd: repoRoot() },
   );
   if (result.status !== 0) {
     throw new Error(
@@ -470,11 +469,11 @@ function setGate(name: string, value: JsonValue) {
 }
 
 function currentHeadSha() {
-  return execFileSync("git", ["rev-parse", "origin/main"], {
+  return runText("git", ["rev-parse", "origin/main"], {
     cwd: repoRoot(),
-    encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+    trim: "both",
+  });
 }
 
 function runSortKey(record: LooseRecord) {

@@ -2041,7 +2041,7 @@ test("spam scanner exact dispatches publish only per-comment audit records", () 
   assert.match(scanner, /reasoning: \{ effort: "high" \}/);
 });
 
-test("issue implementation workflow lets job intent choose dispatch capacity", () => {
+test("issue implementation workflow keeps repository dispatch capacity trusted", () => {
   const workflow = readText(".github/workflows/repair-issue-implementation-intake.yml");
   const dispatchInputs = workflow.slice(
     workflow.indexOf("  workflow_dispatch:"),
@@ -2052,15 +2052,19 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
   assert.doesNotMatch(workflow, /^\s+intake_runner:/m);
   assert.match(
     workflow,
-    /runs-on: \$\{\{ github\.event\.client_payload\.intake_runner \|\| vars\.CLAWSWEEPER_ISSUE_IMPLEMENTATION_INTAKE_RUNNER \|\| 'ubuntu-latest' \}\}/,
+    /runs-on: \$\{\{ vars\.CLAWSWEEPER_ISSUE_IMPLEMENTATION_INTAKE_RUNNER \|\| 'ubuntu-latest' \}\}/,
   );
   assert.match(
     workflow,
-    /RUNNER: \$\{\{ github\.event\.inputs\.runner \|\| github\.event\.client_payload\.runner \|\| vars\.CLAWSWEEPER_WORKER_RUNNER/,
+    /RUNNER: \$\{\{ github\.event\.inputs\.runner \|\| vars\.CLAWSWEEPER_WORKER_RUNNER/,
   );
   assert.match(
     workflow,
-    /EXECUTION_RUNNER: \$\{\{ github\.event\.inputs\.execution_runner \|\| github\.event\.client_payload\.execution_runner \|\| vars\.CLAWSWEEPER_EXECUTION_RUNNER/,
+    /EXECUTION_RUNNER: \$\{\{ github\.event\.inputs\.execution_runner \|\| vars\.CLAWSWEEPER_EXECUTION_RUNNER/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /github\.event\.client_payload\.(?:intake_runner|runner|execution_runner)/,
   );
   assert.match(workflow, /cap_args=\(\)/);
   assert.match(workflow, /--max-live-workers "\$MAX_LIVE_WORKERS"/);

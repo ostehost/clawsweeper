@@ -129,6 +129,7 @@ jobs:
       producer_attempt: ${{ steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
+      JOB_PATH: ${{ inputs.job }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ (inputs.mode == 'execute' || inputs.mode == 'autonomous') && vars.CLAWSWEEPER_ALLOW_EXECUTE == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ (inputs.mode == 'execute' || inputs.mode == 'autonomous') && vars.CLAWSWEEPER_ALLOW_FIX_PR == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_MERGE: ${{ (inputs.mode == 'execute' || inputs.mode == 'autonomous') && (vars.CLAWSWEEPER_ALLOW_MERGE || '0') || '0' }}
@@ -240,7 +241,7 @@ jobs:
           CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
         run: |
           pnpm run repair:issue-implementation-status -- \
-            --job "${{ inputs.job }}" \
+            --job "$JOB_PATH" \
             --dashboard-only \
             --state "Blocked" \
             --detail "Automatic execution is disabled by the trusted CLAWSWEEPER_ALLOW_EXECUTE gate." \
@@ -272,7 +273,7 @@ jobs:
         env:
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
-        run: pnpm run repair:action-session -- register "${{ inputs.job }}"
+        run: pnpm run repair:action-session -- register "$JOB_PATH"
 
       - name: Verify GitHub read token
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
@@ -289,7 +290,7 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
-        run: pnpm run repair:validate-job -- "${{ inputs.job }}"
+        run: pnpm run repair:validate-job -- "$JOB_PATH"
 
       - name: Verify self-heal head
         id: self_heal_head
@@ -297,7 +298,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
-        run: pnpm run repair:conflict-self-heal -- --verify-job-head "${{ inputs.job }}"
+        run: pnpm run repair:conflict-self-heal -- --verify-job-head "$JOB_PATH"
 
       - name: Run worker
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' }}
@@ -310,7 +311,7 @@ jobs:
             echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; rendering plan-only output for requested $worker_mode run"
             worker_mode="plan"
           fi
-          args=("${{ inputs.job }}" --mode "$worker_mode")
+          args=("$JOB_PATH" --mode "$worker_mode")
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi
@@ -428,6 +429,7 @@ jobs:
       producer_attempt: ${{ steps.restore_authorization.outputs.checkpoint_producer_attempt || steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
+      JOB_PATH: ${{ inputs.job }}
     steps:
       - name: Record producer attempt
         id: producer_attempt
@@ -633,7 +635,7 @@ jobs:
             --run-attempt "${{ github.run_attempt }}" \
             --workflow-repository "${{ github.repository }}" \
             --workflow-sha "${{ github.sha }}" \
-            --source-job-path "${{ inputs.job }}" \
+            --source-job-path "$JOB_PATH" \
             --allowed-owner "${CLAWSWEEPER_ALLOWED_OWNER}"
 
       - name: Resolve worker artifact producer
@@ -668,7 +670,7 @@ jobs:
           GH_TOKEN: ${{ steps.target_read_token.outputs.token }}
         run: |
           pnpm run repair:execution-handoff -- authorize \
-            --job "${{ inputs.job }}" \
+            --job "$JOB_PATH" \
             --runs .clawsweeper-repair/incoming \
             --out .clawsweeper-repair/authorized \
             --run-id "${{ github.run_id }}" \
@@ -708,6 +710,8 @@ jobs:
       artifact_digest: ${{ needs.authorize.outputs.recovery_execution_artifact_digest || steps.upload_execution.outputs.artifact-digest }}
       producer_attempt: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && needs.authorize.outputs.producer_attempt || steps.producer_attempt.outputs.value }}
     env:
+      AUTHORIZED_JOB_PATH: ${{ needs.authorize.outputs.job_path }}
+      AUTHORIZED_RESULT_PATH: ${{ needs.authorize.outputs.result_path }}
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
@@ -721,6 +725,7 @@ jobs:
       CLAWSWEEPER_RESOLVE_REVIEW_THREADS: ${{ vars.CLAWSWEEPER_RESOLVE_REVIEW_THREADS || '1' }}
       CLAWSWEEPER_TARGET_VALIDATION_MODE: ${{ vars.CLAWSWEEPER_TARGET_VALIDATION_MODE || 'changed-only' }}
       CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS: ${{ vars.CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS || 'auto-response,Labeler,Stale' }}
+      EXECUTION_INTENT_PATH: ${{ needs.authorize.outputs.execution_intent_path }}
       CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA: ${{ vars.CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA || '50' }}
       CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS: ${{ vars.CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS || '1' }}
       CLAWSWEEPER_GIT_USER_NAME: ${{ vars.CLAWSWEEPER_GIT_USER_NAME || 'clawsweeper[bot]' }}
@@ -848,7 +853,7 @@ jobs:
         if: ${{ needs.authorize.outputs.checkpoint_recovered != '1' && steps.check_job.outputs.job_exists == '1' }}
         env:
           CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
-        run: pnpm run repair:validate-job -- "${{ needs.authorize.outputs.job_path }}"
+        run: pnpm run repair:validate-job -- "$AUTHORIZED_JOB_PATH"
 
       - name: Execute credited fix artifact
         id: execute_fix
@@ -860,10 +865,10 @@ jobs:
           CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
         run: |
           pnpm run repair:execute-fix -- \
-            "${{ needs.authorize.outputs.job_path }}" \
-            "${{ needs.authorize.outputs.result_path }}" \
+            "$AUTHORIZED_JOB_PATH" \
+            "$AUTHORIZED_RESULT_PATH" \
             --prepare-publication \
-            --execution-intent "${{ needs.authorize.outputs.execution_intent_path }}" \
+            --execution-intent "$EXECUTION_INTENT_PATH" \
             --authorization-sha256 "${{ needs.authorize.outputs.authorization_sha256 }}"
 
       - name: Seal execution handoff
@@ -1055,6 +1060,11 @@ jobs:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
       OPENCLAW_LOCAL_CHECK: "0"
+      REQUEUE_EXECUTION_RUNNER: ${{ inputs.execution_runner }}
+      REQUEUE_MODE: ${{ inputs.mode }}
+      REQUEUE_MODEL: ${{ inputs.model }}
+      REQUEUE_RUNNER: ${{ inputs.runner }}
+      SOURCE_JOB_PATH: ${{ needs.authorize.outputs.source_job_path }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1120,14 +1130,14 @@ jobs:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
         run: |
-          pnpm run repair:requeue -- "${{ needs.authorize.outputs.source_job_path }}" \
-            --mode "${{ inputs.mode }}" \
+          pnpm run repair:requeue -- "$SOURCE_JOB_PATH" \
+            --mode "$REQUEUE_MODE" \
             --execute \
             --open-execute-window \
             --wait-for-capacity \
-            --runner "${{ inputs.runner }}" \
-            --execution-runner "${{ inputs.execution_runner }}" \
-            --model "${{ inputs.model }}"
+            --runner "$REQUEUE_RUNNER" \
+            --execution-runner "$REQUEUE_EXECUTION_RUNNER" \
+            --model "$REQUEUE_MODEL"
 
       - name: Publish terminal report-only status
         if: ${{ needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success' }}

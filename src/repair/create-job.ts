@@ -3,6 +3,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { resolveSpawnCommand } from "../command.js";
 import { parseArgs, parseJob, repoRoot, validateJob } from "./lib.js";
 import { ghJsonBestEffort } from "./github-cli.js";
 import { escapeRegExp } from "./text-utils.js";
@@ -317,15 +318,11 @@ function findExistingWork({ repo, branch, clusterId }: LooseRecord) {
   );
   for (const pr of bodyPrs ?? []) existing.push({ type: "open_pr_body", ...pr });
 
-  const remoteBranch = spawnSync(
-    "git",
-    ["ls-remote", `https://github.com/${repo}.git`, `refs/heads/${branch}`],
-    {
-      cwd: repoRoot(),
-      encoding: "utf8",
-      stdio: "pipe",
-    },
-  );
+  const remoteBranch = spawnGit([
+    "ls-remote",
+    `https://github.com/${repo}.git`,
+    `refs/heads/${branch}`,
+  ]);
   if (remoteBranch.status === 0 && remoteBranch.stdout.trim()) {
     existing.push({ type: "remote_branch", branch });
   }
@@ -344,19 +341,23 @@ function uniqueExisting(existing: JsonValue) {
 }
 
 function assertDispatchable(relativePath: string) {
-  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", relativePath], {
-    cwd: repoRoot(),
-    encoding: "utf8",
-    stdio: "pipe",
-  });
-  const clean = spawnSync("git", ["status", "--porcelain", "--", relativePath], {
-    cwd: repoRoot(),
-    encoding: "utf8",
-    stdio: "pipe",
-  });
+  const tracked = spawnGit(["ls-files", "--error-unmatch", relativePath]);
+  const clean = spawnGit(["status", "--porcelain", "--", relativePath]);
   if (tracked.status !== 0 || clean.stdout.trim()) {
     die(`refusing --dispatch because ${relativePath} is not committed and pushed yet`);
   }
+}
+
+function spawnGit(args: string[]) {
+  const cwd = repoRoot();
+  const invocation = resolveSpawnCommand("git", args, { cwd, env: process.env });
+  return spawnSync(invocation.command, invocation.args, {
+    cwd,
+    encoding: "utf8",
+    stdio: "pipe",
+    env: process.env,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+  });
 }
 
 function shellQuote(value: JsonValue) {

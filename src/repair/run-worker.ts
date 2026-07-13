@@ -30,6 +30,7 @@ import {
   repairCodexServiceTier,
 } from "./process-env.js";
 import { sanitizeResultEvidence } from "./url-safety.js";
+import { ghSpawn } from "./github-cli.js";
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -431,7 +432,7 @@ function prepareTargetCheckout(job: LooseRecord): string {
 
   const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-target-"));
   const targetDir = path.join(targetRoot, targetRepo.replace(/[^A-Za-z0-9_.-]+/g, "-"));
-  runCommand("gh", ["repo", "clone", targetRepo, targetDir, "--", "--depth=1"]);
+  runGhCommand(["repo", "clone", targetRepo, targetDir, "--", "--depth=1"]);
   return targetDir;
 }
 
@@ -439,16 +440,12 @@ function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function runCommand(command: string, commandArgs: string[]) {
-  const result = spawnSync(command, commandArgs, {
+function runGhCommand(commandArgs: string[]) {
+  const result = ghSpawn(commandArgs, {
     cwd: repoRoot(),
-    encoding: "utf8",
-    env: process.env,
   });
   if (result.status !== 0) {
-    throw new Error(
-      `${command} ${commandArgs.join(" ")} failed: ${result.stderr || result.stdout}`,
-    );
+    throw new Error(`gh ${commandArgs.join(" ")} failed: ${result.stderr || result.stdout}`);
   }
 }
 

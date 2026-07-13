@@ -360,7 +360,7 @@ test("repair workflow binds one run through no-credential proof and token-only m
   );
   assert.match(
     authorize,
-    /Restore checkpoint authorization before live source intake[\s\S]*--source-root \.clawsweeper-repair\/recovery-authorized[\s\S]*--publication-root \.clawsweeper-repair\/recovery-execution[\s\S]*--publication-receipt \.clawsweeper-repair\/recovery-publication\/receipt\.json[\s\S]*--source-job-path "\$\{\{ inputs\.job \}\}"/,
+    /Restore checkpoint authorization before live source intake[\s\S]*--source-root \.clawsweeper-repair\/recovery-authorized[\s\S]*--publication-root \.clawsweeper-repair\/recovery-execution[\s\S]*--publication-receipt \.clawsweeper-repair\/recovery-publication\/receipt\.json[\s\S]*--source-job-path "\$JOB_PATH"/,
   );
   assert.equal(
     [

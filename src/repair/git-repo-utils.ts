@@ -165,8 +165,11 @@ export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteReba
     };
   }
 
-  assertNoConflictMarkers({ targetDir, paths: unmergedPaths(targetDir) });
-  gitOutput(["add", "--all"], { targetDir });
+  const resolvedPaths = unmergedPaths(targetDir);
+  assertNoConflictMarkers({ targetDir, paths: resolvedPaths });
+  if (resolvedPaths.length > 0) {
+    gitOutput(["--literal-pathspecs", "add", "--", ...resolvedPaths], { targetDir });
+  }
   const unresolved = unmergedPaths(targetDir);
   if (unresolved.length > 0) {
     throw new Error(`rebase conflicts remain unresolved: ${unresolved.join(", ")}`);
@@ -216,12 +219,9 @@ export function hasRebaseInProgress(targetDir: string): boolean {
 }
 
 export function unmergedPaths(targetDir: string): string[] {
-  const child = runGitCommand(["diff", "--name-only", "--diff-filter=U"], { targetDir });
+  const child = runGitCommand(["diff", "--name-only", "--diff-filter=U", "-z"], { targetDir });
   if (child.status !== 0) return [];
-  return child.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+  return child.stdout.split("\0").filter(Boolean);
 }
 
 function fetchDeeperHistory({ targetDir, baseBranch }: TargetBaseBranch): void {

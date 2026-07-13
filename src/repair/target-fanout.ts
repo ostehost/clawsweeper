@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolveCommand } from "../command.js";
+import { resolveSpawnCommand } from "../command.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -290,12 +290,15 @@ function writeFileSyncWithDirs(filePath: string, content: string): void {
 
 function runGh(args: readonly string[], env: NodeJS.ProcessEnv): string {
   const childEnv = { ...process.env, ...env, NO_COLOR: "1", CLICOLOR: "0" };
-  const command = resolveCommand("gh", args, childEnv);
+  const cwd = repoRoot();
+  const command = resolveSpawnCommand("gh", args, { cwd, env: childEnv });
   return execFileSync(command.command, command.args, {
+    cwd,
     encoding: "utf8",
     env: childEnv,
     maxBuffer: 32 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   }).trimEnd();
 }
 

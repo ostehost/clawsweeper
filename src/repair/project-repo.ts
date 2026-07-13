@@ -1,5 +1,4 @@
-import { execFileSync } from "node:child_process";
-
+import { runText } from "../command.js";
 import { repoRoot } from "./paths.js";
 
 export function currentProjectRepo() {
@@ -17,11 +16,11 @@ export function githubActionsRunUrl(runId: string) {
 
 function repoFromOriginRemote() {
   try {
-    const remote = execFileSync("git", ["config", "--get", "remote.origin.url"], {
+    const remote = runText("git", ["config", "--get", "remote.origin.url"], {
       cwd: repoRoot(),
-      encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+      trim: "both",
+    });
     const sshMatch = remote.match(/^git@github\.com:([^/]+\/[^/.]+)(?:\.git)?$/);
     if (sshMatch) return sshMatch[1];
     const httpsMatch = remote.match(/^https:\/\/github\.com\/([^/]+\/[^/.]+)(?:\.git)?$/);

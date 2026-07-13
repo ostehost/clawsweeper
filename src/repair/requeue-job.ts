@@ -3,7 +3,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { runText } from "../command.js";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
@@ -14,7 +14,7 @@ import {
   validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
-import { ghJson, ghText } from "./github-cli.js";
+import { ghJson, ghSpawn, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
@@ -126,11 +126,9 @@ function resolveFromRunId(runId: string) {
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
   );
-  const downloaded = spawnSync(
-    "gh",
-    ["run", "download", runId, "--repo", repo, "--dir", artifactDir],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-  );
+  const downloaded = ghSpawn(["run", "download", runId, "--repo", repo, "--dir", artifactDir], {
+    cwd: repoRoot(),
+  });
   if (downloaded.status !== 0) {
     throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
   }
@@ -157,8 +155,7 @@ function findFirstFile(root: string, basename: string) {
 }
 
 function dispatchJob(jobPath: string, mode: string) {
-  const result = spawnSync(
-    "gh",
+  const result = ghSpawn(
     [
       "workflow",
       "run",
@@ -178,7 +175,7 @@ function dispatchJob(jobPath: string, mode: string) {
       "-f",
       "requeue=true",
     ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    { cwd: repoRoot() },
   );
   if (result.status !== 0) {
     throw new Error(`failed to dispatch ${jobPath}: ${result.stderr || result.stdout}`);
@@ -252,11 +249,11 @@ function setGate(name: string, value: JsonValue) {
 }
 
 function currentHeadSha() {
-  return execFileSync("git", ["rev-parse", "origin/main"], {
+  return runText("git", ["rev-parse", "origin/main"], {
     cwd: repoRoot(),
-    encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+    trim: "both",
+  });
 }
 
 function looksLikeRunId(value: JsonValue) {

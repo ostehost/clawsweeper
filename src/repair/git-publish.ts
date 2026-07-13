@@ -13,6 +13,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
+import { resolveSpawnCommand } from "../command.js";
 import { clawsweeperGitUserEmail, clawsweeperGitUserName } from "./process-env.js";
 import {
   chooseRecordTupleWinner,
@@ -117,11 +118,17 @@ export function runGit(args: readonly string[], options: GitRunOptions = {}): st
 export function spawnGit(args: readonly string[], options: GitRunOptions = {}): GitRunResult {
   recordGitProcess(args[0]);
   console.log(`$ ${formatGitDisplayCommand(options.displayArgs ?? args)}`);
-  const child = spawnSync("git", [...args], {
-    cwd: publishRoot(),
+  const cwd = publishRoot();
+  const invocation = resolveSpawnCommand("git", args, {
+    ...(cwd ? { cwd } : {}),
+    env: process.env,
+  });
+  const child = spawnSync(invocation.command, invocation.args, {
+    cwd,
     env: process.env,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (!options.quiet && child.stdout) process.stdout.write(child.stdout);
   if (!options.quiet && child.stderr) process.stderr.write(child.stderr);
@@ -1345,11 +1352,17 @@ function gitObjectExistence(requests: readonly GitObjectRequest[]): Set<string> 
 function runGitObjectBatch(mode: "--batch" | "--batch-check", specs: readonly string[]): Buffer {
   recordGitProcess("cat-file");
   console.log("$ git cat-file <redacted-args>");
-  const child = spawnSync("git", ["cat-file", mode], {
-    cwd: publishRoot(),
+  const cwd = publishRoot();
+  const invocation = resolveSpawnCommand("git", ["cat-file", mode], {
+    ...(cwd ? { cwd } : {}),
+    env: process.env,
+  });
+  const child = spawnSync(invocation.command, invocation.args, {
+    cwd,
     env: process.env,
     input: Buffer.from(`${specs.join("\n")}\n`, "utf8"),
     maxBuffer: GIT_OBJECT_BATCH_MAX_BUFFER,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (child.error) throw child.error;
   const stdout = Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? "");

@@ -21,7 +21,7 @@ import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweep
 import { safeOutputTail } from "./clawsweeper-text.js";
 import { codexEnv, codexLoginConfig, codexModelArgs, PUBLIC_CODEX_MODEL } from "./codex-env.js";
 import { codexProcessErrorCode, runCodexProcess } from "./codex-process.js";
-import { runText } from "./command.js";
+import { resolveSpawnCommand, runText } from "./command.js";
 import { ghRetryKind, ghRetryWaitMs } from "./github-retry.js";
 import {
   configuredRepositoryProfileFor,
@@ -855,13 +855,15 @@ function dispatchCommitFinding(options: {
         );
   const maxAttempts = 3;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const result = spawnSync("gh", commandArgs, {
+    const invocation = resolveSpawnCommand("gh", commandArgs, { env: process.env });
+    const result = spawnSync(invocation.command, invocation.args, {
       input:
         options.mode === "repository_dispatch"
           ? dispatchPayload(options.dispatch, options.reportRepo)
           : undefined,
       encoding: "utf8",
       env: process.env,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     if (result.status === 0) return;
 

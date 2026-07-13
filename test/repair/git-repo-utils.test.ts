@@ -145,6 +145,95 @@ test("completeRebaseIfResolved continues a resolved conflicting rebase", () => {
   assert.equal(fs.readFileSync(path.join(work, "shared.txt"), "utf8"), "main\nfeature\n");
 });
 
+test("completeRebaseIfResolved does not stage unrelated worktree files", () => {
+  const { work } = fixtureRepo();
+  run("git", ["checkout", "-b", "feature"], { cwd: work });
+  fs.writeFileSync(path.join(work, "shared.txt"), "feature\n");
+  run("git", ["add", "shared.txt"], { cwd: work });
+  run("git", ["commit", "-m", "feature conflict"], { cwd: work });
+
+  run("git", ["checkout", "main"], { cwd: work });
+  fs.writeFileSync(path.join(work, "shared.txt"), "main\n");
+  run("git", ["add", "shared.txt"], { cwd: work });
+  run("git", ["commit", "-m", "main conflict"], { cwd: work });
+  run("git", ["push", "origin", "main"], { cwd: work });
+  run("git", ["checkout", "feature"], { cwd: work });
+
+  const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
+  assert.equal(result.status, "conflicts");
+
+  fs.writeFileSync(path.join(work, "shared.txt"), "main\nfeature\n");
+  fs.writeFileSync(path.join(work, "unrelated-untracked.txt"), "do not stage\n");
+  const continued = completeRebaseIfResolved({ targetDir: work });
+
+  assert.equal(continued.status, "continued");
+  assert.equal(
+    run("git", ["status", "--short", "--", "unrelated-untracked.txt"], { cwd: work }),
+    "?? unrelated-untracked.txt",
+  );
+});
+
+test("completeRebaseIfResolved continues an already staged resolution", () => {
+  const { work } = fixtureRepo();
+  run("git", ["checkout", "-b", "feature"], { cwd: work });
+  fs.writeFileSync(path.join(work, "shared.txt"), "feature\n");
+  run("git", ["add", "shared.txt"], { cwd: work });
+  run("git", ["commit", "-m", "feature conflict"], { cwd: work });
+
+  run("git", ["checkout", "main"], { cwd: work });
+  fs.writeFileSync(path.join(work, "shared.txt"), "main\n");
+  run("git", ["add", "shared.txt"], { cwd: work });
+  run("git", ["commit", "-m", "main conflict"], { cwd: work });
+  run("git", ["push", "origin", "main"], { cwd: work });
+  run("git", ["checkout", "feature"], { cwd: work });
+
+  assert.equal(rebaseOntoBase({ targetDir: work, baseBranch: "main" }).status, "conflicts");
+  fs.writeFileSync(path.join(work, "shared.txt"), "main\nfeature\n");
+  run("git", ["add", "shared.txt"], { cwd: work });
+  assert.deepEqual(unmergedPaths(work), []);
+
+  const continued = completeRebaseIfResolved({ targetDir: work });
+
+  assert.equal(continued.status, "continued");
+  run("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { cwd: work });
+});
+
+test(
+  "completeRebaseIfResolved stages quoted and pathspec-magic conflict paths literally",
+  { skip: process.platform === "win32" },
+  () => {
+    const { work } = fixtureRepo();
+    const conflictPath = ':(glob)café "quoted"*';
+    fs.writeFileSync(path.join(work, conflictPath), "base\n");
+    run("git", ["--literal-pathspecs", "add", "--", conflictPath], { cwd: work });
+    run("git", ["commit", "-m", "quoted path base"], { cwd: work });
+    run("git", ["push", "origin", "main"], { cwd: work });
+
+    run("git", ["checkout", "-b", "feature"], { cwd: work });
+    fs.writeFileSync(path.join(work, conflictPath), "feature\n");
+    run("git", ["--literal-pathspecs", "add", "--", conflictPath], { cwd: work });
+    run("git", ["commit", "-m", "feature quoted path conflict"], { cwd: work });
+
+    run("git", ["checkout", "main"], { cwd: work });
+    fs.writeFileSync(path.join(work, conflictPath), "main\n");
+    run("git", ["--literal-pathspecs", "add", "--", conflictPath], { cwd: work });
+    run("git", ["commit", "-m", "main quoted path conflict"], { cwd: work });
+    run("git", ["push", "origin", "main"], { cwd: work });
+    run("git", ["checkout", "feature"], { cwd: work });
+
+    assert.equal(rebaseOntoBase({ targetDir: work, baseBranch: "main" }).status, "conflicts");
+    assert.deepEqual(unmergedPaths(work), [conflictPath]);
+    fs.writeFileSync(path.join(work, conflictPath), "main\nfeature\n");
+    fs.writeFileSync(path.join(work, "unrelated.txt"), "do not stage\n");
+
+    assert.equal(completeRebaseIfResolved({ targetDir: work }).status, "continued");
+    assert.equal(
+      run("git", ["status", "--short", "--", "unrelated.txt"], { cwd: work }),
+      "?? unrelated.txt",
+    );
+  },
+);
+
 function fixtureRepo() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-git-utils-"));
   const remote = path.join(root, "origin.git");

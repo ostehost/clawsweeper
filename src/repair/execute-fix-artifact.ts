@@ -6,7 +6,6 @@ import path from "node:path";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
 import {
   spawn,
-  spawnSync,
   type ChildProcess,
   type SpawnSyncOptionsWithStringEncoding,
 } from "node:child_process";
@@ -20,7 +19,7 @@ import {
   replacementSourceCloseComment,
   replacementSourceLinkComment,
 } from "./external-messages.js";
-import { runCommand as run } from "./command-runner.js";
+import { runCommand as run, runCommandResult } from "./command-runner.js";
 import {
   remainingRepairBudgetMs,
   repairTimeoutBudgetFromEnv,
@@ -4016,14 +4015,13 @@ function assertIssueImplementationNotPaused() {
 }
 
 function fetchRemoteRecoverableBranch({ targetDir, branch, required = true }: LooseRecord) {
-  const child = spawnSync(
+  const child = runCommandResult(
     "git",
     ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
     {
       cwd: targetDir,
       env: process.env,
-      encoding: "utf8",
-      timeout: currentNetworkCommandTimeoutMs(),
+      timeoutMs: currentNetworkCommandTimeoutMs(),
     },
   );
   if (child.status === 0) return true;

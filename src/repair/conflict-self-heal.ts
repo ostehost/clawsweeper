@@ -2,7 +2,6 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import {
   activeRepairWorkflowRunForJobAfterDispatchRecheck,
   assertLiveWorkerCapacity,
@@ -15,7 +14,7 @@ import {
   waitForLiveWorkerCapacity,
 } from "./lib.js";
 import { publishMainCommit, publishRoot } from "./git-publish.js";
-import { ghJson, ghJsonWithRetry, ghPaged, ghText } from "./github-cli.js";
+import { ghJson, ghJsonWithRetry, ghPaged, ghSpawn, ghText } from "./github-cli.js";
 import { DEFAULT_TARGET_REPO, REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { writePayload } from "./comment-router-utils.js";
 import {
@@ -415,8 +414,7 @@ function findSelfHealStatusComment(number: JsonValue) {
 }
 
 function dispatchRepair(candidate: LooseRecord) {
-  const result = spawnSync(
-    "gh",
+  const result = ghSpawn(
     [
       "workflow",
       "run",
@@ -434,7 +432,7 @@ function dispatchRepair(candidate: LooseRecord) {
       "-f",
       `model=${model}`,
     ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    { cwd: repoRoot() },
   );
   if (result.status !== 0) {
     throw new Error(`failed to dispatch ${candidate.job_path}: ${result.stderr || result.stdout}`);

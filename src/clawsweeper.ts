@@ -106,7 +106,7 @@ import {
 } from "./scheduler-policy.js";
 import {
   isUserFacingCommandError,
-  resolveCommand,
+  resolveSpawnCommand,
   runText,
   UserFacingCommandError,
 } from "./command.js";
@@ -2425,7 +2425,7 @@ function gh(args: string[]): string {
 function ghOnce(args: string[], timeoutMs: number): string {
   const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
-  const command = resolveCommand("gh", resolvedArgs, env);
+  const command = resolveSpawnCommand("gh", resolvedArgs, { cwd: ROOT, env });
   const commandTimeoutMs = githubCommandTimeoutMs(timeoutMs) ?? timeoutMs;
   const runtimeLimitedTimeout = commandTimeoutMs < timeoutMs;
   const result = spawnSync(command.command, command.args, {
@@ -2435,6 +2435,7 @@ function ghOnce(args: string[], timeoutMs: number): string {
     maxBuffer: 8 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: commandTimeoutMs,
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (result.error) {
     if (runtimeLimitedTimeout && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
@@ -2498,7 +2499,15 @@ function maybePublishThrottleHeartbeat(options: {
     }
     writeSweepStatus(statusOptions);
     run("git", ["add", sweepStatusRelativePath()]);
-    const diff = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT });
+    const invocation = resolveSpawnCommand("git", ["diff", "--cached", "--quiet"], {
+      cwd: ROOT,
+      env: process.env,
+    });
+    const diff = spawnSync(invocation.command, invocation.args, {
+      cwd: ROOT,
+      env: process.env,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    });
     if (diff.status === 0) return;
     run("git", ["commit", "-m", "chore: update sweep apply throttle status"]);
     try {
@@ -2546,7 +2555,7 @@ function ghWithRetry(args: string[], attempts = 12): string {
 
 function ghRawOnceWithCheckpoint(args: string[], onBeforeRun: () => void): string {
   const env = { ...process.env };
-  const command = resolveCommand("gh", args, env);
+  const command = resolveSpawnCommand("gh", args, { cwd: ROOT, env });
   const timeoutMs = githubCommandTimeoutMs();
   onBeforeRun();
   const result = spawnSync(command.command, command.args, {
@@ -2556,6 +2565,7 @@ function ghRawOnceWithCheckpoint(args: string[], onBeforeRun: () => void): strin
     maxBuffer: 128 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: timeoutMs,
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (result.error) {
     if (timeoutMs !== undefined && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
@@ -6063,11 +6073,17 @@ function gitTreeEntry(
   path: string,
 ): GitTreeEntry | null | undefined {
   if (!path || path.includes("\0") || path.includes("\n") || path.includes("\r")) return undefined;
-  const result = spawnSync("git", ["ls-tree", "-z", sha, "--", path], {
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  const invocation = resolveSpawnCommand("git", ["ls-tree", "-z", sha, "--", path], {
+    cwd: targetDir,
+    env,
+  });
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: targetDir,
     encoding: "utf8",
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    env,
     maxBuffer: 1024 * 1024,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (result.error || result.status !== 0) return undefined;
   if (!result.stdout) return null;
@@ -19966,11 +19982,17 @@ function buildLocalRangeReview(
     .split("\n")
     .filter(Boolean);
   const localCommitIdentities = localCommitShas.map((sha) => {
-    const result = spawnSync("git", ["cat-file", "commit", sha], {
+    const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+    const invocation = resolveSpawnCommand("git", ["cat-file", "commit", sha], {
+      cwd: targetDir,
+      env,
+    });
+    const result = spawnSync(invocation.command, invocation.args, {
       cwd: targetDir,
       encoding: "utf8",
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      env,
       maxBuffer: 16 * 1024 * 1024,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     if (result.error || result.status !== 0) {
       throw new UserFacingCommandError(`Could not read local commit ${sha} for range review.`);

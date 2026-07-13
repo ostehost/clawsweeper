@@ -88,7 +88,7 @@ jobs:
 
   intake:
     if: ${{ !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
-    runs-on: ${{ github.event.client_payload.intake_runner || vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -186,8 +186,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_COMMIT_FINDING_MAX_LIVE_WORKERS || '' }}
-          RUNNER: ${{ github.event.inputs.runner || github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
-          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+          RUNNER: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
         run: |
           set -euo pipefail
           cap_args=()

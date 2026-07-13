@@ -6,7 +6,7 @@ import { ghCliEnv } from "./process-env.js";
 import { repoRoot } from "./paths.js";
 import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
 import { parseGhJsonWithRetry, parseGhJsonWithRetryAsync } from "../github-json.js";
-import { resolveCommand } from "../command.js";
+import { resolveSpawnCommand } from "../command.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -152,14 +152,16 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
 
 export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
   const env = ghEnv(options.env);
-  const command = ghCommand(ghArgs, env);
+  const cwd = options.cwd ?? repoRoot();
+  const command = ghCommand(ghArgs, env, cwd);
   const text = execFileSync(command.command, command.args, {
-    cwd: options.cwd ?? repoRoot(),
+    cwd,
     env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   return stripAnsi(text).trim();
 }
@@ -204,12 +206,14 @@ export async function ghTextWithRetryAsync(
 export async function ghTextAsync(ghArgs: string[], options: GhRunOptions = {}): Promise<string> {
   if (options.input !== undefined) return ghText(ghArgs, options);
   const env = ghEnv(options.env);
-  const command = ghCommand(ghArgs, env);
+  const cwd = options.cwd ?? repoRoot();
+  const command = ghCommand(ghArgs, env, cwd);
   const { stdout } = await execFileAsync(command.command, command.args, {
-    cwd: options.cwd ?? repoRoot(),
+    cwd,
     env,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   return stripAnsi(String(stdout)).trim();
 }
@@ -235,13 +239,15 @@ export function ghBestEffortWithRetry(
 
 export function ghSpawn(ghArgs: string[], options: GhRunOptions = {}) {
   const env = ghEnv(options.env);
-  const command = ghCommand(ghArgs, env);
+  const cwd = options.cwd ?? repoRoot();
+  const command = ghCommand(ghArgs, env, cwd);
   return spawnSync(command.command, command.args, {
-    cwd: options.cwd ?? repoRoot(),
+    cwd,
     encoding: "utf8",
     env,
     input: options.input,
     stdio: "pipe",
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
 }
 
@@ -288,11 +294,8 @@ function resolveRetryOptions(options: GhRetryOptions | number): GhRetryOptions {
   return { ...options, attempts: Math.max(1, Math.floor(configuredAttempts)) };
 }
 
-function ghCommand(
-  ghArgs: readonly string[],
-  env: NodeJS.ProcessEnv,
-): { command: string; args: string[] } {
-  return resolveCommand("gh", ghArgs, env);
+function ghCommand(ghArgs: readonly string[], env: NodeJS.ProcessEnv, cwd: string) {
+  return resolveSpawnCommand("gh", ghArgs, { cwd, env });
 }
 
 function githubPathWithQueryDefaults(
