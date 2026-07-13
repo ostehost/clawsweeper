@@ -1,16 +1,4 @@
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readdirSync,
-  renameSync,
-  rmdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -18,10 +6,13 @@ import {
   fsyncDirectory,
   prepareSafeReadRoot,
   prepareSafeReadTarget,
+  prepareSafeWriteTarget,
   processIncarnationIdentitySha256,
   processIsDefunct,
   readDirectoryEntriesNoFollow,
   readUtf8FileNoFollow,
+  removeFileNoFollow,
+  writeUtf8FileAtomicReplaceNoFollow,
 } from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
 
@@ -91,16 +82,18 @@ export function writeMutationRecovery<T>(
   payload: T,
 ): void {
   assertMutationRecoveryIdentity(family, key);
-  const directory = prepareMutationRecoveryDirectory(recoveryRoot, family);
-  const target = mutationRecoveryPath(recoveryRoot, family, key);
+  const root = path.resolve(recoveryRoot);
+  prepareMutationRecoveryDirectory(root, family);
+  const target = prepareSafeWriteTarget(
+    root,
+    path.join(".mutation-recovery", family, `${key}.json`),
+    "mutation recovery",
+  );
   const processIncarnation = processIncarnationIdentitySha256();
   if (processIncarnation === null) {
     throw new Error("unable to determine mutation recovery writer process incarnation");
   }
-  const temporary = path.join(
-    directory,
-    `.${key}.${process.pid}.${processIncarnation}.${Date.now()}.${randomUUID()}.tmp`,
-  );
+  const temporaryFilename = `.${key}.${process.pid}.${processIncarnation}.${Date.now()}.${randomUUID()}.tmp`;
   const envelope: MutationRecoveryEnvelope<T> = {
     schema: MUTATION_RECOVERY_SCHEMA,
     schema_version: MUTATION_RECOVERY_VERSION,
@@ -112,21 +105,7 @@ export function writeMutationRecovery<T>(
   if (Buffer.byteLength(content, "utf8") > MUTATION_RECOVERY_MAX_BYTES) {
     throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes`);
   }
-  try {
-    const temporaryDescriptor = openSync(temporary, "wx", 0o600);
-    try {
-      writeFileSync(temporaryDescriptor, content, {
-        encoding: "utf8",
-      });
-      fsyncSync(temporaryDescriptor);
-    } finally {
-      closeSync(temporaryDescriptor);
-    }
-    renameSync(temporary, target);
-    fsyncDirectory(directory, "mutation recovery");
-  } finally {
-    rmSync(temporary, { force: true });
-  }
+  writeUtf8FileAtomicReplaceNoFollow(target, content, temporaryFilename);
 }
 
 export function readMutationRecoveries<T>(
@@ -210,11 +189,24 @@ export function readMutationRecoveries<T>(
   return records;
 }
 
-export function removeMutationRecovery(filePath: string): void {
-  rmSync(filePath, { force: true });
-  const directory = path.dirname(filePath);
-  if (existsSync(directory) && readdirSync(directory).length === 0) {
-    rmdirSync(directory);
+export function removeMutationRecovery(recoveryRoot: string, family: string, key: string): void {
+  assertMutationRecoveryIdentity(family, key);
+  const root = path.resolve(recoveryRoot);
+  if (!existsSync(root)) return;
+  let target;
+  try {
+    target = prepareSafeReadTarget(
+      prepareSafeReadRoot(root, "mutation recovery"),
+      path.join(".mutation-recovery", family, `${key}.json`),
+      "mutation recovery",
+    );
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+  const result = removeFileNoFollow(target);
+  if (result === "changed" || result === "replaced") {
+    throw new Error(`refusing changed mutation recovery file: ${target.path}`);
   }
 }
 

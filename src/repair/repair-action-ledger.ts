@@ -34,7 +34,6 @@ import {
 import {
   actionLedgerRecoveryEnvironment,
   actionLedgerRecoveryRoot,
-  mutationRecoveryPath,
   readMutationRecoveries,
   removeMutationRecovery,
   writeMutationRecovery,
@@ -973,7 +972,7 @@ export function recoverRepairMutationOutcomes(): void {
     if (!repairMutationOutcomeRecorded(payload, context)) {
       recordRepairMutationOutcome(payload.input, payload.options, context);
     }
-    removeMutationRecovery(recovery.path);
+    removeMutationRecovery(current.recoveryRoot, "repair", recovery.key);
   }
 }
 
@@ -1032,7 +1031,7 @@ function removeRepairMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    removeMutationRecovery(mutationRecoveryPath(recovery.recoveryRoot, "repair", recovery.key));
+    removeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key);
   } catch (error) {
     console.error(`[action-ledger] failed to clear ${recovery.key} recovery: ${errorText(error)}`);
   }

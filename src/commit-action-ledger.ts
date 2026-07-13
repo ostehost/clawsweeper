@@ -24,7 +24,6 @@ import {
 import {
   actionLedgerRecoveryEnvironment,
   actionLedgerRecoveryRoot,
-  mutationRecoveryPath,
   readMutationRecoveries,
   removeMutationRecovery,
   writeMutationRecovery,
@@ -441,7 +440,7 @@ export function recoverCommitMutationOutcomes(): void {
       env: { ...process.env, ...payload.context.env },
     };
     if (commitMutationOutcomeRecorded(payload, context)) {
-      removeMutationRecovery(recovery.path);
+      removeMutationRecovery(current.recoveryRoot, "commit", recovery.key);
       continue;
     }
     recordCommitMutationOutcome(
@@ -454,7 +453,7 @@ export function recoverCommitMutationOutcomes(): void {
       payload.parentEventId,
       context,
     );
-    removeMutationRecovery(recovery.path);
+    removeMutationRecovery(current.recoveryRoot, "commit", recovery.key);
   }
 }
 
@@ -499,7 +498,7 @@ function removeCommitMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    removeMutationRecovery(mutationRecoveryPath(recovery.recoveryRoot, "commit", recovery.key));
+    removeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key);
   } catch (error) {
     console.error(
       `[action-ledger] failed to clear ${recovery.key} recovery: ${

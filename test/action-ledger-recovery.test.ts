@@ -7,7 +7,11 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { actionLedgerJson } from "../dist/action-ledger.js";
-import { readMutationRecoveries, writeMutationRecovery } from "../dist/action-ledger-recovery.js";
+import {
+  readMutationRecoveries,
+  removeMutationRecovery,
+  writeMutationRecovery,
+} from "../dist/action-ledger-recovery.js";
 
 test("mutation recovery writers sync content and its directory around the atomic rename", async () => {
   const result = await runInstrumentedWriter("success");
@@ -30,7 +34,6 @@ test("mutation recovery writers sync content and its directory around the atomic
     "open:directory",
     "fsync:directory",
     "close:directory",
-    "cleanup:temporary",
   ]);
 });
 
@@ -51,7 +54,9 @@ test("mutation recovery writers do not rename when syncing staged content fails"
     "write:temporary",
     "fsync:temporary",
     "close:temporary",
-    "cleanup:temporary",
+    "open:directory",
+    "fsync:directory",
+    "close:directory",
   ]);
 });
 
@@ -76,7 +81,6 @@ test("mutation recovery writers retain the renamed WAL but fail closed when dire
     "open:directory",
     "fsync:directory",
     "close:directory",
-    "cleanup:temporary",
   ]);
 });
 
@@ -108,7 +112,6 @@ test("mutation recovery writers skip unsupported directory synchronization on Wi
     "fsync:temporary",
     "close:temporary",
     "rename",
-    "cleanup:temporary",
   ]);
 });
 
@@ -158,6 +161,106 @@ test("mutation recovery writers reject symlinked root ancestors before creating 
     fs.rmSync(root, { force: true, recursive: true });
   }
 });
+
+test(
+  "mutation recovery writers detect a family directory swap before writing staged content",
+  {
+    skip:
+      process.platform === "win32"
+        ? "requires POSIX directory rename and symlink semantics"
+        : false,
+  },
+  () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-parent-swap-")),
+    );
+    const outside = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-parent-outside-")),
+    );
+    const seedKey = "1".repeat(64);
+    const key = "2".repeat(64);
+    writeMutationRecovery(root, "repair", seedKey, { state: "seed" });
+    const directory = path.join(root, ".mutation-recovery", "repair");
+    const savedDirectory = `${directory}.saved`;
+    const originalOpenSync = fs.openSync;
+    let swapped = false;
+
+    fs.openSync = ((filePath, flags, mode) => {
+      if (
+        !swapped &&
+        typeof filePath === "string" &&
+        path.dirname(filePath) === directory &&
+        filePath.endsWith(".tmp")
+      ) {
+        swapped = true;
+        fs.renameSync(directory, savedDirectory);
+        fs.symlinkSync(outside, directory, "dir");
+        try {
+          return originalOpenSync(filePath, flags, mode);
+        } finally {
+          fs.unlinkSync(directory);
+          fs.renameSync(savedDirectory, directory);
+        }
+      }
+      return originalOpenSync(filePath, flags, mode);
+    }) as typeof fs.openSync;
+    try {
+      assert.throws(
+        () => writeMutationRecovery(root, "repair", key, { state: "pending" }),
+        /changed mutation recovery|failed to clean up mutation recovery|missing mutation recovery|mutation recovery staging/,
+      );
+    } finally {
+      fs.openSync = originalOpenSync;
+    }
+
+    try {
+      assert.equal(swapped, true);
+      assert.equal(fs.existsSync(path.join(directory, `${key}.json`)), false);
+      const outsideEntries = fs.readdirSync(outside);
+      assert.equal(outsideEntries.length, 1);
+      assert.equal(fs.statSync(path.join(outside, outsideEntries[0]!)).size, 0);
+    } finally {
+      fs.rmSync(root, { force: true, recursive: true });
+      fs.rmSync(outside, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "mutation recovery removal rejects a replaced family directory",
+  {
+    skip:
+      process.platform === "win32"
+        ? "requires POSIX directory rename and symlink semantics"
+        : false,
+  },
+  () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-remove-swap-")),
+    );
+    const outside = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-remove-outside-")),
+    );
+    const key = "3".repeat(64);
+    writeMutationRecovery(root, "repair", key, { state: "pending" });
+    const directory = path.join(root, ".mutation-recovery", "repair");
+    const savedDirectory = `${directory}.saved`;
+    fs.writeFileSync(path.join(outside, `${key}.json`), "outside\n");
+    fs.renameSync(directory, savedDirectory);
+    fs.symlinkSync(outside, directory, "dir");
+
+    try {
+      assert.throws(() => removeMutationRecovery(root, "repair", key), /symbolic link or junction/);
+      assert.equal(fs.readFileSync(path.join(outside, `${key}.json`), "utf8"), "outside\n");
+      assert.equal(fs.existsSync(path.join(savedDirectory, `${key}.json`)), true);
+    } finally {
+      fs.unlinkSync(directory);
+      fs.renameSync(savedDirectory, directory);
+      fs.rmSync(root, { force: true, recursive: true });
+      fs.rmSync(outside, { force: true, recursive: true });
+    }
+  },
+);
 
 test("mutation recovery readers preserve a live writer staging file", async () => {
   const root = fs.realpathSync(
