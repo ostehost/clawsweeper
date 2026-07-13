@@ -22,6 +22,10 @@ import {
   runRepairMutation,
   runRepairMutationAsync,
 } from "../../dist/repair/repair-action-ledger.js";
+import {
+  finalizeRepairActionLedgerManifest,
+  serializeRepairActionLedgerManifest,
+} from "../../dist/repair/repair-action-ledger-manifest.js";
 
 test("repair receipts preserve operation and mutation identity across workflow retries", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-")));
@@ -403,6 +407,7 @@ test("repair receipts reconstruct one causal chain across workflow processes and
       phase: "queue",
     });
     await flushRepairActionEvents();
+    await writeCausalManifest(queueOutput);
     const queue = readEvents(queueOutput)[0]!;
 
     Object.assign(process.env, workflowEnv(planRoot, planOutput), {
@@ -434,6 +439,7 @@ test("repair receipts reconstruct one causal chain across workflow processes and
       phase: "planned",
     });
     await flushRepairActionEvents();
+    await writeCausalManifest(planOutput);
     const plan = readEvents(planOutput)[0]!;
 
     assert.equal(plan.operation_id, queue.operation_id);
@@ -517,6 +523,7 @@ test("repair causal context rejects noncanonical shard paths before sequencing",
       state: "queued",
     });
     await flushRepairActionEvents();
+    await writeCausalManifest(queueOutput);
     const shardPath = walk(queueOutput).find((file) => file.endsWith(".jsonl"));
     assert.ok(shardPath);
     fs.renameSync(shardPath, path.join(path.dirname(shardPath), "forged.jsonl"));
@@ -544,6 +551,119 @@ test("repair causal context rejects noncanonical shard paths before sequencing",
     for (const root of [queueRoot, nextRoot]) {
       fs.rmSync(root, { force: true, recursive: true });
     }
+  }
+});
+
+test("repair causal context requires an authenticated manifest from the expected producer", async () => {
+  const sourceRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-authenticated-")),
+  );
+  const consumerRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-consumer-")),
+  );
+  const sourceOutput = path.join(sourceRoot, "output");
+  const consumerOutput = path.join(consumerRoot, "output");
+  fs.mkdirSync(sourceOutput);
+  fs.mkdirSync(consumerOutput);
+  const previous = { ...process.env };
+  const lifecycle = repairLifecycle();
+
+  try {
+    Object.assign(process.env, workflowEnv(sourceRoot, sourceOutput));
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+    });
+    await flushRepairActionEvents();
+
+    Object.assign(process.env, workflowEnv(consumerRoot, consumerOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: sourceOutput,
+    });
+    assert.throws(() => recordRepairPlan(lifecycle), /causal action ledger manifest/);
+
+    Object.assign(process.env, workflowEnv(sourceRoot, sourceOutput));
+    await writeCausalManifest(sourceOutput);
+    const manifestPath = path.join(sourceOutput, "repair-action-ledger-manifest.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest.manifest_sha256 = "0".repeat(64);
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+
+    Object.assign(process.env, workflowEnv(consumerRoot, consumerOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: sourceOutput,
+    });
+    assert.throws(() => recordRepairPlan(lifecycle), /manifest digest is invalid/);
+
+    Object.assign(process.env, workflowEnv(sourceRoot, sourceOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: "",
+      GITHUB_RUN_ID: "9999",
+    });
+    fs.rmSync(sourceRoot, { force: true, recursive: true });
+    fs.mkdirSync(sourceRoot);
+    fs.mkdirSync(sourceOutput);
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+    });
+    await flushRepairActionEvents();
+    await writeCausalManifest(sourceOutput);
+
+    Object.assign(process.env, workflowEnv(consumerRoot, consumerOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: sourceOutput,
+    });
+    assert.throws(() => recordRepairPlan(lifecycle), /identity mismatch for run_id/);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(sourceRoot, { force: true, recursive: true });
+    fs.rmSync(consumerRoot, { force: true, recursive: true });
+  }
+});
+
+test("repair causal context rejects a manifest-bound event for another subject", async () => {
+  const sourceRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-subject-")),
+  );
+  const consumerRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-subject-consumer-")),
+  );
+  const sourceOutput = path.join(sourceRoot, "output");
+  const consumerOutput = path.join(consumerRoot, "output");
+  fs.mkdirSync(sourceOutput);
+  fs.mkdirSync(consumerOutput);
+  const previous = { ...process.env };
+  const lifecycle = repairLifecycle();
+
+  try {
+    Object.assign(process.env, workflowEnv(sourceRoot, sourceOutput));
+    recordRepairLifecycleEvent(
+      { ...lifecycle, subjectId: "forged-subject" },
+      {
+        type: ACTION_EVENT_TYPES.repairQueue,
+        status: ACTION_EVENT_STATUSES.queued,
+        reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+        mutation: false,
+        component: "action_session",
+        state: "queued",
+      },
+    );
+    await flushRepairActionEvents();
+    await writeCausalManifest(sourceOutput);
+
+    Object.assign(process.env, workflowEnv(consumerRoot, consumerOutput), {
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: sourceOutput,
+    });
+    assert.throws(() => recordRepairPlan(lifecycle), /causal context subject mismatch/);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(sourceRoot, { force: true, recursive: true });
+    fs.rmSync(consumerRoot, { force: true, recursive: true });
   }
 });
 
@@ -788,6 +908,25 @@ function recordRepairAttempt() {
     state: "executed",
     idempotencySlot: "publish_branch:repair-pr-42",
   });
+}
+
+function recordRepairPlan(lifecycle: ReturnType<typeof repairLifecycle>) {
+  return recordRepairLifecycleEvent(lifecycle, {
+    type: ACTION_EVENT_TYPES.repairPlan,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    mutation: false,
+    component: "action_session",
+    state: "planned",
+  });
+}
+
+async function writeCausalManifest(outputRoot: string): Promise<void> {
+  const manifest = await finalizeRepairActionLedgerManifest("cluster");
+  fs.writeFileSync(
+    path.join(outputRoot, "repair-action-ledger-manifest.json"),
+    serializeRepairActionLedgerManifest(manifest),
+  );
 }
 
 function repairLifecycle() {

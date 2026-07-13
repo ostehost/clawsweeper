@@ -18,12 +18,18 @@ import {
   type ActionEvent,
 } from "../action-ledger.js";
 import {
+  prepareSafeReadRoot,
+  prepareSafeReadTarget,
+  readUtf8FileNoFollow,
+} from "../action-ledger-files.js";
+import {
   flushWorkflowActionEvents,
   interruptOpenWorkflowActionEvents,
   readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
   workflowActionProducer,
   workflowActionEventsEnabled,
+  type ValidatedActionEventShardSource,
 } from "../action-ledger-runtime.js";
 import {
   actionLedgerRecoveryEnvironment,
@@ -34,6 +40,7 @@ import {
   writeMutationRecovery,
 } from "../action-ledger-recovery.js";
 import { repoRoot } from "./paths.js";
+import { parseRepairActionLedgerManifest } from "./repair-action-ledger-manifest.js";
 
 export type RepairLifecycleInput = {
   repository: string;
@@ -141,6 +148,10 @@ const DEFINITE_HTTP_MUTATION_REJECTIONS = new Set([
   400, 401, 403, 404, 405, 406, 407, 410, 411, 413, 414, 415, 416, 417, 421, 422, 426, 428, 431,
   451,
 ]);
+const REPAIR_CAUSAL_MANIFEST_FILE = "repair-action-ledger-manifest.json";
+const REPAIR_CAUSAL_MANIFEST_MAX_BYTES = 256 * 1024;
+const REPAIR_CAUSAL_MANIFEST_LANE = "cluster";
+const REPAIR_CAUSAL_PRODUCER_JOB = "cluster";
 
 export function repairHttpMutationOutcome(response: {
   ok: boolean;
@@ -170,7 +181,7 @@ export function recordRepairLifecycleEvent(
     phase: event.phase ?? null,
     event: event.eventIdentity ?? null,
   };
-  const chainEvents = repairChainEvents(root, input.repository).filter(
+  const chainEvents = repairChainEvents(root, input, operation, operationId).filter(
     (candidate) => candidate.operation_id === operationId && candidate.attempt_id === attemptId,
   );
   const replay = chainEvents.find(
@@ -677,11 +688,16 @@ export function repairSourceRevision(frontmatter: Record<string, unknown>): stri
   return null;
 }
 
-function repairChainEvents(root: string, repository: string): ActionEvent[] {
+function repairChainEvents(
+  root: string,
+  input: RepairLifecycleInput,
+  operation: string,
+  operationId: string,
+): ActionEvent[] {
   const byId = new Map<string, ActionEvent>();
   for (const event of [
-    ...readSpooledActionEvents(root, repository),
-    ...readRepairCausalContextEvents(),
+    ...readSpooledActionEvents(root, input.repository),
+    ...readRepairCausalContextEvents(input, operation, operationId),
   ]) {
     const existing = byId.get(event.event_id);
     if (existing && actionLedgerJson(existing) !== actionLedgerJson(event)) {
@@ -724,9 +740,12 @@ function repairAttemptEvents(
     repairOperationIdentity(input),
   );
   const attemptId = actionAttemptId(operationId, workflowAttemptIdentity(context?.env));
-  return repairChainEvents(context?.root ?? repairActionLedgerRoot(), input.repository).filter(
-    (event) => event.operation_id === operationId && event.attempt_id === attemptId,
-  );
+  return repairChainEvents(
+    context?.root ?? repairActionLedgerRoot(),
+    input,
+    operation,
+    operationId,
+  ).filter((event) => event.operation_id === operationId && event.attempt_id === attemptId);
 }
 
 function nextRepairRequestAttempt(
@@ -978,12 +997,103 @@ function repairProducerMatches(
   );
 }
 
-function readRepairCausalContextEvents(): ActionEvent[] {
+function readRepairCausalContextEvents(
+  input: RepairLifecycleInput,
+  operation: string,
+  operationId: string,
+): ActionEvent[] {
   const roots = String(process.env.CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS ?? "")
     .split(path.delimiter)
     .map((value) => value.trim())
     .filter(Boolean);
-  return readValidatedActionEventShardBatch(roots.map((root) => path.resolve(root))).events;
+  if (roots.length === 0) return [];
+  const currentProducer = workflowActionProducer("repair_causal_context");
+  const expectedProducer = {
+    repository: currentProducer.repository,
+    sha: currentProducer.sha,
+    workflow: currentProducer.workflow,
+    job: REPAIR_CAUSAL_PRODUCER_JOB,
+    runId: currentProducer.runId,
+    runAttempt: currentProducer.runAttempt,
+  };
+  const sources: ValidatedActionEventShardSource[] = roots.map((root) => {
+    const sourceRoot = path.resolve(root);
+    const safeRoot = prepareSafeReadRoot(sourceRoot, "repair causal action ledger");
+    const manifestTarget = prepareSafeReadTarget(
+      safeRoot,
+      REPAIR_CAUSAL_MANIFEST_FILE,
+      "repair causal action ledger manifest",
+    );
+    const manifestContent = readUtf8FileNoFollow(manifestTarget, REPAIR_CAUSAL_MANIFEST_MAX_BYTES);
+    const manifestAttempt = repairCausalManifestRunAttempt(
+      manifestContent,
+      currentProducer.runAttempt,
+    );
+    const manifestProducer = { ...expectedProducer, runAttempt: manifestAttempt };
+    const manifest = parseRepairActionLedgerManifest(
+      manifestContent,
+      REPAIR_CAUSAL_MANIFEST_LANE,
+      manifestProducer,
+    );
+    return {
+      sourceRoot,
+      expectedEventPaths: manifest.event_paths,
+      expectedProducer: manifestProducer,
+    };
+  });
+  return readValidatedActionEventShardBatch(sources).events.filter((event) => {
+    if (event.operation_id !== operationId) return false;
+    if (!repairCausalSubjectMatches(event, input, operation)) {
+      throw new Error(`repair causal context subject mismatch: ${event.event_id}`);
+    }
+    return true;
+  });
+}
+
+function repairCausalSubjectMatches(
+  event: ActionEvent,
+  input: RepairLifecycleInput,
+  operation: string,
+): boolean {
+  const expected = repairSubject(input, {
+    type: event.event_type,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    mutation: false,
+    component: event.producer.component,
+    operation,
+  });
+  return (
+    event.subject.repository === expected.repository &&
+    event.subject.kind === expected.kind &&
+    event.subject.subject_id === expected.subjectId &&
+    event.subject.number === ("number" in expected ? expected.number : undefined) &&
+    event.subject.cluster_id === ("clusterId" in expected ? expected.clusterId : undefined) &&
+    event.subject.source_revision ===
+      ("sourceRevision" in expected ? expected.sourceRevision : undefined) &&
+    event.subject.record_path === ("recordPath" in expected ? expected.recordPath : undefined)
+  );
+}
+
+function repairCausalManifestRunAttempt(content: string, currentAttempt: number): number {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error("repair action ledger manifest is not valid JSON");
+  }
+  const runAttempt =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>).run_attempt
+      : undefined;
+  if (
+    !Number.isSafeInteger(runAttempt) ||
+    Number(runAttempt) < 1 ||
+    Number(runAttempt) > currentAttempt
+  ) {
+    throw new Error("repair causal action ledger producer attempt is invalid");
+  }
+  return Number(runAttempt);
 }
 
 function machineRevision(value: unknown): string | null {

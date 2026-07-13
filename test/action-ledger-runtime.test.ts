@@ -16,6 +16,7 @@ import {
   importActionEventShards,
   interruptOpenWorkflowActionEvents,
   postActionEventToCrabFleet,
+  readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
   recordWorkflowPhaseEvent,
   workflowActionProducer,
@@ -4552,6 +4553,117 @@ test("state shard imports enforce aggregate byte limits before publication", asy
     ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileEvents,
   );
   assert.deepEqual(fs.readdirSync(destination), []);
+});
+
+test("multi-root shard reads enforce aggregate file limits during traversal", () => {
+  const root = tempRoot();
+  const firstSource = trustedChildRoot(root, "first-source");
+  const secondSource = trustedChildRoot(root, "second-source");
+  const firstDirectory = path.join(firstSource, "ledger", "v1", "events");
+  const secondDirectory = path.join(secondSource, "ledger", "v1", "events");
+  fs.mkdirSync(firstDirectory, { recursive: true });
+  fs.mkdirSync(secondDirectory, { recursive: true });
+  for (let index = 0; index < ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles; index += 1) {
+    fs.writeFileSync(path.join(firstDirectory, `entry-${String(index).padStart(4, "0")}.txt`), "");
+  }
+  fs.writeFileSync(path.join(secondDirectory, "overflow.txt"), "");
+
+  assert.throws(
+    () => readValidatedActionEventShardBatch([firstSource, secondSource]),
+    new RegExp(`${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} aggregate file limit`),
+  );
+});
+
+test("multi-root shard reads stop before opening files beyond the aggregate byte budget", () => {
+  const root = tempRoot();
+  const firstSource = trustedChildRoot(root, "first-source");
+  const secondSource = trustedChildRoot(root, "second-source");
+  const base = recordReview(root);
+  assert.ok(base);
+  const first = recreateActionEvent(base, {
+    eventKey: actionEventKey("review.aggregate-bytes-first", {}),
+    parentEventId: null,
+  });
+  const secondFirst = recreateActionEvent(base, {
+    eventKey: actionEventKey("review.aggregate-bytes-second-first", {}),
+    parentEventId: null,
+    producer: { ...base.producer, component: "review.aggregate_bytes_first" },
+  });
+  const secondLate = recreateActionEvent(base, {
+    eventKey: actionEventKey("review.aggregate-bytes-second-late", {}),
+    parentEventId: null,
+    producer: { ...base.producer, component: "review.aggregate_bytes_late" },
+  });
+  const [firstShard] = writeActionEventShards(firstSource, shardIdentity(first), [first]);
+  const secondShards = [
+    ...writeActionEventShards(secondSource, shardIdentity(secondFirst), [secondFirst]),
+    ...writeActionEventShards(secondSource, shardIdentity(secondLate), [secondLate]),
+  ].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  assert.ok(firstShard);
+  assert.equal(secondShards.length, 2);
+  const lateShard = path.join(secondSource, secondShards.at(-1)!.relativePath);
+  const firstBytes = fs.statSync(path.join(firstSource, firstShard.relativePath)).size;
+  const secondFirstBytes = fs.statSync(path.join(secondSource, secondShards[0]!.relativePath)).size;
+  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
+    maxTotalBytes: number;
+  };
+  const originalMaxTotalBytes = mutableLimits.maxTotalBytes;
+  const originalOpenSync = fs.openSync;
+  let lateShardOpened = false;
+  mutableLimits.maxTotalBytes = firstBytes + secondFirstBytes - 1;
+  fs.openSync = ((filePath, flags, mode) => {
+    if (path.resolve(String(filePath)) === lateShard) lateShardOpened = true;
+    return originalOpenSync(filePath, flags, mode);
+  }) as typeof fs.openSync;
+  try {
+    assert.throws(
+      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
+      new RegExp(`${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`),
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    mutableLimits.maxTotalBytes = originalMaxTotalBytes;
+  }
+  assert.equal(lateShardOpened, false);
+});
+
+test("multi-root shard reads reject aggregate event overflow before parsing the next root", () => {
+  const root = tempRoot();
+  const firstSource = trustedChildRoot(root, "first-source");
+  const secondSource = trustedChildRoot(root, "second-source");
+  const base = recordReview(root);
+  assert.ok(base);
+  const first = recreateActionEvent(base, {
+    eventKey: actionEventKey("review.aggregate-events-first", {}),
+    parentEventId: null,
+  });
+  const second = recreateActionEvent(base, {
+    eventKey: actionEventKey("review.aggregate-events-second", {}),
+    parentEventId: null,
+  });
+  writeActionEventShards(firstSource, shardIdentity(base), [first]);
+  writeActionEventShards(secondSource, shardIdentity(base), [second]);
+  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
+    maxTotalEvents: number;
+  };
+  const originalMaxTotalEvents = mutableLimits.maxTotalEvents;
+  const originalParse = JSON.parse;
+  let secondEventParsed = false;
+  mutableLimits.maxTotalEvents = 1;
+  JSON.parse = ((text, reviver) => {
+    if (typeof text === "string" && text.includes(second.event_id)) secondEventParsed = true;
+    return originalParse(text, reviver);
+  }) as typeof JSON.parse;
+  try {
+    assert.throws(
+      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
+      /total event limit/,
+    );
+  } finally {
+    JSON.parse = originalParse;
+    mutableLimits.maxTotalEvents = originalMaxTotalEvents;
+  }
+  assert.equal(secondEventParsed, false);
 });
 
 test("state shard imports accept a complete 4097-event producer run", () => {

@@ -167,6 +167,12 @@ export type ValidatedActionEventShardBatch = {
   totalBytes: number;
 };
 
+export type ValidatedActionEventShardSource = {
+  sourceRoot: string;
+  expectedEventPaths?: readonly string[];
+  expectedProducer?: ExpectedActionEventProducer;
+};
+
 type ImportedActionEventShard = {
   relativePath: string;
   content: string;
@@ -234,6 +240,12 @@ type ActionEventLock = {
   process_incarnation_sha256: string;
   acquired_at_ms: number;
   nonce: string;
+};
+
+type ActionEventShardReadBudget = {
+  files: number;
+  totalBytes: number;
+  totalEvents: number;
 };
 
 export function workflowActionEventsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -1160,68 +1172,88 @@ function validateImportedActionEventProducer(
 }
 
 export function readValidatedActionEventShardBatch(
-  sourceRoots: string | readonly string[],
+  sourceRoots: string | readonly (string | ValidatedActionEventShardSource)[],
 ): ValidatedActionEventShardBatch {
-  const roots = typeof sourceRoots === "string" ? [sourceRoots] : [...sourceRoots];
-  if (roots.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
+  const sourcesToRead = (typeof sourceRoots === "string" ? [sourceRoots] : [...sourceRoots]).map(
+    (source): ValidatedActionEventShardSource =>
+      typeof source === "string" ? { sourceRoot: source } : source,
+  );
+  if (sourcesToRead.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
     throw new Error(
       `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} source root limit`,
     );
   }
-  const sources = roots
-    .map((sourceRoot) => readActionEventShardSource(sourceRoot))
-    .filter((source): source is NonNullable<typeof source> => source !== null);
-  const eventPaths = sources.flatMap((source) => source.relativePaths);
-  if (eventPaths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
-    throw new Error(
-      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} file limit`,
-    );
+  const budget: ActionEventShardReadBudget = {
+    files: 0,
+    totalBytes: 0,
+    totalEvents: 0,
+  };
+  const sources: Array<{
+    relativePaths: string[];
+    shards: ImportedActionEventShard[];
+  }> = [];
+  for (const source of sourcesToRead) {
+    const read = readActionEventShardSource(source, budget);
+    if (read) sources.push(read);
   }
+  const eventPaths = sources.flatMap((source) => source.relativePaths);
   const shards = sources.flatMap((source) => source.shards);
   const events = shards.flatMap((shard) => shard.events);
-  if (events.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents) {
-    throw new Error(
-      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
-    );
-  }
-  const totalBytes = shards.reduce(
-    (total, shard) => total + Buffer.byteLength(shard.content, "utf8"),
-    0,
-  );
-  if (totalBytes > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes) {
-    throw new Error(
-      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
-    );
-  }
   validateCanonicalImportedShardBatch(shards);
   return {
     eventPaths: eventPaths.sort(),
     events,
-    totalBytes,
+    totalBytes: budget.totalBytes,
   };
 }
 
-function readActionEventShardSource(sourceRoot: string): {
+function readActionEventShardSource(
+  source: ValidatedActionEventShardSource,
+  budget: ActionEventShardReadBudget,
+): {
   relativePaths: string[];
   shards: ImportedActionEventShard[];
 } | null {
   let safeSource: SafeReadRoot;
   try {
-    safeSource = prepareSafeReadRoot(sourceRoot, "action event shard import source");
+    safeSource = prepareSafeReadRoot(source.sourceRoot, "action event shard import source");
   } catch (error) {
+    if (isNotFoundError(error) && source.expectedEventPaths !== undefined) {
+      throw new Error("action event shard manifest source root is missing");
+    }
     if (isNotFoundError(error)) return null;
     throw error;
   }
   let relativePaths: string[];
   try {
-    relativePaths = collectActionEventShardFiles(safeSource);
+    relativePaths = collectActionEventShardFiles(safeSource, budget);
   } catch (error) {
+    if (
+      isNotFoundError(error) &&
+      source.expectedEventPaths !== undefined &&
+      source.expectedEventPaths.length === 0
+    ) {
+      return { relativePaths: [], shards: [] };
+    }
+    if (isNotFoundError(error) && source.expectedEventPaths !== undefined) {
+      throw new Error("action event shard manifest source root is missing");
+    }
     if (isNotFoundError(error)) return null;
     throw error;
   }
+  if (source.expectedEventPaths !== undefined) {
+    const expected = validateExpectedActionEventPaths(source.expectedEventPaths, {
+      allowEmpty: true,
+    });
+    if (actionLedgerJson(relativePaths) !== actionLedgerJson(expected)) {
+      throw new Error("action event shard manifest source paths do not match");
+    }
+  }
+  const shards = readImportedActionEventShards(safeSource, relativePaths, {}, budget);
+  if (source.expectedProducer) validateImportedActionEventProducer(shards, source.expectedProducer);
   return {
     relativePaths,
-    shards: readImportedActionEventShards(safeSource, relativePaths),
+    shards,
   };
 }
 
@@ -1469,6 +1501,7 @@ function readImportedActionEventShards(
   source: SafeReadRoot,
   relativePaths: readonly string[],
   options: { requireManifestPaths?: boolean } = {},
+  sharedBudget?: ActionEventShardReadBudget,
 ): ImportedActionEventShard[] {
   let totalBytes = 0;
   const contents = relativePaths.map((relativePath) => {
@@ -1476,12 +1509,26 @@ function readImportedActionEventShards(
       throw new Error(`invalid action event shard path: ${relativePath}`);
     }
     const target = prepareSafeReadTarget(source, relativePath, "action event shard import source");
+    const remainingBytes =
+      ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes - (sharedBudget?.totalBytes ?? 0);
     let content: string;
     try {
-      content = readUtf8FileNoFollow(target, ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes);
+      content = readUtf8FileNoFollow(
+        target,
+        Math.min(ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes, Math.max(0, remainingBytes)),
+      );
     } catch (error) {
       if (options.requireManifestPaths && isNotFoundError(error)) {
         throw new Error(`action event shard manifest path is missing: ${relativePath}`);
+      }
+      if (
+        sharedBudget &&
+        remainingBytes < ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes &&
+        String(error).includes("byte limit")
+      ) {
+        throw new Error(
+          `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
+        );
       }
       throw error;
     }
@@ -1492,15 +1539,26 @@ function readImportedActionEventShards(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
       );
     }
+    if (sharedBudget) sharedBudget.totalBytes += bytes;
     assertImportedShardLineLimit(relativePath, content);
     if (!content.endsWith("\n")) {
       throw new Error(`action event shard must end with a newline: ${relativePath}`);
     }
+    const lineCount = importedShardLineCount(content);
+    if (
+      sharedBudget &&
+      sharedBudget.totalEvents + lineCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents
+    ) {
+      throw new Error(
+        `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
+      );
+    }
+    if (sharedBudget) sharedBudget.totalEvents += lineCount;
     return { relativePath, content };
   });
 
   let totalEvents = 0;
-  const parsed = contents.map(({ relativePath, content }) => {
+  const validated = contents.map(({ relativePath, content }) => {
     const events = parseActionEventShardContent(content, relativePath);
     assertImportedShardEventLimit(relativePath, events);
     totalEvents += events.length;
@@ -1509,18 +1567,22 @@ function readImportedActionEventShards(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
       );
     }
-    return { relativePath, content, events };
+    return {
+      relativePath,
+      content,
+      events,
+      ...validateCanonicalImportedShard(relativePath, events, content),
+    };
   });
-  const validated = parsed.map((shard) => ({
-    ...shard,
-    ...validateCanonicalImportedShard(shard.relativePath, shard.events, shard.content),
-  }));
   validateCanonicalImportedShardBatch(validated);
   return validated;
 }
 
-function validateExpectedActionEventPaths(paths: readonly string[]): string[] {
-  if (paths.length === 0) {
+function validateExpectedActionEventPaths(
+  paths: readonly string[],
+  options: { allowEmpty?: boolean } = {},
+): string[] {
+  if (paths.length === 0 && options.allowEmpty !== true) {
     throw new Error("action event shard manifest is empty");
   }
   if (paths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
@@ -1556,15 +1618,20 @@ function importedShardReplayEquivalent(
 }
 
 function assertImportedShardLineLimit(relativePath: string, content: string): void {
-  let lineCount = content.length === 0 ? 0 : content.endsWith("\n") ? 0 : 1;
-  for (let index = 0; index < content.length; index += 1) {
-    if (content.charCodeAt(index) === 10) lineCount += 1;
-  }
+  const lineCount = importedShardLineCount(content);
   if (lineCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileLines) {
     throw new Error(
       `action event shard exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileLines} line limit: ${relativePath}`,
     );
   }
+}
+
+function importedShardLineCount(content: string): number {
+  let lineCount = content.length === 0 ? 0 : content.endsWith("\n") ? 0 : 1;
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 10) lineCount += 1;
+  }
+  return lineCount;
 }
 
 function assertImportedShardEventLimit(relativePath: string, events: readonly ActionEvent[]): void {
@@ -2501,7 +2568,10 @@ function positiveIntegerEnv(env: NodeJS.ProcessEnv, name: string): number {
   return value;
 }
 
-function collectActionEventShardFiles(root: SafeReadRoot): string[] {
+function collectActionEventShardFiles(
+  root: SafeReadRoot,
+  sharedBudget?: ActionEventShardReadBudget,
+): string[] {
   const files: string[] = [];
   let directoryCount = 0;
   let fileCount = 0;
@@ -2537,9 +2607,15 @@ function collectActionEventShardFiles(root: SafeReadRoot): string[] {
       }
       if (entry.isFile()) {
         fileCount += 1;
+        if (sharedBudget) sharedBudget.files += 1;
         if (fileCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
           throw new Error(
             `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} file limit`,
+          );
+        }
+        if (sharedBudget && sharedBudget.files > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+          throw new Error(
+            `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} aggregate file limit`,
           );
         }
         if (relativePath.endsWith(".jsonl")) files.push(relativePath);

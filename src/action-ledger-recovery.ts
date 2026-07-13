@@ -9,8 +9,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
+import { processIncarnationIdentitySha256, processIsDefunct } from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
 
 const MUTATION_RECOVERY_SCHEMA = "clawsweeper.action-ledger-mutation-recovery";
@@ -19,7 +21,8 @@ const MUTATION_RECOVERY_MAX_FILES = 1024;
 const MUTATION_RECOVERY_MAX_BYTES = 256 * 1024;
 const MUTATION_RECOVERY_FAMILY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const MUTATION_RECOVERY_KEY_PATTERN = /^[a-f0-9]{64}$/;
-const MUTATION_RECOVERY_TEMP_PATTERN = /^\.[a-f0-9]{64}\.[1-9][0-9]*\.[0-9]+\.tmp$/;
+const MUTATION_RECOVERY_TEMP_PATTERN =
+  /^\.(?<key>[a-f0-9]{64})\.(?<pid>[1-9][0-9]*)\.(?<incarnation>[a-f0-9]{64})\.(?<createdAt>[0-9]+)\.(?<nonce>[a-f0-9-]{36})\.tmp$/;
 const WORKFLOW_ENV_KEYS = [
   "CLAWSWEEPER_ACTION_LEDGER_FORCE",
   "CLAWSWEEPER_ACTION_LEDGER_INVOCATION",
@@ -78,7 +81,14 @@ export function writeMutationRecovery<T>(
   assertMutationRecoveryIdentity(family, key);
   const directory = prepareMutationRecoveryDirectory(recoveryRoot, family);
   const target = mutationRecoveryPath(recoveryRoot, family, key);
-  const temporary = path.join(directory, `.${key}.${process.pid}.${Date.now()}.tmp`);
+  const processIncarnation = processIncarnationIdentitySha256();
+  if (processIncarnation === null) {
+    throw new Error("unable to determine mutation recovery writer process incarnation");
+  }
+  const temporary = path.join(
+    directory,
+    `.${key}.${process.pid}.${processIncarnation}.${Date.now()}.${randomUUID()}.tmp`,
+  );
   const envelope: MutationRecoveryEnvelope<T> = {
     schema: MUTATION_RECOVERY_SCHEMA,
     schema_version: MUTATION_RECOVERY_VERSION,
@@ -115,9 +125,14 @@ export function readMutationRecoveries<T>(
   const records: MutationRecoveryRecord<T>[] = [];
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     const filePath = path.join(directory, entry.name);
-    if (MUTATION_RECOVERY_TEMP_PATTERN.test(entry.name)) {
+    const temporary = MUTATION_RECOVERY_TEMP_PATTERN.exec(entry.name);
+    if (temporary?.groups) {
       assertRecoveryFile(filePath, entry.name);
-      rmSync(filePath);
+      if (
+        mutationRecoveryWriterIsStale(Number(temporary.groups.pid), temporary.groups.incarnation!)
+      ) {
+        rmSync(filePath);
+      }
       continue;
     }
     if (!entry.isFile() || !entry.name.endsWith(".json")) {
@@ -212,4 +227,24 @@ function assertRecoveryFile(filePath: string, name: string) {
     throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes: ${name}`);
   }
   return stat;
+}
+
+function mutationRecoveryWriterIsStale(pid: number, expectedIncarnation: string): boolean {
+  if (!processIsAlive(pid)) return true;
+  const currentIncarnation = processIncarnationIdentitySha256(pid, { fresh: true });
+  return currentIncarnation !== null && currentIncarnation !== expectedIncarnation;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1 || processIsDefunct(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ESRCH"
+    );
+  }
 }
