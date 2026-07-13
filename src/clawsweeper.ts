@@ -1125,6 +1125,27 @@ interface ProofLaneCursor {
   sortAt: number;
 }
 
+type ProofLaneName = "proof_nudges" | "bot_proof";
+
+type ProofLaneActionLedger = {
+  lane: ProofLaneName;
+  operationIdentity: {
+    repository: string;
+    lane: ProofLaneName;
+    execute: boolean;
+    limit: number;
+    processedLimit: number;
+    itemSelectionSha256: string;
+    cursorEnabled: boolean;
+  };
+  batchStartEventId: string | null;
+  nextPhaseSeq: number;
+  startedAtMs: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  terminal: boolean;
+};
+
 interface ProofNudgeComment {
   author?: string | undefined;
   body?: string | undefined;
@@ -27625,7 +27646,7 @@ function fetchPullRequestProofNudgeDetails(number: number): ProofNudgePullReques
 
 function postProofNudgeComment(number: number, body: string): Record<string, unknown> {
   const payload = writeCommentPayload(number, body);
-  return ghJson<Record<string, unknown>>([
+  const args = [
     "api",
     `repos/${targetRepo()}/issues/${number}/comments`,
     "--method",
@@ -27634,7 +27655,18 @@ function postProofNudgeComment(number: number, body: string): Record<string, unk
     payload,
     "--jq",
     "{id,html_url}",
-  ]);
+  ];
+  return asRecord(
+    parseGhJson<unknown>(
+      ghObservedMutationCommand({
+        identity: `proof_nudge_comment:${number}:${reviewCommentBodyDigest(body)}`,
+        args,
+        knownNoMutation: (error) =>
+          isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
+      }),
+      args,
+    ),
+  );
 }
 
 function upsertBotProofDecisionComment(
@@ -27648,8 +27680,9 @@ function upsertBotProofDecisionComment(
     .find((comment) => typeof comment.body === "string" && comment.body.includes(marker));
   const payload = writeCommentPayload(number, body);
   const existingId = commentId(existing);
+  let args: string[];
   if (existingId !== null && canPatchReviewComment(existing)) {
-    return ghJson<Record<string, unknown>>([
+    args = [
       "api",
       `repos/${targetRepo()}/issues/comments/${existingId}`,
       "--method",
@@ -27658,18 +27691,30 @@ function upsertBotProofDecisionComment(
       payload,
       "--jq",
       "{id,html_url}",
-    ]);
+    ];
+  } else {
+    args = [
+      "api",
+      `repos/${targetRepo()}/issues/${number}/comments`,
+      "--method",
+      "POST",
+      "--input",
+      payload,
+      "--jq",
+      "{id,html_url}",
+    ];
   }
-  return ghJson<Record<string, unknown>>([
-    "api",
-    `repos/${targetRepo()}/issues/${number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payload,
-    "--jq",
-    "{id,html_url}",
-  ]);
+  return asRecord(
+    parseGhJson<unknown>(
+      ghObservedMutationCommand({
+        identity: `bot_proof_comment:${number}:${headSha}:${reviewCommentBodyDigest(body)}`,
+        args,
+        knownNoMutation: (error) =>
+          isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
+      }),
+      args,
+    ),
+  );
 }
 
 function syncBotProofDecisionLabels(options: {
@@ -27687,7 +27732,7 @@ function syncBotProofDecisionLabels(options: {
   const nextLabels = statusResult.labels.filter((label) => normalizeLabelName(label) !== "stale");
   if (!options.dryRun) {
     for (const label of staleLabels) {
-      ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+      removeIssueLabel(options.number, label);
     }
   }
   const changed = statusResult.changed || staleLabels.length > 0;
@@ -27871,6 +27916,409 @@ export function botProofCandidateRecordsForTest(
   return botProofCandidateRecords(itemsDir, requestedItemNumbers);
 }
 
+function startProofLaneActionLedger(options: {
+  lane: ProofLaneName;
+  execute: boolean;
+  limit: number;
+  processedLimit: number;
+  requestedItemNumbers: readonly number[];
+  cursorEnabled: boolean;
+}): ProofLaneActionLedger {
+  const operationIdentity = {
+    repository: targetRepo(),
+    lane: options.lane,
+    execute: options.execute,
+    limit: options.limit,
+    processedLimit: options.processedLimit,
+    itemSelectionSha256: sha256(
+      stableJson([...options.requestedItemNumbers].sort((a, b) => a - b)),
+    ),
+    cursorEnabled: options.cursorEnabled,
+  };
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofStage,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "proof_lane_start" },
+    operation: "proof_handling",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "proof_lane_start" },
+    component: options.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      review_mode: options.lane,
+      work_kind: "proof_handling",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  return {
+    lane: options.lane,
+    operationIdentity,
+    batchStartEventId: start?.event_id ?? null,
+    nextPhaseSeq: 2,
+    startedAtMs: Date.now(),
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+    terminal: false,
+  };
+}
+
+function nextProofLanePhase(ledger: ProofLaneActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function proofLaneSubject(
+  repository: string,
+  number: number,
+  headSha?: string,
+): ActionEventSubject {
+  if (number <= 0) {
+    return {
+      repository,
+      kind: "workflow",
+    };
+  }
+  return {
+    repository,
+    kind: "pull_request",
+    number,
+    ...(headSha ? { sourceRevision: headSha } : {}),
+  };
+}
+
+function proofLaneResultDisposition(action: ProofNudgeAction | BotProofAction): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  mutation: boolean;
+} {
+  if (action.endsWith("_posted")) {
+    return {
+      status: ACTION_EVENT_STATUSES.published,
+      reasonCode: ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: true,
+    };
+  }
+  if (action.endsWith("_planned")) {
+    return {
+      status: ACTION_EVENT_STATUSES.planned,
+      reasonCode: ACTION_EVENT_REASON_CODES.dryRun,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_runtime_budget") {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_live_fetch_failed") {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_stale_report_head") {
+    return {
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.stale,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  if (
+    action === "skipped_locked_conversation" ||
+    action === "skipped_policy_exempt" ||
+    action === "skipped_protected_label"
+  ) {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.policyBlocked,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.skipped,
+    reasonCode: ACTION_EVENT_REASON_CODES.notApplicable,
+    retryable: false,
+    mutation: false,
+  };
+}
+
+function recordProofLaneResults(
+  ledger: ProofLaneActionLedger,
+  results: readonly (ProofNudgeResult | BotProofResult)[],
+): void {
+  for (const [index, result] of results.entries()) {
+    const disposition = proofLaneResultDisposition(result.action);
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofStage,
+      status: disposition.status,
+      reasonCode: disposition.reasonCode,
+      retryable: disposition.retryable,
+      mutation: disposition.mutation,
+      identity: {
+        slot: "proof_lane_result",
+        index,
+        number: result.number,
+        action: result.action,
+      },
+      operation: "proof_handling",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.batchStartEventId,
+      phaseSeq: nextProofLanePhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        slot: "proof_lane_result",
+        number: result.number,
+        action: result.action,
+        sourceRevision: result.headSha ?? null,
+      },
+      component: ledger.lane,
+      subject: proofLaneSubject(result.repo ?? targetRepo(), result.number, result.headSha),
+      evidence: workflowRunEvidence(),
+      attributes: {
+        completion_reason: result.action,
+        work_kind: ledger.lane,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+  }
+}
+
+function recordProofLaneArtifact(
+  ledger: ProofLaneActionLedger,
+  options: {
+    phase: typeof ACTION_EVENT_TYPES.reviewLogPublication | typeof ACTION_EVENT_TYPES.proofBinding;
+    filePath: string;
+    evidenceKind: string;
+    slot: string;
+    publicationKind: string;
+  },
+): void {
+  const evidence = actionLedgerFileEvidence(options.evidenceKind, options.filePath);
+  const recordPath = repoRelativePath(options.filePath);
+  recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: evidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
+    reasonCode: evidence ? ACTION_EVENT_REASON_CODES.completed : ACTION_EVENT_REASON_CODES.notFound,
+    retryable: false,
+    mutation: false,
+    identity: { slot: options.slot },
+    operation: "proof_handling",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.batchStartEventId,
+    phaseSeq: nextProofLanePhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: options.slot,
+      evidenceSha256: evidence?.sha256 ?? null,
+    },
+    component: ledger.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "publication",
+      ...(!recordPath.startsWith("../") ? { recordPath } : {}),
+    },
+    evidence: [...workflowRunEvidence(), ...(evidence ? [evidence] : [])],
+    attributes: {
+      log_count: evidence ? 1 : 0,
+      log_kind: options.evidenceKind,
+      publication_kind: options.publicationKind,
+      work_kind: ledger.lane,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+}
+
+function finishProofLaneActionLedger(
+  ledger: ProofLaneActionLedger,
+  options: {
+    processedCount: number;
+    actionCount: number;
+    resultCount: number;
+    error?: unknown;
+  },
+): void {
+  if (ledger.terminal) return;
+  const failure =
+    options.error === undefined ? null : actionLedgerFailureDisposition(options.error);
+  recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofStage,
+    status: failure?.status ?? ACTION_EVENT_STATUSES.completed,
+    reasonCode: failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.completed,
+    retryable: failure !== null && !ledger.uncertainMutationObserved,
+    mutation: ledger.mutationObserved,
+    identity: {
+      slot: "proof_lane_terminal",
+      completionReason: failure?.completionReason ?? "completed",
+    },
+    operation: "proof_handling",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.batchStartEventId,
+    phaseSeq: nextProofLanePhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "proof_lane_terminal",
+    },
+    component: ledger.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      action_count: options.actionCount,
+      processed_count: options.processedCount,
+      result_count: options.resultCount,
+      duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
+      completion_reason: failure?.completionReason ?? "completed",
+      work_kind: ledger.lane,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.terminal = true;
+}
+
+function proofLaneMutationRunner(
+  ledger: ProofLaneActionLedger,
+  subject: ActionEventSubject,
+): MutationRunner {
+  let requestAttempt = 0;
+  return <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    requestAttempt += 1;
+    const publicationKind = options.identity.includes("comment")
+      ? "github_comment"
+      : "github_label";
+    const phase =
+      publicationKind === "github_comment"
+        ? ACTION_EVENT_TYPES.reviewCommentPublication
+        : ACTION_EVENT_TYPES.proofStage;
+    const mutationIdentitySha256 = sha256(options.idempotencyIdentity);
+    const attempt = recordWorkflowPhaseEvent(ROOT, {
+      phase,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: true,
+      mutation: false,
+      identity: {
+        slot: "proof_mutation_attempt",
+        requestAttempt,
+        requestIdentitySha256: sha256(options.identity),
+      },
+      operation: "proof_handling",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.batchStartEventId,
+      phaseSeq: nextProofLanePhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        subject,
+        mutationIdentitySha256,
+      },
+      component: ledger.lane,
+      subject,
+      evidence: workflowRunEvidence(),
+      attributes: {
+        attempt: requestAttempt,
+        publication_kind: publicationKind,
+        work_kind: ledger.lane,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    const finish = (outcome: "accepted" | "rejected" | "unknown"): void => {
+      const mutation = outcome !== "rejected";
+      recordWorkflowPhaseEvent(ROOT, {
+        phase,
+        status:
+          outcome === "accepted"
+            ? ACTION_EVENT_STATUSES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_STATUSES.skipped
+              : ACTION_EVENT_STATUSES.failed,
+        reasonCode:
+          outcome === "accepted"
+            ? ACTION_EVENT_REASON_CODES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_REASON_CODES.notApplicable
+              : ACTION_EVENT_REASON_CODES.unavailable,
+        retryable: false,
+        mutation,
+        identity: {
+          slot: "proof_mutation_outcome",
+          requestAttempt,
+          requestIdentitySha256: sha256(options.identity),
+          outcome,
+        },
+        operation: "proof_handling",
+        operationIdentity: ledger.operationIdentity,
+        parentEventId: attempt?.event_id ?? ledger.batchStartEventId,
+        phaseSeq: nextProofLanePhase(ledger),
+        idempotencyIdentity: {
+          operationIdentity: ledger.operationIdentity,
+          subject,
+          mutationIdentitySha256,
+        },
+        component: ledger.lane,
+        subject,
+        evidence: workflowRunEvidence(),
+        attributes: {
+          attempt: requestAttempt,
+          completion_reason: `mutation_${outcome}`,
+          publication_kind: publicationKind,
+          work_kind: ledger.lane,
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      if (mutation) ledger.mutationObserved = true;
+      if (outcome === "unknown") ledger.uncertainMutationObserved = true;
+    };
+    try {
+      const result = options.operation();
+      finish(options.didMutate?.(result) === false ? "rejected" : "accepted");
+      return result;
+    } catch (error) {
+      finish(options.knownNoMutation?.(error) === true ? "rejected" : "unknown");
+      throw error;
+    }
+  };
+}
+
+function runWithProofLaneMutationRunner<T>(
+  ledger: ProofLaneActionLedger,
+  subject: ActionEventSubject,
+  operation: () => T,
+): T {
+  const previousReviewMutationRunner = activeReviewMutationRunner;
+  activeReviewMutationRunner = proofLaneMutationRunner(ledger, subject);
+  try {
+    return operation();
+  } finally {
+    activeReviewMutationRunner = previousReviewMutationRunner;
+  }
+}
+
 function proofNudgesCommand(args: Args): void {
   repoFromArgs(args);
   const itemsDir = resolve(stringArg(args.items_dir, defaultItemsDir()));
@@ -27887,176 +28335,229 @@ function proofNudgesCommand(args: Args): void {
   const reportPath = resolve(stringArg(args.report_path, join(ROOT, "proof-nudge-report.json")));
   const requestedItemNumbers = itemNumbersArg(args.item_numbers, args.item_number);
   const cursorPath = proofLaneCursorPath(args, requestedItemNumbers);
-
-  if (!existsSync(itemsDir)) {
-    const results: ProofNudgeResult[] = [];
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    console.log(JSON.stringify(results, null, 2));
-    return;
-  }
-
-  const allCandidates = proofNudgeCandidateRecords(itemsDir, requestedItemNumbers);
-  const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
-  const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+  const ledger = startProofLaneActionLedger({
+    lane: "proof_nudges",
+    execute,
+    limit,
+    processedLimit,
+    requestedItemNumbers,
+    cursorEnabled: cursorPath !== null,
+  });
   const startedAtMs = Date.now();
   const results: ProofNudgeResult[] = [];
   let processedCount = 0;
   let nudgeCount = 0;
   let lastProcessedCandidate: ProofLaneCandidate | null = null;
-  const markProcessed = (candidate: ProofLaneCandidate): void => {
-    processedCount += 1;
-    lastProcessedCandidate = candidate;
-  };
-  const logProgress = (message: string): void => {
-    const counts = results.reduce<Record<string, number>>((accumulator, result) => {
-      accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
-      return accumulator;
-    }, {});
-    console.error(
-      [
-        `[proof-nudges] ${new Date().toISOString()} ${message}`,
-        `nudges=${nudgeCount}/${limit}`,
-        `processed=${processedCount}/${processedLimit}`,
-        `dry_run=${dryRun}`,
-        `counts=${JSON.stringify(counts)}`,
-      ].join(" "),
-    );
-  };
 
-  logProgress(
-    `starting proof nudges: candidates=${allCandidates.length} min_age_days=${minAgeDays} cooldown_days=${cooldownDays} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
-  );
-  for (const candidate of candidates) {
-    if (nudgeCount >= limit) break;
-    if (processedCount >= processedLimit) break;
-    if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
-      results.push({
-        repo: targetRepo(),
-        number: 0,
-        action: "skipped_runtime_budget",
-        reason: `max runtime ${maxRuntimeMs}ms reached`,
+  try {
+    if (!existsSync(itemsDir)) {
+      ensureDir(dirname(reportPath));
+      writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.reviewLogPublication,
+        filePath: reportPath,
+        evidenceKind: "proof_nudge_report",
+        slot: "proof_nudge_report",
+        publicationKind: "local_artifact",
       });
-      logProgress(`stopping proof nudges: max runtime ${maxRuntimeMs}ms reached`);
-      break;
+      finishProofLaneActionLedger(ledger, {
+        processedCount,
+        actionCount: nudgeCount,
+        resultCount: results.length,
+      });
+      console.log(JSON.stringify(results, null, 2));
+      return;
     }
 
-    const resultBase = {
-      repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
-      number: candidate.number,
-      reviewedAt: candidate.reviewedAt,
+    const allCandidates = proofNudgeCandidateRecords(itemsDir, requestedItemNumbers);
+    const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
+    const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+    const markProcessed = (candidate: ProofLaneCandidate): void => {
+      processedCount += 1;
+      lastProcessedCandidate = candidate;
     };
-    let item: Item;
-    let state: string;
-    try {
-      const fetched = fetchItem(candidate.number);
-      item = fetched.item;
-      state = fetched.state;
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    if (state !== "open") {
-      results.push({
-        ...resultBase,
-        action: "skipped_not_open",
-        reason: `state is ${state}`,
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
-    let comments: ProofNudgeComment[] = [];
-    let authorEditedAt: string | undefined;
-    let authorReviewActivityAt: string | undefined;
-    try {
-      pullDetails =
-        item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
-      comments = item.kind === "pull_request" ? proofNudgeComments(candidate.number) : [];
-      authorEditedAt =
-        item.kind === "pull_request"
-          ? latestAuthorPullRequestEditAt(candidate.number, item.author)
-          : undefined;
-      authorReviewActivityAt =
-        item.kind === "pull_request"
-          ? latestAuthorPullRequestReviewActivityAt(candidate.number, item.author)
-          : undefined;
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const eligibility = proofNudgeEligibility({
-      item,
-      markdown: candidate.markdown,
-      comments,
-      headSha: pullDetails.headSha,
-      headCommittedAt: pullDetails.headCommittedAt,
-      authorEditedAt,
-      authorReviewActivityAt,
-      minAgeDays,
-      cooldownDays,
-    });
-    if (!eligibility.eligible) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: eligibility.reason,
-        headSha: pullDetails.headSha,
-      });
-      markProcessed(candidate);
-      continue;
-    }
+    const logProgress = (message: string): void => {
+      const counts = results.reduce<Record<string, number>>((accumulator, result) => {
+        accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
+        return accumulator;
+      }, {});
+      console.error(
+        [
+          `[proof-nudges] ${new Date().toISOString()} ${message}`,
+          `nudges=${nudgeCount}/${limit}`,
+          `processed=${processedCount}/${processedLimit}`,
+          `dry_run=${dryRun}`,
+          `counts=${JSON.stringify(counts)}`,
+        ].join(" "),
+      );
+    };
 
-    const timestamp = new Date().toISOString();
-    const headSha = pullDetails.headSha;
-    if (!headSha) {
-      results.push({
-        ...resultBase,
-        action: "skipped_no_live_head",
-        reason: "live PR head SHA could not be inspected",
+    logProgress(
+      `starting proof nudges: candidates=${allCandidates.length} min_age_days=${minAgeDays} cooldown_days=${cooldownDays} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
+    );
+    for (const candidate of candidates) {
+      if (nudgeCount >= limit) break;
+      if (processedCount >= processedLimit) break;
+      if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
+        results.push({
+          repo: targetRepo(),
+          number: 0,
+          action: "skipped_runtime_budget",
+          reason: `max runtime ${maxRuntimeMs}ms reached`,
+        });
+        logProgress(`stopping proof nudges: max runtime ${maxRuntimeMs}ms reached`);
+        break;
+      }
+
+      const resultBase = {
+        repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
+        number: candidate.number,
+        reviewedAt: candidate.reviewedAt,
+      };
+      let item: Item;
+      let state: string;
+      try {
+        const fetched = fetchItem(candidate.number);
+        item = fetched.item;
+        state = fetched.state;
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      if (state !== "open") {
+        results.push({
+          ...resultBase,
+          action: "skipped_not_open",
+          reason: `state is ${state}`,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
+      let comments: ProofNudgeComment[] = [];
+      let authorEditedAt: string | undefined;
+      let authorReviewActivityAt: string | undefined;
+      try {
+        pullDetails =
+          item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
+        comments = item.kind === "pull_request" ? proofNudgeComments(candidate.number) : [];
+        authorEditedAt =
+          item.kind === "pull_request"
+            ? latestAuthorPullRequestEditAt(candidate.number, item.author)
+            : undefined;
+        authorReviewActivityAt =
+          item.kind === "pull_request"
+            ? latestAuthorPullRequestReviewActivityAt(candidate.number, item.author)
+            : undefined;
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const eligibility = proofNudgeEligibility({
+        item,
+        markdown: candidate.markdown,
+        comments,
+        headSha: pullDetails.headSha,
+        headCommittedAt: pullDetails.headCommittedAt,
+        authorEditedAt,
+        authorReviewActivityAt,
+        minAgeDays,
+        cooldownDays,
       });
+      if (!eligibility.eligible) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: eligibility.reason,
+          headSha: pullDetails.headSha,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+
+      const timestamp = new Date().toISOString();
+      const headSha = pullDetails.headSha;
+      if (!headSha) {
+        results.push({
+          ...resultBase,
+          action: "skipped_no_live_head",
+          reason: "live PR head SHA could not be inspected",
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const body = renderProofNudgeComment({ item, headSha, timestamp });
+      if (dryRun) {
+        results.push({
+          ...resultBase,
+          action: "proof_nudge_planned",
+          reason: eligibility.reason,
+          headSha,
+        });
+      } else {
+        const comment = runWithProofLaneMutationRunner(
+          ledger,
+          proofLaneSubject(resultBase.repo, candidate.number, headSha),
+          () => postProofNudgeComment(candidate.number, body),
+        );
+        results.push({
+          ...resultBase,
+          action: "proof_nudge_posted",
+          reason: eligibility.reason,
+          url: commentUrl(comment) ?? undefined,
+          headSha,
+        });
+      }
       markProcessed(candidate);
-      continue;
+      nudgeCount += 1;
+      logProgress(`${dryRun ? "planned" : "posted"} proof nudge #${candidate.number}`);
     }
-    const body = renderProofNudgeComment({ item, headSha, timestamp });
-    if (dryRun) {
-      results.push({
-        ...resultBase,
-        action: "proof_nudge_planned",
-        reason: eligibility.reason,
-        headSha,
-      });
-    } else {
-      const comment = postProofNudgeComment(candidate.number, body);
-      results.push({
-        ...resultBase,
-        action: "proof_nudge_posted",
-        reason: eligibility.reason,
-        url: commentUrl(comment) ?? undefined,
-        headSha,
+    if (!dryRun && cursorPath && lastProcessedCandidate) {
+      writeProofLaneCursor(cursorPath, "proof_nudges", lastProcessedCandidate);
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.proofBinding,
+        filePath: cursorPath,
+        evidenceKind: "proof_nudge_cursor",
+        slot: "proof_nudge_cursor",
+        publicationKind: "cursor",
       });
     }
-    markProcessed(candidate);
-    nudgeCount += 1;
-    logProgress(`${dryRun ? "planned" : "posted"} proof nudge #${candidate.number}`);
+    ensureDir(dirname(reportPath));
+    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+    recordProofLaneResults(ledger, results);
+    recordProofLaneArtifact(ledger, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      filePath: reportPath,
+      evidenceKind: "proof_nudge_report",
+      slot: "proof_nudge_report",
+      publicationKind: "local_artifact",
+    });
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount: nudgeCount,
+      resultCount: results.length,
+    });
+    logProgress("finished proof nudges");
+    console.log(JSON.stringify(results, null, 2));
+  } catch (error) {
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount: nudgeCount,
+      resultCount: results.length,
+      error,
+    });
+    throw error;
   }
-  if (!dryRun && cursorPath && lastProcessedCandidate) {
-    writeProofLaneCursor(cursorPath, "proof_nudges", lastProcessedCandidate);
-  }
-  ensureDir(dirname(reportPath));
-  writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-  logProgress("finished proof nudges");
-  console.log(JSON.stringify(results, null, 2));
 }
 
 function botProofCommand(args: Args): void {
@@ -28070,161 +28571,221 @@ function botProofCommand(args: Args): void {
   const reportPath = resolve(stringArg(args.report_path, join(ROOT, "bot-proof-report.json")));
   const requestedItemNumbers = itemNumbersArg(args.item_numbers, args.item_number);
   const cursorPath = proofLaneCursorPath(args, requestedItemNumbers);
-
-  if (!existsSync(itemsDir)) {
-    const results: BotProofResult[] = [];
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    console.log(JSON.stringify(results, null, 2));
-    return;
-  }
-
-  const allCandidates = botProofCandidateRecords(itemsDir, requestedItemNumbers);
-  const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
-  const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+  const ledger = startProofLaneActionLedger({
+    lane: "bot_proof",
+    execute,
+    limit,
+    processedLimit,
+    requestedItemNumbers,
+    cursorEnabled: cursorPath !== null,
+  });
   const startedAtMs = Date.now();
   const results: BotProofResult[] = [];
   let processedCount = 0;
   let actionCount = 0;
   let lastProcessedCandidate: ProofLaneCandidate | null = null;
-  const markProcessed = (candidate: ProofLaneCandidate): void => {
-    processedCount += 1;
-    lastProcessedCandidate = candidate;
-  };
-  const logProgress = (message: string): void => {
-    const counts = results.reduce<Record<string, number>>((accumulator, result) => {
-      accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
-      return accumulator;
-    }, {});
-    console.error(
-      [
-        `[bot-proof] ${new Date().toISOString()} ${message}`,
-        `actions=${actionCount}/${limit}`,
-        `processed=${processedCount}/${processedLimit}`,
-        `dry_run=${dryRun}`,
-        `counts=${JSON.stringify(counts)}`,
-      ].join(" "),
-    );
-  };
 
-  logProgress(
-    `starting bot proof handling: candidates=${allCandidates.length} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
-  );
-  for (const candidate of candidates) {
-    if (actionCount >= limit) break;
-    if (processedCount >= processedLimit) break;
-    if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
-      results.push({
-        repo: targetRepo(),
-        number: 0,
-        action: "skipped_runtime_budget",
-        reason: `max runtime ${maxRuntimeMs}ms reached`,
+  try {
+    if (!existsSync(itemsDir)) {
+      ensureDir(dirname(reportPath));
+      writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.reviewLogPublication,
+        filePath: reportPath,
+        evidenceKind: "bot_proof_report",
+        slot: "bot_proof_report",
+        publicationKind: "local_artifact",
       });
-      logProgress(`stopping bot proof handling: max runtime ${maxRuntimeMs}ms reached`);
-      break;
+      finishProofLaneActionLedger(ledger, {
+        processedCount,
+        actionCount,
+        resultCount: results.length,
+      });
+      console.log(JSON.stringify(results, null, 2));
+      return;
     }
 
-    const resultBase = {
-      repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
-      number: candidate.number,
-      reviewedAt: candidate.reviewedAt,
+    const allCandidates = botProofCandidateRecords(itemsDir, requestedItemNumbers);
+    const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
+    const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+    const markProcessed = (candidate: ProofLaneCandidate): void => {
+      processedCount += 1;
+      lastProcessedCandidate = candidate;
     };
-    let item: Item;
-    let state: string;
-    let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
-    try {
-      const fetched = fetchItem(candidate.number);
-      item = fetched.item;
-      state = fetched.state;
-      pullDetails =
-        item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    if (state !== "open") {
-      results.push({
-        ...resultBase,
-        action: "skipped_not_open",
-        reason: `state is ${state}`,
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const eligibility = botProofEligibility({
-      item,
-      markdown: candidate.markdown,
-      headSha: pullDetails.headSha,
-      draft: pullDetails.draft,
-    });
-    if (!eligibility.eligible) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: eligibility.reason,
+    const logProgress = (message: string): void => {
+      const counts = results.reduce<Record<string, number>>((accumulator, result) => {
+        accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
+        return accumulator;
+      }, {});
+      console.error(
+        [
+          `[bot-proof] ${new Date().toISOString()} ${message}`,
+          `actions=${actionCount}/${limit}`,
+          `processed=${processedCount}/${processedLimit}`,
+          `dry_run=${dryRun}`,
+          `counts=${JSON.stringify(counts)}`,
+        ].join(" "),
+      );
+    };
+
+    logProgress(
+      `starting bot proof handling: candidates=${allCandidates.length} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
+    );
+    for (const candidate of candidates) {
+      if (actionCount >= limit) break;
+      if (processedCount >= processedLimit) break;
+      if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
+        results.push({
+          repo: targetRepo(),
+          number: 0,
+          action: "skipped_runtime_budget",
+          reason: `max runtime ${maxRuntimeMs}ms reached`,
+        });
+        logProgress(`stopping bot proof handling: max runtime ${maxRuntimeMs}ms reached`);
+        break;
+      }
+
+      const resultBase = {
+        repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
+        number: candidate.number,
+        reviewedAt: candidate.reviewedAt,
+      };
+      let item: Item;
+      let state: string;
+      let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
+      try {
+        const fetched = fetchItem(candidate.number);
+        item = fetched.item;
+        state = fetched.state;
+        pullDetails =
+          item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      if (state !== "open") {
+        results.push({
+          ...resultBase,
+          action: "skipped_not_open",
+          reason: `state is ${state}`,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const eligibility = botProofEligibility({
+        item,
+        markdown: candidate.markdown,
         headSha: pullDetails.headSha,
+        draft: pullDetails.draft,
       });
-      markProcessed(candidate);
-      continue;
-    }
-    const headSha = pullDetails.headSha;
-    if (!headSha) {
-      results.push({
-        ...resultBase,
-        action: "skipped_no_live_head",
-        reason: "live PR head SHA could not be inspected",
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const commentBody = renderBotProofDecisionComment({
-      item,
-      headSha,
-      markdown: candidate.markdown,
-      timestamp: new Date().toISOString(),
-      mantisRecommendation: eligibility.mantisRecommendation,
-    });
-    const labelResult = syncBotProofDecisionLabels({
-      number: candidate.number,
-      labels: item.labels,
-      dryRun,
-    });
-    if (dryRun) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+      if (!eligibility.eligible) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: eligibility.reason,
+          headSha: pullDetails.headSha,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const headSha = pullDetails.headSha;
+      if (!headSha) {
+        results.push({
+          ...resultBase,
+          action: "skipped_no_live_head",
+          reason: "live PR head SHA could not be inspected",
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const commentBody = renderBotProofDecisionComment({
+        item,
         headSha,
+        markdown: candidate.markdown,
+        timestamp: new Date().toISOString(),
+        mantisRecommendation: eligibility.mantisRecommendation,
       });
-    } else {
-      const comment = upsertBotProofDecisionComment(candidate.number, headSha, commentBody);
-      results.push({
-        ...resultBase,
-        action:
-          eligibility.action === "bot_proof_mantis_request_planned"
-            ? "bot_proof_mantis_request_posted"
-            : "bot_proof_decision_posted",
-        reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
-        url: commentUrl(comment) ?? undefined,
-        headSha,
+      const { labelResult, comment } = runWithProofLaneMutationRunner(
+        ledger,
+        proofLaneSubject(resultBase.repo, candidate.number, headSha),
+        () => {
+          const labelResult = syncBotProofDecisionLabels({
+            number: candidate.number,
+            labels: item.labels,
+            dryRun,
+          });
+          return {
+            labelResult,
+            comment: dryRun
+              ? undefined
+              : upsertBotProofDecisionComment(candidate.number, headSha, commentBody),
+          };
+        },
+      );
+      if (dryRun) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+          headSha,
+        });
+      } else {
+        results.push({
+          ...resultBase,
+          action:
+            eligibility.action === "bot_proof_mantis_request_planned"
+              ? "bot_proof_mantis_request_posted"
+              : "bot_proof_decision_posted",
+          reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+          url: commentUrl(comment) ?? undefined,
+          headSha,
+        });
+      }
+      markProcessed(candidate);
+      actionCount += 1;
+      logProgress(`${dryRun ? "planned" : "posted"} bot proof handling #${candidate.number}`);
+    }
+    if (!dryRun && cursorPath && lastProcessedCandidate) {
+      writeProofLaneCursor(cursorPath, "bot_proof", lastProcessedCandidate);
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.proofBinding,
+        filePath: cursorPath,
+        evidenceKind: "bot_proof_cursor",
+        slot: "bot_proof_cursor",
+        publicationKind: "cursor",
       });
     }
-    markProcessed(candidate);
-    actionCount += 1;
-    logProgress(`${dryRun ? "planned" : "posted"} bot proof handling #${candidate.number}`);
+    ensureDir(dirname(reportPath));
+    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+    recordProofLaneResults(ledger, results);
+    recordProofLaneArtifact(ledger, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      filePath: reportPath,
+      evidenceKind: "bot_proof_report",
+      slot: "bot_proof_report",
+      publicationKind: "local_artifact",
+    });
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount,
+      resultCount: results.length,
+    });
+    logProgress("finished bot proof handling");
+    console.log(JSON.stringify(results, null, 2));
+  } catch (error) {
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount,
+      resultCount: results.length,
+      error,
+    });
+    throw error;
   }
-  if (!dryRun && cursorPath && lastProcessedCandidate) {
-    writeProofLaneCursor(cursorPath, "bot_proof", lastProcessedCandidate);
-  }
-  ensureDir(dirname(reportPath));
-  writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-  logProgress("finished bot proof handling");
-  console.log(JSON.stringify(results, null, 2));
 }
 
 function applyArtifactsCommand(args: Args): void {
