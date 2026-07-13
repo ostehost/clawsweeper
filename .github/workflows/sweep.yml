@@ -930,6 +930,7 @@ jobs:
         run: |
           pnpm run repair:publish-main -- \
             --message "chore: record ClawSweeper event comment routing" \
+            --receipt-kind event_comment_router_state_publication \
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \
@@ -1455,6 +1456,11 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
+      - uses: ./clawsweeper/.github/actions/setup-action-ledger
+        id: plan-action-ledger
+        with:
+          worktree-path: clawsweeper
+
       - name: Resolve target repository
         id: target
         run: |
@@ -1509,12 +1515,14 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./clawsweeper/.github/actions/setup-state
+        id: plan-setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
           worktree-path: clawsweeper
           fetch-depth: 1
 
       - uses: ./clawsweeper/.github/actions/setup-pnpm
+        id: plan-setup-pnpm
         with:
           working-directory: clawsweeper
           build-script: build:all
@@ -1533,6 +1541,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           timeout 20s pnpm run repair:publish-main -- \
             --message "chore: mark sweep planning started" \
+            --receipt-kind sweep_planning_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs || echo "::warning::Skipped slow planning-started dashboard publish so candidate selection can start."
 
@@ -1835,8 +1844,54 @@ jobs:
             --capacity-reason "${{ steps.select.outputs.capacity_reason }}"
           timeout 20s pnpm run repair:publish-main -- \
             --message "chore: mark sweep review in progress" \
+            --receipt-kind sweep_planning_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs || echo "::warning::Skipped slow in-progress dashboard publish so review shards can start."
+
+      - name: Finalize planning state publication action ledger
+        id: finalize-planning-state-action-ledger
+        if: ${{ always() && steps.plan-action-ledger.outcome == 'success' && steps.plan-setup-pnpm.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/planning-state-action-ledger-finalize.json
+
+      - name: Import immutable planning state action ledger
+        id: import-planning-state-action-ledger
+        if: ${{ always() && steps.plan-setup-state.outcome == 'success' && steps.finalize-planning-state-action-ledger.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/planning-state-action-ledger-import.json"
+          event_paths_file=".artifacts/planning-state-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job plan \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Planning state action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+
+      - name: Publish immutable planning state action ledger
+        if: ${{ always() && steps.import-planning-state-action-ledger.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/planning-state-action-ledger-paths.txt \
+            --message "chore: append planning state action ledger"
 
   review:
     name: Review shard ${{ matrix.shard }} · ${{ needs.plan.outputs.target_repo }}#${{ matrix.item_numbers }}
@@ -2201,6 +2256,7 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-action-ledger
+        id: publish-action-ledger
         continue-on-error: true
 
       - name: Create target write token
@@ -2396,11 +2452,13 @@ jobs:
           fi
           pnpm run repair:publish-main -- \
             --message "chore: update sweep records" \
+            --receipt-kind sweep_review_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           echo "records_published=true" >> "$GITHUB_OUTPUT"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep status" \
+            --receipt-kind sweep_review_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
@@ -2641,17 +2699,19 @@ jobs:
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
           pnpm run repair:publish-main -- \
             --message "chore: sync selected review comments" \
+            --receipt-kind selected_review_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           pnpm run repair:publish-main -- \
             --message "chore: publish selected review comment status" \
+            --receipt-kind selected_review_status_publication \
             --path apply-report.json \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
       - name: Finalize selected review comment action ledger
         id: finalize-selected-review-comment-action-ledger
-        if: ${{ always() && steps.sync-selected-review-comments.outcome != 'skipped' }}
+        if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.setup-publish-pnpm.outcome == 'success' }}
         env:
           SELECTED_COMMENT_EXIT_CODE: ${{ steps.sync-selected-review-comments.outputs.exit_code || '' }}
           SELECTED_COMMENT_OUTCOME: ${{ steps.sync-selected-review-comments.outcome || 'not_started' }}
@@ -2661,13 +2721,15 @@ jobs:
             args=(--interrupt-open-attempts --reason cancelled)
           elif [ "$SELECTED_COMMENT_EXIT_CODE" = "124" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "137" ]; then
             args=(--interrupt-open-attempts --reason timeout)
-          elif [ "$SELECTED_COMMENT_OUTCOME" != "success" ]; then
+          elif [ "$SELECTED_COMMENT_OUTCOME" != "success" ] &&
+             [ "$SELECTED_COMMENT_OUTCOME" != "skipped" ] &&
+             [ "$SELECTED_COMMENT_OUTCOME" != "not_started" ]; then
             args=(--interrupt-open-attempts --reason workflow_failed)
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
       - name: Publish selected review comment action ledger
-        if: ${{ always() && steps.sync-selected-review-comments.outcome != 'skipped' && steps.finalize-selected-review-comment-action-ledger.outcome == 'success' }}
+        if: ${{ always() && steps.finalize-selected-review-comment-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -2921,6 +2983,15 @@ jobs:
           echo "exit_code=$retry_exit_code" >> "$GITHUB_OUTPUT"
           exit "$retry_exit_code"
 
+      - name: Publish failed-review retry state
+        if: ${{ always() && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
+        run: |
+          pnpm run repair:publish-main -- \
+            --message "chore: update failed review retry state" \
+            --receipt-kind failed_review_retry_state_publication \
+            --path results/failed-review-retries/openclaw-openclaw \
+            --rebase-strategy theirs
+
       - name: Finalize failed-review retry action ledger
         if: ${{ always() }}
         env:
@@ -2936,14 +3007,6 @@ jobs:
             args=(--interrupt-open-attempts --reason workflow_failed)
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
-
-      - name: Publish failed-review retry state
-        if: ${{ always() && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
-        run: |
-          pnpm run repair:publish-main -- \
-            --message "chore: update failed review retry state" \
-            --path results/failed-review-retries/openclaw-openclaw \
-            --rebase-strategy theirs
 
       - name: Publish failed-review retry action ledger
         if: ${{ always() }}
@@ -3008,6 +3071,9 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: audit-action-ledger
+
       - name: Resolve target repository
         id: target
         run: |
@@ -3068,10 +3134,12 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-state
+        id: audit-setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
 
       - uses: ./.github/actions/setup-pnpm
+        id: audit-setup-pnpm
         with:
           build-script: build:all
 
@@ -3102,14 +3170,58 @@ jobs:
           target_slug="${target_slug//\//-}"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep audit state" \
+            --receipt-kind sweep_audit_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           pnpm run repair:publish-main -- \
             --message "chore: publish sweep audit status" \
+            --receipt-kind sweep_audit_status_publication \
             --path README.md \
             --path "results/audit/${target_slug}.json" \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
+
+      - name: Finalize sweep audit state action ledger
+        id: finalize-audit-state-action-ledger
+        if: ${{ always() && steps.audit-action-ledger.outcome == 'success' && steps.audit-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/sweep-audit-state-action-ledger-finalize.json
+
+      - name: Import immutable sweep audit state action ledger
+        id: import-audit-state-action-ledger
+        if: ${{ always() && steps.audit-setup-state.outcome == 'success' && steps.finalize-audit-state-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/sweep-audit-state-action-ledger-import.json"
+          event_paths_file=".artifacts/sweep-audit-state-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job audit-dashboard \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Sweep audit state action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+
+      - name: Publish immutable sweep audit state action ledger
+        if: ${{ always() && steps.import-audit-state-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/sweep-audit-state-action-ledger-paths.txt \
+            --message "chore: append sweep audit state action ledger"
 
       - name: Refresh state dashboard
         env:
@@ -3891,6 +4003,21 @@ jobs:
         if: ${{ always() && !cancelled() && steps.apply-existing-run.outcome == 'success' }}
         run: echo "succeeded=true" >> "$GITHUB_OUTPUT"
 
+      - name: Retry final apply status publication
+        if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
+        run: |
+          if [ "${APPLY_NOOP:-false}" = "true" ]; then
+            echo "No proposed closes were ready; no final apply status to retry."
+            exit 0
+          fi
+          target_slug="$APPLY_TARGET_REPO"
+          target_slug="${target_slug//\//-}"
+          pnpm run repair:publish-main -- \
+            --message "chore: mark sweep apply finished" \
+            --receipt-kind sweep_apply_status_publication \
+            --path "results/sweep-status/${target_slug}.json" \
+            --rebase-strategy apply-records
+
       - name: Finalize apply action ledger
         if: ${{ always() }}
         env:
@@ -3903,20 +4030,6 @@ jobs:
             args=(--interrupt-open-attempts --reason workflow_failed)
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
-
-      - name: Retry final apply status publication
-        if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
-        run: |
-          if [ "${APPLY_NOOP:-false}" = "true" ]; then
-            echo "No proposed closes were ready; no final apply status to retry."
-            exit 0
-          fi
-          target_slug="$APPLY_TARGET_REPO"
-          target_slug="${target_slug//\//-}"
-          pnpm run repair:publish-main -- \
-            --message "chore: mark sweep apply finished" \
-            --path "results/sweep-status/${target_slug}.json" \
-            --rebase-strategy apply-records
 
       - name: Publish apply action events
         if: ${{ always() }}

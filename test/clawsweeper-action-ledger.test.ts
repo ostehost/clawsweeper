@@ -758,6 +758,8 @@ test("sweep publishes complete immutable shards for every review and apply produ
     "Publish review artifact action ledger",
     "Publish selected review comment action ledger",
     "Publish failed-review retry action ledger",
+    "Publish immutable planning state action ledger",
+    "Publish immutable sweep audit state action ledger",
     "Finalize exact event action ledger",
     "Publish exact event action ledger",
     "Publish late command status action ledger",
@@ -776,7 +778,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
   assert.match(workflow, /include-hidden-files: true/);
   assert.match(workflow, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
   assert.match(workflow, /durable_event_path="\$CLAWSWEEPER_STATE_DIR\/\$event_path"/);
-  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 9);
+  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 11);
   assert.doesNotMatch(
     workflow,
     /--message "chore: append (?:review|apply).*action ledger"[\s\S]{0,180}--path "ledger\/v1\/events"/,

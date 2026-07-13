@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import path from "node:path";
+
 import { publishMainCommit, type GitPublishOptions, type RebaseStrategy } from "./git-publish.js";
 import { repairPublicationContentDigest, runRepairMutation } from "./repair-action-ledger.js";
 
@@ -14,6 +16,7 @@ type Args = {
 };
 
 const args = parseArgs(process.argv.slice(2));
+assertPublicationReceipt(args.paths, args.receiptKind);
 const publishOptions: GitPublishOptions = {
   message: args.message,
   paths: args.paths,
@@ -83,6 +86,26 @@ function parseReceiptKind(value: string): string {
     throw new Error("--receipt-kind must be a bounded machine identifier");
   }
   return value;
+}
+
+function assertPublicationReceipt(paths: readonly string[], receiptKind?: string): void {
+  if (receiptKind) return;
+  const ledgerPaths = paths.filter(isImmutableLedgerPath);
+  if (ledgerPaths.length === paths.length) return;
+  if (ledgerPaths.length > 0) {
+    throw new Error(
+      "--receipt-kind is required when publishing a mixed ledger/non-ledger path set",
+    );
+  }
+  throw new Error(
+    "--receipt-kind is required for mutable state publication; only immutable ledger/ paths may be published without one",
+  );
+}
+
+function isImmutableLedgerPath(value: string): boolean {
+  if (value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:\//.test(value)) return false;
+  const normalized = path.posix.normalize(value);
+  return normalized === "ledger" || normalized.startsWith("ledger/");
 }
 
 function requiredValue(argv: readonly string[], index: number, flag: string): string {

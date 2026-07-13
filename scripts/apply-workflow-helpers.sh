@@ -54,12 +54,23 @@ publish_changes_with_strategy() {
   local rebase_strategy="$1"
   local message="$2"
   shift 2
-  local publish_args=(--message "$message" --rebase-strategy "$rebase_strategy")
+  local receipt_kind="sweep_apply_state_publication"
+  if [ "$rebase_strategy" = "reconcile-records" ]; then
+    receipt_kind="sweep_apply_records_publication"
+  fi
+  local publish_args=(
+    --message "$message"
+    --receipt-kind "$receipt_kind"
+    --rebase-strategy "$rebase_strategy"
+  )
+  CLAWSWEEPER_PUBLISH_MAIN_SEQUENCE=$(( ${CLAWSWEEPER_PUBLISH_MAIN_SEQUENCE:-0} + 1 ))
+  local action_ledger_invocation="publish-main-${CLAWSWEEPER_PUBLISH_MAIN_SEQUENCE}"
   local path
   for path in "$@"; do
     publish_args+=(--path "$path")
   done
-  pnpm run repair:publish-main -- "${publish_args[@]}"
+  CLAWSWEEPER_ACTION_LEDGER_INVOCATION="$action_ledger_invocation" \
+    pnpm run repair:publish-main -- "${publish_args[@]}"
 }
 
 publish_changes() {

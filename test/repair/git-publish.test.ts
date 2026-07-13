@@ -2181,7 +2181,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
   run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
   run("git", ["checkout", "-B", "main", "origin/main"], work);
 
-  write(path.join(work, "results/from-cli.txt"), "from cli\n");
+  write(path.join(work, "ledger/from-cli.txt"), "from cli\n");
   run(
     process.execPath,
     [
@@ -2190,7 +2190,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
       "--message",
       "chore: publish cli ledger",
       "--path",
-      "results",
+      "ledger/from-cli.txt",
       "--rebase-strategy",
       "theirs",
       "--max-attempts",
@@ -2202,7 +2202,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
   );
 
   assert.equal(
-    run("git", ["--git-dir", origin, "show", "main:results/from-cli.txt"], root),
+    run("git", ["--git-dir", origin, "show", "main:ledger/from-cli.txt"], root),
     "from cli\n",
   );
 });
