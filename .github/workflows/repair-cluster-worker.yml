@@ -1240,6 +1240,7 @@ jobs:
             --model "${{ inputs.model }}"
 
       - name: Publish terminal report-only status
+        id: publish_terminal_status
         if: ${{ needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success' }}
         continue-on-error: true
         env:
@@ -1254,6 +1255,16 @@ jobs:
             --detail "The automatic implementation worker stopped before all deterministic gates completed. Open the workflow run for the exact blocker." \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+      - name: Finalize report status repair action ledger
+        if: ${{ always() && steps.report-setup-pnpm.outcome == 'success' && steps.publish_terminal_status.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane report-status \
+            > .artifacts/report-repair-action-ledger-manifest.json
+
       - name: Finalize report command action ledger
         if: ${{ always() && steps.report-setup-pnpm.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         run: |
@@ -1264,31 +1275,59 @@ jobs:
             --lane report-requeue \
             > .artifacts/report-command-action-ledger-manifest.json
 
-      - name: Publish immutable report command action ledger
-        if: ${{ always() && steps.report-setup-pnpm.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+      - name: Publish immutable report action ledgers
+        if: ${{ always() && steps.report-setup-pnpm.outcome == 'success' && (steps.publish_terminal_status.outcome != 'skipped' || (steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0')) }}
+        env:
+          REPORT_STATUS_OUTCOME: ${{ steps.publish_terminal_status.outcome }}
+          REQUEUE_COUNT: ${{ steps.repair_requeue.outputs.count }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          manifest_file=".artifacts/report-command-action-ledger-manifest.json"
-          test -s "$manifest_file"
-          event_paths_file=".artifacts/report-command-action-ledger-paths.txt"
-          import_result_file=".artifacts/report-command-action-ledger-import.json"
-          pnpm run --silent repair:action-ledger -- publish \
-            --lane report-requeue \
-            --manifest "$manifest_file" \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
-          if ! jq -e --slurpfile manifest "$manifest_file" \
-            '.eventPaths == $manifest[0].event_paths' \
-            "$import_result_file" >/dev/null; then
-            echo "Imported report command action event paths do not match the finalized manifest." >&2
-            exit 1
+          event_paths_file=".artifacts/report-action-ledger-paths.txt"
+          : > "$event_paths_file"
+          publish_manifest() {
+            local family="$1"
+            local lane="$2"
+            local manifest_file="$3"
+            local import_result_file="$4"
+            local lane_args=()
+            if [ "$family" = "repair" ]; then
+              lane_args+=(--repair-lane "$lane")
+            else
+              lane_args+=(--lane "$lane")
+            fi
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- publish \
+              "${lane_args[@]}" \
+              --manifest "$manifest_file" \
+              --source-root "$source_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+            if ! jq -e --slurpfile manifest "$manifest_file" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$import_result_file" >/dev/null; then
+              echo "Imported report $family action event paths do not match the finalized manifest." >&2
+              exit 1
+            fi
+            jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+          }
+          if [ "$REPORT_STATUS_OUTCOME" != "skipped" ]; then
+            publish_manifest \
+              repair \
+              report-status \
+              .artifacts/report-repair-action-ledger-manifest.json \
+              .artifacts/report-repair-action-ledger-import.json
           fi
-          jq -r '.paths[]?' "$import_result_file" |
-            sort -u > "$event_paths_file"
+          if [ -n "$REQUEUE_COUNT" ] && [ "$REQUEUE_COUNT" != "0" ]; then
+            publish_manifest \
+              command \
+              report-requeue \
+              .artifacts/report-command-action-ledger-manifest.json \
+              .artifacts/report-command-action-ledger-import.json
+          fi
+          sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "Report command action event shards existed but no paths were imported." >&2
+            echo "Report action event shards existed but no paths were imported." >&2
             exit 1
           fi
           action_ledger_args=()
@@ -1300,7 +1339,7 @@ jobs:
             action_ledger_args+=(--path "$event_path")
           done < "$event_paths_file"
           pnpm run repair:publish-main -- \
-            --message "chore: append report command action ledger" \
+            --message "chore: append report action ledgers" \
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
 

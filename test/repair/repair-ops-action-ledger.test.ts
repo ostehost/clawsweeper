@@ -71,6 +71,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     workflow.indexOf("\n  mutate:"),
     workflow.indexOf("\n  publish-repair-action-ledger:"),
   );
+  const report = workflow.slice(workflow.indexOf("\n  report:"), workflow.indexOf("\n  mutate:"));
   const execute = workflow.slice(
     workflow.indexOf("\n  execute:"),
     workflow.indexOf("\n  validate:"),
@@ -128,6 +129,17 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     execute,
     /checkpoint_recovered \}\}" = "1"[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane execute/,
   );
+  assert.match(report, /id: publish_terminal_status/);
+  assert.match(report, /Finalize report status repair action ledger/);
+  assert.match(report, /--repair-lane report-status/);
+  assert.match(report, /Finalize report command action ledger/);
+  assert.match(report, /--lane report-requeue/);
+  assert.match(report, /Publish immutable report action ledgers/);
+  assert.match(
+    report,
+    /publish_manifest[\s\S]*repair[\s\S]*report-status[\s\S]*publish_manifest[\s\S]*command[\s\S]*report-requeue/,
+  );
+  assert.match(report, /--message "chore: append report action ledgers"/);
 
   assert.match(publisher, /name: Publish immutable repair action ledger/);
   assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
