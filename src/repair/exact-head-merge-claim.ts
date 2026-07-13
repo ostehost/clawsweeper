@@ -42,6 +42,7 @@ export type ExactHeadMergeClaimResult =
       claimId: number;
       lastClaimMutationId: number;
       lastClaimMutationAt: string | null;
+      claimMutationIds?: number[];
     }
   | {
       status: "existing";
@@ -54,6 +55,7 @@ export type ExactHeadMergeClaimResult =
       expectedSquashMessage: string | null;
       lastClaimMutationId: number;
       lastClaimMutationAt: string | null;
+      claimMutationIds?: number[];
     }
   | { status: "recovered"; reason: string; claimId: null }
   | { status: "blocked" | "unknown"; reason: string; claimId: null };
@@ -530,6 +532,7 @@ export function ensureExactHeadMergeClaim(
       claimId: winningClaim.id,
       lastClaimMutationId: winningClaim.id,
       lastClaimMutationAt: winningClaim.createdAt,
+      claimMutationIds: [winningClaim.id],
     };
   }
   const dispatch = matchingDispatch(confirmed.value, winningClaim.claim, winningClaim.id);
@@ -544,6 +547,11 @@ export function ensureExactHeadMergeClaim(
     expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
     lastClaimMutationId: dispatch?.id ?? winningClaim.id,
     lastClaimMutationAt: dispatch?.createdAt ?? winningClaim.createdAt,
+    claimMutationIds: matchingClaimMutationIds(
+      confirmed.value,
+      winningClaim.claim,
+      winningClaim.id,
+    ),
   };
 }
 
@@ -810,6 +818,7 @@ export function inspectExactHeadMergeClaim(
       expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
       lastClaimMutationId: dispatch?.id ?? active.id,
       lastClaimMutationAt: dispatch?.createdAt ?? active.createdAt,
+      claimMutationIds: matchingClaimMutationIds(inspected.value, active.claim, active.id),
     };
   }
   if (inspected.value.exactHistory) {
@@ -1264,6 +1273,25 @@ function matchingDispatch(
   return undefined;
 }
 
+function matchingClaimMutationIds(
+  inspected: InspectedClaims,
+  request: ParsedClaim,
+  claimId: number,
+): number[] {
+  return [
+    claimId,
+    ...inspected.dispatches
+      .filter(
+        (candidate) =>
+          candidate.dispatch.claimId === claimId &&
+          sameClaim(candidate.dispatch, request) &&
+          candidate.dispatch.owner === request.owner &&
+          candidate.dispatch.claimant === request.claimant,
+      )
+      .map((candidate) => candidate.id),
+  ];
+}
+
 function hasMatchingDispatch(
   inspected: InspectedClaims,
   request: ParsedClaim,
@@ -1433,16 +1461,21 @@ function commentTimestamp(comment: LooseRecord): string | null {
 
 export function exactHeadMergeClaimOwnsUpdatedAt(
   claim: {
+    claimId?: number | null;
     lastClaimMutationId?: number | null;
     lastClaimMutationAt?: string | null;
+    claimMutationIds?: number[];
   },
+  reviewedUpdatedAt: unknown,
   updatedAt: unknown,
   timeline: LooseRecord[],
 ): boolean {
+  const reviewedAt = normalizeTimestamp(reviewedUpdatedAt);
   const mutationId = Number(claim.lastClaimMutationId);
   const mutationAt = normalizeTimestamp(claim.lastClaimMutationAt);
   const liveUpdatedAt = normalizeTimestamp(updatedAt);
   if (
+    !reviewedAt ||
     !Number.isSafeInteger(mutationId) ||
     mutationId < 1 ||
     !mutationAt ||
@@ -1451,26 +1484,40 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
   ) {
     return false;
   }
+  const reviewedAtMs = Date.parse(reviewedAt);
   const mutationMs = Date.parse(mutationAt);
   const liveUpdatedAtMs = Date.parse(liveUpdatedAt);
   if (
+    mutationMs <= reviewedAtMs ||
     liveUpdatedAtMs < mutationMs ||
     liveUpdatedAtMs - mutationMs > CLAIM_ACTIVITY_PROPAGATION_MS
   ) {
     return false;
   }
+  const allowedMutationIds = new Set(
+    [
+      Number(claim.claimId),
+      mutationId,
+      ...(Array.isArray(claim.claimMutationIds) ? claim.claimMutationIds.map(Number) : []),
+    ].filter((value) => Number.isSafeInteger(value) && value > 0),
+  );
   let matchedMutation = false;
   for (const activity of timeline) {
     const activityAt = normalizeTimestamp(activity.updated_at ?? activity.created_at);
-    if (!activityAt || Date.parse(activityAt) < mutationMs) continue;
+    if (!activityAt) continue;
+    const activityAtMs = Date.parse(activityAt);
+    if (activityAtMs <= reviewedAtMs) continue;
+    const activityId = Number(activity.id);
     if (
-      Number(activity.id) !== mutationId ||
-      !exactHeadMergeUpdatedAtMatches(activityAt, mutationAt) ||
+      !allowedMutationIds.has(activityId) ||
       (activity.event !== undefined && String(activity.event) !== "commented")
     ) {
       return false;
     }
-    matchedMutation = true;
+    if (activityId === mutationId) {
+      if (!exactHeadMergeUpdatedAtMatches(activityAt, mutationAt)) return false;
+      matchedMutation = true;
+    }
   }
   return matchedMutation;
 }

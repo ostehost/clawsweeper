@@ -1562,7 +1562,7 @@ function applyMergeUpdatedAtMatches(
     const timeline = ghPaged<LooseRecord>(
       `repos/${request.repository}/issues/${request.number}/timeline?per_page=100`,
     );
-    return exactHeadMergeClaimOwnsUpdatedAt(claim, liveUpdatedAt, timeline);
+    return exactHeadMergeClaimOwnsUpdatedAt(claim, expectedUpdatedAt, liveUpdatedAt, timeline);
   } catch {
     return false;
   }

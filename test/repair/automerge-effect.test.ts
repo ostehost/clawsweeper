@@ -414,10 +414,29 @@ test("durable dispatch records distinguish claim-owned timestamp drift", () => {
   assert.equal(inspected.expectedSquashMessage, squashCommitMessage);
   assert.equal(inspected.lastClaimMutationId, 1452);
   assert.equal(inspected.lastClaimMutationAt, "2026-07-13T08:02:00.000Z");
-  const timeline = [{ ...comments[1], event: "commented" }];
-  assert.equal(exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:02:02Z", timeline), true);
+  const timeline = comments.map((comment) => ({ ...comment, event: "commented" }));
   assert.equal(
-    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:02:02Z", [
+    exactHeadMergeClaimOwnsUpdatedAt(
+      inspected,
+      "2026-07-13T08:00:00Z",
+      "2026-07-13T08:02:02Z",
+      timeline,
+    ),
+    true,
+  );
+  assert.equal(
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:00:00Z", "2026-07-13T08:02:02Z", [
+      {
+        id: 9998,
+        event: "commented",
+        created_at: "2026-07-13T08:00:30Z",
+      },
+      ...timeline,
+    ]),
+    false,
+  );
+  assert.equal(
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:00:00Z", "2026-07-13T08:02:02Z", [
       ...timeline,
       {
         id: 9999,
@@ -428,7 +447,12 @@ test("durable dispatch records distinguish claim-owned timestamp drift", () => {
     false,
   );
   assert.equal(
-    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:03:00Z", timeline),
+    exactHeadMergeClaimOwnsUpdatedAt(
+      inspected,
+      "2026-07-13T08:00:00Z",
+      "2026-07-13T08:03:00Z",
+      timeline,
+    ),
     false,
   );
 });
