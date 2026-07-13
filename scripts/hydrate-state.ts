@@ -7,6 +7,7 @@ const GENERATED_PATHS = [
   "jobs",
   "results",
   "assets",
+  "notifications",
   "apply-report.json",
   "repair-apply-report.json",
 ];

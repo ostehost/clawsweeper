@@ -42,6 +42,23 @@ test("buildApplyEvent maps ClawSweeper merge, close, and blocked events", () => 
   });
   assert.equal(close?.type, "clawsweeper.item_closed");
   assert.equal(close?.url, "https://github.com/openclaw/openclaw/issues/456");
+  const republishedClose = buildApplyEvent({
+    repo: "openclaw/openclaw",
+    target: "#456",
+    action: "close_duplicate",
+    status: "executed",
+    run_id: "stable-run",
+    published_at: "2026-05-03T10:00:00Z",
+  });
+  const originalClose = buildApplyEvent({
+    repo: "openclaw/openclaw",
+    target: "#456",
+    action: "close_duplicate",
+    status: "executed",
+    run_id: "stable-run",
+    published_at: "2026-05-02T10:00:00Z",
+  });
+  assert.equal(republishedClose?.key, originalClose?.key);
 
   const blocked = buildApplyEvent({
     repo: "openclaw/openclaw",
@@ -84,6 +101,18 @@ test("buildFixEvent maps opened fix PRs and repair failures", () => {
   );
   assert.equal(opened?.type, "clawsweeper.fix_pr_opened");
   assert.equal(opened?.target, "#42");
+  assert.equal(
+    opened?.key,
+    buildFixEvent(
+      {
+        action: "open_fix_pr",
+        status: "opened",
+        pr: "https://github.com/openclaw/openclaw/pull/42",
+        branch: "clawsweeper-repair/fix",
+      },
+      { ...record, published_at: "2026-05-03T10:00:00Z" },
+    )?.key,
+  );
 
   const failed = buildFixEvent(
     {
@@ -395,11 +424,16 @@ test("runClawSweeperEventNotifier mirrors events to the live status dashboard", 
   );
 
   const hookRequests: { body: Record<string, unknown>; auth: string | null }[] = [];
-  const dashboardRequests: { body: Record<string, unknown>; auth: string | null }[] = [];
+  const dashboardRequests: {
+    body: Record<string, unknown>;
+    auth: string | null;
+    idempotency: string | null;
+  }[] = [];
   const mockFetch: typeof fetch = async (input, init) => {
     const request = {
       body: JSON.parse(String(init?.body)),
       auth: new Headers(init?.headers).get("authorization"),
+      idempotency: new Headers(init?.headers).get("idempotency-key"),
     };
     if (String(input).startsWith("https://status.example/")) {
       dashboardRequests.push(request);
@@ -428,8 +462,10 @@ test("runClawSweeperEventNotifier mirrors events to the live status dashboard", 
   assert.equal(hookRequests.length, 1);
   assert.equal(dashboardRequests.length, 1);
   assert.equal(dashboardRequests[0]?.auth, "Bearer status-secret");
+  assert.match(String(dashboardRequests[0]?.idempotency), /^clawsweeper-event:[a-f0-9]{64}$/);
   assert.deepEqual(dashboardRequests[0]?.body, {
     event_type: "clawsweeper.item_closed",
+    idempotency_key: dashboardRequests[0]?.idempotency,
     mode: "item_closed",
     stage: "close_duplicate",
     status: "executed",

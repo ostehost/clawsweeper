@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -197,7 +198,7 @@ export function buildApplyEvent(row: JsonObject): ClawSweeperEvent | null {
         type: "clawsweeper.pr_merged",
         severity: "info",
         url: target ? `https://github.com/${repo}/pull/${target.slice(1)}` : null,
-        discriminator: commit ?? stringOrNull(row.merged_at) ?? publishedAt ?? runId,
+        discriminator: commit ?? stringOrNull(row.merged_at) ?? runId ?? clusterId ?? reason,
         details: row,
       });
     }
@@ -207,7 +208,7 @@ export function buildApplyEvent(row: JsonObject): ClawSweeperEvent | null {
         type: "clawsweeper.merge_blocked",
         severity: status === "failed" ? "error" : "warning",
         url: target ? `https://github.com/${repo}/pull/${target.slice(1)}` : null,
-        discriminator: reason ?? publishedAt ?? runId,
+        discriminator: reason ?? runId ?? clusterId,
         details: row,
       });
     }
@@ -220,7 +221,7 @@ export function buildApplyEvent(row: JsonObject): ClawSweeperEvent | null {
         type: "clawsweeper.item_closed",
         severity: "info",
         url: target ? `https://github.com/${repo}/issues/${target.slice(1)}` : null,
-        discriminator: publishedAt ?? runId ?? reason,
+        discriminator: runId ?? clusterId ?? reason,
         details: row,
       });
     }
@@ -230,7 +231,7 @@ export function buildApplyEvent(row: JsonObject): ClawSweeperEvent | null {
         type: "clawsweeper.close_blocked",
         severity: status === "failed" ? "error" : "warning",
         url: target ? `https://github.com/${repo}/issues/${target.slice(1)}` : null,
-        discriminator: reason ?? publishedAt ?? runId,
+        discriminator: reason ?? runId ?? clusterId,
         details: row,
       });
     }
@@ -273,8 +274,9 @@ export function buildFixEvent(row: JsonObject, record: JsonObject): ClawSweeperE
       stringOrNull(row.commit) ??
       stringOrNull(row.branch) ??
       stringOrNull(row.pr) ??
-      stringOrNull(record.published_at) ??
-      stringOrNull(record.run_id),
+      stringOrNull(record.run_id) ??
+      stringOrNull(record.cluster_id) ??
+      stringOrNull(row.reason),
     details: row,
   });
 }
@@ -658,6 +660,7 @@ async function postStatusDashboardEvent({
     headers: {
       Authorization: `Bearer ${config.token}`,
       "Content-Type": "application/json",
+      "Idempotency-Key": event.idempotencyKey,
     },
     body: JSON.stringify(statusDashboardPayload(event)),
   });
@@ -693,6 +696,7 @@ function statusDashboardPayload(event: ClawSweeperEvent): JsonObject {
     : 0;
   return {
     event_type: event.type,
+    idempotency_key: event.idempotencyKey,
     mode: event.type.replace(/^clawsweeper\./, ""),
     stage: event.action,
     status: event.status,
@@ -748,7 +752,7 @@ function createEvent(params: {
   ].join(":");
   return {
     key,
-    idempotencyKey: key,
+    idempotencyKey: `clawsweeper-event:${createHash("sha256").update(key).digest("hex")}`,
     type: params.type,
     severity: params.severity,
     repo: params.repo,
@@ -903,7 +907,7 @@ function writeEventReportIfRequested({
   pending: number;
   actions: JsonObject[];
 }): void {
-  if (actions.length === 0 && !Boolean(args["write-report"])) return;
+  if (actions.length === 0 && !args["write-report"]) return;
   const reportPath = path.resolve(root, stringArg(args.report) ?? DEFAULT_REPORT_PATH);
   writeJsonFile(reportPath, {
     version: 1,
