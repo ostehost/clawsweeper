@@ -706,7 +706,7 @@ function assertPriorCommitActionLedgerProducer(
     source.producer.repository !== current.repository ||
     source.producer.sha !== current.sha ||
     source.producer.workflow !== current.workflow ||
-    source.producer.job !== "review" ||
+    source.producer.job !== "attest" ||
     source.producer.run_id !== current.runId ||
     source.producer.run_attempt > current.runAttempt
   ) {

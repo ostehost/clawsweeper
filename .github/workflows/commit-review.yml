@@ -499,7 +499,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: commit-review-raw-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: commit-artifacts
           if-no-files-found: ignore
 
@@ -533,15 +533,34 @@ jobs:
         with:
           build-script: build
 
+      - name: Resolve raw commit review artifact
+        id: raw-review-artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"
+        run: |
+          pnpm run --silent repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix "commit-review-raw-${{ matrix.sha }}"
+
       - uses: actions/download-artifact@v8
         with:
-          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: commit-artifacts
+          artifact-ids: ${{ steps.raw-review-artifact.outputs.artifact_id }}
+          path: raw-commit-artifacts
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       - name: Attest immutable commit review report
         run: |
           set -euo pipefail
-          report_path="$(find commit-artifacts -type f -name '${{ matrix.sha }}.md' -print -quit)"
+          rm -rf trusted-commit-artifacts
+          mkdir -p trusted-commit-artifacts
+          cp -R raw-commit-artifacts/. trusted-commit-artifacts/
+          report_path="$(find trusted-commit-artifacts -type f -name '${{ matrix.sha }}.md' -print -quit)"
           if [ -z "$report_path" ]; then
             echo "Missing report artifact for ${{ matrix.sha }}" >&2
             exit 1
@@ -559,6 +578,15 @@ jobs:
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane "commit-review-${{ matrix.sha }}" \
             > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Upload attested commit review report
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trusted-commit-artifacts
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Upload commit review action ledger
         if: ${{ always() && steps.attest-setup-pnpm.outcome == 'success' }}
@@ -824,6 +852,22 @@ jobs:
               --report-path "$report_path" \
               --report-relative-path "$relative_path" \
               --report-repo "${{ github.repository }}"
+          done
+
+      - name: Finalize commit reviews without checks
+        if: ${{ needs.plan.outputs.planned_count != '0' && needs.plan.outputs.create_checks != 'true' }}
+        run: |
+          set -euo pipefail
+          find commit-artifacts -name '*.md' -print0 | while IFS= read -r -d '' report_path; do
+            sha="$(basename "$report_path" .md)"
+            node dist/commit-sweeper.js finish-review \
+              --target-repo "${{ needs.plan.outputs.target_repo }}" \
+              --commit-sha "$sha" \
+              --report-path "$report_path" \
+              --review-outcome success \
+              --check-outcome skipped \
+              --checks-requested false \
+              --start-workflow
           done
 
       - name: Continue commit review range

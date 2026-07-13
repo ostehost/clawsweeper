@@ -381,6 +381,8 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(attestor, /setup-action-ledger/);
   assert.match(attestor, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
   assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
+  assert.match(attestor, /commit-review-raw-\$\{\{ matrix\.sha \}\}/);
+  assert.match(attestor, /Upload attested commit review report/);
   assert.match(attestor, /--report-path "\$report_path"/);
   assert.ok(
     attestor.indexOf("- name: Attest immutable commit review report") <
@@ -392,7 +394,7 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(
     review,
-    /commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+    /commit-review-raw-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
   assert.match(review, /codex-logs-commit-review-\$\{\{ matrix\.sha \}\}/);
   assert.match(
@@ -523,6 +525,23 @@ test("commit review and notification workflows publish their operation receipts"
   }
   assert.ok((activity.match(/--allow-empty/g) ?? []).length >= 2);
   assert.match(activity, /if \[ ! -s "\$paths_file" \]; then[\s\S]*exit 0/);
+});
+
+test("merge claim recovery reads ClawSweeper workflow state with central credentials", () => {
+  const router = readText(".github/workflows/repair-comment-router.yml");
+  const worker = readText(".github/workflows/repair-cluster-worker.yml");
+  const sweep = readText(".github/workflows/sweep.yml");
+
+  assert.equal(
+    [
+      ...router.matchAll(
+        /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ steps\.dispatch-token\.outputs\.token \}\}/g,
+      ),
+    ].length,
+    2,
+  );
+  assert.match(worker, /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(sweep, /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ github\.token \}\}/);
 });
 
 test("issue implementation intake finalizes and publishes source-bound status receipts", () => {

@@ -22,7 +22,11 @@ import { publishCheckFromReport, splitFrontMatter } from "./commit-checks.js";
 import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweeper-args.js";
 import { safeOutputTail } from "./clawsweeper-text.js";
 import { codexEnv, codexLoginConfig, codexModelArgs, PUBLIC_CODEX_MODEL } from "./codex-env.js";
-import { codexProcessErrorCode, runCodexProcess } from "./codex-process.js";
+import {
+  codexProcessErrorCode,
+  runCodexProcess,
+  type CodexProcessResult,
+} from "./codex-process.js";
 import { runText } from "./command.js";
 import {
   configuredRepositoryProfileFor,
@@ -362,7 +366,9 @@ function runCodex(options: {
     eventIdentity: { sha: options.sha },
   });
   if (options.serviceTier) codexConfig.splice(1, 0, `service_tier="${options.serviceTier}"`);
-  const result = runCodexProcess({
+  const processEnv = codexEnv({ ghToken: process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN });
+  const redactionSecrets = commitReviewRedactionSecrets(processEnv);
+  const rawResult = runCodexProcess({
     args: [
       "exec",
       ...codexModelArgs(options.model),
@@ -377,12 +383,16 @@ function runCodex(options: {
       "-",
     ],
     cwd: options.targetDir,
-    env: codexEnv({ ghToken: process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN }),
+    env: processEnv,
     input: readFileSync(promptPath, "utf8"),
     stdoutPath,
     stderrPath,
     timeoutMs: options.timeoutMs,
   });
+  for (const artifactPath of [promptPath, outputPath, stdoutPath, stderrPath]) {
+    redactCommitReviewFile(artifactPath, redactionSecrets);
+  }
+  const result = redactCommitReviewProcessResult(rawResult, redactionSecrets);
   recordCommitArtifactPrepared(lifecycle, {
     path: stdoutPath,
     kind: "commit_review_jsonl",
@@ -438,6 +448,55 @@ function runCodex(options: {
     eventIdentity: { sha: options.sha },
   });
   return stripMarkdownFence(readFileSync(outputPath, "utf8"));
+}
+
+const COMMIT_REVIEW_SECRET_ENV = [
+  "COMMIT_SWEEPER_TARGET_GH_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+] as const;
+
+function commitReviewRedactionSecrets(env: NodeJS.ProcessEnv): string[] {
+  return [
+    ...new Set(
+      COMMIT_REVIEW_SECRET_ENV.map((name) => String(env[name] ?? "").trim()).filter(
+        (value) => value.length >= 6,
+      ),
+    ),
+  ].sort((left, right) => right.length - left.length);
+}
+
+function redactCommitReviewText(value: string, secrets: readonly string[]): string {
+  return secrets.reduce((redacted, secret) => redacted.split(secret).join("[REDACTED]"), value);
+}
+
+function redactCommitReviewFile(file: string, secrets: readonly string[]): void {
+  if (secrets.length === 0 || !existsSync(file)) return;
+  const contents = readFileSync(file, "utf8");
+  const redacted = redactCommitReviewText(contents, secrets);
+  if (redacted !== contents) writeFileSync(file, redacted, "utf8");
+}
+
+function redactCommitReviewProcessResult(
+  result: CodexProcessResult,
+  secrets: readonly string[],
+): CodexProcessResult {
+  if (secrets.length === 0) return result;
+  let error: Error | undefined;
+  if (result.error) {
+    error = new Error(redactCommitReviewText(result.error.message, secrets));
+    error.name = result.error.name;
+    const code = codexProcessErrorCode(result.error);
+    if (code) (error as NodeJS.ErrnoException).code = code;
+  }
+  return {
+    ...result,
+    ...(error ? { error } : {}),
+    stdout: redactCommitReviewText(result.stdout, secrets),
+    stderr: redactCommitReviewText(result.stderr, secrets),
+  };
 }
 
 function reviewCommand(args: Args): void {
@@ -737,6 +796,7 @@ function finishReviewCommand(args: Args): void {
   const checksRequested = argBool(args, "checks_requested");
   const reportPath = argString(args, "report_path", "");
   const reportResult = commitReviewReportResult(reportPath);
+  if (argBool(args, "start_workflow")) recordCommitWorkflowEvent(lifecycle, "started");
   if (
     commitReviewLifecycleSucceeded({
       reviewOutcome,
@@ -767,7 +827,6 @@ function attestReviewCommand(args: Args): void {
   const sha = assertSha(argString(args, "commit_sha", ""));
   const reportPath = resolve(argString(args, "report_path", ""));
   const lifecycle = commitLifecycle(targetRepo, sha);
-  recordCommitWorkflowEvent(lifecycle, "started");
   try {
     if (!existsSync(reportPath)) throw new Error("commit review report is missing");
     const markdown = readFileSync(reportPath, "utf8");
@@ -800,7 +859,6 @@ function attestReviewCommand(args: Args): void {
       reviewMode: "commit_review",
       eventIdentity: { sha, reportResult },
     });
-    recordCommitWorkflowEvent(lifecycle, "completed");
   } catch (error) {
     recordCommitLifecycleEvent(lifecycle, {
       type: ACTION_EVENT_TYPES.reviewFailed,
@@ -812,10 +870,7 @@ function attestReviewCommand(args: Args): void {
       reviewMode: "commit_review",
       eventIdentity: { sha },
     });
-    recordCommitWorkflowEvent(lifecycle, "failed", error);
     throw error;
-  } finally {
-    recordCommitWorkflowEvent(lifecycle, "finalized");
   }
 }
 

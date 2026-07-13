@@ -21,6 +21,8 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
   assert.match(attestor, /setup-action-ledger/);
   assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
   assert.match(attestor, /--report-path "\$report_path"/);
+  assert.match(attestor, /Resolve raw commit review artifact/);
+  assert.match(attestor, /Upload attested commit review report/);
   assert.match(attestor, /Finalize commit review action ledger/);
 });
 
@@ -64,7 +66,8 @@ if (process.env.CLAWSWEEPER_INTERNAL_MODEL) {
 }
 const outputIndex = args.indexOf("--output-last-message");
 const outputPath = args[outputIndex + 1];
-process.stdout.write(JSON.stringify({ type: "thread.started", marker: "stream-start" }) + "\\n");
+const token = process.env.GH_TOKEN;
+process.stdout.write(JSON.stringify({ type: "thread.started", marker: "stream-start", token }) + "\\n");
 for (let index = 0; index < 1600; index += 1) {
   process.stdout.write(JSON.stringify({
     type: "item.completed",
@@ -73,7 +76,7 @@ for (let index = 0; index < 1600; index += 1) {
   }) + "\\n");
 }
 process.stdout.write(JSON.stringify({ type: "turn.completed", marker: "stream-end" }) + "\\n");
-process.stderr.write("stderr-start\\n");
+process.stderr.write("stderr-start token=" + token + "\\n");
 process.stderr.write("diagnostic\\n".repeat(7000));
 process.stderr.write("stderr-end\\n");
 fs.writeFileSync(outputPath, [
@@ -84,6 +87,8 @@ fs.writeFileSync(outputPath, [
   "---",
   "",
   "# Commit Review",
+  "",
+  "Credential echo: " + token,
   "",
   "No findings.",
   ""
@@ -122,6 +127,7 @@ fs.writeFileSync(outputPath, [
         env: {
           ...process.env,
           CLAWSWEEPER_INTERNAL_MODEL: "private-model-name",
+          COMMIT_SWEEPER_TARGET_GH_TOKEN: "ghs_review-secret-token-123456",
           CODEX_BIN: codexPath,
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         },
@@ -134,6 +140,8 @@ fs.writeFileSync(outputPath, [
     assert.doesNotMatch(invocation.join(" "), /private-model-name/);
 
     const jsonl = fs.readFileSync(path.join(workDir, `${sha}.jsonl`), "utf8");
+    assert.doesNotMatch(jsonl, /ghs_review-secret-token-123456/);
+    assert.match(jsonl, /\[REDACTED\]/);
     assert.ok(Buffer.byteLength(jsonl) > 64 * 1024);
     const events = jsonl
       .trim()
@@ -144,10 +152,16 @@ fs.writeFileSync(outputPath, [
     assert.equal(events.length, 1602);
 
     const stderr = fs.readFileSync(path.join(workDir, `${sha}.stderr.log`), "utf8");
+    assert.doesNotMatch(stderr, /ghs_review-secret-token-123456/);
+    assert.match(stderr, /\[REDACTED\]/);
     assert.ok(Buffer.byteLength(stderr) > 64 * 1024);
-    assert.match(stderr, /^stderr-start\n/);
+    assert.match(stderr, /^stderr-start token=\[REDACTED\]\n/);
     assert.match(stderr, /stderr-end\n$/);
-    assert.ok(fs.existsSync(path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`)));
+    const reportPath = path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`);
+    assert.ok(fs.existsSync(reportPath));
+    const report = fs.readFileSync(reportPath, "utf8");
+    assert.doesNotMatch(report, /ghs_review-secret-token-123456/);
+    assert.match(report, /\[REDACTED\]/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

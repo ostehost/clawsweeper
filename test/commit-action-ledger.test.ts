@@ -665,7 +665,7 @@ test("trusted commit review attestation binds the immutable report before public
       events
         .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
         .map((event) => event.attributes?.state),
-      ["started", "completed", "finalized"],
+      [],
     );
   } finally {
     restoreEnv(previous);
@@ -717,6 +717,9 @@ test("commit check publisher owns every privileged check write and installs atte
 
   assert.doesNotMatch(review, /setup-action-ledger|permission-checks: write|publish-check/);
   assert.match(attestor, /attest-review/);
+  assert.match(attestor, /Resolve raw commit review artifact/);
+  assert.match(attestor, /--prefix "commit-review-raw-\$\{\{ matrix\.sha \}\}"/);
+  assert.match(attestor, /Upload attested commit review report/);
   assert.match(publisher, /commit-review-action-ledger-causality\.json/);
   assert.match(publisher, /CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=/);
   assert.match(publisher, /--expected-job attest/);
@@ -727,6 +730,10 @@ test("commit check publisher owns every privileged check write and installs atte
   assert.match(
     publisher,
     /find commit-artifacts[\s\S]*node dist\/commit-sweeper\.js publish-check/,
+  );
+  assert.match(
+    publisher,
+    /Finalize commit reviews without checks[\s\S]*finish-review[\s\S]*--start-workflow/,
   );
   assert.ok(
     publisher.indexOf("repair:action-ledger -- verify") <
@@ -749,7 +756,9 @@ test("commit check retries continue authenticated shard causality", async () => 
   const identity = { sha: lifecycle.sha, reportSha256: "c".repeat(64) };
 
   try {
-    Object.assign(process.env, workflowEnv(reviewRoot, reviewOutput));
+    Object.assign(process.env, workflowEnv(reviewRoot, reviewOutput), {
+      GITHUB_JOB: "attest",
+    });
     runCommitMutation(lifecycle, {
       kind: "commit_check_publication",
       identity,
@@ -854,7 +863,7 @@ test("commit check causality rejects unauthenticated prior shards before the wir
       repository: recordedProducer.repository,
       sha: recordedProducer.sha,
       workflow: recordedProducer.workflow,
-      job: "publish",
+      job: "review",
       run_id: recordedProducer.run_id,
       run_attempt: recordedProducer.run_attempt,
     };
