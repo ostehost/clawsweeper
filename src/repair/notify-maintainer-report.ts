@@ -16,6 +16,7 @@ import {
 import {
   deliverRetriedNotification,
   recordNotificationPhase,
+  recordNotificationPreflightFailureSafely,
 } from "./notification-action-ledger.js";
 
 export type MaintainerReportPointer = {
@@ -127,20 +128,27 @@ export async function runMaintainerReportNotifier(
   const deliver = boolEnv(env.CLAWSWEEPER_MAINTAINER_REPORT_DELIVER, true);
   const accessHeaders = resolveReportsAccessHeaders(env);
   const repository = env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper";
+  const preliminaryNotificationLedgerInput = {
+    repository,
+    key: `maintainer-report:${date?.trim() || "latest"}`,
+  };
 
-  const pointer = await fetchReportPointer({
-    fetcher,
-    baseUrl,
-    publicBaseUrl,
-    ...(accessHeaders ? { headers: accessHeaders } : {}),
-    ...(date ? { date } : {}),
-  });
+  let pointer: MaintainerReportPointer | null;
+  try {
+    pointer = await fetchReportPointer({
+      fetcher,
+      baseUrl,
+      publicBaseUrl,
+      ...(accessHeaders ? { headers: accessHeaders } : {}),
+      ...(date ? { date } : {}),
+    });
+  } catch (error) {
+    recordNotificationPreflightFailureSafely(preliminaryNotificationLedgerInput, error);
+    throw error;
+  }
   if (!pointer) {
     recordNotificationPhase(
-      {
-        repository,
-        key: `maintainer-report:${date?.trim() || "latest"}`,
-      },
+      preliminaryNotificationLedgerInput,
       "skipped",
       "report_not_found",
     );
@@ -149,13 +157,28 @@ export async function runMaintainerReportNotifier(
     return summary;
   }
 
-  const report = await fetchJson(fetcher, pointer.dataUrl, accessHeaders);
-  const message = renderMaintainerReportMessage({ report, reportUrl: pointer.reportUrl });
-  const config = resolveOpenClawHookConfig(env);
   const notificationLedgerInput = {
     repository,
     key: `maintainer-report:${pointer.date}`,
   };
+  let prepared: {
+    report: JsonObject;
+    message: string;
+    config: ReturnType<typeof resolveOpenClawHookConfig>;
+  };
+  try {
+    const report = await fetchJson(fetcher, pointer.dataUrl, accessHeaders);
+    const message = renderMaintainerReportMessage({ report, reportUrl: pointer.reportUrl });
+    prepared = {
+      report,
+      message,
+      config: resolveOpenClawHookConfig(env),
+    };
+  } catch (error) {
+    recordNotificationPreflightFailureSafely(notificationLedgerInput, error);
+    throw error;
+  }
+  const { report, message, config } = prepared;
   if (!config) {
     recordNotificationPhase(notificationLedgerInput, "skipped", "not_configured");
     if (args["write-report"]) {

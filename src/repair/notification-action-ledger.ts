@@ -88,6 +88,36 @@ export function recordNotificationPhaseSafely(
   }
 }
 
+export function recordNotificationPreflightFailureSafely(
+  input: NotificationLedgerInput,
+  error: unknown,
+  report: (message: string) => void = console.error,
+): void {
+  try {
+    recordRepairLifecycleEvent(notificationLifecycle(input), {
+      type: ACTION_EVENT_TYPES.notificationFailed,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.exception,
+      mutation: false,
+      retryable: true,
+      component: "notification",
+      operation: "notification",
+      state: "failed",
+      completionReason: "preflight_failed",
+      eventIdentity: {
+        key: input.key,
+        errorKind: error instanceof Error ? error.name : typeof error,
+      },
+    });
+  } catch (receiptError) {
+    report(
+      `[action-ledger] failed to record notification preflight failure after the primary failure: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
+}
+
 export async function deliverNotificationAttempt<T>(
   input: NotificationLedgerInput,
   options: {
