@@ -550,6 +550,130 @@ test("accepted and ambiguous durable receipts prevent notification claim replay"
   }
 });
 
+test("definitive rejection receipts recover notification claims from producer directories", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-claim-rejected-")),
+  );
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    path.join(root, "repair-apply-report.json"),
+    `${JSON.stringify([
+      {
+        repo: "openclaw/openclaw",
+        target: "#123",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:00:00Z",
+      },
+    ])}\n`,
+  );
+  const baseEnv = {
+    CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+    CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+    CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_JOB: "notification",
+    GITHUB_RUN_ID: "5252",
+    GITHUB_RUN_ATTEMPT: "1",
+  };
+  const previous = { ...process.env };
+
+  try {
+    await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root,
+      env: baseEnv,
+      now: () => new Date("2026-05-02T11:00:00Z"),
+      log: () => undefined,
+    });
+    const claim = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+
+    Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+    await assert.rejects(
+      deliverNotificationAttempt(
+        {
+          repository: claim.repo,
+          key: claim.key,
+          number: 123,
+        },
+        {
+          kind: "notification_delivery",
+          destination: "openclaw_hook",
+          knownNoMutation: () => true,
+          operation: async () => {
+            throw new Error("definitive rejection");
+          },
+        },
+      ),
+      /definitive rejection/,
+    );
+    await flushRepairActionEvents();
+    restoreEnv(previous);
+
+    const producerDirectories = walk(outputRoot)
+      .filter((entry) => entry.endsWith(".jsonl"))
+      .map((entry) => path.basename(path.dirname(entry)));
+    assert.deepEqual(
+      [...new Set(producerDirectories)],
+      ["notification.notify.notification-receipt-test"],
+    );
+
+    const recovered = await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root,
+      env: {
+        ...baseEnv,
+        CLAWSWEEPER_STATE_DIR: outputRoot,
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/actions/runs/5252/attempts/1")) {
+          return Response.json({
+            id: 5252,
+            run_attempt: 1,
+            status: "completed",
+            created_at: "2026-07-12T10:00:00Z",
+          });
+        }
+        assert.match(url, /actions\/runs\/5252\/attempts\/1\/jobs\?/);
+        return Response.json({
+          total_count: 1,
+          jobs: [
+            {
+              run_id: 5252,
+              run_attempt: 1,
+              status: "completed",
+              steps: [
+                { name: "Commit notification claims", conclusion: "success" },
+                {
+                  name: "Notify OpenClaw about ClawSweeper events",
+                  conclusion: "failure",
+                },
+              ],
+            },
+          ],
+        });
+      },
+      now: () => new Date("2026-05-02T11:02:00Z"),
+      log: () => undefined,
+    });
+
+    assert.equal(recovered.skipped, 0);
+    assert.equal(recovered.pending, 1);
+    const recoveredClaim = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(recoveredClaim.deliveryStatus, "hook_claimed");
+    assert.equal(recoveredClaim.claimRunAttempt, "2");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("permanent hook rejection records a terminal no-mutation notification", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-hook-rejected-")),

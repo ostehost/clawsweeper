@@ -127,6 +127,9 @@ const UNSAFE_NOTIFICATION_COMPLETION_REASONS = new Set([
   "mutation_observed",
   "mutation_outcome_unknown",
 ]);
+const NOTIFICATION_RECEIPT_PRODUCER_PATTERN = /^notification\.[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+$/;
+const MAX_NOTIFICATION_RECEIPT_PRODUCERS = 32;
+const MAX_NOTIFICATION_RECEIPT_SHARDS = 32;
 
 export function normalizeEventLedger(value: JsonValue): ClawSweeperEventLedger {
   const object = asJsonObject(value);
@@ -1012,7 +1015,7 @@ function readDurableNotificationReceiptEvents(
     .map((value) => fs.realpathSync(value));
   const byId = new Map<string, ActionEvent>();
   for (const sourceRoot of roots) {
-    const eventDirectory = path.join(
+    const repositoryDirectory = path.join(
       sourceRoot,
       "ledger",
       "v1",
@@ -1021,26 +1024,61 @@ function readDurableNotificationReceiptEvents(
       month!,
       date!,
       slugForRepo(workflowRepository),
-      "notification",
     );
-    if (!fs.existsSync(eventDirectory)) continue;
+    if (!fs.existsSync(repositoryDirectory)) continue;
+    const producerDirectories = notificationReceiptProducerDirectories(repositoryDirectory);
     const prefix = `${owner.runId}-${owner.runAttempt}-${job}-`;
-    const files = fs
-      .readdirSync(eventDirectory, { withFileTypes: true })
-      .filter((entry) => entry.name.startsWith(prefix) && entry.name.endsWith(".jsonl"));
-    if (files.length > 32) throw new Error("notification receipt shard count is invalid");
-    for (const file of files) {
-      if (!file.isFile()) throw new Error(`notification receipt shard is not a file: ${file.name}`);
-      for (const event of readActionEventShard(path.join(eventDirectory, file.name))) {
-        const existing = byId.get(event.event_id);
-        if (existing && JSON.stringify(existing) !== JSON.stringify(event)) {
-          throw new Error(`conflicting durable notification receipt ${event.event_id}`);
+    let shardCount = 0;
+    for (const eventDirectory of producerDirectories) {
+      const files = fs
+        .readdirSync(eventDirectory, { withFileTypes: true })
+        .filter((entry) => entry.name.startsWith(prefix) && entry.name.endsWith(".jsonl"));
+      shardCount += files.length;
+      if (shardCount > MAX_NOTIFICATION_RECEIPT_SHARDS) {
+        throw new Error("notification receipt shard count is invalid");
+      }
+      for (const file of files) {
+        if (!file.isFile()) {
+          throw new Error(`notification receipt shard is not a file: ${file.name}`);
         }
-        byId.set(event.event_id, existing ?? event);
+        for (const event of readActionEventShard(path.join(eventDirectory, file.name))) {
+          const existing = byId.get(event.event_id);
+          if (existing && JSON.stringify(existing) !== JSON.stringify(event)) {
+            throw new Error(`conflicting durable notification receipt ${event.event_id}`);
+          }
+          byId.set(event.event_id, existing ?? event);
+        }
       }
     }
   }
   return [...byId.values()];
+}
+
+function notificationReceiptProducerDirectories(repositoryDirectory: string): string[] {
+  const resolvedRepositoryDirectory = path.resolve(repositoryDirectory);
+  if (fs.realpathSync(repositoryDirectory) !== resolvedRepositoryDirectory) {
+    throw new Error("notification receipt repository directory is invalid");
+  }
+  const candidates = fs
+    .readdirSync(repositoryDirectory, { withFileTypes: true })
+    .filter((entry) => entry.name.startsWith("notification."));
+  if (candidates.length > MAX_NOTIFICATION_RECEIPT_PRODUCERS) {
+    throw new Error("notification receipt producer directory count is invalid");
+  }
+  return candidates.map((entry) => {
+    if (
+      !entry.isDirectory() ||
+      entry.name.length > 120 ||
+      !NOTIFICATION_RECEIPT_PRODUCER_PATTERN.test(entry.name)
+    ) {
+      throw new Error(`notification receipt producer directory is invalid: ${entry.name}`);
+    }
+    const directory = path.join(repositoryDirectory, entry.name);
+    if (fs.realpathSync(directory) !== path.resolve(directory)) {
+      throw new Error(`notification receipt producer directory is invalid: ${entry.name}`);
+    }
+    return directory;
+  });
 }
 
 function workflowRunPartitionDate(run: JsonObject): string | null {
