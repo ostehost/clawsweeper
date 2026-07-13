@@ -1427,7 +1427,7 @@ test("review interruption recovery aggregates coordination comment mutations", (
   assert.equal(recoveredBatch.action.mutation, true);
 });
 
-test("interruption recovery preserves any earlier unknown mutation outcome", () => {
+test("interruption recovery preserves unresolved unknowns and ignores observed ones", () => {
   const root = tempRoot();
   const env = workflowEnv({
     CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-unknown-then-accepted",
@@ -1566,6 +1566,45 @@ test("interruption recovery preserves any earlier unknown mutation outcome", () 
 
   const unknown = recordAttempt("a".repeat(64), "unknown", 11);
   recordAttempt("b".repeat(64), "accepted", 21);
+  const observedIdentity = {
+    operation: "apply",
+    slot: "apply_mutation",
+    repository: "openclaw/openclaw",
+    number: 54,
+    sourceRevision: "revision-54",
+    mutationIdentitySha256: "c".repeat(64),
+  };
+  const observedUnknown = recordAttempt("c".repeat(64), "unknown", 31);
+  const observed = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.executed,
+      reasonCode: ACTION_EVENT_REASON_CODES.alreadyComplete,
+      retryable: false,
+      mutation: true,
+      identity: {
+        slot: "apply_mutation_outcome",
+        mutationIdentitySha256: "c".repeat(64),
+        outcome: "observed",
+      },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: observedUnknown.event_id,
+      phaseSeq: 33,
+      idempotencyIdentity: observedIdentity,
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        sourceRevision: "revision-54",
+      },
+      attributes: { completion_reason: "mutation_observed" },
+    },
+    { env },
+  );
+  assert.ok(observed);
 
   assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
   const allEvents = readAllSpooledActionEvents(root);

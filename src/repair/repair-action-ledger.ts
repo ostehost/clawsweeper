@@ -104,6 +104,13 @@ export type RepairMutationOptions<T> = {
   knownNoMutation?: (error: unknown) => boolean;
 };
 
+export type RepairMutationObservationOptions = {
+  kind: string;
+  identity: unknown;
+  operationName?: string;
+  component?: string;
+};
+
 export function repairMutationIdempotencyIdentity(
   input: RepairLifecycleInput,
   options: {
@@ -154,6 +161,7 @@ const REPAIR_CAUSAL_MANIFEST_LANE = "cluster";
 const REPAIR_CAUSAL_PRODUCER_JOB = "cluster";
 const TERMINAL_MUTATION_COMPLETION_REASONS = new Set([
   "mutation_accepted",
+  "mutation_observed",
   "mutation_rejected",
   "mutation_outcome_unknown",
 ]);
@@ -361,6 +369,34 @@ export function runRepairMutation<T>(
     "after the successful operation",
   );
   return result;
+}
+
+export function recordRepairMutationObservedSafely(
+  input: RepairLifecycleInput,
+  options: RepairMutationObservationOptions,
+): void {
+  try {
+    const kind = machineText(options.kind, "github_mutation");
+    const operation = machineText(options.operationName ?? "repair", "repair");
+    const requestSha256 = stableDigest(options.identity);
+    recordRepairLifecycleEvent(input, {
+      type: ACTION_EVENT_TYPES.repairMutation,
+      status: ACTION_EVENT_STATUSES.executed,
+      reasonCode: ACTION_EVENT_REASON_CODES.alreadyComplete,
+      mutation: true,
+      retryable: false,
+      component: options.component ?? "repair_mutation",
+      operation,
+      eventIdentity: { kind, requestSha256, outcome: "observed" },
+      idempotencyIdentity: repairMutationIdempotencyIdentity(input, options),
+      completionReason: "mutation_observed",
+      state: "mutation_observed",
+    });
+  } catch (error) {
+    console.error(
+      `[action-ledger] failed to record observed ${options.kind} mutation: ${errorText(error)}`,
+    );
+  }
 }
 
 export async function runRepairMutationAsync<T>(
@@ -788,19 +824,23 @@ function repairMutationState(
   mutationObserved: boolean;
   uncertainMutationObserved: boolean;
 } {
-  let mutationObserved = false;
-  let uncertainMutationObserved = false;
+  const outcomes = new Map<string, { observed: boolean; unknown: boolean; phaseSeq: number }>();
   for (const event of repairAttemptEvents(input, operation)) {
     if (event.event_type !== ACTION_EVENT_TYPES.repairMutation) continue;
     const completionReason = String(event.attributes?.completion_reason ?? "");
-    if (
-      completionReason === "mutation_accepted" ||
-      completionReason === "mutation_outcome_unknown"
-    ) {
-      mutationObserved = true;
+    const key = event.idempotency_key_sha256;
+    if (!key) continue;
+    const current = outcomes.get(key) ?? { observed: false, unknown: false, phaseSeq: 0 };
+    if (event.phase_seq < current.phaseSeq) continue;
+    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+      outcomes.set(key, { observed: true, unknown: false, phaseSeq: event.phase_seq });
+    } else if (completionReason === "mutation_outcome_unknown" && !current.observed) {
+      outcomes.set(key, { observed: false, unknown: true, phaseSeq: event.phase_seq });
     }
-    if (completionReason === "mutation_outcome_unknown") uncertainMutationObserved = true;
   }
+  const states = [...outcomes.values()];
+  const mutationObserved = states.some((state) => state.observed || state.unknown);
+  const uncertainMutationObserved = states.some((state) => state.unknown && !state.observed);
   return { mutationObserved, uncertainMutationObserved };
 }
 

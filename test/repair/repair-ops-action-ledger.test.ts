@@ -337,7 +337,11 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   assert.match(postFlight, /post_flight_merge/);
   assert.match(postFlight, /closeout_comment/);
   assert.match(postFlight, /source_pull_request_closeout/);
-  assert.match(postFlight, /\(\) => ghText\(mergeArgs\)/);
+  assert.match(
+    postFlight,
+    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*outcome:[\s\S]*"accepted"[\s\S]*"unknown"/,
+  );
+  assert.match(postFlight, /recordRepairMutationObservedSafely\(/);
   assert.match(postFlight, /\(\) => ghText\(\["pr", "close"/);
   assert.doesNotMatch(postFlight, /\(\) => ghWithRetry\(mergeArgs\)/);
   assert.doesNotMatch(postFlight, /\(\) => ghWithRetry\(\["pr", "close"/);

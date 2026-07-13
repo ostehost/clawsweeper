@@ -40,6 +40,7 @@ import {
   verifyPublishedPullContext,
 } from "./execution-handoff.js";
 import {
+  recordRepairMutationObservedSafely,
   recordRepairWorkflowEvent,
   repairSourceRevision,
   repairWorkflowTerminalPhase,
@@ -253,6 +254,7 @@ function finalizeFixPr(action: LooseRecord) {
           reason: "merged pull request head does not match the authorized repair commit",
         };
       }
+      recordPostFlightMergeObserved(parsed.number, action.commit);
       return {
         ...prBase,
         status: "executed",
@@ -394,12 +396,7 @@ function finalizeFixPr(action: LooseRecord) {
         }
         const mutation = runRepairMutation(postFlightLifecycle(null), {
           kind: "post_flight_merge",
-          identity: {
-            repo: result.repo,
-            number: parsed.number,
-            headSha: action.commit ?? null,
-            method: "squash",
-          },
+          identity: postFlightMergeMutationIdentity(parsed.number, action.commit),
           component: "post_flight",
           operation: () => {
             try {
@@ -434,6 +431,7 @@ function finalizeFixPr(action: LooseRecord) {
       view = reconciliation.view;
       prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
       if (reconciliation.mergedAt) {
+        recordPostFlightMergeObserved(parsed.number, action.commit);
         return {
           ...prBase,
           status: "executed",
@@ -587,6 +585,23 @@ function reconcileMergeState(number: number, expectedHeadSha: JsonValue) {
     };
   }
   return { pull, view, mergedAt, block: "" };
+}
+
+function postFlightMergeMutationIdentity(number: number, headSha: JsonValue) {
+  return {
+    repo: result.repo,
+    number,
+    headSha: headSha ?? null,
+    method: "squash",
+  };
+}
+
+function recordPostFlightMergeObserved(number: number, headSha: JsonValue) {
+  recordRepairMutationObservedSafely(postFlightLifecycle(null), {
+    kind: "post_flight_merge",
+    identity: postFlightMergeMutationIdentity(number, headSha),
+    component: "post_flight",
+  });
 }
 
 function postFlightMergeRetryBlock({

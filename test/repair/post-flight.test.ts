@@ -546,6 +546,10 @@ test("post-flight rechecks live security immediately before privileged mutations
     /mergeAttempt\.policyBlock[\s\S]*const confirmation = mergeAttempt\.confirmation[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
   );
   assert.match(
+    finalizeFixPr,
+    /if \(mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)[\s\S]*if \(reconciliation\.mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)/,
+  );
+  assert.match(
     source,
     /function reconcileMergeState[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*mergedHead !== expectedHeadSha/,
   );
@@ -601,6 +605,8 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       FAKE_GH_MERGE_COUNT_FILE: fixture.mergeCountPath,
       FAKE_GH_COMMENTS_COUNT_FILE: fixture.commentsCountPath,
       FAKE_GH_FAILURE_COMMENTS_FILE: fixture.failureCommentsPath,
+      FAKE_GH_DELAYED_MERGE_FILE: fixture.delayedMergePath,
+      FAKE_GH_CONFIRMATION_COUNT_FILE: fixture.confirmationCountPath,
       GITHUB_ACTION: "post_flight",
       GITHUB_JOB: "mutate",
       GITHUB_REPOSITORY: "openclaw/clawsweeper",
@@ -622,6 +628,18 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
       ["started", "mutation_attempted"],
       ["executed", "mutation_accepted"],
+    ]);
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "delayed_ambiguous" }, 0);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(report.actions[0]?.reason, "merge confirmed after ambiguous response");
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+      ["executed", "mutation_observed"],
     ]);
 
     fixture.reset();
@@ -665,10 +683,31 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
     assert.equal(fs.existsSync(fixture.mergedPath), false);
-    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+    let queueEvents = finalizeVerifiedActionLedger(fixture, commonEnv);
+    assert.deepEqual(mutationReceiptStates(queueEvents), [
       ["started", "mutation_attempted"],
       ["failed", "mutation_outcome_unknown"],
     ]);
+    fs.writeFileSync(fixture.mergedPath, "1");
+    fs.rmSync(fixture.reportPath, { force: true });
+    const observedEnv = {
+      ...commonEnv,
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-observe",
+      GITHUB_RUN_ATTEMPT: "2",
+    };
+    runVerifiedPostFlight(fixture, observedEnv, 0);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(report.actions[0]?.reason, "already merged");
+    queueEvents = finalizeVerifiedActionLedger(fixture, observedEnv);
+    assert.ok(
+      queueEvents.some(
+        (event) =>
+          event.event_type === "repair.mutation" &&
+          event.action.status === "executed" &&
+          event.attributes?.completion_reason === "mutation_observed",
+      ),
+    );
 
     fixture.reset();
     runVerifiedPostFlight(
@@ -1072,6 +1111,8 @@ function createVerifiedMergeFixture() {
   const mergeCountPath = path.join(root, "merge-count.txt");
   const commentsCountPath = path.join(root, "comments-count.txt");
   const failureCommentsPath = path.join(root, "failure-comments.txt");
+  const delayedMergePath = path.join(root, "delayed-merge.txt");
+  const confirmationCountPath = path.join(root, "confirmation-count.txt");
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
   const clusterId = "automerge-openclaw-openclaw-123";
@@ -1321,7 +1362,10 @@ function createVerifiedMergeFixture() {
       "const fixture = JSON.parse(fs.readFileSync(process.env.FAKE_GH_PULL_FILE, 'utf8'));",
       "const pull = fixture.target;",
       "const sourcePull = fixture.source;",
-      "const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE);",
+      "const delayedMerge = fs.existsSync(process.env.FAKE_GH_DELAYED_MERGE_FILE);",
+      "let confirmationCount = fs.existsSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, 'utf8')) : 0;",
+      "if (delayedMerge && args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { confirmationCount += 1; fs.writeFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, String(confirmationCount)); }",
+      "const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE) || (delayedMerge && confirmationCount >= 2);",
       "const mergeCount = () => fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, 'utf8')) : 0;",
       "if (merged) { pull.state = 'closed'; pull.merged_at = '2026-07-13T08:00:00Z'; pull.merge_commit_sha = 'b'.repeat(40); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
@@ -1349,6 +1393,7 @@ function createVerifiedMergeFixture() {
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'ambiguous') { fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1'); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
+      "  if (process.env.FAKE_GH_MERGE_MODE === 'delayed_ambiguous') { fs.writeFileSync(process.env.FAKE_GH_DELAYED_MERGE_FILE, '1'); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'transient' && count === 1) { const comments = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; fs.writeFileSync(process.env.FAKE_GH_FAILURE_COMMENTS_FILE, String(comments)); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'queue') process.exit(0);",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
@@ -1377,6 +1422,8 @@ function createVerifiedMergeFixture() {
     mergeCountPath,
     commentsCountPath,
     failureCommentsPath,
+    delayedMergePath,
+    confirmationCountPath,
     ledgerRoot,
     ledgerOutputRoot,
     reset() {
@@ -1384,6 +1431,8 @@ function createVerifiedMergeFixture() {
       fs.rmSync(mergeCountPath, { force: true });
       fs.rmSync(commentsCountPath, { force: true });
       fs.rmSync(failureCommentsPath, { force: true });
+      fs.rmSync(delayedMergePath, { force: true });
+      fs.rmSync(confirmationCountPath, { force: true });
       fs.rmSync(ledgerRoot, { recursive: true, force: true });
       fs.rmSync(ledgerOutputRoot, { recursive: true, force: true });
       fs.mkdirSync(ledgerRoot);

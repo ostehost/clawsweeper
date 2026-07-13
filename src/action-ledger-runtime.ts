@@ -471,9 +471,39 @@ function workflowActionEventIsUncertainMutationStart(event: ActionEvent): boolea
 function workflowActionEventIsMutationOutcome(event: ActionEvent): boolean {
   return (
     event.attributes?.completion_reason === "mutation_accepted" ||
+    event.attributes?.completion_reason === "mutation_observed" ||
     event.attributes?.completion_reason === "mutation_rejected" ||
     event.attributes?.completion_reason === "mutation_outcome_unknown"
   );
+}
+
+function workflowActionUnresolvedUnknownMutation(
+  events: readonly ActionEvent[],
+): ActionEvent | undefined {
+  const observed = new Set<string>();
+  const unresolved = new Map<string, ActionEvent>();
+  let dispatchUnknown: ActionEvent | undefined;
+  for (const event of [...events].sort(
+    (left, right) =>
+      left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+  )) {
+    const completionReason = event.attributes?.completion_reason;
+    const key = event.idempotency_key_sha256;
+    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+      observed.add(key);
+      unresolved.delete(key);
+    } else if (completionReason === "mutation_outcome_unknown" && !observed.has(key)) {
+      unresolved.set(key, event);
+    } else if (completionReason === "dispatch_outcome_unknown") {
+      dispatchUnknown = event;
+    }
+  }
+  return [...unresolved.values(), ...(dispatchUnknown ? [dispatchUnknown] : [])]
+    .sort(
+      (left, right) =>
+        left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+    )
+    .at(-1);
 }
 
 function workflowActionRecoveryPriority(event: ActionEvent): number {
@@ -667,13 +697,8 @@ export function interruptOpenWorkflowActionEvents(
         const relevantMutationEvents = aggregatesChildMutations
           ? mutationEvents
           : lifecycleMutations;
-        const unknownMutationOutcome = relevantMutationEvents
-          .filter(
-            (event) =>
-              event.attributes?.completion_reason === "mutation_outcome_unknown" ||
-              event.attributes?.completion_reason === "dispatch_outcome_unknown",
-          )
-          .at(-1);
+        const unknownMutationOutcome =
+          workflowActionUnresolvedUnknownMutation(relevantMutationEvents);
         const uncertainMutation = openUncertainMutation || unknownMutationOutcome !== undefined;
         const mutationOccurred =
           workflowActionEventIsUncertainMutationStart(start) ||
