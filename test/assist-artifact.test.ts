@@ -243,6 +243,7 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.doesNotMatch(workflow, /inputs\.reasoning_effort|client_payload\.reasoning_effort/);
 
   assert.match(generation, /Create read-only GitHub App token/);
+  assert.match(generation, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.ok(
     generation.indexOf("Resolve validated target repository") <
       generation.indexOf("Create read-only GitHub App token"),
@@ -260,6 +261,10 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(generation, /generation_attempt=\$GITHUB_RUN_ATTEMPT/);
   assert.match(generation, /actions\/upload-artifact@v7/);
   assert.match(generation, /include-hidden-files: true/);
+  assert.match(
+    generation,
+    /action-ledger-assist-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
   assert.doesNotMatch(generation, /permission-issues: write/);
   assert.doesNotMatch(generation, /write_token|Create narrow GitHub App write token/);
 
@@ -269,6 +274,8 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.ok(validateIndex >= 0 && validateIndex < tokenIndex && tokenIndex < mutateIndex);
   assert.match(publish, /runs-on: ubuntu-latest/);
   assert.match(publish, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(publish, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(publish, /uses: \.\/\.github\/actions\/setup-state/);
   assert.match(publish, /Verify exact workflow source/);
   assert.ok(
     publish.indexOf("Resolve validated target repository") <
@@ -286,6 +293,10 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(publish, /GH_TOKEN: \$\{\{ steps\.write_token\.outputs\.token \}\}/);
   assert.match(publish, /assist-validate/);
   assert.match(publish, /assist-publish/);
+  assert.equal(publish.match(/publish-action-events/g)?.length, 2);
+  assert.match(publish, /--expected-producer-job assist/);
+  assert.match(publish, /--expected-producer-job "\$GITHUB_JOB"/);
+  assert.match(publish, /publish-action-event-paths/);
   assert.doesNotMatch(publish, /setup-codex|OPENAI_API_KEY|CLAWSWEEPER_INTERNAL_MODEL/);
   assert.ok(publish.indexOf("GH_TOKEN:") > tokenIndex);
   assert.match(
@@ -296,5 +307,9 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(source, /readBoundedUtf8File\([\s\S]*ASSIST_ARTIFACT_MAX_BYTES/);
   assert.match(source, /findOwnedCommentByMarker[\s\S]*canPatchReviewComment/);
   assert.match(source, /live\.sourceComment\?\.htmlUrl \?\? request\.sourceCommentUrl/);
+  assert.match(source, /ACTION_EVENT_TYPES\.reviewLogPublication/);
+  assert.match(source, /ACTION_EVENT_TYPES\.reviewCommentPublication/);
+  assert.match(source, /assistCommentMutationRunner/);
+  assert.match(source, /ghObservedMutationCommand\(\{[\s\S]*assist_comment/);
   assert.doesNotMatch(source, /idempotency marker is owned by a non-ClawSweeper comment/);
 });

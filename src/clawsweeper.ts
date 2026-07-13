@@ -83,6 +83,7 @@ import {
   ASSIST_ANSWER_MAX_BYTES,
   ASSIST_ARTIFACT_MAX_BYTES,
   assertAssistArtifactLiveRevision,
+  assistRequestSha256,
   assistSourceCommentSha256,
   createAssistArtifact,
   parseAssistArtifact,
@@ -9994,27 +9995,34 @@ function publishIdempotentAssistComment(
 ): "posted" | "updated" | "unchanged" {
   if (existing && existing.body === body) return "unchanged";
   const payload = writeCommentPayload(number, body);
+  const mutationIdentity = `assist_comment:${targetRepo()}:${number}:${sha256(body)}`;
   const existingId =
     typeof existing?.id === "number" || typeof existing?.id === "string" ? existing.id : null;
   if (existingId) {
-    ghWithRetry([
-      "api",
-      `repos/${targetRepo()}/issues/comments/${existingId}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payload,
-    ]);
+    ghObservedMutationCommand({
+      identity: `${mutationIdentity}:update`,
+      args: [
+        "api",
+        `repos/${targetRepo()}/issues/comments/${existingId}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payload,
+      ],
+    });
     return "updated";
   }
-  ghWithRetry([
-    "api",
-    `repos/${targetRepo()}/issues/${number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payload,
-  ]);
+  ghObservedMutationCommand({
+    identity: `${mutationIdentity}:post`,
+    args: [
+      "api",
+      `repos/${targetRepo()}/issues/${number}/comments`,
+      "--method",
+      "POST",
+      "--input",
+      payload,
+    ],
+  });
   return "posted";
 }
 
@@ -30067,6 +30075,292 @@ function assistPromptContextDigest(item: Item, context: ItemContext): string {
   );
 }
 
+type AssistActionLedger = {
+  operationIdentity: {
+    repository: string;
+    number: number;
+    kind: ItemKind;
+    sourceRevision: string;
+    requestSha256: string;
+    mode: string;
+    lens: string;
+  };
+  subject: ActionEventSubject;
+  lastEventId: string | null;
+  nextPhaseSeq: number;
+  startedAtMs: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+};
+
+function assistActionLedgerIdentity(options: {
+  repository: string;
+  number: number;
+  kind: ItemKind;
+  sourceRevision: string;
+  requestSha256: string;
+  mode: string;
+  lens: string;
+}) {
+  return {
+    repository: options.repository,
+    number: options.number,
+    kind: options.kind,
+    sourceRevision: options.sourceRevision,
+    requestSha256: options.requestSha256,
+    mode: options.mode,
+    lens: options.lens,
+  };
+}
+
+function startAssistActionLedger(options: {
+  operationIdentity: AssistActionLedger["operationIdentity"];
+  component: "assist_generate" | "assist_publish";
+  phase: typeof ACTION_EVENT_TYPES.reviewItem | typeof ACTION_EVENT_TYPES.reviewCommentPublication;
+  evidence?: readonly ActionEventEvidence[];
+}): AssistActionLedger {
+  const subject: ActionEventSubject = {
+    repository: options.operationIdentity.repository,
+    kind: options.operationIdentity.kind,
+    number: options.operationIdentity.number,
+    sourceRevision: options.operationIdentity.sourceRevision,
+  };
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "assist_start" },
+    operation: "assist",
+    operationIdentity: options.operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: {
+      operationIdentity: options.operationIdentity,
+      slot: "assist_start",
+      component: options.component,
+    },
+    component: options.component,
+    subject,
+    evidence: [...workflowRunEvidence(), ...(options.evidence ?? [])],
+    attributes: {
+      review_mode: options.operationIdentity.mode,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  return {
+    operationIdentity: options.operationIdentity,
+    subject,
+    lastEventId: start?.event_id ?? null,
+    nextPhaseSeq: 2,
+    startedAtMs: Date.now(),
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+  };
+}
+
+function nextAssistActionPhase(ledger: AssistActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function recordAssistGenerationLog(
+  ledger: AssistActionLedger,
+  options: {
+    outputPath: string;
+    model: string;
+    reasoningEffort: string;
+    failure?: unknown;
+  },
+): void {
+  const outputEvidence = actionLedgerFileEvidence("assist_review_output", options.outputPath);
+  const failure =
+    options.failure === undefined ? null : actionLedgerFailureDisposition(options.failure);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: outputEvidence
+      ? ACTION_EVENT_STATUSES.completed
+      : (failure?.status ?? ACTION_EVENT_STATUSES.skipped),
+    reasonCode: outputEvidence
+      ? ACTION_EVENT_REASON_CODES.completed
+      : (failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.notFound),
+    retryable: failure !== null,
+    mutation: false,
+    identity: { slot: "assist_review_output" },
+    operation: "assist",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextAssistActionPhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "assist_review_output",
+    },
+    component: "assist_generate",
+    subject: ledger.subject,
+    evidence: [...workflowRunEvidence(), ...(outputEvidence ? [outputEvidence] : [])],
+    attributes: {
+      log_count: outputEvidence ? 1 : 0,
+      log_kind: "assist_review",
+      publication_kind: "local_artifact",
+      model: options.model,
+      reasoning_effort: options.reasoningEffort,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function finishAssistActionLedger(
+  ledger: AssistActionLedger,
+  options: {
+    component: "assist_generate" | "assist_publish";
+    phase:
+      | typeof ACTION_EVENT_TYPES.reviewItem
+      | typeof ACTION_EVENT_TYPES.reviewCommentPublication;
+    status: ActionEventStatus;
+    reasonCode: ActionEventReasonCode;
+    retryable: boolean;
+    mutation: boolean;
+    completionReason: string;
+    evidence?: readonly ActionEventEvidence[];
+    publicationKind?: string;
+  },
+): void {
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: options.status,
+    reasonCode: options.reasonCode,
+    retryable: options.retryable && !ledger.uncertainMutationObserved,
+    mutation: options.mutation || ledger.mutationObserved,
+    identity: { slot: "assist_terminal", completionReason: options.completionReason },
+    operation: "assist",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextAssistActionPhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "assist_terminal",
+      component: options.component,
+    },
+    component: options.component,
+    subject: ledger.subject,
+    evidence: [...workflowRunEvidence(), ...(options.evidence ?? [])],
+    attributes: {
+      completion_reason: options.completionReason,
+      duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
+      review_mode: ledger.operationIdentity.mode,
+      ...(options.publicationKind ? { publication_kind: options.publicationKind } : {}),
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function assistCommentMutationRunner(ledger: AssistActionLedger): MutationRunner {
+  let requestAttempt = 0;
+  return <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    requestAttempt += 1;
+    const mutationIdentitySha256 = sha256(options.idempotencyIdentity);
+    const attempt = recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: true,
+      mutation: false,
+      identity: {
+        slot: "assist_comment_mutation_attempt",
+        requestAttempt,
+        requestIdentitySha256: sha256(options.identity),
+      },
+      operation: "assist",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.lastEventId,
+      phaseSeq: nextAssistActionPhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        slot: "assist_comment_mutation",
+        mutationIdentitySha256,
+      },
+      component: "assist_publish",
+      subject: ledger.subject,
+      evidence: workflowRunEvidence(),
+      attributes: {
+        attempt: requestAttempt,
+        publication_kind: "github_comment",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
+    const finish = (outcome: "accepted" | "rejected" | "unknown"): void => {
+      const mutation = outcome !== "rejected";
+      const event = recordWorkflowPhaseEvent(ROOT, {
+        phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+        status:
+          outcome === "accepted"
+            ? ACTION_EVENT_STATUSES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_STATUSES.skipped
+              : ACTION_EVENT_STATUSES.failed,
+        reasonCode:
+          outcome === "accepted"
+            ? ACTION_EVENT_REASON_CODES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_REASON_CODES.notApplicable
+              : ACTION_EVENT_REASON_CODES.unavailable,
+        retryable: outcome === "unknown",
+        mutation,
+        identity: {
+          slot: "assist_comment_mutation_outcome",
+          requestAttempt,
+          requestIdentitySha256: sha256(options.identity),
+          outcome,
+        },
+        operation: "assist",
+        operationIdentity: ledger.operationIdentity,
+        parentEventId: attempt?.event_id ?? ledger.lastEventId,
+        phaseSeq: nextAssistActionPhase(ledger),
+        idempotencyIdentity: {
+          operationIdentity: ledger.operationIdentity,
+          slot: "assist_comment_mutation",
+          mutationIdentitySha256,
+        },
+        component: "assist_publish",
+        subject: ledger.subject,
+        evidence: workflowRunEvidence(),
+        attributes: {
+          attempt: requestAttempt,
+          publication_kind: "github_comment",
+          completion_reason:
+            outcome === "accepted"
+              ? "mutation_accepted"
+              : outcome === "rejected"
+                ? "mutation_rejected"
+                : "mutation_outcome_unknown",
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+      if (mutation) ledger.mutationObserved = true;
+      if (outcome === "unknown") ledger.uncertainMutationObserved = true;
+    };
+    try {
+      const result = options.operation();
+      finish(options.didMutate?.(result) === false ? "rejected" : "accepted");
+      return result;
+    } catch (error) {
+      finish(options.knownNoMutation?.(error) === true ? "rejected" : "unknown");
+      throw error;
+    }
+  };
+}
+
 function captureLiveAssistBinding(request: AssistRequestBinding): LiveAssistBinding {
   const { item, state } = fetchItem(request.itemNumber);
   if (state.toLowerCase() !== "open") {
@@ -30109,108 +30403,211 @@ function assistGenerateCommand(args: Args): void {
   const timeoutMs = numberArg(args.codex_timeout_ms, 120_000);
   const workDir = resolve(stringArg(args.work_dir, join(ROOT, ".artifacts", "assist-codex")));
   const live = captureLiveAssistBinding(request);
-  const answer = runCodexAssist({
-    item: live.item,
-    context: live.context,
-    question: request.question,
-    sourceCommentUrl: live.sourceComment?.htmlUrl ?? request.sourceCommentUrl,
-    author: live.sourceComment?.author ?? request.author,
-    model,
-    reasoningEffort: request.reasoningEffort,
-    sandboxMode,
-    timeoutMs,
-    workDir,
+  const operationIdentity = assistActionLedgerIdentity({
+    repository: request.targetRepo,
+    number: request.itemNumber,
+    kind: live.item.kind,
+    sourceRevision: live.context.sourceRevision!,
+    requestSha256: assistRequestSha256(request),
     mode: request.mode,
     lens: request.lens,
   });
-  const pullHeadSha =
-    live.item.kind === "pull_request" ? itemHeadSha(live.item, live.context) : null;
-  const artifact = createAssistArtifact({
-    generatedAt: new Date().toISOString(),
-    runId: workflow.runId,
-    runAttempt: workflow.runAttempt,
-    itemKind: live.item.kind,
-    sourceRevision: live.context.sourceRevision!,
-    contextDigest: assistPromptContextDigest(live.item, live.context),
-    pullHeadSha,
-    sourceDigest: assistSourceDigest(live.sourceComment),
-    request,
-    answer,
+  const ledger = startAssistActionLedger({
+    operationIdentity,
+    component: "assist_generate",
+    phase: ACTION_EVENT_TYPES.reviewItem,
   });
-  ensureDir(dirname(artifactPath));
-  writeFileSync(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-  console.log(
-    JSON.stringify({
-      generated: true,
-      posted: false,
-      artifact: artifactPath,
-      idempotency_key: artifact.idempotency_key,
+  const outputPath = join(workDir, `${live.item.number}.assist.md`);
+  try {
+    const answer = runCodexAssist({
+      item: live.item,
+      context: live.context,
+      question: request.question,
+      sourceCommentUrl: live.sourceComment?.htmlUrl ?? request.sourceCommentUrl,
+      author: live.sourceComment?.author ?? request.author,
+      model,
+      reasoningEffort: request.reasoningEffort,
+      sandboxMode,
+      timeoutMs,
+      workDir,
       mode: request.mode,
-      item: request.itemNumber,
+      lens: request.lens,
+    });
+    const pullHeadSha =
+      live.item.kind === "pull_request" ? itemHeadSha(live.item, live.context) : null;
+    const artifact = createAssistArtifact({
+      generatedAt: new Date().toISOString(),
+      runId: workflow.runId,
+      runAttempt: workflow.runAttempt,
+      itemKind: live.item.kind,
+      sourceRevision: live.context.sourceRevision!,
+      contextDigest: assistPromptContextDigest(live.item, live.context),
+      pullHeadSha,
+      sourceDigest: assistSourceDigest(live.sourceComment),
+      request,
+      answer,
+    });
+    ensureDir(dirname(artifactPath));
+    writeFileSync(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+    recordAssistGenerationLog(ledger, {
+      outputPath,
       model: PUBLIC_CODEX_MODEL,
       reasoningEffort: request.reasoningEffort,
-    }),
-  );
+    });
+    const artifactEvidence = actionLedgerFileEvidence("assist_review_artifact", artifactPath);
+    finishAssistActionLedger(ledger, {
+      component: "assist_generate",
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      completionReason: "completed",
+      evidence: artifactEvidence ? [artifactEvidence] : [],
+      publicationKind: "local_artifact",
+    });
+    console.log(
+      JSON.stringify({
+        generated: true,
+        posted: false,
+        artifact: artifactPath,
+        idempotency_key: artifact.idempotency_key,
+        mode: request.mode,
+        item: request.itemNumber,
+        model: PUBLIC_CODEX_MODEL,
+        reasoningEffort: request.reasoningEffort,
+      }),
+    );
+  } catch (error) {
+    recordAssistGenerationLog(ledger, {
+      outputPath,
+      model: PUBLIC_CODEX_MODEL,
+      reasoningEffort: request.reasoningEffort,
+      failure: error,
+    });
+    const failure = actionLedgerFailureDisposition(error);
+    finishAssistActionLedger(ledger, {
+      component: "assist_generate",
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: failure.status,
+      reasonCode: failure.reasonCode,
+      retryable: true,
+      mutation: false,
+      completionReason: failure.completionReason,
+    });
+    throw error;
+  }
 }
 
 function assistPublishCommand(args: Args): void {
   repoFromArgs(args);
   const request = assistRequestFromArgs(args);
   const workflow = assistWorkflowIdentity(args);
+  const artifactPath = assistArtifactPath(args);
   const artifact = parseAssistArtifact(
-    readBoundedUtf8File(assistArtifactPath(args), ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
+    readBoundedUtf8File(artifactPath, ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
     {
       runId: workflow.runId,
       runAttempt: workflow.runAttempt,
       request,
     },
   );
-
-  const initialLive = validateLiveAssistArtifact(artifact, request);
-  const initialHead =
-    initialLive.item.kind === "pull_request"
-      ? itemHeadSha(initialLive.item, initialLive.context)
-      : "na";
-  const marker =
-    request.mode === "visual"
-      ? visualCommentMarker(request.itemNumber, request.lens, initialHead)
-      : assistCommentMarker(artifact.idempotency_key);
-  const existing = findOwnedCommentByMarker(request.itemNumber, marker);
-
-  // Re-fetch after idempotency discovery so target/source drift during artifact handling wins
-  // immediately before the only GitHub mutation in this process.
-  const live = validateLiveAssistArtifact(artifact, request);
-  const sourceCommentUrl = live.sourceComment?.htmlUrl ?? request.sourceCommentUrl;
-  const body =
-    request.mode === "visual"
-      ? renderVisualComment({
-          body: artifact.output.answer,
-          item: live.item,
-          context: live.context,
-          lens: request.lens,
-          model: PUBLIC_CODEX_MODEL,
-          reasoningEffort: request.reasoningEffort,
-          sourceCommentUrl,
-          sourceCommentId: request.sourceCommentId,
-        })
-      : renderAssistComment({
-          body: artifact.output.answer,
-          model: PUBLIC_CODEX_MODEL,
-          reasoningEffort: request.reasoningEffort,
-          sourceCommentUrl,
-          sourceCommentId: request.sourceCommentId,
-          idempotencyKey: artifact.idempotency_key,
-        });
-  const action = publishIdempotentAssistComment(request.itemNumber, existing, body);
-  console.log(
-    JSON.stringify({
-      posted: action === "posted",
-      action,
-      mode: request.mode,
-      item: request.itemNumber,
-      idempotency_key: artifact.idempotency_key,
+  const ledger = startAssistActionLedger({
+    operationIdentity: assistActionLedgerIdentity({
+      repository: artifact.target.repo,
+      number: artifact.target.item_number,
+      kind: artifact.target.item_kind,
+      sourceRevision: artifact.target.source_revision,
+      requestSha256: artifact.request.sha256,
+      mode: artifact.request.mode,
+      lens: artifact.request.lens,
     }),
-  );
+    component: "assist_publish",
+    phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+    evidence: [actionLedgerFileEvidence("assist_review_artifact", artifactPath)].filter(
+      (entry): entry is ActionEventEvidence => entry !== null,
+    ),
+  });
+  const previousReviewMutationRunner = activeReviewMutationRunner;
+  try {
+    const initialLive = validateLiveAssistArtifact(artifact, request);
+    const initialHead =
+      initialLive.item.kind === "pull_request"
+        ? itemHeadSha(initialLive.item, initialLive.context)
+        : "na";
+    const marker =
+      request.mode === "visual"
+        ? visualCommentMarker(request.itemNumber, request.lens, initialHead)
+        : assistCommentMarker(artifact.idempotency_key);
+    const existing = findOwnedCommentByMarker(request.itemNumber, marker);
+
+    // Re-fetch after idempotency discovery so target/source drift during artifact handling wins
+    // immediately before the only GitHub mutation in this process.
+    const live = validateLiveAssistArtifact(artifact, request);
+    const sourceCommentUrl = live.sourceComment?.htmlUrl ?? request.sourceCommentUrl;
+    const body =
+      request.mode === "visual"
+        ? renderVisualComment({
+            body: artifact.output.answer,
+            item: live.item,
+            context: live.context,
+            lens: request.lens,
+            model: PUBLIC_CODEX_MODEL,
+            reasoningEffort: request.reasoningEffort,
+            sourceCommentUrl,
+            sourceCommentId: request.sourceCommentId,
+          })
+        : renderAssistComment({
+            body: artifact.output.answer,
+            model: PUBLIC_CODEX_MODEL,
+            reasoningEffort: request.reasoningEffort,
+            sourceCommentUrl,
+            sourceCommentId: request.sourceCommentId,
+            idempotencyKey: artifact.idempotency_key,
+          });
+    activeReviewMutationRunner = assistCommentMutationRunner(ledger);
+    const action = publishIdempotentAssistComment(request.itemNumber, existing, body);
+    finishAssistActionLedger(ledger, {
+      component: "assist_publish",
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status:
+        action === "unchanged" ? ACTION_EVENT_STATUSES.unchanged : ACTION_EVENT_STATUSES.published,
+      reasonCode:
+        action === "unchanged"
+          ? ACTION_EVENT_REASON_CODES.contentUnchanged
+          : ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: action !== "unchanged",
+      completionReason: action,
+      publicationKind: "github_comment",
+    });
+    console.log(
+      JSON.stringify({
+        posted: action === "posted",
+        action,
+        mode: request.mode,
+        item: request.itemNumber,
+        idempotency_key: artifact.idempotency_key,
+      }),
+    );
+  } catch (error) {
+    const failure = actionLedgerFailureDisposition(error);
+    finishAssistActionLedger(ledger, {
+      component: "assist_publish",
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status: failure.status,
+      reasonCode: failure.reasonCode,
+      retryable: true,
+      mutation: ledger.mutationObserved,
+      completionReason: ledger.uncertainMutationObserved
+        ? "mutation_outcome_unknown"
+        : failure.completionReason,
+      publicationKind: "github_comment",
+    });
+    throw error;
+  } finally {
+    activeReviewMutationRunner = previousReviewMutationRunner;
+  }
 }
 
 function assistValidateArtifactCommand(args: Args): void {
