@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -47,6 +48,44 @@ test("published repair receipts use production-valid result and plan revision fi
     "b".repeat(40),
   );
   assert.equal(reviewedResultRevision(result, plan, { expected_head_sha: "c".repeat(40) }), null);
+});
+
+test("canonical PR revision rejects issue and foreign-repository URLs", () => {
+  const plan = {
+    repo: "openclaw/openclaw",
+    cluster_id: "repair-pr-42",
+    items: [
+      {
+        repo: "openclaw/openclaw",
+        ref: "#42",
+        number: 42,
+        kind: "pull_request",
+        pull_request: { head_sha: "b".repeat(40) },
+      },
+    ],
+  };
+  assert.equal(
+    reviewedResultRevision(
+      productionResult({
+        canonical_pr: "https://github.com/openclaw/openclaw/pull/42",
+      }),
+      plan,
+      { expected_head_sha: "b".repeat(40) },
+    ),
+    "b".repeat(40),
+  );
+  for (const canonicalPr of [
+    "https://github.com/openclaw/openclaw/issues/42",
+    "https://github.com/other/repo/pull/42",
+  ]) {
+    assert.throws(
+      () =>
+        resultPublicationSourceRevision(productionResult({ canonical_pr: canonicalPr }), plan, {
+          expected_head_sha: "b".repeat(40),
+        }),
+      /missing one exact reviewed target revision/,
+    );
+  }
 });
 
 test("published repair receipts bind issue and commit workflow source revisions", () => {
@@ -159,6 +198,8 @@ source_issue_revision_sha256: ${"d".repeat(64)}
     cluster_id: "repair-pr-42",
     source_job: sourceJob,
   };
+  const stateRoot = path.join(runDir, "state");
+  const stateRevision = commitStateJob(stateRoot, sourceJob, job);
   fs.writeFileSync(path.join(runDir, "source-job.md"), job);
   fs.writeFileSync(
     path.join(runDir, "source-job.json"),
@@ -166,7 +207,7 @@ source_issue_revision_sha256: ${"d".repeat(64)}
       {
         schema_version: 1,
         source_job: sourceJob,
-        state_revision: "a".repeat(40),
+        state_revision: stateRevision,
         job_sha256: jobSha256,
       },
       null,
@@ -175,9 +216,9 @@ source_issue_revision_sha256: ${"d".repeat(64)}
   );
 
   try {
-    const sealed = readSealedPublishedSource(runDir, result, plan);
+    const sealed = readSealedPublishedSource(runDir, result, plan, "result.json", null, stateRoot);
     assert.equal(sealed?.sourceJob, sourceJob);
-    assert.equal(sealed?.stateRevision, "a".repeat(40));
+    assert.equal(sealed?.stateRevision, stateRevision);
     assert.equal(sealed?.jobSha256, jobSha256);
     assert.equal(
       resultPublicationSourceRevision(result, plan, sealed?.frontmatter ?? null),
@@ -186,8 +227,48 @@ source_issue_revision_sha256: ${"d".repeat(64)}
 
     fs.appendFileSync(path.join(runDir, "source-job.md"), "\ntampered\n");
     assert.throws(
-      () => readSealedPublishedSource(runDir, result, plan),
+      () => readSealedPublishedSource(runDir, result, plan, "result.json", null, stateRoot),
       /sealed source job SHA-256 mismatch/,
+    );
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("sealed source identity cannot self-assert bytes absent from its state revision", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-forged-source-"));
+  const stateRoot = path.join(runDir, "state");
+  const sourceJob = "jobs/openclaw/inbox/cluster-42.md";
+  const trustedJob = repairJob("# trusted source");
+  const forgedJob = repairJob("# forged artifact");
+  const stateRevision = commitStateJob(stateRoot, sourceJob, trustedJob);
+  fs.writeFileSync(path.join(runDir, "source-job.md"), forgedJob);
+  fs.writeFileSync(
+    path.join(runDir, "source-job.json"),
+    `${JSON.stringify({
+      schema_version: 1,
+      source_job: sourceJob,
+      state_revision: stateRevision,
+      job_sha256: createHash("sha256").update(forgedJob).digest("hex"),
+    })}\n`,
+  );
+
+  try {
+    assert.throws(
+      () =>
+        readSealedPublishedSource(
+          runDir,
+          productionResult({}),
+          {
+            repo: "openclaw/openclaw",
+            cluster_id: "repair-pr-42",
+            source_job: sourceJob,
+          },
+          "result.json",
+          null,
+          stateRoot,
+        ),
+      /immutable job SHA-256 mismatch/,
     );
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
@@ -294,4 +375,35 @@ function productionResult(overrides: Record<string, unknown>) {
     fix_artifact: null,
     ...overrides,
   };
+}
+
+function repairJob(body: string): string {
+  return `---
+repo: openclaw/openclaw
+cluster_id: repair-pr-42
+mode: autonomous
+job_intent: repair_cluster
+allowed_actions:
+  - fix
+candidates:
+  - "#42"
+source: clawsweeper
+---
+
+${body}
+`;
+}
+
+function commitStateJob(stateRoot: string, sourceJob: string, contents: string): string {
+  fs.mkdirSync(path.dirname(path.join(stateRoot, sourceJob)), { recursive: true });
+  execFileSync("git", ["init", "-q"], { cwd: stateRoot });
+  execFileSync("git", ["config", "user.name", "ClawSweeper Tests"], { cwd: stateRoot });
+  execFileSync("git", ["config", "user.email", "tests@example.invalid"], { cwd: stateRoot });
+  fs.writeFileSync(path.join(stateRoot, sourceJob), contents);
+  execFileSync("git", ["add", sourceJob], { cwd: stateRoot });
+  execFileSync("git", ["commit", "-qm", "fixture"], { cwd: stateRoot });
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: stateRoot,
+    encoding: "utf8",
+  }).trim();
 }

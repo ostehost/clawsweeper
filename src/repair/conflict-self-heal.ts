@@ -356,7 +356,12 @@ function executeDispatches(
   }
   currentLedger.updated_at = new Date().toISOString();
   writeLedger(currentLedger);
-  summary.status = "dispatched";
+  summary.status =
+    ready.length > 0
+      ? "dispatched"
+      : summary.attempts.some((attempt: LooseRecord) => attempt.status === "waiting")
+        ? "waiting"
+        : "skipped";
   return summary;
 }
 

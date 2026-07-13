@@ -127,6 +127,10 @@ import {
 } from "./github-cli.js";
 import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
 import { issueSourceRevisionSha256 } from "./issue-source-guard.js";
+import {
+  immutableJobDispatchArgs,
+  resolveCurrentStateJobIdentity,
+} from "./immutable-job-handoff.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
 import {
@@ -3227,11 +3231,13 @@ function freeformReviewPrompt(command: LooseRecord): string {
 }
 
 function dispatchRepair(command: LooseRecord) {
+  const immutableJob = resolveCurrentStateJobIdentity(command.target.job_path);
   let dispatchKey = dispatchReceiptKey(command);
   const expectedTitle = repairRunNameForJob(
-    command.target.job_path,
+    immutableJob.jobPath,
     automergeRunNamePrefix,
     dispatchKey,
+    immutableJob.jobSha256,
   );
   const claimed = claimedDispatchState({
     command,
@@ -3244,7 +3250,9 @@ function dispatchRepair(command: LooseRecord) {
       ...claimed,
       workflow,
       repair_repo: repairRepo,
-      job_path: command.target.job_path,
+      job_path: immutableJob.jobPath,
+      state_revision: immutableJob.stateRevision,
+      job_sha256: immutableJob.jobSha256,
       mode: command.target.mode,
       runner,
       execution_runner: executionRunner,
@@ -3252,12 +3260,14 @@ function dispatchRepair(command: LooseRecord) {
     };
   }
   dispatchKey = dispatchReceiptKey(command);
-  const activeRun = activeRepairRunForCommand(command);
+  const activeRun = activeRepairRunForCommand(immutableJob.jobPath, immutableJob.jobSha256);
   if (activeRun) {
     return {
       workflow,
       repair_repo: repairRepo,
-      job_path: command.target.job_path,
+      job_path: immutableJob.jobPath,
+      state_revision: immutableJob.stateRevision,
+      job_sha256: immutableJob.jobSha256,
       mode: command.target.mode,
       runner,
       execution_runner: executionRunner,
@@ -3275,7 +3285,9 @@ function dispatchRepair(command: LooseRecord) {
     {
       repository: repairRepo,
       workflow,
-      jobPath: command.target.job_path,
+      jobPath: immutableJob.jobPath,
+      stateRevision: immutableJob.stateRevision,
+      jobSha256: immutableJob.jobSha256,
       dispatchKey,
     },
     [
@@ -3285,9 +3297,10 @@ function dispatchRepair(command: LooseRecord) {
       "--repo",
       repairRepo,
       "-f",
-      `job=${command.target.job_path}`,
+      `job=${immutableJob.jobPath}`,
       "-f",
       `dispatch_key=${dispatchKey}`,
+      ...immutableJobDispatchArgs(immutableJob),
       "-f",
       `mode=${command.target.mode}`,
       "-f",
@@ -3301,14 +3314,16 @@ function dispatchRepair(command: LooseRecord) {
   );
   if (result.status !== 0) {
     throw new Error(
-      `failed to dispatch ${command.target.job_path}: ${result.stderr || result.stdout}`,
+      `failed to dispatch ${immutableJob.jobPath}: ${result.stderr || result.stdout}`,
     );
   }
   const runUrl = githubActionsRunUrlFromDispatchOutput(result.stdout);
   return {
     workflow,
     repair_repo: repairRepo,
-    job_path: command.target.job_path,
+    job_path: immutableJob.jobPath,
+    state_revision: immutableJob.stateRevision,
+    job_sha256: immutableJob.jobSha256,
     mode: command.target.mode,
     runner,
     execution_runner: executionRunner,
@@ -3318,10 +3333,15 @@ function dispatchRepair(command: LooseRecord) {
 }
 
 function dispatchRepairActionStatus(repair: LooseRecord) {
+  const immutableIdentity = {
+    ...(repair.state_revision ? { state_revision: repair.state_revision } : {}),
+    ...(repair.job_sha256 ? { job_sha256: repair.job_sha256 } : {}),
+  };
   if (repair.status === "claimed") {
     return {
       status: "claimed",
       reason: repair.reason,
+      ...immutableIdentity,
       ...(repair.dispatch_key ? { dispatch_key: repair.dispatch_key } : {}),
     };
   }
@@ -3330,6 +3350,7 @@ function dispatchRepairActionStatus(repair: LooseRecord) {
       status: "active",
       reason: repair.reason,
       checked_at: new Date().toISOString(),
+      ...immutableIdentity,
       ...(repair.run_url ? { run_url: repair.run_url } : {}),
       ...(repair.run_id ? { run_id: repair.run_id } : {}),
       ...(repair.run_status ? { run_status: repair.run_status } : {}),
@@ -3337,6 +3358,7 @@ function dispatchRepairActionStatus(repair: LooseRecord) {
   }
   return {
     status: "executed",
+    ...immutableIdentity,
     ...(repair.status === "recovered"
       ? { recovered: true, receipt_verified_at: new Date().toISOString() }
       : { dispatched_at: new Date().toISOString() }),
@@ -3360,13 +3382,13 @@ function commandHasWaitingRepairDispatch(command: LooseRecord) {
   );
 }
 
-function activeRepairRunForCommand(command: LooseRecord) {
-  const jobPath = String(command.target?.job_path ?? "");
+function activeRepairRunForCommand(jobPath: string, jobSha256: string) {
   if (!jobPath) return null;
   return activeRepairWorkflowRunForJobAfterDispatchRecheck({
     repo: repairRepo,
     workflow,
     jobPath,
+    jobSha256,
     automergeRunNamePrefix,
     activeRunsByPrefix: activeRepairRunsByPrefix,
     env: dispatchTokenEnv(),

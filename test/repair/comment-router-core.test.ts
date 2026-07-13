@@ -1988,6 +1988,42 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.match(repairWorkflow, /dispatch_key:/);
 });
 
+test("comment router dispatches the exact immutable repair job generation", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const dispatchRepair = source.slice(
+    source.indexOf("function dispatchRepair(command: LooseRecord)"),
+    source.indexOf("function dispatchRepairActionStatus"),
+  );
+  const activeRepair = source.slice(
+    source.indexOf("function activeRepairRunForCommand"),
+    source.indexOf("function dispatchTokenEnv"),
+  );
+
+  assert.match(
+    source,
+    /import \{\s*immutableJobDispatchArgs,\s*resolveCurrentStateJobIdentity,\s*\} from "\.\/immutable-job-handoff\.js";/,
+  );
+  assert.match(
+    dispatchRepair,
+    /const immutableJob = resolveCurrentStateJobIdentity\(command\.target\.job_path\);/,
+  );
+  assert.match(
+    dispatchRepair,
+    /repairRunNameForJob\(\s*immutableJob\.jobPath,\s*automergeRunNamePrefix,\s*dispatchKey,\s*immutableJob\.jobSha256,\s*\)/,
+  );
+  assert.match(
+    dispatchRepair,
+    /activeRepairRunForCommand\(immutableJob\.jobPath, immutableJob\.jobSha256\)/,
+  );
+  assert.match(dispatchRepair, /\.\.\.immutableJobDispatchArgs\(immutableJob\)/);
+  assert.match(dispatchRepair, /stateRevision: immutableJob\.stateRevision/);
+  assert.match(dispatchRepair, /jobSha256: immutableJob\.jobSha256/);
+  assert.match(dispatchRepair, /state_revision: immutableJob\.stateRevision/);
+  assert.match(dispatchRepair, /job_sha256: immutableJob\.jobSha256/);
+  assert.match(activeRepair, /jobSha256,/);
+  assert.equal(source.match(/const repair = dispatchRepair\(command\);/g)?.length, 2);
+});
+
 test("exact comment fast path converges terminal acknowledgement before own reaction cleanup", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const retryConstant = source.indexOf("const TARGET_LOOKUP_RETRY_ATTEMPTS = 3");

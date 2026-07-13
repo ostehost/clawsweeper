@@ -147,6 +147,63 @@ test("failed-run self-heal replays the recorded sealed job generation", () => {
   }
 });
 
+test("failed-run self-heal fetches an exact historical revision from a depth-one state checkout", () => {
+  const fixture = createSelfHealFixture("shallow");
+  try {
+    replaceStateWithDepthOneClone(fixture);
+    assert.notEqual(
+      spawnSync("git", ["cat-file", "-e", `${fixture.originalRevision}^{commit}`], {
+        cwd: fixture.stateRoot,
+      }).status,
+      0,
+    );
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_state_revision, fixture.originalRevision);
+    assert.equal(
+      spawnSync("git", ["cat-file", "-e", `${fixture.originalRevision}^{commit}`], {
+        cwd: fixture.stateRoot,
+      }).status,
+      0,
+    );
+    assert.equal(fs.existsSync(path.join(fixture.stateRoot, ".git", "shallow")), true);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal skips an unavailable historical revision without dropping valid jobs", () => {
+  const fixture = createSelfHealFixture("bounded");
+  try {
+    replaceStateWithDepthOneClone(fixture);
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+    });
+    writeRunRecord(fixture.runsDir, "910002", {
+      source_job: "jobs/openclaw/inbox/missing-history.md",
+      source_state_revision: "f".repeat(40),
+      source_job_sha256: "e".repeat(64),
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_job, fixture.jobPath);
+    assert.equal(summary.skipped_candidates.length, 1);
+    assert.equal(summary.skipped_candidates[0].reason, "immutable_provenance_unavailable");
+    assert.match(summary.skipped_candidates[0].detail, /could not fetch historical/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("legacy self-heal records recover one complete sealed producer cohort", () => {
   const fixture = createSelfHealFixture("legacy");
   try {
@@ -256,6 +313,14 @@ function runSelfHeal(fixture: ReturnType<typeof createSelfHealFixture>) {
   );
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
+}
+
+function replaceStateWithDepthOneClone(fixture: ReturnType<typeof createSelfHealFixture>): void {
+  const sourceRoot = path.join(fixture.root, "state-source");
+  const remoteRoot = path.join(fixture.root, "state-origin.git");
+  fs.renameSync(fixture.stateRoot, sourceRoot);
+  execFileSync("git", ["clone", "-q", "--bare", sourceRoot, remoteRoot]);
+  execFileSync("git", ["clone", "-q", "--depth=1", `file://${remoteRoot}`, fixture.stateRoot]);
 }
 
 function writeRunRecord(runsDir: string, runId: string, provenance: Record<string, string>): void {

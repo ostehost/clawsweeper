@@ -8,7 +8,7 @@ on:
       - completed
 
 permissions:
-  contents: write
+  contents: read
   actions: read
   pull-requests: read
 
@@ -25,23 +25,11 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - name: Create GitHub App token
-        id: app_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
-          permission-actions: read
-          permission-contents: write
-          permission-pull-requests: read
-
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           filter: blob:none
           fetch-depth: 0
-          token: ${{ steps.app_token.outputs.token }}
           persist-credentials: false
 
       - name: Classify trusted worker artifact contract
@@ -54,14 +42,14 @@ jobs:
           set -euo pipefail
           echo "trusted_legacy_worker_head=" >> "$GITHUB_OUTPUT"
           if [[ ! "$WORKER_HEAD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "::notice title=Untrusted legacy worker::Worker head is not an exact commit."
-            exit 0
+            echo "::error title=Untrusted worker::Worker head is not an exact commit."
+            exit 1
           fi
           git fetch --no-tags origin "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
           if ! git cat-file -e "${WORKER_HEAD_SHA}^{commit}" 2>/dev/null ||
              ! git merge-base --is-ancestor "$WORKER_HEAD_SHA" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
-            echo "::notice title=Untrusted legacy worker::Worker head is not on default-branch history."
-            exit 0
+            echo "::error title=Untrusted worker::Worker head is not on default-branch history."
+            exit 1
           fi
           mapfile -t contract_commits < <(
             git log --reverse --format=%H \
@@ -77,6 +65,17 @@ jobs:
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Create GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
+          permission-actions: read
+          permission-contents: write
+          permission-pull-requests: read
+
       - name: Create state token
         id: state-token
         uses: ./.github/actions/create-state-token
@@ -87,6 +86,7 @@ jobs:
       - uses: ./.github/actions/setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 0
 
       - uses: ./.github/actions/setup-action-ledger
 

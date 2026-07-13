@@ -9,7 +9,7 @@ import {
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
 } from "../action-ledger.js";
-import { githubActionsRunUrl, parseArgs, parseJob, repoRoot } from "./lib.js";
+import { githubActionsRunUrl, parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile as readJson } from "./json-file.js";
 import { escapeRegExp, slug } from "./text-utils.js";
 import { renderClusterReport, writeClosedRecord } from "./publish-cluster-report.js";
@@ -44,6 +44,7 @@ import {
   recordRepairLifecycleFailureSafely,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
+import { resolveStateJobIdentity } from "./immutable-job-handoff.js";
 
 const DASHBOARD_START = "<!-- clawsweeper-repair-dashboard:start -->";
 const DASHBOARD_END = "<!-- clawsweeper-repair-dashboard:end -->";
@@ -309,6 +310,7 @@ export function readSealedPublishedSource(
   clusterPlan: LooseRecord | null,
   resultPath = "result.json",
   trustedLegacyWorkerHead: string | null = null,
+  stateRoot?: string,
 ): {
   sourceJob: string;
   stateRevision: string | null;
@@ -360,12 +362,22 @@ export function readSealedPublishedSource(
   ) {
     throw new Error(`sealed source job identity is invalid: ${resultPath}`);
   }
-  const actualJobSha256 = createHash("sha256").update(fs.readFileSync(sourceJobPath)).digest("hex");
-  if (actualJobSha256 !== jobSha256) {
+  const immutableJob = resolveStateJobIdentity({
+    jobPath: sourceJob,
+    stateRevision,
+    jobSha256,
+    ...(stateRoot === undefined ? {} : { stateRoot }),
+  });
+  const sealedJobBytes = fs.readFileSync(sourceJobPath);
+  const actualJobSha256 = createHash("sha256").update(sealedJobBytes).digest("hex");
+  if (
+    actualJobSha256 !== immutableJob.jobSha256 ||
+    !sealedJobBytes.equals(Buffer.from(immutableJob.job.raw, "utf8"))
+  ) {
     throw new Error(`sealed source job SHA-256 mismatch: ${resultPath}`);
   }
 
-  const frontmatter = parseJob(sourceJobPath).frontmatter;
+  const frontmatter = immutableJob.job.frontmatter;
   const expectedRepo = String(result.repo ?? clusterPlan?.repo ?? "");
   const expectedClusterId = String(result.cluster_id ?? clusterPlan?.cluster_id ?? "");
   if (

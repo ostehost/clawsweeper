@@ -63,6 +63,20 @@ test("self-heal mutations emit durable action receipts", () => {
   assert.doesNotMatch(candidateLifecycle, /candidate\.state_revision/);
 });
 
+test("conflict self-heal reports zero-dispatch outcomes without claiming dispatch", () => {
+  const conflicts = readText("src/repair/conflict-self-heal.ts");
+  const finalStatus = conflicts.slice(
+    conflicts.indexOf("currentLedger.updated_at = new Date().toISOString();"),
+    conflicts.indexOf("function publishSelfHealJobs"),
+  );
+
+  assert.match(
+    finalStatus,
+    /ready\.length > 0[\s\S]*\? "dispatched"[\s\S]*attempt\.status === "waiting"[\s\S]*\? "waiting"[\s\S]*: "skipped"/,
+  );
+  assert.doesNotMatch(finalStatus, /summary\.status = "dispatched"/);
+});
+
 test("self-heal workflows publish immutable action-ledger shards", () => {
   const workflows = [
     {

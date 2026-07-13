@@ -58,6 +58,7 @@ const maxLiveWorkers = readMaxLiveWorkers(args);
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const allowRepeat = Boolean(args["allow-repeat"]);
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
+const skippedDispatchCandidates: LooseRecord[] = [];
 
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
   throw new Error(`repo must be owner/repo, got ${repo}`);
@@ -88,6 +89,7 @@ const report: LooseRecord = {
     model,
     max_prs: maxPrs,
     candidates: dispatchCandidates.map(summarizeDispatchCandidate),
+    skipped_candidates: skippedDispatchCandidates,
   },
   prs,
 };
@@ -498,13 +500,13 @@ function loadPublishedRecords() {
 }
 
 function existingJobPath(clusterId: string) {
+  const owner = repo.split("/")[0] || "openclaw";
   for (const relative of [
-    path.join("jobs", "openclaw", "inbox", `${clusterId}.md`),
-    path.join("jobs", "openclaw", "outbox", "finalized", `${clusterId}.md`),
-    path.join("jobs", "openclaw", "outbox", "stuck", `${clusterId}.md`),
+    path.join("jobs", owner, "inbox", `${clusterId}.md`),
+    path.join("jobs", owner, "outbox", "finalized", `${clusterId}.md`),
+    path.join("jobs", owner, "outbox", "stuck", `${clusterId}.md`),
   ]) {
-    const resolved = path.resolve(relative);
-    if (fs.existsSync(resolved)) return path.relative(repoRoot(), resolved);
+    if (fs.existsSync(path.join(repoRoot(), relative))) return relative.split(path.sep).join("/");
   }
   return null;
 }
@@ -518,10 +520,23 @@ function selectDispatchCandidates(openPrs: JsonValue) {
           .map((attempt: JsonValue) => attempt.idempotency_key)
           .filter(Boolean) ?? []),
   );
-  return openPrs
-    .filter((pr: JsonValue) => isDispatchableFinalizerPr(pr))
-    .map((pr: JsonValue) => dispatchCandidateFromPr(pr))
-    .filter((candidate: JsonValue) => allowRepeat || !attempted.has(candidate.idempotency_key));
+  const selected: LooseRecord[] = [];
+  for (const pr of openPrs.filter((candidate: JsonValue) => isDispatchableFinalizerPr(candidate))) {
+    try {
+      const candidate = dispatchCandidateFromPr(pr);
+      if (allowRepeat || !attempted.has(candidate.idempotency_key)) selected.push(candidate);
+    } catch (error) {
+      skippedDispatchCandidates.push({
+        pr: pr.number,
+        url: pr.url,
+        cluster_id: pr.cluster_id,
+        job_path: pr.job_path,
+        reason: "immutable_job_unavailable",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return selected;
 }
 
 function isDispatchableFinalizerPr(pr: JsonValue) {
@@ -541,7 +556,8 @@ function isDispatchableFinalizerPr(pr: JsonValue) {
 }
 
 function dispatchCandidateFromPr(pr: JsonValue) {
-  const immutableJob = resolveCurrentStateJobIdentity(pr.job_path);
+  const jobPath = normalizedFinalizerDispatchJobPath(pr.job_path);
+  const immutableJob = resolveCurrentStateJobIdentity(jobPath);
   const mode = resolveDispatchMode(immutableJob);
   return {
     pr: pr.number,
@@ -559,6 +575,24 @@ function dispatchCandidateFromPr(pr: JsonValue) {
     recommended_next_action: pr.recommended_next_action,
     idempotency_key: `finalize-open-prs:${repo}#${pr.number}:${pr.head_sha || pr.branch || "unknown"}:${immutableJob.identityKey}`,
   };
+}
+
+function normalizedFinalizerDispatchJobPath(value: unknown): string {
+  const normalized = String(value ?? "")
+    .trim()
+    .replaceAll("\\", "/");
+  if (path.posix.normalize(normalized) !== normalized) {
+    throw new Error("finalizer job path must be normalized without traversal");
+  }
+  const match = normalized.match(
+    /^jobs\/([A-Za-z0-9_.-]+)\/(?:inbox|outbox\/(?:finalized|stuck))\/([A-Za-z0-9_.-]+\.md)$/,
+  );
+  if (!match) {
+    throw new Error(
+      "finalizer job path must match jobs/<owner>/(inbox|outbox/finalized|outbox/stuck)/<job>.md",
+    );
+  }
+  return `jobs/${match[1]}/inbox/${match[2]}`;
 }
 
 function resolveDispatchMode(immutableJob: ReturnType<typeof resolveCurrentStateJobIdentity>) {

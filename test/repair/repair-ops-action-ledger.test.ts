@@ -363,7 +363,7 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(commit, /name: Deduplicate commit review continuation receipt/);
   assert.match(
     commit,
-    /dispatch-receipt-owner\.sh \\\n\s+commit-review\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Plan commits" "Select commits"/,
+    /dispatch-receipt-owner\.sh \\\n\s+commit-review\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Commit reports" "Complete commit review continuation receipt"/,
   );
   assert.match(
     commit,
@@ -494,6 +494,14 @@ test("commit review and notification workflows publish their operation receipts"
   assert.ok(
     publisher.indexOf("- name: Finalize commit publication action ledger") <
       publisher.indexOf("- name: Publish immutable commit review action ledger"),
+  );
+  assert.match(
+    publisher,
+    /name: Complete commit review continuation receipt\n\s+if: \$\{\{ success\(\) && \(github\.event\.inputs\.continuation_key \|\| github\.event\.client_payload\.continuation_key\) \}\}/,
+  );
+  assert.ok(
+    publisher.indexOf("- name: Publish immutable commit review action ledger") <
+      publisher.indexOf("- name: Complete commit review continuation receipt"),
   );
   const commitSweeper = readText("src/commit-sweeper.ts");
   const findingDispatch = commitSweeper.slice(

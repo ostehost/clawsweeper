@@ -81,10 +81,10 @@ jobs:
           expected_title="Commit review ${TARGET_REPO}@${COMMIT_SHA} [${CONTINUATION_KEY}]"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
             commit-review.yml "$expected_title" "$GITHUB_RUN_ID" \
-            "Plan commits" "Select commits")"
+            "Commit reports" "Complete commit review continuation receipt")"
           if [ "$owner" = "owner" ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
-            echo "An older active or successfully planned continuation already exists; skipping duplicate review."
+            echo "An older active or durably published continuation already exists; skipping duplicate review."
             exit 0
           fi
           echo "proceed=true" >> "$GITHUB_OUTPUT"
@@ -1019,3 +1019,7 @@ jobs:
           pnpm run repair:publish-main -- \
             --message "chore: append commit review action ledger" \
             "${action_ledger_args[@]}"
+
+      - name: Complete commit review continuation receipt
+        if: ${{ success() && (github.event.inputs.continuation_key || github.event.client_payload.continuation_key) }}
+        run: echo "Commit review continuation is durably published."

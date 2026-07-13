@@ -26,6 +26,7 @@ import {
   repairSourceRevision,
   runRepairMutation,
   runRepairMutationAsync,
+  type RepairMutationOutcome,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -91,7 +92,16 @@ async function main() {
       title: stringArg(args.title) || `Issue #${itemNumber}`,
       sourceRevision: sourceRevision ?? "",
     };
-    const dashboard = await postDashboardStatus(options);
+    let dashboard: DashboardStatus;
+    let failureOutcome: RepairMutationOutcome | undefined;
+    try {
+      dashboard = await postDashboardStatus(options);
+    } catch (error) {
+      dashboard = "failed";
+      failureOutcome = dashboardFailureOutcome(error);
+      recordDashboardStatus(options, dashboard, failureOutcome);
+      throw error;
+    }
     recordDashboardStatus(options, dashboard);
     writeStepOutput("dashboard_status", dashboard);
     console.log(
@@ -252,7 +262,9 @@ async function main() {
     idempotencySlot: `issue_status:${state.trim().toLowerCase()}`,
   });
 
-  const dashboard = await postDashboardStatus(options).catch((error) => {
+  let dashboardFailure: RepairMutationOutcome | undefined;
+  const dashboard: DashboardStatus = await postDashboardStatus(options).catch((error) => {
+    dashboardFailure = dashboardFailureOutcome(error);
     recordRepairLifecycleFailureSafely(issueStatusLifecycle(options), {
       component: "issue_implementation_status",
       operation: "dashboard",
@@ -263,7 +275,7 @@ async function main() {
     console.warn(`dashboard status publish failed: ${errorText(error)}`);
     return "failed";
   });
-  recordDashboardStatus(options, dashboard);
+  recordDashboardStatus(options, dashboard, dashboardFailure);
   writeStepOutput("comment_id", String(commentId || ""));
   writeStepOutput("dashboard_status", dashboard);
   console.log(
@@ -340,7 +352,21 @@ function issueStatusLifecycleFromArgs(): RepairLifecycleInput | null {
   }
 }
 
-function recordDashboardStatus(options: StatusOptions, dashboard: string) {
+type DashboardStatus = "sent" | "skipped" | "failed";
+
+export function recordDashboardStatus(
+  options: StatusOptions,
+  dashboard: DashboardStatus,
+  failureOutcome?: RepairMutationOutcome,
+) {
+  const mutationOutcome =
+    dashboard === "sent"
+      ? "accepted"
+      : dashboard === "skipped"
+        ? null
+        : (failureOutcome ?? "unknown");
+  const mutationUnknown = mutationOutcome === "unknown";
+  const mutationRejected = mutationOutcome === "rejected";
   recordRepairLifecycleEvent(issueStatusLifecycle(options), {
     type: ACTION_EVENT_TYPES.dashboardLifecycle,
     status:
@@ -348,17 +374,32 @@ function recordDashboardStatus(options: StatusOptions, dashboard: string) {
         ? ACTION_EVENT_STATUSES.sent
         : dashboard === "skipped"
           ? ACTION_EVENT_STATUSES.skipped
-          : ACTION_EVENT_STATUSES.failed,
+          : mutationRejected
+            ? ACTION_EVENT_STATUSES.skipped
+            : ACTION_EVENT_STATUSES.failed,
     reasonCode:
       dashboard === "sent"
         ? ACTION_EVENT_REASON_CODES.published
         : dashboard === "skipped"
           ? ACTION_EVENT_REASON_CODES.notApplicable
-          : ACTION_EVENT_REASON_CODES.unavailable,
-    mutation: dashboard === "sent",
+          : mutationRejected
+            ? ACTION_EVENT_REASON_CODES.notApplicable
+            : ACTION_EVENT_REASON_CODES.unavailable,
+    mutation: mutationOutcome !== null && !mutationRejected,
+    retryable: mutationUnknown,
     component: "issue_implementation_status",
     operation: "dashboard",
-    state: options.state,
+    state: mutationUnknown ? "mutation_unknown" : options.state,
+    ...(mutationOutcome
+      ? {
+          completionReason:
+            mutationOutcome === "accepted"
+              ? "mutation_accepted"
+              : mutationRejected
+                ? "mutation_rejected"
+                : "mutation_outcome_unknown",
+        }
+      : {}),
     statusKind: "issue_implementation",
     idempotencySlot: `dashboard_status:${options.state.trim().toLowerCase()}`,
   });
@@ -479,9 +520,28 @@ export async function postDashboardStatus(options: StatusOptions, fetchImpl: typ
     outcome: repairHttpMutationOutcome,
   });
   if (!response.ok) {
-    throw new Error(`dashboard ingest returned ${response.status}: ${await response.text()}`);
+    throw new DashboardIngestError(
+      response.status,
+      await response.text(),
+      repairHttpMutationOutcome(response),
+    );
   }
   return "sent";
+}
+
+class DashboardIngestError extends Error {
+  constructor(
+    status: number,
+    detail: string,
+    readonly mutationOutcome: RepairMutationOutcome,
+  ) {
+    super(`dashboard ingest returned ${status}: ${detail}`);
+    this.name = "DashboardIngestError";
+  }
+}
+
+export function dashboardFailureOutcome(error: unknown): RepairMutationOutcome {
+  return error instanceof DashboardIngestError ? error.mutationOutcome : "unknown";
 }
 
 function eventTypeForState(state: string) {

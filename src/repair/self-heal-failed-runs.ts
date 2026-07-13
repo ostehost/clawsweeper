@@ -35,6 +35,8 @@ const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
 const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
+const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+const preparedStateRevisions = new Map<string, string | null>();
 
 type RecoveredRunCohort = {
   source_job: string;
@@ -446,6 +448,7 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
     jobSha256 = recovered.job_sha256;
     recoveredMode = recovered.mode;
   }
+  ensureHistoricalStateRevision(stateRevision);
   const immutableJob = resolveStateJobIdentity({
     jobPath: sourceJob,
     stateRevision,
@@ -455,6 +458,69 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
     throw new Error("legacy artifact cohort mode does not match its sealed source job");
   }
   return { immutableJob, recoveredMode };
+}
+
+function ensureHistoricalStateRevision(stateRevision: string): void {
+  if (!STATE_REVISION.test(stateRevision)) {
+    throw new Error("state revision is malformed");
+  }
+  const previous = preparedStateRevisions.get(stateRevision);
+  if (previous !== undefined) {
+    if (previous) throw new Error(previous);
+    return;
+  }
+
+  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+  if (!stateRoot) {
+    throw new Error("CLAWSWEEPER_STATE_DIR is required for immutable job handoff");
+  }
+  if (stateCommitExists(stateRoot, stateRevision)) {
+    preparedStateRevisions.set(stateRevision, null);
+    return;
+  }
+
+  const fetched = spawnSync(
+    "git",
+    [
+      "-C",
+      stateRoot,
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--depth=1",
+      "--filter=blob:none",
+      "origin",
+      stateRevision,
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: STATE_REVISION_FETCH_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  if (fetched.status !== 0 || fetched.error || !stateCommitExists(stateRoot, stateRevision)) {
+    const detail = String(fetched.stderr || fetched.stdout || fetched.error?.message || "").trim();
+    const message = detail
+      ? `could not fetch historical clawsweeper-state commit ${stateRevision}: ${detail}`
+      : `could not fetch historical clawsweeper-state commit ${stateRevision}`;
+    preparedStateRevisions.set(stateRevision, message);
+    throw new Error(message);
+  }
+  preparedStateRevisions.set(stateRevision, null);
+}
+
+function stateCommitExists(stateRoot: string, stateRevision: string): boolean {
+  const result = spawnSync(
+    "git",
+    ["-C", stateRoot, "cat-file", "-e", `${stateRevision}^{commit}`],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 10_000,
+    },
+  );
+  return result.status === 0 && !result.error;
 }
 
 function recoverRunArtifactCohort(runId: string, sourceJob: string): RecoveredRunCohort {

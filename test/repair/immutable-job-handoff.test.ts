@@ -299,9 +299,10 @@ test("repair operational callers resolve immutable state before dedupe and dispa
   );
   assert.doesNotMatch(selfHeal, /resolveCurrentStateJobIdentity\(sourceJob\)/);
   assert.match(selfHeal, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
-  assert.match(finalizer, /const immutableJob = resolveCurrentStateJobIdentity\(pr\.job_path\)/);
+  assert.match(finalizer, /const jobPath = normalizedFinalizerDispatchJobPath\(pr\.job_path\)/);
+  assert.match(finalizer, /const immutableJob = resolveCurrentStateJobIdentity\(jobPath\)/);
   assert.ok(
-    finalizer.indexOf("resolveCurrentStateJobIdentity(pr.job_path)") <
+    finalizer.indexOf("resolveCurrentStateJobIdentity(jobPath)") <
       finalizer.indexOf("resolveDispatchMode(immutableJob)"),
   );
   assert.match(finalizer, /jobSha256: candidate\.job_sha256/);
