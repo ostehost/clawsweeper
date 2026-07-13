@@ -7,6 +7,7 @@ import {
 } from "../action-ledger.js";
 import {
   recordRepairLifecycleEvent,
+  repairMutationIdempotencyIdentity,
   runRepairMutationAsync,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
@@ -69,7 +70,7 @@ export function recordNotificationPhase(
         : {}),
     eventIdentity: { key: input.key, reason },
     ...(phase === "sent" || phase === "failed"
-      ? { idempotencyIdentity: { notification: input.key, outcome: phase } }
+      ? { idempotencyIdentity: notificationDeliveryIdempotencyIdentity(input) }
       : {}),
   });
 }
@@ -203,4 +204,12 @@ function notificationLifecycle(input: NotificationLedgerInput): RepairLifecycleI
     subjectKind: "notification",
     subjectId: `notification-${createHash("sha256").update(input.key).digest("hex").slice(0, 24)}`,
   };
+}
+
+function notificationDeliveryIdempotencyIdentity(input: NotificationLedgerInput) {
+  return repairMutationIdempotencyIdentity(notificationLifecycle(input), {
+    kind: "notification_delivery",
+    operationName: "notification",
+    identity: { key: input.key, destination: "openclaw_hook" },
+  });
 }

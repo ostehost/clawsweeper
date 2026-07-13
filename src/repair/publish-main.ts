@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { publishMainCommit, type RebaseStrategy } from "./git-publish.js";
-import { runRepairMutation } from "./repair-action-ledger.js";
+import { repairPublicationContentDigest, runRepairMutation } from "./repair-action-ledger.js";
 
 type Args = {
   message: string;
@@ -23,10 +23,11 @@ const publishOptions = {
 };
 if (args.receiptKind) {
   const repository = String(process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper");
+  const publicationContentSha256 = repairPublicationContentDigest(args.paths);
   runRepairMutation(
     {
       repository,
-      workKey: `state-publication:${args.receiptKind}`,
+      workKey: `state-publication:${args.receiptKind}:${publicationContentSha256}`,
       sourceRevision: String(process.env.GITHUB_SHA ?? ""),
       recordPath: args.paths[0] ?? null,
       subjectKind: "workflow",
@@ -40,6 +41,7 @@ if (args.receiptKind) {
         paths: [...args.paths].sort(),
         restorePaths: [...args.restorePaths].sort(),
         rebaseStrategy: args.rebaseStrategy ?? "normal",
+        publicationContentSha256,
       },
       operation: () => publishMainCommit(publishOptions),
       outcome: (result) => (result === "committed" ? "accepted" : "rejected"),

@@ -87,6 +87,8 @@ for (const scenario of [
       if (scenario.requestState) {
         assert.equal(events[2]?.attributes?.state, scenario.requestState);
       }
+      assert.equal(events[1]?.idempotency_key_sha256, events[2]?.idempotency_key_sha256);
+      assert.equal(events[2]?.idempotency_key_sha256, events.at(-1)?.idempotency_key_sha256);
     } finally {
       restoreEnv(previous);
       fs.rmSync(root, { force: true, recursive: true });
@@ -228,6 +230,7 @@ test("retrying hook delivery records every wire request as its own attempt", asy
     const attempts = events.filter((event) => event.attributes?.state === "mutation_attempted");
     assert.equal(attempts.length, 3);
     assert.equal(new Set(attempts.map((event) => event.event_id)).size, 3);
+    assert.equal(new Set(events.slice(1).map((event) => event.idempotency_key_sha256)).size, 1);
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

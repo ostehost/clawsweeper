@@ -134,6 +134,10 @@ confidential-identifier checks as every other durable machine-text field.
   unknown mutation state survives later verification, reporting, and workflow
   failures. Finalization converts an interrupted open request into an immutable
   `mutation_outcome_unknown` child instead of claiming that no write occurred.
+- State-publication identity binds a deterministic pre-push manifest of every
+  selected path, entry type, executable bit, symlink target, and file-content
+  digest. Distinct generated state from the same workflow revision cannot reuse
+  a publication receipt, while replaying the same selected bytes remains stable.
 - Every repair Codex subprocess that persists output (write preflight, edit,
   base reconcile, validation fix, `/review`, and review-fix) records a typed
   attempt lifecycle plus SHA-256 evidence for JSONL, stderr, and report
@@ -153,7 +157,10 @@ confidential-identifier checks as every other durable machine-text field.
   shards are finalized and imported into the state repository; GitHub artifact
   upload is retention, not the durable audit boundary. Failure-receipt writes
   are best-effort after a notification delivery error, preserving the primary
-  error and allowing later notifications to continue.
+  error and allowing later notifications to continue. Notification start,
+  accepted, rejected, unknown, and terminal failure receipts share one
+  outcome-independent delivery idempotency key; only request-attempt identity
+  distinguishes repeated wire calls.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix

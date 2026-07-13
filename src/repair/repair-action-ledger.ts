@@ -97,6 +97,40 @@ export type RepairMutationOptions<T> = {
   knownNoMutation?: (error: unknown) => boolean;
 };
 
+export function repairMutationIdempotencyIdentity(
+  input: RepairLifecycleInput,
+  options: {
+    kind: string;
+    identity: unknown;
+    operationName?: string;
+  },
+) {
+  return {
+    operation: repairOperationIdentity(input),
+    operationName: machineText(options.operationName ?? "repair", "repair"),
+    mutation: machineText(options.kind, "github_mutation"),
+    requestSha256: stableDigest(options.identity),
+  };
+}
+
+export function repairPublicationContentDigest(
+  paths: readonly string[],
+  root: string = process.cwd(),
+): string {
+  const digest = createHash("sha256");
+  const selections = [...new Set(paths.map((value) => value.trim()).filter(Boolean))].sort(
+    compareUtf8,
+  );
+  if (selections.length === 0) throw new Error("No publication paths were provided");
+
+  updatePublicationDigest(digest, "version", "repair-publication-content-v1");
+  for (const selection of selections) {
+    updatePublicationDigest(digest, "selection", selection);
+    hashPublicationEntry(digest, path.resolve(root, selection), "");
+  }
+  return digest.digest("hex");
+}
+
 type RepairActionLedgerContext = {
   root: string;
   recoveryRoot: string;
@@ -222,19 +256,13 @@ export function runRepairMutation<T>(
   const kind = machineText(options.kind, "github_mutation");
   const operation = machineText(options.operationName ?? "repair", "repair");
   const requestSha256 = stableDigest(options.identity);
+  const idempotencyIdentity = repairMutationIdempotencyIdentity(input, options);
   const requestAttempt = nextRepairRequestAttempt(
     input,
     operation,
-    kind,
-    requestSha256,
+    idempotencyIdentity,
     ledgerContext,
   );
-  const idempotencyIdentity = {
-    operation: repairOperationIdentity(input),
-    operationName: operation,
-    mutation: kind,
-    requestSha256,
-  };
   const attemptEvent = recordRepairLifecycleEvent(
     input,
     {
@@ -324,19 +352,13 @@ export async function runRepairMutationAsync<T>(
   const kind = machineText(options.kind, "github_mutation");
   const operation = machineText(options.operationName ?? "repair", "repair");
   const requestSha256 = stableDigest(options.identity);
+  const idempotencyIdentity = repairMutationIdempotencyIdentity(input, options);
   const requestAttempt = nextRepairRequestAttempt(
     input,
     operation,
-    kind,
-    requestSha256,
+    idempotencyIdentity,
     ledgerContext,
   );
-  const idempotencyIdentity = {
-    operation: repairOperationIdentity(input),
-    operationName: operation,
-    mutation: kind,
-    requestSha256,
-  };
   const attemptEvent = recordRepairLifecycleEvent(
     input,
     {
@@ -710,16 +732,10 @@ function repairAttemptEvents(
 function nextRepairRequestAttempt(
   input: RepairLifecycleInput,
   operation: string,
-  kind: string,
-  requestSha256: string,
+  idempotencyIdentity: unknown,
   context?: RepairActionLedgerContext,
 ): number {
-  const idempotencyKeySha256 = actionIdempotencyKey({
-    operation: repairOperationIdentity(input),
-    operationName: operation,
-    mutation: kind,
-    requestSha256,
-  });
+  const idempotencyKeySha256 = actionIdempotencyKey(idempotencyIdentity);
   return (
     repairAttemptEvents(input, operation, context).filter(
       (event) =>
@@ -990,6 +1006,66 @@ function positiveInteger(value: unknown): number | null {
 
 function stableDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function hashPublicationEntry(
+  digest: ReturnType<typeof createHash>,
+  absolutePath: string,
+  relativePath: string,
+): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(absolutePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    updatePublicationDigest(digest, "entry", relativePath);
+    updatePublicationDigest(digest, "type", "missing");
+    return;
+  }
+
+  updatePublicationDigest(digest, "entry", relativePath);
+  if (stat.isDirectory()) {
+    updatePublicationDigest(digest, "type", "directory");
+    const names = fs.readdirSync(absolutePath).sort(compareUtf8);
+    for (const name of names) {
+      hashPublicationEntry(
+        digest,
+        path.join(absolutePath, name),
+        relativePath ? `${relativePath}/${name}` : name,
+      );
+    }
+    return;
+  }
+  if (stat.isFile()) {
+    updatePublicationDigest(digest, "type", "file");
+    updatePublicationDigest(digest, "executable", stat.mode & 0o111 ? "1" : "0");
+    updatePublicationDigest(
+      digest,
+      "sha256",
+      createHash("sha256").update(fs.readFileSync(absolutePath)).digest("hex"),
+    );
+    return;
+  }
+  if (stat.isSymbolicLink()) {
+    updatePublicationDigest(digest, "type", "symlink");
+    updatePublicationDigest(digest, "target", fs.readlinkSync(absolutePath));
+    return;
+  }
+  throw new Error(`Unsupported publication path entry: ${absolutePath}`);
+}
+
+function updatePublicationDigest(
+  digest: ReturnType<typeof createHash>,
+  field: string,
+  value: string,
+): void {
+  const bytes = Buffer.from(value, "utf8");
+  digest.update(`${field}:${bytes.length}:`, "utf8");
+  digest.update(bytes);
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function errorText(error: unknown): string {
