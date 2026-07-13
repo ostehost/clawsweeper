@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parse } from "yaml";
 
 import { resolveRunArtifact } from "../../dist/repair/run-artifact.js";
 import { readText } from "../helpers.ts";
 
 const digest = "1".repeat(64);
+
+test("repair result publication serializes every completed worker generation", () => {
+  const worker = parse(readText(".github/workflows/repair-cluster-worker.yml"));
+  const publisher = parse(readText(".github/workflows/repair-publish-results.yml"));
+
+  assert.equal(worker.concurrency?.["cancel-in-progress"], false);
+  assert.equal(worker.concurrency?.queue, "max");
+  assert.equal(publisher.concurrency?.group, "clawsweeper-repair-publish-results");
+  assert.equal(publisher.concurrency?.["cancel-in-progress"], false);
+  assert.equal(publisher.concurrency?.queue, "max");
+});
 
 test("repair result publication treats a missing current artifact as an explicit empty outcome", () => {
   const workflow = readText(".github/workflows/repair-publish-results.yml");

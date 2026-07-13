@@ -82,6 +82,7 @@ concurrency:
   group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}-{2}', inputs.job, inputs.job_sha256, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
   # Keep an active execute run alive so its temporary gate cleanup can finish;
   # queue every immutable generation instead of replacing an older pending run.
+  # Each completion then enters the publisher's matching expanded queue.
   cancel-in-progress: false
   queue: max
 

@@ -18,7 +18,10 @@ env:
 
 concurrency:
   group: clawsweeper-repair-publish-results
+  # Serialize state publication while retaining every completed worker
+  # generation instead of replacing the older pending publisher.
   cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
