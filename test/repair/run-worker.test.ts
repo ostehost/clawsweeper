@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -167,6 +167,114 @@ test("run-worker starts Codex in the target checkout when one is available", () 
   } finally {
     for (const runDir of fs.globSync(
       path.join(repoRoot, `.clawsweeper-repair/runs/${jobName}-plan-*`),
+    )) {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("run-worker preserves short failed Codex output after capture close", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-run-worker-failure-"));
+  const fakeBin = path.join(tmp, "bin");
+  const targetCheckout = path.join(tmp, "target-openclaw");
+
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(targetCheckout, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeBin, "gh"),
+    [
+      "#!/usr/bin/env node",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw') {",
+      "  process.stdout.write(JSON.stringify({ default_branch: 'main' }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/branches/main') {",
+      "  process.stdout.write(JSON.stringify({ commit: { sha: '1111111111111111111111111111111111111111' } }));",
+      "  process.exit(0);",
+      "}",
+      "process.stderr.write(`unexpected gh args: ${args.join(' ')}\\n`);",
+      "process.exit(1);",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    path.join(fakeBin, "codex"),
+    [
+      "#!/usr/bin/env node",
+      "const stream = process.env.FAKE_CODEX_FAILURE_STREAM;",
+      "const message = process.env.FAKE_CODEX_FAILURE_MESSAGE;",
+      "process.stdin.resume();",
+      "process.stdin.on('end', () => {",
+      "  process[stream].write(`${message}\\n`, () => process.exit(17));",
+      "});",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  try {
+    for (const stream of ["stderr", "stdout"] as const) {
+      const message = `short ${stream} failure`;
+      const jobName = `run-worker-short-${stream}-${path.basename(tmp)}`;
+      const jobPath = path.join(tmp, `${jobName}.md`);
+      fs.writeFileSync(
+        jobPath,
+        [
+          "---",
+          "repo: openclaw/openclaw",
+          `cluster_id: ${jobName}`,
+          "mode: plan",
+          "allowed_actions:",
+          "  - fix",
+          "source: clawsweeper_commit",
+          "commit_sha: 1111111111111111111111111111111111111111",
+          "security_policy: central_security_only",
+          "security_sensitive: false",
+          "---",
+          "Plan only.",
+          "",
+        ].join("\n"),
+      );
+
+      const run = spawnSync(
+        process.execPath,
+        ["dist/repair/run-worker.js", jobPath, "--mode", "plan"],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CLAWSWEEPER_TARGET_CHECKOUT: targetCheckout,
+            CLAWSWEEPER_STEERABLE_CODEX: "0",
+            FAKE_CODEX_FAILURE_STREAM: stream,
+            FAKE_CODEX_FAILURE_MESSAGE: message,
+            LONG_FAILURE_CAPTURE_SECRET: "x".repeat(256),
+            PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+
+      assert.equal(run.status, 1);
+      assert.match(run.stderr, new RegExp(message));
+      const runDirs = fs.globSync(
+        path.join(repoRoot, `.clawsweeper-repair/runs/${jobName}-plan-*`),
+      );
+      assert.equal(runDirs.length, 1);
+      const runDir = runDirs[0];
+      assert.ok(runDir);
+      assert.equal(
+        JSON.parse(fs.readFileSync(path.join(runDir, "result.json"), "utf8")).summary,
+        message,
+      );
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  } finally {
+    for (const runDir of fs.globSync(
+      path.join(
+        repoRoot,
+        `.clawsweeper-repair/runs/run-worker-short-*-${path.basename(tmp)}-plan-*`,
+      ),
     )) {
       fs.rmSync(runDir, { recursive: true, force: true });
     }

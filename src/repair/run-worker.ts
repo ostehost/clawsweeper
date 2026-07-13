@@ -334,12 +334,17 @@ function spawnCodexWithHeartbeat({
       clearTimeout(timeout);
       closeCodexOutputCapture(stdout);
       closeCodexOutputCapture(stderr);
+      const completedResult = {
+        ...result,
+        stdout: codexOutputTail(stdout),
+        stderr: codexOutputTail(stderr),
+      };
       try {
         redactCodexOutputLastMessage(commandArgs, codexRedactValues);
-        resolve(result);
+        resolve(completedResult);
       } catch (error) {
         resolve({
-          ...result,
+          ...completedResult,
           error: error instanceof Error ? error : new Error(String(error)),
         });
       }
@@ -358,8 +363,6 @@ function spawnCodexWithHeartbeat({
     child.on("error", (error) => {
       finish({
         status: null,
-        stdout: codexOutputTail(stdout),
-        stderr: codexOutputTail(stderr),
         error,
       });
     });
@@ -367,8 +370,6 @@ function spawnCodexWithHeartbeat({
       finish({
         status,
         signal,
-        stdout: codexOutputTail(stdout),
-        stderr: codexOutputTail(stderr),
         error: timeoutError ?? undefined,
       });
     });
