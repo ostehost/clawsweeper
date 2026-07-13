@@ -72,11 +72,11 @@ if (command === "finalize") {
       fs.readFileSync(manifestPath, "utf8"),
       lane,
       {
-        repository: current.repository,
-        sha: current.sha,
-        workflow: current.workflow,
+        repository: args.expectedRepository ?? current.repository,
+        sha: args.expectedSha ?? current.sha,
+        workflow: args.expectedWorkflow ?? current.workflow,
         job: args.expectedJob ?? current.job,
-        runId: current.runId,
+        runId: args.expectedRunId ?? current.runId,
         runAttempt: args.expectedRunAttempt ?? current.runAttempt,
       },
       {
@@ -145,7 +145,7 @@ if (command === "finalize") {
   }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-job job --expected-run-attempt attempt] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
+    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-repository owner/repo --expected-sha sha --expected-workflow workflow --expected-job job --expected-run-id id --expected-run-attempt attempt] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
   );
 }
 
@@ -164,7 +164,11 @@ function parseArgs(argv: readonly string[]) {
     manifest?: string;
     sourceRoot?: string;
     stateRoot?: string;
+    expectedRepository?: string;
+    expectedSha?: string;
+    expectedWorkflow?: string;
     expectedJob?: string;
+    expectedRunId?: string;
     expectedRunAttempt?: number;
     commitReport?: string;
     expectedCommitRepository?: string;
@@ -178,8 +182,16 @@ function parseArgs(argv: readonly string[]) {
     else if (arg === "--source-root") parsed.sourceRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--state-root") parsed.stateRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--allow-empty") parsed.allowEmpty = true;
-    else if (arg === "--expected-job") parsed.expectedJob = requiredValue(argv, ++index, arg);
-    else if (arg === "--commit-report") parsed.commitReport = requiredValue(argv, ++index, arg);
+    else if (arg === "--expected-repository") {
+      parsed.expectedRepository = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-sha") {
+      parsed.expectedSha = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-workflow") {
+      parsed.expectedWorkflow = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-job") parsed.expectedJob = requiredValue(argv, ++index, arg);
+    else if (arg === "--expected-run-id") {
+      parsed.expectedRunId = requiredValue(argv, ++index, arg);
+    } else if (arg === "--commit-report") parsed.commitReport = requiredValue(argv, ++index, arg);
     else if (arg === "--expected-commit-repository") {
       parsed.expectedCommitRepository = requiredValue(argv, ++index, arg);
     } else if (arg === "--expected-commit-sha") {

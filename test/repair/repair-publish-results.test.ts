@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parse } from "yaml";
 
-import { resolveRunArtifact } from "../../dist/repair/run-artifact.js";
 import { readText } from "../helpers.ts";
-
-const digest = "1".repeat(64);
 
 test("repair result publication serializes every completed worker generation", () => {
   const worker = parse(readText(".github/workflows/repair-cluster-worker.yml"));
@@ -38,86 +35,26 @@ test("repair result publication treats a missing current artifact as an explicit
   const workflow = readText(".github/workflows/repair-publish-results.yml");
   const current = workflow.slice(
     workflow.indexOf("- name: Resolve current worker result artifact"),
-    workflow.indexOf("- name: Resolve verified prior worker result cohort"),
+    workflow.indexOf("- name: Download exact current worker result artifact"),
   );
   const verify = workflow.slice(
-    workflow.indexOf("- name: Verify selected worker result artifact"),
+    workflow.indexOf("- name: Verify current worker result artifact"),
     workflow.indexOf("- name: Publish result ledger"),
   );
 
-  assert.match(current, /resolveOptionalRunArtifact/);
-  assert.match(current, /prefix: "clawsweeper-repair"/);
-  assert.match(current, /fallbackPrefixes: \["clawsweeper-repair-worker"\]/);
-  assert.match(current, /allowPriorAttempts: false/);
+  assert.match(current, /finalName = `clawsweeper-repair-\$\{runId\}-\$\{runAttempt\}`/);
+  assert.match(current, /workerName = `clawsweeper-repair-worker-\$\{runId\}-\$\{runAttempt\}`/);
+  assert.match(current, /current worker result artifact is ambiguous/);
   assert.match(current, /artifact_found: "0"/);
   assert.match(verify, /if \[ "\$ARTIFACT_FOUND" != "1" \]; then/);
   assert.match(verify, /echo "has_artifacts=0" >> "\$GITHUB_OUTPUT"/);
   assert.match(verify, /exit 0/);
-});
-
-test("repair result reruns reuse only a verified prior final provenance cohort", () => {
-  const workflow = readText(".github/workflows/repair-publish-results.yml");
-  const prior = workflow.slice(
-    workflow.indexOf("- name: Resolve verified prior worker result cohort"),
-    workflow.indexOf("- name: Select worker result artifact"),
-  );
-  const download = workflow.slice(
-    workflow.indexOf("- name: Select worker result artifact"),
-    workflow.indexOf("- name: Publish result ledger"),
-  );
-
-  assert.match(prior, /steps\.current-result-artifact\.outputs\.artifact_found != '1'/);
-  assert.match(prior, /attempts\/\$\{RUN_ATTEMPT\}\/jobs\?per_page=100/);
-  assert.match(prior, /allowsPriorResultArtifactCohort/);
-  assert.match(prior, /prefix: "clawsweeper-repair"/);
-  assert.match(prior, /requiredPrefixes: \["clawsweeper-repair-provenance"\]/);
-  assert.match(prior, /maxProducerAttempt: currentAttempt - 1/);
-  assert.match(prior, /allowPriorAttempts: true/);
-  assert.doesNotMatch(prior, /fallbackPrefixes/);
-  assert.match(download, /artifact-ids: \$\{\{ steps\.result-artifact\.outputs\.artifact_id \}\}/);
-  assert.match(
-    download,
-    /artifact-ids: \$\{\{ steps\.result-artifact\.outputs\.provenance_artifact_id \}\}/,
-  );
-  assert.match(download, /provenanceFiles\.length !== 1/);
-  assert.match(download, /verifyPriorResultArtifactCohort/);
-  assert.match(download, /resultArtifactId: process\.env\.ARTIFACT_ID/);
-  assert.match(download, /resultArtifactDigest: process\.env\.ARTIFACT_DIGEST/);
-  assert.match(download, /provenanceArtifactId: process\.env\.PROVENANCE_ARTIFACT_ID/);
-  assert.match(download, /provenanceArtifactDigest: process\.env\.PROVENANCE_ARTIFACT_DIGEST/);
-  assert.match(download, /findResultPaths\("artifacts"\)/);
-  assert.match(download, /if \[ ! -s "\$result_paths_file" \]; then/);
-  assert.match(download, /pnpm run repair:review-results -- "\$\{result_paths\[@\]\}"/);
-  assert.doesNotMatch(download, /gh run download "\$RUN_ID"[\s\S]*--dir artifacts/);
-});
-
-test("repair result current-attempt selection rejects a stale prior artifact", () => {
-  assert.throws(
-    () =>
-      resolveRunArtifact({
-        artifacts: [workerArtifact(101, 1)],
-        prefix: "clawsweeper-repair",
-        fallbackPrefixes: ["clawsweeper-repair-worker"],
-        runId: "9001",
-        currentAttempt: 2,
-        allowPriorAttempts: false,
-      }),
-    /current producer attempt did not publish/,
-  );
-});
-
-test("repair result current-attempt selection rejects ambiguity", () => {
-  assert.throws(
-    () =>
-      resolveRunArtifact({
-        artifacts: [workerArtifact(201, 2), workerArtifact(202, 2)],
-        prefix: "clawsweeper-repair",
-        fallbackPrefixes: ["clawsweeper-repair-worker"],
-        runId: "9001",
-        currentAttempt: 2,
-        allowPriorAttempts: false,
-      }),
-    /selection is ambiguous/,
+  assert.match(workflow, /artifact-ids: \$\{\{ steps\.result-artifact\.outputs\.artifact_id \}\}/);
+  assert.match(verify, /findResultPaths\("artifacts"\)/);
+  assert.match(verify, /pnpm run repair:review-results -- "\$\{result_paths\[@\]\}"/);
+  assert.doesNotMatch(
+    workflow,
+    /run-artifact\.js|Resolve verified prior worker result cohort|allowPriorAttempts|prior-attempt/,
   );
 });
 
@@ -188,12 +125,3 @@ test("repair event notifications publish durable claims before delivery and rece
   assert.doesNotMatch(result, /--path notifications/);
   assert.doesNotMatch(result, /--best-effort-refresh/);
 });
-
-function workerArtifact(id: number, attempt: number) {
-  return {
-    id,
-    name: `clawsweeper-repair-worker-9001-${attempt}`,
-    digest,
-    expired: false,
-  };
-}

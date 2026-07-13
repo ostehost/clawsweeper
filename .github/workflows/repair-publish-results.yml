@@ -18,8 +18,6 @@ env:
 
 concurrency:
   group: clawsweeper-repair-publish-results
-  # Serialize state publication while retaining every completed worker
-  # generation instead of replacing the older pending publisher.
   cancel-in-progress: false
   queue: max
 
@@ -148,24 +146,28 @@ jobs:
           pnpm run build:repair
 
       - name: Resolve current worker result artifact
-        id: current-result-artifact
+        id: result-artifact
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
+          JOB_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-jobs.json
         run: |
           set -euo pipefail
           rm -rf artifacts
-          rm -rf artifact-provenance
-          mkdir -p artifacts artifact-provenance
+          mkdir -p artifacts
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
             > "$ARTIFACT_INVENTORY"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            > "$JOB_INVENTORY"
           node --input-type=module <<'NODE'
           import fs from "node:fs";
-          import { resolveOptionalRunArtifact } from "./dist/repair/run-artifact.js";
 
+          const runId = requiredDigits(process.env.RUN_ID, "run id");
+          const runAttempt = requiredDigits(process.env.RUN_ATTEMPT, "run attempt");
           const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
           if (!Array.isArray(pages)) throw new Error("workflow artifact response is invalid");
           const artifacts = pages.flatMap((page) => {
@@ -174,115 +176,79 @@ jobs:
             }
             return page.artifacts;
           });
-          const artifact = resolveOptionalRunArtifact({
-            artifacts,
-            prefix: "clawsweeper-repair",
-            fallbackPrefixes: ["clawsweeper-repair-worker"],
-            runId: process.env.RUN_ID,
-            currentAttempt: Number(process.env.RUN_ATTEMPT),
-            allowPriorAttempts: false,
-          });
-          if (!artifact) {
-            writeOutputs({ artifact_found: "0" });
-          } else {
-            writeOutputs({
-              artifact_found: "1",
-              artifact_id: String(artifact.id),
-              artifact_name: artifact.name,
-              producer_attempt: String(artifact.producerAttempt),
-              artifact_digest: artifact.digest,
-            });
-          }
-
-          function writeOutputs(outputs) {
-            fs.appendFileSync(
-              process.env.GITHUB_OUTPUT,
-              Object.entries(outputs)
-                .map(([name, value]) => `${name}=${value}\n`)
-                .join(""),
+          const finalName = `clawsweeper-repair-${runId}-${runAttempt}`;
+          const workerName = `clawsweeper-repair-worker-${runId}-${runAttempt}`;
+          const clusterLedgerName =
+            `clawsweeper-repair-worker-action-ledger-cluster-${runId}-${runAttempt}`;
+          const executeLedgerName =
+            `clawsweeper-repair-worker-action-ledger-execute-${runId}-${runAttempt}`;
+          const select = (name) =>
+            artifacts.filter(
+              (artifact) =>
+                artifact?.name === name &&
+                artifact.expired !== true &&
+                Number.isSafeInteger(Number(artifact.id)),
             );
+          const finalArtifacts = select(finalName);
+          const workerArtifacts = select(workerName);
+          const clusterLedgers = select(clusterLedgerName);
+          const executeLedgers = select(executeLedgerName);
+          if (
+            finalArtifacts.length > 1 ||
+            workerArtifacts.length > 1 ||
+            clusterLedgers.length > 1 ||
+            executeLedgers.length > 1
+          ) {
+            throw new Error("current worker result artifact is ambiguous");
           }
-          NODE
-
-      - name: Resolve verified prior worker result cohort
-        id: prior-result-artifact
-        if: ${{ steps.current-result-artifact.outputs.artifact_found != '1' }}
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
-          CURRENT_ATTEMPT_JOBS: ${{ runner.temp }}/clawsweeper-repair-current-attempt-jobs.json
-        run: |
-          set -euo pipefail
-          gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
-            > "$CURRENT_ATTEMPT_JOBS"
-          node --input-type=module <<'NODE'
-          import fs from "node:fs";
-          import {
-            allowsPriorResultArtifactCohort,
-            resolveOptionalRunArtifact,
-            resolveRunArtifact,
-          } from "./dist/repair/run-artifact.js";
-
-          const artifacts = readPages(process.env.ARTIFACT_INVENTORY, "artifacts");
-          const jobs = readPages(process.env.CURRENT_ATTEMPT_JOBS, "jobs");
-          const currentAttempt = Number(process.env.RUN_ATTEMPT);
-          if (!Number.isInteger(currentAttempt) || currentAttempt < 1) {
-            throw new Error("current workflow attempt is invalid");
-          }
-          const policyAllowsPrior = allowsPriorResultArtifactCohort({
-            jobs,
-            currentAttempt,
+          const jobPages = JSON.parse(fs.readFileSync(process.env.JOB_INVENTORY, "utf8"));
+          if (!Array.isArray(jobPages)) throw new Error("workflow job response is invalid");
+          const jobs = jobPages.flatMap((page) => {
+            if (!Array.isArray(page?.jobs)) throw new Error("workflow job page is invalid");
+            return page.jobs;
           });
-          if (!policyAllowsPrior) {
-            writeOutputs({ artifact_found: "0", selection_policy: "current-attempt-only" });
-            process.exit(0);
-          }
-
-          const artifact = resolveOptionalRunArtifact({
-            artifacts,
-            prefix: "clawsweeper-repair",
-            requiredPrefixes: ["clawsweeper-repair-provenance"],
-            runId: process.env.RUN_ID,
-            currentAttempt,
-            maxProducerAttempt: currentAttempt - 1,
-            allowPriorAttempts: true,
-          });
+          const clusterJobResult = exactJobResult(jobs, "Plan and review cluster");
+          const executeJobResult = exactJobResult(jobs, "Execute and apply cluster actions");
+          const artifact = finalArtifacts[0] ?? workerArtifacts[0];
           if (!artifact) {
-            writeOutputs({ artifact_found: "0", selection_policy: "no-prior-cohort" });
+            writeOutputs({
+              artifact_found: "0",
+              cluster_job_result: clusterJobResult,
+              execute_job_result: executeJobResult,
+              cluster_ledger_found: clusterLedgers[0] ? "1" : "0",
+              cluster_ledger_id: clusterLedgers[0] ? String(clusterLedgers[0].id) : "",
+              execute_ledger_found: executeLedgers[0] ? "1" : "0",
+              execute_ledger_id: executeLedgers[0] ? String(executeLedgers[0].id) : "",
+            });
             process.exit(0);
           }
-          const provenance = resolveRunArtifact({
-            artifacts,
-            prefix: "clawsweeper-repair-provenance",
-            runId: process.env.RUN_ID,
-            currentAttempt,
-            expectedProducerAttempt: artifact.producerAttempt,
-            allowPriorAttempts: true,
-          });
           writeOutputs({
             artifact_found: "1",
-            selection_policy: "verified-prior-cohort",
             artifact_id: String(artifact.id),
             artifact_name: artifact.name,
-            producer_attempt: String(artifact.producerAttempt),
-            artifact_digest: artifact.digest,
-            provenance_artifact_id: String(provenance.id),
-            provenance_artifact_name: provenance.name,
-            provenance_artifact_digest: provenance.digest,
+            producer_attempt: runAttempt,
+            cluster_job_result: clusterJobResult,
+            execute_job_result: executeJobResult,
+            cluster_ledger_found: clusterLedgers[0] ? "1" : "0",
+            cluster_ledger_id: clusterLedgers[0] ? String(clusterLedgers[0].id) : "",
+            execute_ledger_found: executeLedgers[0] ? "1" : "0",
+            execute_ledger_id: executeLedgers[0] ? String(executeLedgers[0].id) : "",
           });
 
-          function readPages(filePath, key) {
-            const pages = JSON.parse(fs.readFileSync(filePath, "utf8"));
-            if (!Array.isArray(pages)) throw new Error(`workflow ${key} response is invalid`);
-            return pages.flatMap((page) => {
-              if (!Array.isArray(page?.[key])) {
-                throw new Error(`workflow ${key} page is invalid`);
-              }
-              return page[key];
-            });
+          function requiredDigits(value, label) {
+            const text = String(value ?? "");
+            if (!/^[1-9][0-9]*$/.test(text)) throw new Error(`${label} is invalid`);
+            return text;
+          }
+
+          function exactJobResult(jobs, name) {
+            const matches = jobs.filter((job) => job?.name === name);
+            if (matches.length !== 1) {
+              throw new Error(`workflow job inventory has ${matches.length} ${name} jobs`);
+            }
+            const result = String(matches[0].conclusion ?? matches[0].status ?? "").trim();
+            if (!result) throw new Error(`workflow job ${name} has no terminal result`);
+            return result;
           }
 
           function writeOutputs(outputs) {
@@ -295,57 +261,7 @@ jobs:
           }
           NODE
 
-      - name: Select worker result artifact
-        id: result-artifact
-        env:
-          CURRENT_FOUND: ${{ steps.current-result-artifact.outputs.artifact_found }}
-          CURRENT_ARTIFACT_ID: ${{ steps.current-result-artifact.outputs.artifact_id }}
-          CURRENT_ARTIFACT_NAME: ${{ steps.current-result-artifact.outputs.artifact_name }}
-          CURRENT_PRODUCER_ATTEMPT: ${{ steps.current-result-artifact.outputs.producer_attempt }}
-          CURRENT_ARTIFACT_DIGEST: ${{ steps.current-result-artifact.outputs.artifact_digest }}
-          PRIOR_FOUND: ${{ steps.prior-result-artifact.outputs.artifact_found }}
-          PRIOR_POLICY: ${{ steps.prior-result-artifact.outputs.selection_policy }}
-          PRIOR_ARTIFACT_ID: ${{ steps.prior-result-artifact.outputs.artifact_id }}
-          PRIOR_ARTIFACT_NAME: ${{ steps.prior-result-artifact.outputs.artifact_name }}
-          PRIOR_PRODUCER_ATTEMPT: ${{ steps.prior-result-artifact.outputs.producer_attempt }}
-          PRIOR_ARTIFACT_DIGEST: ${{ steps.prior-result-artifact.outputs.artifact_digest }}
-          PRIOR_PROVENANCE_ARTIFACT_ID: ${{ steps.prior-result-artifact.outputs.provenance_artifact_id }}
-          PRIOR_PROVENANCE_ARTIFACT_NAME: ${{ steps.prior-result-artifact.outputs.provenance_artifact_name }}
-          PRIOR_PROVENANCE_ARTIFACT_DIGEST: ${{ steps.prior-result-artifact.outputs.provenance_artifact_digest }}
-        run: |
-          set -euo pipefail
-          if [ "$CURRENT_FOUND" = "1" ]; then
-            {
-              echo "artifact_found=1"
-              echo "selection=current"
-              echo "selection_policy=current-attempt"
-              echo "artifact_id=$CURRENT_ARTIFACT_ID"
-              echo "artifact_name=$CURRENT_ARTIFACT_NAME"
-              echo "producer_attempt=$CURRENT_PRODUCER_ATTEMPT"
-              echo "artifact_digest=$CURRENT_ARTIFACT_DIGEST"
-            } >> "$GITHUB_OUTPUT"
-          elif [ "$PRIOR_FOUND" = "1" ]; then
-            {
-              echo "artifact_found=1"
-              echo "selection=prior"
-              echo "selection_policy=$PRIOR_POLICY"
-              echo "artifact_id=$PRIOR_ARTIFACT_ID"
-              echo "artifact_name=$PRIOR_ARTIFACT_NAME"
-              echo "producer_attempt=$PRIOR_PRODUCER_ATTEMPT"
-              echo "artifact_digest=$PRIOR_ARTIFACT_DIGEST"
-              echo "provenance_artifact_id=$PRIOR_PROVENANCE_ARTIFACT_ID"
-              echo "provenance_artifact_name=$PRIOR_PROVENANCE_ARTIFACT_NAME"
-              echo "provenance_artifact_digest=$PRIOR_PROVENANCE_ARTIFACT_DIGEST"
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo "artifact_found=0"
-              echo "selection=empty"
-              echo "selection_policy=${PRIOR_POLICY:-no-current-artifact}"
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download exact worker result artifact
+      - name: Download exact current worker result artifact
         if: ${{ steps.result-artifact.outputs.artifact_found == '1' }}
         uses: actions/download-artifact@v8
         with:
@@ -355,121 +271,99 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      - name: Download exact worker result provenance
-        if: ${{ steps.result-artifact.outputs.selection == 'prior' }}
+      - name: Download cluster action ledger
+        if: ${{ steps.result-artifact.outputs.cluster_ledger_found == '1' }}
         uses: actions/download-artifact@v8
         with:
-          artifact-ids: ${{ steps.result-artifact.outputs.provenance_artifact_id }}
-          path: artifact-provenance
+          artifact-ids: ${{ steps.result-artifact.outputs.cluster_ledger_id }}
+          path: .clawsweeper-repair/action-ledger-download/cluster
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      - name: Verify selected worker result artifact
+      - name: Download execution action ledger
+        if: ${{ steps.result-artifact.outputs.execute_ledger_found == '1' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.result-artifact.outputs.execute_ledger_id }}
+          path: .clawsweeper-repair/action-ledger-download/execute
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Verify current worker action ledgers
+        id: worker-ledgers
+        env:
+          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
+          CLUSTER_LEDGER_FOUND: ${{ steps.result-artifact.outputs.cluster_ledger_found }}
+          EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
+          EXECUTE_LEDGER_FOUND: ${{ steps.result-artifact.outputs.execute_ledger_found }}
+        run: |
+          set -euo pipefail
+          verify_lane() {
+            local lane="$1"
+            local job="$2"
+            local job_result="$3"
+            local artifact_found="$4"
+            local allow_empty="${5:-false}"
+            if [ "$job_result" = "skipped" ]; then
+              if [ "$artifact_found" = "1" ]; then
+                echo "$lane job was skipped but exposed an action ledger artifact." >&2
+                return 1
+              fi
+              return
+            fi
+            if [ "$artifact_found" != "1" ]; then
+              echo "$lane job ($job_result) did not expose its current-attempt action ledger." >&2
+              return 1
+            fi
+            local source_root=".clawsweeper-repair/action-ledger-download/$lane"
+            local manifest_file="$source_root/repair-action-ledger-manifest.json"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --expected-repository "$GITHUB_REPOSITORY" \
+              --expected-sha "$WORKER_HEAD_SHA" \
+              --expected-workflow repair-cluster-worker.yml \
+              --expected-job "$job" \
+              --expected-run-id "$WORKER_RUN_ID" \
+              --expected-run-attempt "$WORKER_RUN_ATTEMPT" \
+              "${allow_empty_args[@]}" \
+              --source-root "$source_root" >/dev/null
+          }
+          verify_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_FOUND"
+          verify_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_FOUND" true
+
+      - name: Verify current worker result artifact
         id: download
         env:
           ARTIFACT_FOUND: ${{ steps.result-artifact.outputs.artifact_found }}
-          SELECTION: ${{ steps.result-artifact.outputs.selection }}
-          SELECTION_POLICY: ${{ steps.result-artifact.outputs.selection_policy }}
+          ARTIFACT_NAME: ${{ steps.result-artifact.outputs.artifact_name }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          ARTIFACT_ID: ${{ steps.result-artifact.outputs.artifact_id }}
-          ARTIFACT_NAME: ${{ steps.result-artifact.outputs.artifact_name }}
-          ARTIFACT_DIGEST: ${{ steps.result-artifact.outputs.artifact_digest }}
-          PRODUCER_ATTEMPT: ${{ steps.result-artifact.outputs.producer_attempt }}
-          PROVENANCE_ARTIFACT_ID: ${{ steps.result-artifact.outputs.provenance_artifact_id }}
-          PROVENANCE_ARTIFACT_NAME: ${{ steps.result-artifact.outputs.provenance_artifact_name }}
-          PROVENANCE_ARTIFACT_DIGEST: ${{ steps.result-artifact.outputs.provenance_artifact_digest }}
-          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
         run: |
           set -euo pipefail
           if [ "$ARTIFACT_FOUND" != "1" ]; then
             echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
-            echo "::notice title=No repair artifacts::No verified result payload for worker run $RUN_ID ($SELECTION_POLICY)."
+            echo "::notice title=No repair artifacts::No current-attempt result payload for worker run $RUN_ID."
             exit 0
           fi
-
-          if [ "$SELECTION" = "current" ]; then
-            if [ "$PRODUCER_ATTEMPT" != "$RUN_ATTEMPT" ]; then
-              echo "::error::Resolved current worker result attempt does not match workflow attempt."
+          case "$ARTIFACT_NAME" in
+            "clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT}" | \
+            "clawsweeper-repair-worker-${RUN_ID}-${RUN_ATTEMPT}") ;;
+            *)
+              echo "::error::Resolved worker result artifact does not belong to the current attempt."
               exit 1
-            fi
-            case "$ARTIFACT_NAME" in
-              "clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT}" | \
-              "clawsweeper-repair-worker-${RUN_ID}-${RUN_ATTEMPT}") ;;
-              *)
-                echo "::error::Resolved worker result artifact does not belong to the current attempt."
-                exit 1
-                ;;
-            esac
-          elif [ "$SELECTION" = "prior" ]; then
-            if [ "$PRODUCER_ATTEMPT" -ge "$RUN_ATTEMPT" ] ||
-               [ "$ARTIFACT_NAME" != "clawsweeper-repair-${RUN_ID}-${PRODUCER_ATTEMPT}" ]; then
-              echo "::error::Resolved prior worker result artifact identity is invalid."
-              exit 1
-            fi
-            node --input-type=module <<'NODE'
-            import fs from "node:fs";
-            import path from "node:path";
-            import { verifyPriorResultArtifactCohort } from "./dist/repair/run-artifact.js";
-
-            const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
-            if (!Array.isArray(pages)) throw new Error("workflow artifact response is invalid");
-            const artifacts = pages.flatMap((page) => {
-              if (!Array.isArray(page?.artifacts)) {
-                throw new Error("workflow artifact page is invalid");
-              }
-              return page.artifacts;
-            });
-            const runId = process.env.RUN_ID;
-            const currentAttempt = positiveInteger(process.env.RUN_ATTEMPT, "current attempt");
-            const producerAttempt = positiveInteger(
-              process.env.PRODUCER_ATTEMPT,
-              "producer attempt",
-            );
-            const provenanceFiles = fs
-              .readdirSync("artifact-provenance", { recursive: true })
-              .map((entry) => path.join("artifact-provenance", String(entry)))
-              .filter(
-                (entry) =>
-                  path.basename(entry) === "final-worker.json" && fs.statSync(entry).isFile(),
-              );
-            if (provenanceFiles.length !== 1) {
-              throw new Error("prior result provenance file is missing or ambiguous");
-            }
-            const provenance = JSON.parse(fs.readFileSync(provenanceFiles[0], "utf8"));
-            verifyPriorResultArtifactCohort({
-              artifacts,
-              provenance,
-              repository: process.env.GITHUB_REPOSITORY,
-              runId,
-              workflowSha: process.env.WORKER_HEAD_SHA,
-              currentAttempt,
-              producerAttempt,
-              resultArtifactId: process.env.ARTIFACT_ID,
-              resultArtifactName: process.env.ARTIFACT_NAME,
-              resultArtifactDigest: process.env.ARTIFACT_DIGEST,
-              provenanceArtifactId: process.env.PROVENANCE_ARTIFACT_ID,
-              provenanceArtifactName: process.env.PROVENANCE_ARTIFACT_NAME,
-              provenanceArtifactDigest: process.env.PROVENANCE_ARTIFACT_DIGEST,
-            });
-
-            function positiveInteger(value, label) {
-              const text = String(value ?? "");
-              if (!/^[1-9][0-9]*$/.test(text)) {
-                throw new Error(`${label} is invalid`);
-              }
-              const parsed = Number(text);
-              if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is invalid`);
-              return parsed;
-            }
-            NODE
-          else
-            echo "::error::Worker result artifact selection is invalid."
-            exit 1
-          fi
-
+              ;;
+          esac
           result_paths_file="$RUNNER_TEMP/clawsweeper-repair-result-paths.txt"
           node --input-type=module > "$result_paths_file" <<'NODE'
           import { findResultPaths } from "./dist/repair/publish-files.js";
@@ -478,7 +372,7 @@ jobs:
           }
           NODE
           if [ ! -s "$result_paths_file" ]; then
-            echo "::error::Exact worker artifact $ARTIFACT_NAME has no verified result payload."
+            echo "::error::Current worker artifact $ARTIFACT_NAME has no verified result payload."
             exit 1
           fi
           mapfile -t result_paths < "$result_paths_file"
@@ -530,8 +424,8 @@ jobs:
               --workflow-created-at "$WORKFLOW_CREATED_AT" \
               --producer-attempt "$PRODUCER_ATTEMPT"
 
-      # This workflow_run job executes trusted main-branch code only; artifacts
-      # from worker runs are downloaded as data and handled by repair publishers.
+      # This workflow_run job executes trusted main-branch code only; notification
+      # claims must be durable before external delivery begins.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Prepare durable notification claims
@@ -553,9 +447,8 @@ jobs:
             --prepare-only \
             --write-report
 
-      # This workflow_run job executes trusted main-branch code only; notification
-      # claims are generated locally from already verified result artifacts and
-      # must be durable before any external delivery can begin.
+      # This workflow_run job executes trusted main-branch code only; claims are
+      # generated from verified worker data and committed before delivery.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit notification claims
@@ -575,8 +468,8 @@ jobs:
               --push-attempts 4
           fi
 
-      # This workflow_run job executes trusted main-branch code only; delivery is
-      # permitted only for claims durably published by this exact run attempt.
+      # This workflow_run job executes trusted main-branch code only; artifacts
+      # from worker runs are downloaded as data and handled by repair publishers.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Notify OpenClaw about ClawSweeper events
@@ -599,7 +492,7 @@ jobs:
             --write-report
 
       # This workflow_run job executes trusted main-branch code only; accepted
-      # hook and dashboard receipts advance the already durable claim.
+      # delivery receipts advance the already durable claim.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit notification receipts
@@ -623,7 +516,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit result ledger
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.app_token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
@@ -638,22 +531,37 @@ jobs:
             --push-attempts 4
 
       - name: Finalize repair publication action ledger
+        id: finalize-publication-action-ledger
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          WORKER_LEDGER_OUTCOME: ${{ steps.worker-ledgers.outcome }}
         run: |
           set -euo pipefail
           : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
           allow_empty_args=()
-          if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+          allow_empty=false
+          if [ "${{ steps.download.outputs.has_artifacts }}" != "1" ] ||
+             [ "$WORKER_LEDGER_OUTCOME" != "success" ]; then
+            allow_empty=true
             allow_empty_args+=(--allow-empty)
           fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane repair-publication \
             "${allow_empty_args[@]}" \
             > .artifacts/repair-publication-action-ledger-manifest.json
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable repair publication action ledger
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          ALLOW_EMPTY: ${{ steps.finalize-publication-action-ledger.outputs.allow_empty }}
+          WORKER_LEDGER_OUTCOME: ${{ steps.worker-ledgers.outcome }}
+          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
+          EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -661,10 +569,46 @@ jobs:
           manifest_file=".artifacts/repair-publication-action-ledger-manifest.json"
           event_paths_file=".artifacts/repair-publication-action-ledger-paths.txt"
           import_result_file=".artifacts/repair-publication-action-ledger-import.json"
-          mkdir -p .artifacts
           test -s "$manifest_file"
+          : > "$event_paths_file"
+          import_worker_lane() {
+            local lane="$1"
+            local job="$2"
+            local job_result="$3"
+            local allow_empty="${4:-false}"
+            if [ "$job_result" = "skipped" ]; then
+              return
+            fi
+            local worker_root=".clawsweeper-repair/action-ledger-download/$lane"
+            local worker_manifest="$worker_root/repair-action-ledger-manifest.json"
+            local worker_import=".artifacts/$lane-action-ledger-import.json"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "$lane" \
+              --manifest "$worker_manifest" \
+              --expected-repository "$GITHUB_REPOSITORY" \
+              --expected-sha "$WORKER_HEAD_SHA" \
+              --expected-workflow repair-cluster-worker.yml \
+              --expected-job "$job" \
+              --expected-run-id "$WORKER_RUN_ID" \
+              --expected-run-attempt "$WORKER_RUN_ATTEMPT" \
+              "${allow_empty_args[@]}" \
+              --source-root "$worker_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$worker_import"
+            jq -e --slurpfile manifest "$worker_manifest" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$worker_import" >/dev/null
+            jq -r '.paths[]?' "$worker_import" >> "$event_paths_file"
+          }
+          if [ "$WORKER_LEDGER_OUTCOME" = "success" ]; then
+            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT"
+            import_worker_lane execute execute "$EXECUTE_JOB_RESULT" true
+          fi
           allow_empty_args=()
-          if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+          if [ "$ALLOW_EMPTY" = "true" ]; then
             allow_empty_args+=(--allow-empty)
           fi
           pnpm run --silent repair:action-ledger -- publish \
@@ -676,9 +620,10 @@ jobs:
           jq -e --slurpfile manifest "$manifest_file" \
             '.eventPaths == $manifest[0].event_paths' \
             "$import_result_file" >/dev/null
-          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+          sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+            if [ "$ALLOW_EMPTY" = "true" ]; then
               exit 0
             fi
             echo "Repair publication action event shards existed but no paths were imported." >&2

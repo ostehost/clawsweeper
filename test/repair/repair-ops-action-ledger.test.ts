@@ -1,8 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
@@ -72,41 +68,25 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.doesNotMatch(publisher, /recordAggregatePreparation\([^)]*,/);
 });
 
-test("repair worker jobs upload shards and one credentialed job publishes them", () => {
-  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
-  const cluster = workflow.slice(
-    workflow.indexOf("\n  cluster:"),
-    workflow.indexOf("\n  authorize:"),
-  );
-  const mutate = workflow.slice(
-    workflow.indexOf("\n  mutate:"),
-    workflow.indexOf("\n  publish-repair-action-ledger:"),
-  );
-  const report = workflow.slice(workflow.indexOf("\n  report:"), workflow.indexOf("\n  mutate:"));
-  const execute = workflow.slice(
-    workflow.indexOf("\n  execute:"),
-    workflow.indexOf("\n  validate:"),
-  );
-  const publisher = workflow.slice(workflow.indexOf("\n  publish-repair-action-ledger:"));
-  const clusterRegistration = cluster.slice(
-    cluster.indexOf("- name: Register repair lifecycle"),
-    cluster.indexOf("- name: Verify GitHub read token"),
-  );
+test("repair worker jobs upload current-attempt ledgers for the trusted publisher", () => {
+  const worker = readText(".github/workflows/repair-cluster-worker.yml");
+  const publisher = readText(".github/workflows/repair-publish-results.yml");
+  const cluster = worker.slice(worker.indexOf("\n  cluster:"), worker.indexOf("\n  execute:"));
+  const execute = worker.slice(worker.indexOf("\n  execute:"));
   const clusterWorker = cluster.slice(
     cluster.indexOf("- name: Run worker"),
     cluster.indexOf("- name: Review worker result"),
   );
-  const mutationRegistration = mutate.slice(
-    mutate.indexOf("- name: Resume repair lifecycle"),
-    mutate.indexOf("- name: Create exact-repository mutation token"),
-  );
 
+  assert.match(worker, /concurrency:[\s\S]*cancel-in-progress: false[\s\S]*queue: max/);
   assert.match(cluster, /permissions:\s+actions: read\s+contents: read/);
   assert.match(cluster, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(cluster, /Finalize cluster repair action ledger/);
-  assert.match(cluster, /clawsweeper-repair-worker-action-ledger-cluster-/);
-  assert.match(clusterWorker, /id: run_worker/);
-  assert.match(clusterWorker, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: repair-worker-codex/);
+  assert.match(
+    cluster,
+    /clawsweeper-repair-worker-action-ledger-cluster-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  assert.match(clusterWorker, /pnpm run repair:worker/);
   assert.ok(
     cluster.indexOf("uses: ./.github/actions/setup-action-ledger") <
       cluster.indexOf("- name: Run worker"),
@@ -115,149 +95,51 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     cluster.indexOf("- name: Run worker") <
       cluster.indexOf("- name: Finalize cluster repair action ledger"),
   );
-  assert.match(clusterRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
-  assert.match(
-    clusterRegistration,
-    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ env\.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs\.dry_run && secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \|\| '' \}\}/,
-  );
-  assert.doesNotMatch(
-    clusterRegistration,
-    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \}\}/,
-  );
-  assert.doesNotMatch(clusterRegistration, /if:.*CLAWSWEEPER_STEERABLE_CODEX/);
-  assert.match(mutate, /uses: \.\/\.github\/actions\/setup-action-ledger/);
-  assert.match(mutate, /Finalize mutation repair action ledger/);
-  assert.match(mutate, /clawsweeper-repair-worker-action-ledger-mutate-/);
-  assert.match(mutationRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
-  assert.match(
-    mutationRegistration,
-    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ env\.CLAWSWEEPER_STEERABLE_CODEX == '1' && secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \|\| '' \}\}/,
-  );
-  assert.doesNotMatch(
-    mutationRegistration,
-    /CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: \$\{\{ secrets\.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN \}\}/,
-  );
-  assert.match(mutationRegistration, /--skip-repair-receipt/);
-  assert.doesNotMatch(mutationRegistration, /if:.*CLAWSWEEPER_STEERABLE_CODEX/);
-  assert.match(
-    mutate,
-    /Resolve planning action ledger context[\s\S]*--expected-artifact-id "\$\{\{ needs\.cluster\.outputs\.action_ledger_artifact_id \}\}"[\s\S]*Download planning action ledger context[\s\S]*artifact-ids: \$\{\{ steps\.planning_action_ledger\.outputs\.artifact_id \}\}/,
-  );
-  assert.match(mutate, /CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS:/);
-  assert.doesNotMatch(mutate, /create-state-token|setup-state/);
   assert.match(execute, /uses: \.\/\.github\/actions\/setup-action-ledger/);
-  assert.match(execute, /CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS:/);
-  assert.match(execute, /Resolve planning action ledger context/);
   assert.match(execute, /Finalize execution repair action ledger/);
-  assert.match(execute, /clawsweeper-repair-worker-action-ledger-execute-/);
   assert.match(
     execute,
-    /checkpoint_recovered \}\}" = "1"[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane execute/,
+    /clawsweeper-repair-worker-action-ledger-execute-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
-  assert.match(report, /id: publish_terminal_status/);
-  assert.match(report, /Finalize report status repair action ledger/);
-  assert.match(report, /--repair-lane report-status[\s\S]*--allow-empty/);
-  assert.match(report, /Finalize report command action ledger/);
-  assert.match(report, /--lane report-requeue/);
-  assert.match(report, /Publish immutable report action ledgers/);
-  assert.match(
-    report,
-    /publish_manifest[\s\S]*repair[\s\S]*report-status[\s\S]*publish_manifest[\s\S]*command[\s\S]*report-requeue/,
-  );
-  assert.match(report, /--message "chore: append report action ledgers"/);
-
-  assert.match(publisher, /name: Publish immutable repair action ledger/);
-  assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
+  assert.match(publisher, /attempts\/\$\{RUN_ATTEMPT\}\/jobs\?per_page=100/);
+  assert.match(publisher, /exactJobResult\(jobs, "Plan and review cluster"\)/);
+  assert.match(publisher, /exactJobResult\(jobs, "Execute and apply cluster actions"\)/);
+  assert.match(publisher, /Download cluster action ledger/);
+  assert.match(publisher, /Download execution action ledger/);
+  assert.match(publisher, /Verify current worker action ledgers/);
   assert.match(
     publisher,
-    /if: \$\{\{ always\(\) && needs\.cluster\.result != 'skipped' && needs\.cluster\.outputs\.job_exists == '1' \}\}/,
+    /\$lane job \(\$job_result\) did not expose its current-attempt action ledger/,
   );
-  assert.match(publisher, /create-state-token/);
+  assert.match(publisher, /--expected-repository "\$GITHUB_REPOSITORY"/);
+  assert.match(publisher, /--expected-sha "\$WORKER_HEAD_SHA"/);
+  assert.match(publisher, /--expected-workflow repair-cluster-worker\.yml/);
+  assert.match(publisher, /--expected-run-id "\$WORKER_RUN_ID"/);
+  assert.match(
+    publisher,
+    /verify_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_LEDGER_FOUND"/,
+  );
+  assert.match(
+    publisher,
+    /verify_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_FOUND" true/,
+  );
+  assert.match(publisher, /import_worker_lane cluster cluster "\$CLUSTER_JOB_RESULT"/);
+  assert.match(publisher, /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" true/);
   assert.ok(
-    publisher.indexOf("- uses: ./.github/actions/setup-pnpm") <
-      publisher.indexOf("- name: Create repair action ledger state token"),
-    "repair ledger publisher must build before minting state write credentials",
+    publisher.indexOf("- name: Verify current worker action ledgers") <
+      publisher.indexOf("- name: Publish result ledger"),
   );
-  assert.match(
-    publisher,
-    /artifact-ids: \$\{\{ needs\.cluster\.outputs\.action_ledger_artifact_id \}\}/,
+  assert.doesNotMatch(
+    worker,
+    /\n  (authorize|report|mutate|validate|publish-repair-action-ledger):/,
   );
-  assert.match(
-    publisher,
-    /artifact-ids: \$\{\{ needs\.execute\.outputs\.action_ledger_artifact_id \}\}/,
-  );
-  assert.match(
-    publisher,
-    /artifact-ids: \$\{\{ needs\.mutate\.outputs\.action_ledger_artifact_id \}\}/,
-  );
-  assert.match(publisher, /repair:action-ledger -- publish/);
-  assert.match(publisher, /--repair-lane "\$lane"/);
-  assert.match(publisher, /--expected-job "\$job"/);
-  assert.match(publisher, /--expected-run-attempt "\$run_attempt"/);
-  assert.match(
-    publisher,
-    /EXECUTE_LEDGER_ALLOW_EMPTY:[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*collect_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_ARTIFACT_ID" "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_DOWNLOAD_OUTCOME" "\$EXECUTE_LEDGER_ALLOW_EMPTY"/,
-  );
-  assert.match(publisher, /collect_lane cluster cluster/);
-  assert.match(publisher, /collect_lane execute execute/);
-  assert.match(publisher, /collect_lane mutate mutate/);
-  assert.match(publisher, /\$lane job \(\$job_result\) did not expose an action ledger artifact/);
-  assert.match(publisher, /record_lane "\$lane" "\$\{job_result:-not-started\}" "missing"/);
-  assert.match(publisher, /One or more advertised repair action ledger lanes failed closed/);
-  assert.match(publisher, /continue-on-error: true/);
-  assert.doesNotMatch(publisher, /require_lane/);
-  assert.match(publisher, /--message "chore: append repair action ledger"/);
-});
-
-test("repair ledger collector publishes present lanes when downstream lanes are absent", () => {
-  const result = runRepairLedgerCollector();
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.summary, /\| cluster \| success \| published \|/);
-  assert.match(result.summary, /\| execute \| skipped \| missing \|/);
-  assert.match(result.summary, /\| mutate \| skipped \| missing \|/);
-  assert.match(result.published, /ledger\/cluster\.json/);
-});
-
-test("repair ledger collector accepts a genuinely non-started lane without an artifact", () => {
-  const result = runRepairLedgerCollector({ executeResult: "" });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.summary, /\| cluster \| success \| published \|/);
-  assert.match(result.summary, /\| execute \| not-started \| missing \|/);
-  assert.match(result.published, /ledger\/cluster\.json/);
-});
-
-for (const jobResult of ["success", "failure", "cancelled"]) {
-  test(`repair ledger collector rejects a ${jobResult} lane without an artifact`, () => {
-    const result = runRepairLedgerCollector({ executeResult: jobResult });
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stderr,
-      new RegExp(`execute job \\(${jobResult}\\) did not expose an action ledger artifact`),
-    );
-    assert.match(result.stderr, /advertised repair action ledger lanes failed closed/);
-    assert.match(result.summary, /\| cluster \| success \| published \|/);
-    assert.match(
-      result.summary,
-      new RegExp(`\\| execute \\| ${jobResult} \\| invalid: missing started artifact \\|`),
-    );
-    assert.match(result.published, /ledger\/cluster\.json/);
-  });
-}
-
-test("repair ledger collector preserves valid lanes but fails closed on a forged lane", () => {
-  const result = runRepairLedgerCollector({ forgedMutate: true });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /advertised repair action ledger lanes failed closed/);
-  assert.match(result.summary, /\| cluster \| success \| published \|/);
-  assert.match(result.summary, /\| mutate \| failure \| invalid: verification failed \|/);
-  assert.match(result.published, /ledger\/cluster\.json/);
+  assert.doesNotMatch(publisher, /resolve-run-artifact|prior-attempt|allowPriorAttempts/);
 });
 
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
   const ledger = readText("src/repair/repair-action-ledger.ts");
   const codexLedger = readText("src/repair/repair-codex-action-ledger.ts");
   const worker = readText("src/repair/run-worker.ts");
-  const handoff = readText("src/repair/execution-handoff.ts");
   const executor = readText("src/repair/execute-fix-artifact.ts");
   const github = readText("src/repair/execute-fix-github.ts");
   const postFlight = readText("src/repair/post-flight.ts");
@@ -266,26 +148,11 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   assert.match(ledger, /requestAttempt/);
   assert.match(ledger, /mutation_outcome_unknown/);
   assert.match(ledger, /repairMutationState/);
-  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "started"\)/);
-  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "failed", error\)/);
-  assert.match(handoff, /recordPublicationWorkflowEventSafely\(lifecycle, "finalized"\)/);
-  for (const boundary of [
-    "branch_push",
-    "pull_request_create",
-    "pull_request_reopen",
-    "pull_request_comment",
-    "pull_request_labels",
-    "source_pull_request_close",
-    "source_pull_request_reopen_compensation",
-  ]) {
-    assert.match(handoff, new RegExp(`kind: "${boundary}"`));
-  }
   assert.match(executor, /beginRepairCodexAction/);
   for (const action of [
     "repair_plan",
     "repair_result_repair",
     "repair_edit",
-    "repair_write_preflight",
     "repair_base_reconcile",
     "repair_review",
     "repair_review_fix",
@@ -363,8 +230,7 @@ test("commit review and notification workflows publish their operation receipts"
   const commit = readText(".github/workflows/commit-review.yml");
   const activity = readText(".github/workflows/github-activity.yml");
   const maintainer = readText(".github/workflows/maintainer-report-discord.yml");
-  const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  attest:"));
-  const attestor = commit.slice(commit.indexOf("\n  attest:"), commit.indexOf("\n  publish:"));
+  const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  publish:"));
   const publisher = commit.slice(commit.indexOf("\n  publish:"));
 
   assert.match(commit, /run-name:.*continuation_key/);
@@ -378,28 +244,17 @@ test("commit review and notification workflows publish their operation receipts"
     commit,
     /plan:\n\s+name: Plan commits\n\s+needs: receipt\n\s+if:.*needs\.receipt\.outputs\.proceed == 'true'/,
   );
-  assert.doesNotMatch(review, /setup-action-ledger|CLAWSWEEPER_ACTION_LEDGER/);
+  assert.match(review, /setup-action-ledger/);
+  assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
   assert.match(review, /--defer-workflow-completion/);
   assert.doesNotMatch(review, /publish-check|permission-checks: write|finish-review/);
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
-  assert.match(attestor, /setup-action-ledger/);
-  assert.match(attestor, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
-  assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
-  assert.match(attestor, /commit-review-raw-\$\{\{ matrix\.sha \}\}/);
-  assert.match(attestor, /Upload attested commit review report/);
-  assert.match(attestor, /--report-path "\$report_path"/);
-  assert.ok(
-    attestor.indexOf("- name: Attest immutable commit review report") <
-      attestor.indexOf("- name: Finalize commit review action ledger"),
-  );
-  assert.match(
-    attestor,
-    /action-ledger-commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
-  );
   assert.match(
     review,
-    /commit-review-raw-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+    /commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
+  assert.match(review, /Finalize commit review action ledger/);
+  assert.match(review, /Prepare commit review receipt bundle/);
   assert.match(review, /commit-review-diagnostic-\$\{\{ matrix\.sha \}\}/);
   assert.match(
     publisher,
@@ -407,20 +262,19 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(publisher, /create-state-token/);
   assert.match(publisher, /setup-state/);
-  assert.match(publisher, /--expected-job attest/);
+  assert.match(publisher, /--expected-job review/);
   assert.doesNotMatch(publisher, /accepted-commit-review-check-shas|skipping duplicate write/);
-  assert.match(publisher, /Resolve commit review artifact cohort/);
-  assert.match(publisher, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"/);
-  assert.match(publisher, /pnpm run --silent repair:resolve-run-artifact/);
-  assert.match(publisher, /--commit-shas-file "\$expected_shas_file"/);
-  assert.match(publisher, /--cohort-file "\$cohort_file"/);
   assert.match(
     publisher,
-    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.ledger_artifact_ids \}\}/,
+    /pattern: commit-review-\*-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
   assert.match(
     publisher,
-    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.report_artifact_ids \}\}/,
+    /artifact_name="commit-review-\$\{commit_sha\}-\$\{GITHUB_RUN_ID\}-\$\{GITHUB_RUN_ATTEMPT\}"/,
+  );
+  assert.doesNotMatch(
+    publisher,
+    /resolve-run-artifact|CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT|prior-attempt/,
   );
 
   for (const workflowPath of [
@@ -458,8 +312,7 @@ test("commit review and notification workflows publish their operation receipts"
       workflowPath,
     );
   }
-  assert.match(publisher, /normalize_single_download/);
-  assert.match(publisher, /Verify and assemble commit review artifact cohort/);
+  assert.match(publisher, /Verify current-attempt commit review bundles/);
   assert.match(publisher, /merge-multiple: false/);
   assert.match(publisher, /--commit-report "\$\{report_files\[0\]\}"/);
   assert.match(publisher, /--expected-commit-repository "\$EXPECTED_TARGET_REPO"/);
@@ -474,7 +327,7 @@ test("commit review and notification workflows publish their operation receipts"
     publisher.indexOf("mapfile -d '' report_files") <
       publisher.indexOf('--commit-report "${report_files[0]}"'),
   );
-  assert.match(publisher, /Publish immutable commit review action ledger/);
+  assert.match(publisher, /Publish immutable current-attempt commit review action ledger/);
   assert.match(publisher, /append commit review action ledger/);
   assert.match(
     publisher,
@@ -483,7 +336,7 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(publisher, /node dist\/commit-sweeper\.js dispatch-continuation/);
   assert.doesNotMatch(publisher, /\n\s+gh workflow run commit-review\.yml/);
   assert.ok(
-    publisher.indexOf("- name: Verify and assemble commit review artifact cohort") <
+    publisher.indexOf("- name: Verify current-attempt commit review bundles") <
       publisher.indexOf("- name: Commit reports"),
   );
   assert.ok(
@@ -496,14 +349,14 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.ok(
     publisher.indexOf("- name: Finalize commit publication action ledger") <
-      publisher.indexOf("- name: Publish immutable commit review action ledger"),
+      publisher.indexOf("- name: Publish immutable current-attempt commit review action ledger"),
   );
   assert.match(
     publisher,
     /name: Complete commit review continuation receipt\n\s+if: \$\{\{ success\(\) && \(github\.event\.inputs\.continuation_key \|\| github\.event\.client_payload\.continuation_key\) \}\}/,
   );
   assert.ok(
-    publisher.indexOf("- name: Publish immutable commit review action ledger") <
+    publisher.indexOf("- name: Publish immutable current-attempt commit review action ledger") <
       publisher.indexOf("- name: Complete commit review continuation receipt"),
   );
   const commitSweeper = readText("src/commit-sweeper.ts");
@@ -535,7 +388,6 @@ test("commit review and notification workflows publish their operation receipts"
 
 test("merge claim recovery reads ClawSweeper workflow state with central credentials", () => {
   const router = readText(".github/workflows/repair-comment-router.yml");
-  const worker = readText(".github/workflows/repair-cluster-worker.yml");
   const sweep = readText(".github/workflows/sweep.yml");
 
   assert.equal(
@@ -546,7 +398,6 @@ test("merge claim recovery reads ClawSweeper workflow state with central credent
     ].length,
     2,
   );
-  assert.match(worker, /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ github\.token \}\}/);
   assert.match(sweep, /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ github\.token \}\}/);
 });
 
@@ -587,48 +438,33 @@ test("issue implementation intake finalizes and publishes source-bound status re
 });
 
 test("commit finding and cluster intake publish their dispatch receipts", () => {
-  const workflows = [
-    {
-      path: ".github/workflows/repair-commit-finding-intake.yml",
-      label: "commit finding intake",
-      lane: "commit-finding-intake",
-      decision: "steps.prepare.outputs.should_repair",
-      dispatch: "Dispatch sealed repair worker",
-    },
-    {
-      path: ".github/workflows/repair-cluster-intake.yml",
-      label: "cluster intake",
-      lane: "cluster-intake",
-      decision: "steps.import.outputs.should_dispatch",
-      dispatch: "Dispatch imported cluster repair",
-    },
-  ] as const;
+  const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
+  const cluster = readText(".github/workflows/repair-cluster-intake.yml");
 
-  for (const expected of workflows) {
-    const workflow = readText(expected.path);
+  for (const [workflow, lane, label] of [
+    [commitFinding, "commit-finding-intake", "commit finding intake"],
+    [cluster, "cluster-intake", "cluster intake"],
+  ] as const) {
     assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
-    assert.match(workflow, new RegExp(`Finalize ${expected.label} action ledger`));
-    assert.match(workflow, new RegExp(`--repair-lane ${expected.lane}`));
-    assert.match(
-      workflow,
-      new RegExp(`${expected.decision.replaceAll(".", "\\.")}[^\\n]*!= "true"`),
-    );
-    assert.match(workflow, /allow_empty_args\+=\(--allow-empty\)/);
-    assert.match(workflow, new RegExp(`Publish immutable ${expected.label} action ledger`));
+    assert.match(workflow, new RegExp(`Finalize ${label} action ledger`));
+    assert.match(workflow, new RegExp(`--repair-lane ${lane}`));
+    assert.match(workflow, new RegExp(`Publish immutable ${label} action ledger`));
     assert.match(workflow, /repair:action-ledger -- publish/);
     assert.match(workflow, /\.eventPaths == \$manifest\[0\]\.event_paths/);
     assert.match(workflow, /jq -r '\.paths\[\]\?'/);
-    assert.match(workflow, new RegExp(`append ${expected.label} action ledger`));
-    assert.match(workflow, /--receipt-kind [a-z0-9_]+_state/);
-    assert.ok(
-      workflow.indexOf(expected.dispatch) <
-        workflow.indexOf(`Finalize ${expected.label} action ledger`),
-    );
+    assert.match(workflow, new RegExp(`append ${label} action ledger`));
   }
-  const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
-  assert.match(commitFinding, /--dispatch-key "\$DISPATCH_KEY"/);
-  assert.match(commitFinding, /"Intake commit finding" "Complete durable intake handoff"/);
-  assert.match(commitFinding, /name: Complete durable intake handoff/);
+  assert.match(commitFinding, /--receipt-kind commit_finding_intake_state/);
+  assert.ok(
+    commitFinding.indexOf("Commit intake ledger") <
+      commitFinding.indexOf("Finalize commit finding intake action ledger"),
+  );
+  assert.match(cluster, /allow_empty_args\+=\(--allow-empty\)/);
+  assert.match(cluster, /--receipt-kind cluster_intake_state/);
+  assert.ok(
+    cluster.indexOf("Dispatch imported cluster repair") <
+      cluster.indexOf("Finalize cluster intake action ledger"),
+  );
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {
@@ -647,10 +483,9 @@ test("result and finalizer workflows publish their repair operation receipts", (
     results,
     /steps\.download\.outputs\.has_artifacts[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane repair-publication/,
   );
-  assert.match(
-    results,
-    /if \[ "\$\{\{ steps\.download\.outputs\.has_artifacts \}\}" = "0" \]; then[\s\S]*exit 0/,
-  );
+  assert.match(results, /Verify current worker action ledgers/);
+  assert.match(results, /import_worker_lane cluster cluster/);
+  assert.match(results, /import_worker_lane execute execute/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
@@ -678,7 +513,6 @@ test("repair and commit publishers require canonical exact manifests", () => {
     ".github/workflows/commit-review.yml",
     ".github/workflows/github-activity.yml",
     ".github/workflows/maintainer-report-discord.yml",
-    ".github/workflows/repair-cluster-worker.yml",
     ".github/workflows/repair-cluster-intake.yml",
     ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/repair-finalize-open-prs.yml",
@@ -702,136 +536,13 @@ test("repair and commit publishers require canonical exact manifests", () => {
   assert.match(commit, /--receipt-kind commit_review_state/);
   assert.match(
     commit,
-    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.ledger_artifact_ids \}\}/,
+    /pattern: commit-review-\*-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
-  assert.match(commit, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"/);
-  assert.match(commit, /--commit-shas-file "\$expected_shas_file"/);
-  assert.match(commit, /--cohort-file "\$cohort_file"/);
+  assert.doesNotMatch(commit, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT|resolve-run-artifact/);
   assert.match(commit, /EXPECTED_COMMIT_MATRIX:/);
   assert.match(commit, /cmp -s "\$expected_shas_file" "\$actual_shas_file"/);
   assert.match(
     commit,
-    /Verify and assemble commit review artifact cohort[\s\S]*repair:action-ledger -- verify[\s\S]*Commit reports[\s\S]*repair:action-ledger -- publish/,
+    /Verify current-attempt commit review bundles[\s\S]*repair:action-ledger -- verify[\s\S]*Commit reports[\s\S]*repair:action-ledger -- publish/,
   );
 });
-
-function runRepairLedgerCollector({
-  forgedMutate = false,
-  executeResult = "skipped",
-}: {
-  forgedMutate?: boolean;
-  executeResult?: string;
-} = {}) {
-  const workflow = parse(readText(".github/workflows/repair-cluster-worker.yml"));
-  const step = workflow.jobs["publish-repair-action-ledger"].steps.find(
-    (candidate: { name?: string }) => candidate.name === "Publish immutable repair action ledger",
-  );
-  assert.equal(typeof step?.run, "string");
-
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-ledger-collector-"));
-  const bin = path.join(root, "bin");
-  const state = path.join(root, "state");
-  const summary = path.join(root, "summary.md");
-  const publishLog = path.join(root, "publish.log");
-  fs.mkdirSync(bin, { recursive: true });
-  fs.mkdirSync(state, { recursive: true });
-  writeLaneManifest(root, "cluster", "ledger/cluster.json");
-  if (forgedMutate) writeLaneManifest(root, "mutate", "ledger/mutate.json");
-  fs.writeFileSync(
-    path.join(bin, "pnpm"),
-    `#!/usr/bin/env node
-import fs from "node:fs";
-import path from "node:path";
-const args = process.argv.slice(2);
-if (args.includes("repair:publish-main")) {
-  fs.appendFileSync(process.env.PUBLISH_LOG, args.join(" ") + "\\n");
-  process.exit(0);
-}
-const separator = args.indexOf("--");
-const operation = separator >= 0 ? args[separator + 1] : "";
-const value = (name) => {
-  const index = args.indexOf(name);
-  return index >= 0 ? args[index + 1] : "";
-};
-const lane = value("--repair-lane");
-if (operation === "verify") {
-  process.exit(process.env.FORGED_MUTATE === "1" && lane === "mutate" ? 1 : 0);
-}
-if (operation === "publish") {
-  const manifest = JSON.parse(fs.readFileSync(value("--manifest"), "utf8"));
-  const stateRoot = value("--state-root");
-  for (const relative of manifest.event_paths) {
-    const target = path.join(stateRoot, relative);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, lane + "\\n");
-  }
-  process.stdout.write(JSON.stringify({ eventPaths: manifest.event_paths, paths: manifest.event_paths }));
-  process.exit(0);
-}
-process.exit(2);
-`,
-    { mode: 0o755 },
-  );
-  fs.writeFileSync(
-    path.join(bin, "jq"),
-    `#!/usr/bin/env node
-import fs from "node:fs";
-const args = process.argv.slice(2);
-if (args[0] === "-r") {
-  const input = JSON.parse(fs.readFileSync(args.at(-1), "utf8"));
-  process.stdout.write(input.paths.map((value) => value + "\\n").join(""));
-  process.exit(0);
-}
-const manifestIndex = args.indexOf("--slurpfile");
-const manifest = JSON.parse(fs.readFileSync(args[manifestIndex + 2], "utf8"));
-const input = JSON.parse(fs.readFileSync(args.at(-1), "utf8"));
-process.exit(JSON.stringify(input.eventPaths) === JSON.stringify(manifest.event_paths) ? 0 : 1);
-`,
-    { mode: 0o755 },
-  );
-
-  try {
-    const child = spawnSync("bash", ["-c", step.run], {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
-        CLAWSWEEPER_STATE_DIR: state,
-        GITHUB_STEP_SUMMARY: summary,
-        PUBLISH_LOG: publishLog,
-        FORGED_MUTATE: forgedMutate ? "1" : "0",
-        CLUSTER_LEDGER_ARTIFACT_ID: "101",
-        CLUSTER_LEDGER_ATTEMPT: "1",
-        CLUSTER_JOB_RESULT: "success",
-        CLUSTER_DOWNLOAD_OUTCOME: "success",
-        EXECUTE_LEDGER_ARTIFACT_ID: "",
-        EXECUTE_LEDGER_ATTEMPT: "",
-        EXECUTE_LEDGER_ALLOW_EMPTY: "false",
-        EXECUTE_JOB_RESULT: executeResult,
-        EXECUTE_DOWNLOAD_OUTCOME: "skipped",
-        MUTATE_LEDGER_ARTIFACT_ID: forgedMutate ? "303" : "",
-        MUTATE_LEDGER_ATTEMPT: forgedMutate ? "1" : "",
-        MUTATE_JOB_RESULT: forgedMutate ? "failure" : "skipped",
-        MUTATE_DOWNLOAD_OUTCOME: forgedMutate ? "success" : "skipped",
-      },
-    });
-    return {
-      status: child.status,
-      stderr: child.stderr,
-      summary: fs.readFileSync(summary, "utf8"),
-      published: fs.existsSync(publishLog) ? fs.readFileSync(publishLog, "utf8") : "",
-    };
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-}
-
-function writeLaneManifest(root: string, lane: string, eventPath: string) {
-  const laneRoot = path.join(root, ".clawsweeper-repair", "action-ledger-download", lane);
-  fs.mkdirSync(laneRoot, { recursive: true });
-  fs.writeFileSync(
-    path.join(laneRoot, "repair-action-ledger-manifest.json"),
-    `${JSON.stringify({ event_paths: [eventPath] })}\n`,
-  );
-}

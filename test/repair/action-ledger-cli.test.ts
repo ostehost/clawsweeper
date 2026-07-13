@@ -88,7 +88,16 @@ test("action-ledger CLI publishes an authenticated empty repair manifest as a no
     assert.equal(finalize.status, 0, finalize.stderr);
     fs.writeFileSync(manifestPath, finalize.stdout);
 
-    const publish = spawnSync(
+    const publisherEnv = {
+      ...env,
+      GITHUB_JOB: "publish",
+      GITHUB_RUN_ID: "9001",
+      GITHUB_SHA: "b".repeat(40),
+      GITHUB_WORKFLOW: "repair publish cluster results",
+      GITHUB_WORKFLOW_REF:
+        "openclaw/clawsweeper/.github/workflows/repair-publish-results.yml@refs/heads/main",
+    };
+    const rejected = spawnSync(
       process.execPath,
       [
         path.resolve("dist/repair/action-ledger-cli.js"),
@@ -103,7 +112,39 @@ test("action-ledger CLI publishes an authenticated empty repair manifest as a no
         "--state-root",
         stateRoot,
       ],
-      { encoding: "utf8", env },
+      { encoding: "utf8", env: publisherEnv },
+    );
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /manifest identity mismatch/);
+
+    const publish = spawnSync(
+      process.execPath,
+      [
+        path.resolve("dist/repair/action-ledger-cli.js"),
+        "publish",
+        "--repair-lane",
+        "report-status",
+        "--allow-empty",
+        "--manifest",
+        manifestPath,
+        "--expected-repository",
+        "openclaw/clawsweeper",
+        "--expected-sha",
+        "a".repeat(40),
+        "--expected-workflow",
+        "repair-cluster-worker.yml",
+        "--expected-job",
+        "report",
+        "--expected-run-id",
+        "4242",
+        "--expected-run-attempt",
+        "1",
+        "--source-root",
+        outputRoot,
+        "--state-root",
+        stateRoot,
+      ],
+      { encoding: "utf8", env: publisherEnv },
     );
     assert.equal(publish.status, 0, publish.stderr);
     assert.deepEqual(JSON.parse(publish.stdout), {

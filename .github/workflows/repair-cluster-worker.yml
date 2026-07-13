@@ -75,6 +75,7 @@ concurrency:
   # Keep an active execute run alive so its temporary gate cleanup can finish;
   # GitHub still coalesces pending runs in this group to the newest dispatch.
   cancel-in-progress: false
+  queue: max
 
 jobs:
   receipt:
@@ -123,6 +124,9 @@ jobs:
     if: ${{ needs.receipt.outputs.proceed == 'true' }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
     outputs:
       allow_execute: ${{ steps.capture_gates.outputs.allow_execute }}
       allow_fix_pr: ${{ steps.capture_gates.outputs.allow_fix_pr }}
@@ -148,6 +152,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           filter: blob:none
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: cluster-action-ledger
 
       - name: Resolve target owner
         id: target
@@ -232,6 +239,7 @@ jobs:
           echo "CLAWSWEEPER_CODEX_THREAD_STATE=$codex_home/clawsweeper-thread-state.json" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/setup-pnpm
+        id: cluster-setup-pnpm
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
@@ -396,6 +404,25 @@ jobs:
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase planning_failed --summary "Planning Action failed" --completion-reason action_failed
 
+      - name: Finalize cluster repair action ledger
+        if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane cluster \
+            > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Upload cluster repair action ledger
+        if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.cluster-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
   execute:
     name: Execute and apply cluster actions
     needs: cluster
@@ -429,6 +456,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           filter: blob:none
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: execute-action-ledger
 
       - name: Resolve target owner
         id: target
@@ -878,3 +908,34 @@ jobs:
         if: ${{ always() && failure() && steps.crabfleet_session.outcome == 'success' && (steps.repair_requeue.outputs.count == '' || steps.repair_requeue.outputs.count == '0' || steps.requeue_dispatch.outcome != 'success') }}
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase action_failed --summary "Repair Action failed before all completion gates passed" --completion-reason action_failed
+
+      - name: Finalize execution repair action ledger
+        id: finalize-execute-action-ledger
+        if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          allow_empty_args=()
+          allow_empty=false
+          if [ "${{ steps.check_job.outputs.job_exists }}" != "1" ] ||
+             [ "${{ steps.self_heal_head.outputs.matched }}" = "false" ] ||
+             [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ] ||
+             [ "${CLAWSWEEPER_ALLOW_FIX_PR}" != "1" ]; then
+            allow_empty=true
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane execute \
+            "${allow_empty_args[@]}" \
+            > "$output_root/repair-action-ledger-manifest.json"
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
+
+      - name: Upload execution repair action ledger
+        if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.execute-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
