@@ -131,12 +131,19 @@ gh workflow run repair-commit-finding-intake.yml \
   --repo openclaw/clawsweeper \
   -f target_repo=openclaw/openclaw \
   -f commit_sha=<sha> \
-  -f report_repo=openclaw/clawsweeper \
-  -f report_path=records/openclaw-openclaw/commits/<sha>.md
+  -f report_repo=openclaw/clawsweeper-state \
+  -f report_path=records/openclaw-openclaw/commits/<sha>.md \
+  -f report_revision=<exact-state-commit-sha> \
+  -f report_sha256=<sha256-of-exact-report-bytes>
 ```
 
-The workflow is idempotent for the commit SHA. It updates the same audit file,
-job file, branch, and PR path on rerun.
+Resolve the digest from the report bytes at `report_revision`, not from the
+mutable `state` branch tip. The workflow rejects another repository, a
+noncanonical report path, a mutable or malformed revision, a digest mismatch,
+or report frontmatter for another repository/commit.
+
+The workflow is idempotent for the immutable report identity. It updates the
+same audit file, job file, branch, and PR path on rerun.
 
 If latest `main` no longer needs a fix, the generated artifact allows a clean
 no-PR outcome and the audit file records the skip.

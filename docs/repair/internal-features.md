@@ -231,18 +231,21 @@ ClawSweeper can dispatch `clawsweeper_commit_finding` when a main-branch commit
 review report has `result: findings`. ClawSweeper treats that report as a source
 finding, not as an order to open a PR.
 
-The intake step fetches the report from latest `openclaw/clawsweeper@main`,
-writes one audit file, and then decides whether an automatic repair PR is
-allowed:
+The intake step fetches one report from `openclaw/clawsweeper-state` at an
+exact state commit, verifies its SHA-256 and embedded repository/commit
+identity, writes one audit file, and then decides whether an automatic repair
+PR is allowed:
 
 - audit path: `results/commit-findings/<repo-slug>/<sha>.md`
 - job path: `jobs/<owner>/inbox/clawsweeper-commit-<repo-slug>-<shortsha>.md`
 - branch: `clawsweeper/clawsweeper-commit-<repo-slug>-<shortsha>`
 
 Non-finding, disabled, security/privacy/supply-chain, and broad findings stop
-at the audit record. Eligible ordinary bug/regression/reliability findings get a
-deterministic synthetic ClawSweeper result and fix artifact. That skips the normal
-cluster-planning Codex pass and sends the report straight to
+at the audit record. Eligible ordinary bug/regression/reliability findings get
+a deterministic synthetic ClawSweeper result and fix artifact. The worker
+handoff binds the published state commit and exact job digest so a later state
+update cannot replace queued work. That skips the normal cluster-planning Codex
+pass and sends the report straight to
 `execute-fix-artifact`, where Codex is used for the repair loop against latest
 target `main`. The executor handles trivial branch-refresh work before asking
 Codex to edit: a clean rebase that changes only commit ancestry skips the edit

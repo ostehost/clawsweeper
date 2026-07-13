@@ -194,10 +194,11 @@ App-permission changes, but the workflow uses `workflow_dispatch` so the
 ClawSweeper App only needs Actions write access on `openclaw/clawsweeper`.
 
 The dispatch is intentionally report-based. ClawSweeper sends the target repo,
-commit SHA, report repo, report path, report URL, severity, check conclusion,
-and source run URL. The repair intake fetches the report from latest
-`openclaw/clawsweeper@main`, writes an audit record, and decides whether an
-automatic PR makes sense on latest target `main`.
+commit SHA, canonical state repository/path, exact state revision, report
+SHA-256, immutable report URL, severity, check conclusion, and source run URL.
+The repair intake fetches and verifies those exact report bytes and embedded
+source identity, writes an audit record, and decides whether an automatic PR
+makes sense on latest target `main`.
 
 Disable this without code changes by setting:
 

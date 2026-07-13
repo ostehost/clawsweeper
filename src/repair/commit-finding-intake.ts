@@ -28,6 +28,7 @@ import { sanitizeResultEvidence } from "./url-safety.js";
 
 const args = parseArgs(process.argv.slice(2));
 const command = args._[0] ?? "prepare";
+const COMMIT_FINDING_REPORT_REPO = "openclaw/clawsweeper-state";
 
 if (command === "prepare") prepare();
 else if (command === "finalize") finalize();
@@ -36,10 +37,10 @@ else die(`unknown command: ${command}`);
 function prepare() {
   const enabled = stringArg("enabled", "true");
   const targetRepo = stringArg("target-repo", stringArg("target_repo", "openclaw/openclaw"));
-  const reportRepo = stringArg(
-    "report-repo",
-    stringArg("report_repo", "openclaw/clawsweeper-state"),
-  );
+  const reportRepo = stringArg("report-repo", stringArg("report_repo", COMMIT_FINDING_REPORT_REPO));
+  if (reportRepo !== COMMIT_FINDING_REPORT_REPO) {
+    die(`report repository must be ${COMMIT_FINDING_REPORT_REPO}`);
+  }
   const sha = assertSha(stringArg("commit-sha", stringArg("commit_sha", "")));
   const reportRevision = requiredReportRevision(
     stringArg("report-revision", stringArg("report_revision", "")),
@@ -47,10 +48,11 @@ function prepare() {
   const reportSha256 = requiredReportSha256(
     stringArg("report-sha256", stringArg("report_sha256", "")),
   );
-  const reportPath = stringArg(
-    "report-path",
-    stringArg("report_path", `records/${repoSlug(targetRepo)}/commits/${sha}.md`),
-  );
+  const expectedReportPath = `records/${repoSlug(targetRepo)}/commits/${sha}.md`;
+  const reportPath = stringArg("report-path", stringArg("report_path", expectedReportPath));
+  if (reportPath !== expectedReportPath) {
+    die(`report path must be ${expectedReportPath}`);
+  }
   const immutableReportUrl = immutableCommitFindingReportUrl(
     String(reportRepo),
     String(reportPath),
@@ -67,6 +69,9 @@ function prepare() {
     : ({ ok: true, markdown: "" } satisfies CommitFindingReportReadResult);
   const reportMarkdown = reportRead.ok ? reportRead.markdown : "";
   const report = parseCommitReport(reportMarkdown);
+  if (active && reportRead.ok) {
+    assertCommitReportIdentity(report, targetRepo, sha);
+  }
   const clusterId = slug(`clawsweeper-commit-${repoSlug(targetRepo)}-${sha.slice(0, 12)}`);
   const owner = targetRepo.split("/")[0];
   const jobPath = path.join(repoRoot(), "jobs", owner, "inbox", `${clusterId}.md`);
@@ -485,6 +490,18 @@ function parseCommitReport(markdown: string) {
     ...frontmatter,
     body: match ? markdown.slice(match[0].length) : markdown,
   };
+}
+
+function assertCommitReportIdentity(report: LooseRecord, targetRepo: string, sha: string): void {
+  const reportRepo = String(report.repository ?? "").trim();
+  const reportSha = String(report.sha ?? "")
+    .trim()
+    .toLowerCase();
+  if (reportRepo !== targetRepo || reportSha !== sha) {
+    die(
+      `commit finding report identity mismatch: expected ${targetRepo}@${sha}, got ${reportRepo || "missing"}@${reportSha || "missing"}`,
+    );
+  }
 }
 
 function findingKinds(markdown: string) {

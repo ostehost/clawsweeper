@@ -96,10 +96,12 @@ required checks to appear and settle green, then removes the repair-loop label
 and leaves the PR open; generated issue PRs never automerge.
 
 ClawSweeper commit findings have a separate intake lane. A
-`clawsweeper_commit_finding` dispatch fetches the latest markdown commit report,
-writes an audit record under `results/commit-findings/`, and only sends the
-finding into the PR executor when the issue is narrow, non-security, and still
-worth repairing on latest `main`.
+`clawsweeper_commit_finding` dispatch identifies one report in
+`openclaw/clawsweeper-state` by state commit, deterministic path, and SHA-256.
+Intake verifies those exact bytes plus the report's embedded target repository
+and commit before writing an audit record under `results/commit-findings/`.
+Only narrow, non-security findings that remain worth repairing on latest
+target `main` enter the PR executor.
 
 Each cluster job:
 

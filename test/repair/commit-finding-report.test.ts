@@ -156,6 +156,112 @@ test("commit finding intake rejects mismatched fetched bytes before writing stat
   }
 });
 
+test("commit finding intake accepts only the canonical report repository and path", () => {
+  const unique = randomUUID().replaceAll("-", "").slice(0, 12);
+  const targetRepo = `fixture-${unique}/repo`;
+  const sha = "a".repeat(40);
+  const revision = "b".repeat(40);
+  const expectedPath = `records/fixture-${unique}-repo/commits/${sha}.md`;
+  const baseArgs = [
+    path.resolve("dist/repair/commit-finding-intake.js"),
+    "prepare",
+    "--target-repo",
+    targetRepo,
+    "--commit-sha",
+    sha,
+    "--report-revision",
+    revision,
+    "--report-sha256",
+    "c".repeat(64),
+  ];
+
+  const wrongRepo = spawnSync(
+    process.execPath,
+    [...baseArgs, "--report-repo", "openclaw/clawsweeper", "--report-path", expectedPath],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.equal(wrongRepo.status, 2);
+  assert.match(wrongRepo.stderr, /report repository must be openclaw\/clawsweeper-state/);
+
+  const wrongPath = spawnSync(
+    process.execPath,
+    [
+      ...baseArgs,
+      "--report-repo",
+      "openclaw/clawsweeper-state",
+      "--report-path",
+      `records/other-repo/commits/${sha}.md`,
+    ],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.equal(wrongPath.status, 2);
+  assert.match(wrongPath.stderr, new RegExp(`report path must be ${expectedPath}`));
+});
+
+test("commit finding intake rejects a valid immutable report for another source", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "commit-finding-intake-identity-"));
+  const unique = randomUUID().replaceAll("-", "").slice(0, 12);
+  const targetRepo = `fixture-${unique}/repo`;
+  const targetSlug = `fixture-${unique}-repo`;
+  const sha = "4".repeat(40);
+  const revision = "5".repeat(40);
+  const reportPath = `records/${targetSlug}/commits/${sha}.md`;
+  const reportFile = path.join(root, "report.md");
+  const reportBytes = Buffer.from(
+    `---\nresult: findings\nsha: ${"6".repeat(40)}\nrepository: another/repo\n---\n\n## Summary\n\nWrong source.\n`,
+    "utf8",
+  );
+  const clusterId = `clawsweeper-commit-${targetSlug}-${sha.slice(0, 12)}`;
+  const jobRoot = path.join(process.cwd(), "jobs", `fixture-${unique}`);
+  const auditRoot = path.join(process.cwd(), "results", "commit-findings", targetSlug);
+  const runRoot = path.join(process.cwd(), ".clawsweeper-repair", "runs");
+  fs.writeFileSync(reportFile, reportBytes);
+
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        path.resolve("dist/repair/commit-finding-intake.js"),
+        "prepare",
+        "--target-repo",
+        targetRepo,
+        "--commit-sha",
+        sha,
+        "--report-repo",
+        "openclaw/clawsweeper-state",
+        "--report-path",
+        reportPath,
+        "--report-revision",
+        revision,
+        "--report-sha256",
+        createHash("sha256").update(reportBytes).digest("hex"),
+        "--report-file",
+        reportFile,
+      ],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+
+    assert.equal(child.status, 2);
+    assert.match(
+      child.stderr,
+      new RegExp(`commit finding report identity mismatch: expected ${targetRepo}@${sha}`),
+    );
+    assert.equal(fs.existsSync(path.join(jobRoot, "inbox", `${clusterId}.md`)), false);
+    assert.equal(fs.existsSync(path.join(auditRoot, `${sha}.md`)), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(jobRoot, { recursive: true, force: true });
+    fs.rmSync(auditRoot, { recursive: true, force: true });
+    if (fs.existsSync(runRoot)) {
+      for (const entry of fs.readdirSync(runRoot)) {
+        if (entry.startsWith(`${clusterId}-commit-finding-`)) {
+          fs.rmSync(path.join(runRoot, entry), { recursive: true, force: true });
+        }
+      }
+    }
+  }
+});
+
 test("commit finding intake classifies missing report blobs as skips", () => {
   const revision = "c".repeat(40);
   assert.equal(isMissingGithubContentError("gh: Not Found (HTTP 404)"), true);
