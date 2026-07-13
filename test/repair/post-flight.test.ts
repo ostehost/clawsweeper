@@ -785,6 +785,31 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     ]);
 
     fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        FAKE_GH_MERGE_MODE: "transient",
+        FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ: "2",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(
+      report.actions[0]?.reason,
+      /^merge attempt failed and its outcome could not be confirmed:/,
+    );
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+    ]);
+
+    fixture.reset();
     runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_PENDING_BEFORE_MUTATION: "1" }, 1);
     report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
     assert.equal(report.outcome, "requeue");
@@ -1449,11 +1474,12 @@ function createVerifiedMergeFixture() {
       "const sourcePull = fixture.source;",
       "const delayedMerge = fs.existsSync(process.env.FAKE_GH_DELAYED_MERGE_FILE);",
       "let confirmationCount = fs.existsSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, 'utf8')) : 0;",
-      "if (delayedMerge && args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { confirmationCount += 1; fs.writeFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, String(confirmationCount)); }",
+      "const postMergeConfirmationRead = args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123' && fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE);",
+      "if ((delayedMerge || process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ) && postMergeConfirmationRead) { confirmationCount += 1; fs.writeFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, String(confirmationCount)); }",
       "const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE) || (delayedMerge && confirmationCount >= 2);",
       "const mergeCount = () => fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, 'utf8')) : 0;",
       "if (merged) { pull.state = 'closed'; pull.merged_at = '2026-07-13T08:00:00Z'; pull.merge_commit_sha = 'b'.repeat(40); }",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } if (process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ === String(confirmationCount)) { process.stderr.write('gh: HTTP 502: reconciliation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/122') { process.stdout.write(JSON.stringify(sourcePull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123') { process.stdout.write(JSON.stringify({ labels: pull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/122') { process.stdout.write(JSON.stringify({ labels: sourcePull.labels })); process.exit(0); }",

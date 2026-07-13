@@ -434,7 +434,20 @@ function finalizeFixPr(action: LooseRecord) {
       });
     } catch (error) {
       const detail = ghErrorText(error);
-      const reconciliation = reconcileMergeState(parsed.number, action.commit);
+      let reconciliation: ReturnType<typeof reconcileMergeState>;
+      try {
+        reconciliation = reconcileMergeState(parsed.number, action.commit);
+      } catch (reconciliationError) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: `merge attempt failed and its outcome could not be confirmed: ${compactText(ghErrorText(reconciliationError), 500)}`,
+          merge_method: "squash",
+          retry_recommended: true,
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
       pull = reconciliation.pull;
       view = reconciliation.view;
       prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
