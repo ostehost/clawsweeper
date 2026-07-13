@@ -800,7 +800,8 @@ test("comment router publishes immutable command receipts for initial and retry 
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);
   assert.match(finalizeStep, /--lane comment-router/);
-  assert.match(finalizeStep, /steps\.route-comments\.outcome.*success/);
+  assert.match(finalizeStep, /ROUTE_COMMENTS_OUTCOME: \$\{\{ steps\.route-comments\.outcome \}\}/);
+  assert.match(finalizeStep, /if \[ "\$ROUTE_COMMENTS_OUTCOME" = "success" \]/);
   assert.match(finalizeStep, /\.commands_seen == 0/);
   assert.match(finalizeStep, /allow_empty_args\+=\(--allow-empty\)/);
   assert.match(finalizeStep, /echo "publish=false" >> "\$GITHUB_OUTPUT"/);

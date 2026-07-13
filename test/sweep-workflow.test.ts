@@ -196,6 +196,17 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   const selectedApply = step("publish", "Dispatch selected safe close proposals to isolated apply");
   assert.match(selectedApply.if ?? "", /sync-selected-review-comments\.outputs\.sync_succeeded/);
   assert.doesNotMatch(selectedApply.if ?? "", /success\(\)|action-ledger/);
+  assert.equal(
+    selectedApply.env?.APPLY_AFTER_REVIEW_CLOSE_REASONS,
+    "${{ github.event.inputs.apply_after_review_close_reasons || 'implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr' }}",
+  );
+  assert.equal(
+    selectedApply.env?.APPLY_AFTER_REVIEW_MIN_AGE_MINUTES,
+    "${{ github.event.inputs.apply_after_review_min_age_minutes || '0' }}",
+  );
+  const backgroundSync = step("publish", "Dispatch background review comment sync");
+  assert.equal(backgroundSync.env?.APPLY_AFTER_REVIEW_CLOSE_REASONS, undefined);
+  assert.equal(backgroundSync.env?.APPLY_AFTER_REVIEW_MIN_AGE_MINUTES, undefined);
   const reviewContinuation = step("publish", "Continue sweep");
   assert.match(
     reviewContinuation.if ?? "",
@@ -214,6 +225,11 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
     job("apply-existing").if ?? "",
     /needs\.apply-proof\.result|publish-apply-proof-action-ledger/,
   );
+  const applyRun = step("apply-existing", "Apply unchanged proposed decisions with checkpoints");
+  assert.match(applyRun.run ?? "", /"\$limit" =~ \^\[0-9\]\{1,8\}\$/);
+  assert.match(applyRun.run ?? "", /"\$sync_batch_size" =~ \^\[0-9\]\{1,8\}\$/);
+  assert.match(applyRun.run ?? "", /item_numbers=.*sed -E/);
+  assert.match(applyRun.run ?? "", /apply_close_reasons=.*sed -E/);
 
   const applySteps = job("apply-existing").steps;
   const applyMarkerIndex = applySteps.findIndex(
@@ -1188,8 +1204,9 @@ test("targeted apply dispatches keep apply names ahead of exact-review names", (
   }
   assert.match(
     workflow,
-    /item_numbers="\$\{\{ github\.event_name == 'repository_dispatch' && github\.event\.client_payload\.item_number \|\| github\.event\.inputs\.apply_item_numbers \|\| '' \}\}"/,
+    /REQUESTED_ITEM_NUMBERS: \$\{\{ github\.event_name == 'repository_dispatch' && github\.event\.client_payload\.item_number \|\| github\.event\.inputs\.apply_item_numbers \|\| '' \}\}/,
   );
+  assert.match(workflow, /item_numbers="\$REQUESTED_ITEM_NUMBERS"/);
 });
 
 test("apply workflow bounds checkpoints and requeues with a fresh token", () => {
@@ -1798,10 +1815,15 @@ test("comment commands keep the router-to-sweep dispatch contract", () => {
   assert.match(routerWorkflow, /pnpm run repair:comment-router/);
   assert.match(
     routerWorkflow,
-    /status_comment_id="\$\{\{ github\.event\.client_payload\.status_comment_id \|\| '' \}\}"/,
+    /ROUTER_STATUS_COMMENT_ID: \$\{\{ github\.event_name == 'repository_dispatch' && github\.event\.client_payload\.status_comment_id \|\| '' \}\}/,
   );
+  assert.match(routerWorkflow, /status_comment_id="\$ROUTER_STATUS_COMMENT_ID"/);
   assert.match(routerWorkflow, /--status-comment-id "\$status_comment_id"/);
-  assert.match(routerWorkflow, /dispatch_actor="\$\{\{ github\.actor \}\}"/);
+  assert.match(
+    routerWorkflow,
+    /ROUTER_DISPATCH_ACTOR: \$\{\{ github\.event_name == 'repository_dispatch' && github\.actor \|\| '' \}\}/,
+  );
+  assert.match(routerWorkflow, /dispatch_actor="\$ROUTER_DISPATCH_ACTOR"/);
   assert.match(routerWorkflow, /--dispatch-actor "\$dispatch_actor"/);
   assert.match(routerWorkflow, /--comment-event-auth "\$comment_event_auth"/);
   assert.match(routerWorkflow, /--comment-updated-at "\$comment_updated_at"/);
@@ -1907,8 +1929,9 @@ test("sweep workflow schedules cursor-based PR comment sync batches", () => {
   assert.doesNotMatch(workflow, /apply_sync_open_pr_batch:/);
   assert.match(
     workflow,
-    /sync_batch_size="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.apply_limit \|\| '25' \}\}"/,
+    /REQUESTED_SYNC_BATCH_SIZE: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.apply_limit \|\| '25' \}\}/,
   );
+  assert.match(workflow, /sync_batch_size="\$REQUESTED_SYNC_BATCH_SIZE"/);
   assert.match(workflow, /\$item_numbers" = "__cursor__"/);
   assert.match(workflow, /comment-sync-batch/);
   assert.match(workflow, /write-comment-sync-cursor/);
@@ -1960,8 +1983,9 @@ test("target hot sweep dispatches honor shard cap payload", () => {
   assert.match(modeBlock, /elif \[ "\$hot_intake" = "true" \]; then/);
   assert.match(
     modeBlock,
-    /shard_count="\$\{\{ github\.event\.client_payload\.shard_count \|\| '' \}\}"/,
+    /REQUESTED_HOT_SHARD_COUNT: \$\{\{ github\.event\.client_payload\.shard_count \|\| '' \}\}/,
   );
+  assert.match(modeBlock, /shard_count="\$REQUESTED_HOT_SHARD_COUNT"/);
   assert.match(modeBlock, /shard_count="\$hot_intake_shards"/);
 });
 
@@ -2149,10 +2173,7 @@ test("scheduled normal review uses one item per shard for lease coverage", () =>
     workflow.indexOf("- id: select"),
   );
 
-  assert.match(
-    modeBlock,
-    /if \[ "\$\{\{ github\.event_name \}\}" = "schedule" \]; then\s+batch_size="1"/,
-  );
+  assert.match(modeBlock, /if \[ "\$GITHUB_EVENT_NAME" = "schedule" \]; then\s+batch_size="1"/);
 });
 
 test("planned background reviews allow safe content-cache reuse without weakening exact reviews", () => {

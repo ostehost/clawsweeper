@@ -222,8 +222,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Explain skipped event
+        env:
+          TARGET_REPO: ${{ github.event.client_payload.target_repo }}
+          ITEM_NUMBER: ${{ github.event.client_payload.item_number || '?' }}
         run: |
-          echo "Skipping ${{ github.event.client_payload.target_repo }}#${{ github.event.client_payload.item_number || '?' }}."
+          echo "Skipping $TARGET_REPO#$ITEM_NUMBER."
           echo "Set CLAWSWEEPER_ENABLE_CLAWHUB=1 after installing the ClawSweeper GitHub App on openclaw/clawhub."
 
   legacy-event-queue-intake:
@@ -315,6 +318,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$QUEUE_LEASE_ID"
+          if ! [[ "$QUEUE_LEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "Invalid exact-review queue lease ID." >&2
+            exit 1
+          fi
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
             const runAttempt = Number(process.env.RUN_ATTEMPT);
@@ -527,7 +534,7 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           target_branch="$(gh api "repos/$TARGET_REPO" --jq .default_branch)"
-          if ! printf '%s' "$target_branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$'; then
+          if ! [[ "$target_branch" =~ ^[A-Za-z0-9_./-]+$ ]]; then
             echo "Invalid live default branch for $TARGET_REPO: $target_branch" >&2
             exit 1
           fi
@@ -1448,11 +1455,15 @@ jobs:
 
       - name: Resolve target repository
         id: target
+        env:
+          REQUESTED_TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || '' }}
+          REQUESTED_TARGET_BRANCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_branch || github.event.client_payload.target_branch || 'main' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
-          target_repo="${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || '' }}"
-          target_branch="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_branch || github.event.client_payload.target_branch || 'main' }}"
+          target_repo="$REQUESTED_TARGET_REPO"
+          target_branch="$REQUESTED_TARGET_BRANCH"
           if [ -z "$target_repo" ]; then
-            case "${{ github.event.schedule || '' }}" in
+            case "$EVENT_SCHEDULE" in
               "2/5 * * * *"|"22 * * * *"|"8,23,38,53 * * * *"|"12 */6 * * *")
                 target_repo="openclaw/clawhub"
                 ;;
@@ -1461,14 +1472,18 @@ jobs:
               ;;
             esac
           fi
-          if ! printf '%s' "$target_branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$'; then
+          if ! [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
+          fi
+          if ! [[ "$target_branch" =~ ^[A-Za-z0-9_./-]+$ ]]; then
             echo "Invalid target_branch: $target_branch" >&2
             exit 1
           fi
           target_owner="${target_repo%%/*}"
           target_name="${target_repo#*/}"
           target_checkout_dir="$target_name"
-          if [ "$target_repo" = "${{ github.repository }}" ]; then
+          if [ "$target_repo" = "$GITHUB_REPOSITORY" ]; then
             target_checkout_dir="${target_name}-target"
           fi
           {
@@ -1530,6 +1545,13 @@ jobs:
       - id: mode
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_HOT_INTAKE: ${{ ((github.event_name == 'repository_dispatch' && github.event.client_payload.hot_intake == 'true') || (github.event_name == 'workflow_dispatch' && github.event.inputs.hot_intake == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '*/5 * * * *' || github.event.schedule == '2/5 * * * *'))) && 'true' || 'false' }}
+          REQUESTED_EXACT_ITEM: ${{ github.event.client_payload.item_number || github.event.inputs.item_number || github.event.inputs.item_numbers || '' }}
+          REQUESTED_HOT_SHARD_COUNT: ${{ github.event.client_payload.shard_count || '' }}
+          REQUESTED_BATCH_SIZE: ${{ github.event.client_payload.batch_size || github.event.inputs.batch_size || '3' }}
+          REQUESTED_SHARD_COUNT: ${{ github.event.client_payload.shard_count || github.event.inputs.shard_count || '' }}
+          REQUESTED_CODEX_TIMEOUT_MS: ${{ github.event.client_payload.review_options.codex_timeout_ms || github.event.client_payload.codex_timeout_ms || github.event.inputs.codex_timeout_ms || vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1200000' }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
         run: |
           limit() {
             pnpm --dir clawsweeper run --silent workflow -- limit "$1"
@@ -1668,16 +1690,16 @@ jobs:
           active_background_workers="$(( $(active_run_count ".github/workflows/commit-review.yml") * commit_page_size + $(active_sweep_background_workers) ))"
           hot_intake_shards="$(worker_limit hot_intake --active-critical "$active_critical_workers" --active-background "$active_background_workers")"
           normal_shards="$(worker_limit normal_review --active-critical "$active_critical_workers" --active-background "$active_background_workers")"
-          hot_intake="${{ ((github.event_name == 'repository_dispatch' && github.event.client_payload.hot_intake == 'true') || (github.event_name == 'workflow_dispatch' && github.event.inputs.hot_intake == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '*/5 * * * *' || github.event.schedule == '2/5 * * * *'))) && 'true' || 'false' }}"
-          exact_item="${{ github.event.client_payload.item_number || github.event.inputs.item_number || github.event.inputs.item_numbers || '' }}"
-          target_repo="${{ steps.target.outputs.target_repo }}"
+          hot_intake="$REQUESTED_HOT_INTAKE"
+          exact_item="$REQUESTED_EXACT_ITEM"
+          target_repo="$TARGET_REPO"
           if [ "$hot_intake" = "true" ] && [ -n "$exact_item" ]; then
             batch_size="1"
             shard_count="$exact_item_shards"
             max_pages="1"
           elif [ "$hot_intake" = "true" ]; then
             batch_size="1"
-            shard_count="${{ github.event.client_payload.shard_count || '' }}"
+            shard_count="$REQUESTED_HOT_SHARD_COUNT"
             if [ -z "$shard_count" ]; then
               shard_count="$hot_intake_shards"
             fi
@@ -1685,17 +1707,17 @@ jobs:
             min_active_shards="0"
             min_backfill_review_age_minutes="360"
           else
-            if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
               batch_size="1"
             else
-              batch_size="${{ github.event.client_payload.batch_size || github.event.inputs.batch_size || '3' }}"
+              batch_size="$REQUESTED_BATCH_SIZE"
             fi
             if [ "$target_repo" = "openclaw/openclaw" ]; then
               min_active_shards="$normal_active_floor"
             else
               min_active_shards="0"
             fi
-            shard_count="${{ github.event.client_payload.shard_count || github.event.inputs.shard_count || '' }}"
+            shard_count="$REQUESTED_SHARD_COUNT"
             if [ -z "$shard_count" ]; then
               shard_count="$normal_shards"
             fi
@@ -1706,7 +1728,11 @@ jobs:
             min_active_shards="0"
             min_backfill_review_age_minutes="360"
           fi
-          if ! [[ "$shard_count" =~ ^[0-9]+$ ]]; then
+          if ! [[ "$batch_size" =~ ^[1-9][0-9]{0,3}$ ]]; then
+            echo "Invalid batch_size: $batch_size" >&2
+            exit 1
+          fi
+          if ! [[ "$shard_count" =~ ^[1-9][0-9]{0,3}$ ]]; then
             shard_count="$normal_shards"
           fi
           if [ "$shard_count" -gt "$hard_shard_cap" ]; then
@@ -1725,9 +1751,14 @@ jobs:
               shard_count="$lane_shard_cap"
             fi
           fi
+          codex_timeout_ms="$REQUESTED_CODEX_TIMEOUT_MS"
+          if ! [[ "$codex_timeout_ms" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            echo "Invalid codex_timeout_ms; using 1200000." >&2
+            codex_timeout_ms="1200000"
+          fi
           {
             echo "batch_size=$batch_size"
-            echo "codex_timeout_ms=${{ github.event.client_payload.review_options.codex_timeout_ms || github.event.client_payload.codex_timeout_ms || github.event.inputs.codex_timeout_ms || vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1200000' }}"
+            echo "codex_timeout_ms=$codex_timeout_ms"
             echo "hot_intake=$hot_intake"
             echo "max_pages=$max_pages"
             echo "min_active_shards=$min_active_shards"
@@ -2693,6 +2724,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+          APPLY_AFTER_REVIEW_CLOSE_REASONS: ${{ github.event.inputs.apply_after_review_close_reasons || 'implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr' }}
+          APPLY_AFTER_REVIEW_MIN_AGE_MINUTES: ${{ github.event.inputs.apply_after_review_min_age_minutes || '0' }}
         run: |
           set -euo pipefail
           item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
@@ -2701,8 +2734,17 @@ jobs:
             exit 0
           fi
           item_count="$(pnpm run --silent workflow -- count-csv --items "$item_numbers")"
-          close_reasons="${{ github.event.inputs.apply_after_review_close_reasons || 'implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr' }}"
-          min_age_minutes="${{ github.event.inputs.apply_after_review_min_age_minutes || '0' }}"
+          close_reasons="$APPLY_AFTER_REVIEW_CLOSE_REASONS"
+          min_age_minutes="$APPLY_AFTER_REVIEW_MIN_AGE_MINUTES"
+          close_reasons="$(printf '%s' "$close_reasons" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
+          if ! [[ "$close_reasons" =~ ^(all|[a-z_]+(,[a-z_]+)*)$ ]]; then
+            echo "Invalid apply-after-review close reasons." >&2
+            exit 1
+          fi
+          if ! [[ "$min_age_minutes" =~ ^[0-9]{1,8}$ ]]; then
+            echo "Invalid apply-after-review minimum age." >&2
+            exit 1
+          fi
           for attempt in 1 2 3; do
             if gh workflow run sweep.yml \
               --ref main \
@@ -3001,10 +3043,13 @@ jobs:
 
       - name: Resolve target repository
         id: target
+        env:
+          REQUESTED_TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || '' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
-          target_repo="${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || '' }}"
+          target_repo="$REQUESTED_TARGET_REPO"
           if [ -z "$target_repo" ]; then
-            case "${{ github.event.schedule || '' }}" in
+            case "$EVENT_SCHEDULE" in
               "12 */6 * * *")
                 target_repo="openclaw/clawhub"
                 ;;
@@ -3015,6 +3060,10 @@ jobs:
                 target_repo="openclaw/openclaw"
                 ;;
             esac
+          fi
+          if ! [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
           fi
           target_owner="${target_repo%%/*}"
           target_name="${target_repo#*/}"
@@ -3140,13 +3189,20 @@ jobs:
 
       - name: Resolve proof target repository
         id: target
+        env:
+          REQUESTED_TARGET_REPO: ${{ github.event.inputs.target_repo || '' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
-          target_repo="${{ github.event.inputs.target_repo || '' }}"
+          target_repo="$REQUESTED_TARGET_REPO"
           if [ -z "$target_repo" ]; then
-            case "${{ github.event.schedule || '' }}" in
+            case "$EVENT_SCHEDULE" in
               "8,23,38,53 * * * *") target_repo="openclaw/clawhub" ;;
               *) target_repo="openclaw/openclaw" ;;
             esac
+          fi
+          if ! [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
           fi
           echo "target_repo=$target_repo" >> "$GITHUB_OUTPUT"
 
@@ -3169,11 +3225,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          REQUESTED_ITEM_NUMBERS: ${{ github.event.inputs.apply_item_numbers || '' }}
         run: |
           set -euo pipefail
-          item_numbers="${{ github.event.inputs.apply_item_numbers || '' }}"
+          item_numbers="$REQUESTED_ITEM_NUMBERS"
+          item_numbers="$(printf '%s' "$item_numbers" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
           if [ "$item_numbers" = "__cursor__" ]; then
             item_numbers=""
+          fi
+          if [ -n "$item_numbers" ] && ! [[ "$item_numbers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+            echo "Invalid apply item numbers." >&2
+            exit 1
           fi
           reconcile_args=(--target-repo "$TARGET_REPO" --skip-closed-at)
           if [ -n "$item_numbers" ]; then
@@ -3185,18 +3247,49 @@ jobs:
         id: proof-select
         env:
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          REQUESTED_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}
+          REQUESTED_MIN_AGE_MINUTES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}
+          REQUESTED_APPLY_KIND: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}
+          REQUESTED_APPLY_CLOSE_REASONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}
+          REQUESTED_STALE_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}
+          REQUESTED_ITEM_NUMBERS: ${{ github.event.inputs.apply_item_numbers || '' }}
+          REQUESTED_SYNC_COMMENTS_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_sync_comments_only || 'false' }}
         run: |
           set -euo pipefail
-          min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}"
-          min_age_minutes="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}"
-          apply_kind="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}"
-          apply_close_reasons="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}"
-          stale_min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}"
-          item_numbers="${{ github.event.inputs.apply_item_numbers || '' }}"
-          sync_comments_only="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_sync_comments_only || 'false' }}"
+          min_age_days="$REQUESTED_MIN_AGE_DAYS"
+          min_age_minutes="$REQUESTED_MIN_AGE_MINUTES"
+          apply_kind="$REQUESTED_APPLY_KIND"
+          apply_close_reasons="$REQUESTED_APPLY_CLOSE_REASONS"
+          stale_min_age_days="$REQUESTED_STALE_MIN_AGE_DAYS"
+          item_numbers="$REQUESTED_ITEM_NUMBERS"
+          sync_comments_only="$REQUESTED_SYNC_COMMENTS_ONLY"
+          apply_close_reasons="$(printf '%s' "$apply_close_reasons" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
+          item_numbers="$(printf '%s' "$item_numbers" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
           if [ "$item_numbers" = "__cursor__" ]; then
             item_numbers=""
             sync_comments_only="true"
+          fi
+          if ! [[ "$min_age_days" =~ ^[0-9]{1,8}$ ]] ||
+             { [ -n "$min_age_minutes" ] && ! [[ "$min_age_minutes" =~ ^[0-9]{1,10}$ ]]; } ||
+             ! [[ "$stale_min_age_days" =~ ^[0-9]{1,8}$ ]]; then
+            echo "Invalid apply age bound." >&2
+            exit 1
+          fi
+          if ! [[ "$apply_kind" =~ ^(all|issue|pull_request)$ ]]; then
+            echo "Invalid apply kind." >&2
+            exit 1
+          fi
+          if ! [[ "$apply_close_reasons" =~ ^(all|[a-z_]+(,[a-z_]+)*)$ ]]; then
+            echo "Invalid apply close reasons." >&2
+            exit 1
+          fi
+          if ! [[ "$sync_comments_only" =~ ^(true|false)$ ]]; then
+            echo "Invalid sync-comments-only flag." >&2
+            exit 1
+          fi
+          if [ -n "$item_numbers" ] && ! [[ "$item_numbers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+            echo "Invalid apply item numbers." >&2
+            exit 1
           fi
           product_direction_enabled=false
           case "${CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED,,}" in
@@ -3250,11 +3343,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          ITEM_NUMBERS: ${{ steps.proof-select.outputs.item_numbers }}
+          MIN_AGE_MINUTES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}
+          APPLY_KIND: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}
+          APPLY_CLOSE_REASONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}
+          STALE_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}
+          MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}
         run: |
           set -euo pipefail
-          item_numbers="${{ steps.proof-select.outputs.item_numbers }}"
+          item_numbers="$ITEM_NUMBERS"
           item_count="$(pnpm run --silent workflow -- count-csv --items "$item_numbers")"
-          min_age_minutes="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}"
+          min_age_minutes="$MIN_AGE_MINUTES"
           min_age_minutes_arg=()
           if [ -n "$min_age_minutes" ]; then
             min_age_minutes_arg=(--min-age-minutes "$min_age_minutes")
@@ -3265,10 +3364,10 @@ jobs:
             --skip-dashboard \
             --dry-run \
             --item-numbers "$item_numbers" \
-            --apply-kind "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}" \
-            --apply-close-reasons "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}" \
-            --stale-min-age-days "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}" \
-            --min-age-days "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}" \
+            --apply-kind "$APPLY_KIND" \
+            --apply-close-reasons "$APPLY_CLOSE_REASONS" \
+            --stale-min-age-days "$STALE_MIN_AGE_DAYS" \
+            --min-age-days "$MIN_AGE_DAYS" \
             "${min_age_minutes_arg[@]}" \
             --limit "$item_count" \
             --processed-limit "$((item_count * 10))" \
@@ -3421,10 +3520,12 @@ jobs:
         id: target
         env:
           PROOF_TARGET_REPO: ${{ needs.apply-proof.outputs.target_repo }}
+          REQUESTED_TARGET_REPO: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || github.event.inputs.target_repo || '' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
-          target_repo="${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || github.event.inputs.target_repo || '' }}"
+          target_repo="$REQUESTED_TARGET_REPO"
           if [ -z "$target_repo" ]; then
-            case "${{ github.event.schedule || '' }}" in
+            case "$EVENT_SCHEDULE" in
               "8,23,38,53 * * * *")
                 target_repo="openclaw/clawhub"
                 ;;
@@ -3432,6 +3533,10 @@ jobs:
                 target_repo="openclaw/openclaw"
                 ;;
             esac
+          fi
+          if ! [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
           fi
           if [ -z "$PROOF_TARGET_REPO" ] || [ "$target_repo" != "$PROOF_TARGET_REPO" ]; then
             echo "Resolved mutation target '$target_repo' differs from proof target '${PROOF_TARGET_REPO:-missing}'." >&2
@@ -3491,12 +3596,18 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          REQUESTED_ITEM_NUMBERS: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event.inputs.apply_item_numbers || '' }}
         run: |
           set -euo pipefail
           source scripts/apply-workflow-helpers.sh
-          item_numbers="${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event.inputs.apply_item_numbers || '' }}"
+          item_numbers="$REQUESTED_ITEM_NUMBERS"
+          item_numbers="$(printf '%s' "$item_numbers" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
           if [ "$item_numbers" = "__cursor__" ]; then
             item_numbers=""
+          fi
+          if [ -n "$item_numbers" ] && ! [[ "$item_numbers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+            echo "Invalid apply item numbers." >&2
+            exit 1
           fi
           reconcile_args=(--target-repo "$TARGET_REPO" --skip-closed-at)
           if [ -n "$item_numbers" ]; then
@@ -3514,32 +3625,74 @@ jobs:
           CLAWSWEEPER_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CLAWSWEEPER_THROTTLE_STATUS_MIN_WAIT_MS: "60000"
           CLAWSWEEPER_THROTTLE_STATUS_MIN_INTERVAL_MS: "120000"
+          REQUESTED_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '20' }}
+          REQUESTED_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}
+          REQUESTED_MIN_AGE_MINUTES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}
+          REQUESTED_APPLY_KIND: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}
+          REQUESTED_APPLY_CLOSE_REASONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}
+          REQUESTED_STALE_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}
+          REQUESTED_CLOSE_DELAY_MS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_delay_ms || '2000' }}
+          REQUESTED_CHECKPOINT_SIZE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_checkpoint_size || '20' }}
+          REQUESTED_SYNC_BATCH_SIZE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '25' }}
+          REQUESTED_ITEM_NUMBERS: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event.inputs.apply_item_numbers || '' }}
+          REQUESTED_SYNC_OPEN_PR_BATCH: ${{ github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *' && 'true' || 'false' }}
+          REQUESTED_SYNC_COMMENTS_ONLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_sync_comments_only || 'false' }}
+          REQUESTED_COMMENT_SYNC_MIN_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_comment_sync_min_age_days || '7' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
           source scripts/apply-workflow-helpers.sh
-          limit="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '20' }}"
-          min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}"
-          min_age_minutes="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}"
-          apply_kind="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}"
-          apply_close_reasons="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}"
-          stale_min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}"
-          close_delay_ms="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_delay_ms || '2000' }}"
-          checkpoint_size="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_checkpoint_size || '20' }}"
+          limit="$REQUESTED_LIMIT"
+          min_age_days="$REQUESTED_MIN_AGE_DAYS"
+          min_age_minutes="$REQUESTED_MIN_AGE_MINUTES"
+          apply_kind="$REQUESTED_APPLY_KIND"
+          apply_close_reasons="$REQUESTED_APPLY_CLOSE_REASONS"
+          stale_min_age_days="$REQUESTED_STALE_MIN_AGE_DAYS"
+          close_delay_ms="$REQUESTED_CLOSE_DELAY_MS"
+          checkpoint_size="$REQUESTED_CHECKPOINT_SIZE"
           comment_sync_processed_limit=1000
           base_close_processed_limit=300
           close_processed_limit="$base_close_processed_limit"
           adaptive_apply_scan_reason="base_window"
-          sync_batch_size="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '25' }}"
-          item_numbers="${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event.inputs.apply_item_numbers || '' }}"
-          sync_open_pr_batch="${{ github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *' && 'true' || 'false' }}"
+          sync_batch_size="$REQUESTED_SYNC_BATCH_SIZE"
+          item_numbers="$REQUESTED_ITEM_NUMBERS"
+          sync_open_pr_batch="$REQUESTED_SYNC_OPEN_PR_BATCH"
+          apply_close_reasons="$(printf '%s' "$apply_close_reasons" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
+          item_numbers="$(printf '%s' "$item_numbers" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')"
           if [ "$item_numbers" = "__cursor__" ]; then
             sync_open_pr_batch="true"
             item_numbers=""
           fi
           explicit_item_numbers="$item_numbers"
           auto_selected_apply_batch=false
-          sync_comments_only="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_sync_comments_only || 'false' }}"
+          sync_comments_only="$REQUESTED_SYNC_COMMENTS_ONLY"
+          if ! [[ "$limit" =~ ^[0-9]{1,8}$ ]] ||
+             ! [[ "$min_age_days" =~ ^[0-9]{1,8}$ ]] ||
+             { [ -n "$min_age_minutes" ] && ! [[ "$min_age_minutes" =~ ^[0-9]{1,10}$ ]]; } ||
+             ! [[ "$stale_min_age_days" =~ ^[0-9]{1,8}$ ]] ||
+             ! [[ "$close_delay_ms" =~ ^[0-9]{1,10}$ ]] ||
+             ! [[ "$checkpoint_size" =~ ^[1-9][0-9]{0,7}$ ]] ||
+             ! [[ "$sync_batch_size" =~ ^[0-9]{1,8}$ ]]; then
+            echo "Invalid numeric apply input." >&2
+            exit 1
+          fi
+          if ! [[ "$apply_kind" =~ ^(all|issue|pull_request)$ ]]; then
+            echo "Invalid apply kind." >&2
+            exit 1
+          fi
+          if ! [[ "$apply_close_reasons" =~ ^(all|[a-z_]+(,[a-z_]+)*)$ ]]; then
+            echo "Invalid apply close reasons." >&2
+            exit 1
+          fi
+          if ! [[ "$sync_open_pr_batch" =~ ^(true|false)$ ]] ||
+             ! [[ "$sync_comments_only" =~ ^(true|false)$ ]]; then
+            echo "Invalid apply boolean input." >&2
+            exit 1
+          fi
+          if [ -n "$item_numbers" ] && ! [[ "$item_numbers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+            echo "Invalid apply item numbers." >&2
+            exit 1
+          fi
           product_direction_enabled=false
           case "${CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED,,}" in
             true|1|yes|on) product_direction_enabled=true ;;
@@ -3559,7 +3712,11 @@ jobs:
             echo "APPLY_NOOP=true" >> "$GITHUB_ENV"
             exit 0
           fi
-          comment_sync_min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_comment_sync_min_age_days || '7' }}"
+          comment_sync_min_age_days="$REQUESTED_COMMENT_SYNC_MIN_AGE_DAYS"
+          if ! [[ "$comment_sync_min_age_days" =~ ^[0-9]{1,8}$ ]]; then
+            echo "Invalid comment sync minimum age." >&2
+            exit 1
+          fi
           target_slug="$TARGET_REPO"
           target_slug="${target_slug//\//-}"
           cursor_path="results/comment-sync-cursors/${target_slug}.json"

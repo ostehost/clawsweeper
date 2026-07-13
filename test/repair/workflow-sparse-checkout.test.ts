@@ -57,8 +57,9 @@ test("repair comment router workflow preserves repository dispatch target branch
   assert.match(workflow, /target_branch:\n\s+description:/);
   assert.match(
     workflow,
-    /target_branch="\$\{\{ github\.event\.client_payload\.target_branch \|\| '' \}\}"/,
+    /ROUTER_TARGET_BRANCH: \$\{\{ github\.event_name == 'repository_dispatch' && github\.event\.client_payload\.target_branch/,
   );
+  assert.equal([...workflow.matchAll(/target_branch="\$ROUTER_TARGET_BRANCH"/g)].length, 2);
   assert.equal(
     [
       ...workflow.matchAll(
@@ -85,12 +86,13 @@ test("repair comment router sparse checkout includes action ledger runtime", () 
 test("sweep workflow preserves manual target branches and hydrates exact branches live", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const dispatchTargetBranchResolver =
-    /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
+    /REQUESTED_TARGET_BRANCH: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}/g;
   const continuationTargetBranch =
     /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
 
   assert.match(workflow, /target_branch:\n\s+description: "Target repository branch to review"/);
   assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
+  assert.match(workflow, /target_branch="\$REQUESTED_TARGET_BRANCH"/);
   assert.equal([...workflow.matchAll(continuationTargetBranch)].length, 2);
   assert.match(
     workflow,

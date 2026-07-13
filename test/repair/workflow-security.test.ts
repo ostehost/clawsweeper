@@ -4,11 +4,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import YAML from "yaml";
 
 const intakeWorkflows = [
   ".github/workflows/repair-commit-finding-intake.yml",
   ".github/workflows/repair-issue-implementation-intake.yml",
 ];
+
+function workflowRunScripts(workflowPath: string): { label: string; run: string }[] {
+  const workflow = YAML.parse(fs.readFileSync(workflowPath, "utf8")) as {
+    jobs?: Record<string, { steps?: { name?: string; run?: string }[] }>;
+  };
+  const scripts: { label: string; run: string }[] = [];
+  for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+    for (const [index, step] of (job.steps ?? []).entries()) {
+      if (typeof step.run !== "string") continue;
+      scripts.push({ label: `${jobName}/${step.name ?? index}`, run: step.run });
+    }
+  }
+  return scripts;
+}
 
 test("repository dispatch payloads cannot select repair runners", () => {
   for (const path of intakeWorkflows) {
@@ -44,11 +59,109 @@ test("comment router passes replay attempt identities through the environment", 
       (line) => line.includes("inputs.attempt_id") || line.includes("client_payload.attempt_id"),
     );
 
-  assert.equal(directAttemptLines.length, 2);
+  assert.equal(directAttemptLines.length, 1);
   for (const line of directAttemptLines) {
     assert.match(line, /^\s*ROUTER_ATTEMPT_ID:/, line);
   }
   assert.equal(workflow.match(/attempt_id="\$ROUTER_ATTEMPT_ID"/g)?.length, 2);
+});
+
+test("write-capable workflows never compile event data into shell source", () => {
+  for (const workflowPath of [
+    ".github/workflows/repair-cluster-worker.yml",
+    ".github/workflows/repair-comment-router.yml",
+    ".github/workflows/repair-commit-finding-intake.yml",
+    ".github/workflows/repair-issue-implementation-intake.yml",
+    ".github/workflows/sweep.yml",
+  ]) {
+    for (const { label, run } of workflowRunScripts(workflowPath)) {
+      const expressions = run.match(/\$\{\{[\s\S]*?\}\}/g) ?? [];
+      for (const expression of expressions) {
+        assert.doesNotMatch(
+          expression,
+          /\b(?:github\.event(?:\.|_name)|inputs\.)/,
+          `${workflowPath}:${label}: ${expression}`,
+        );
+      }
+    }
+  }
+});
+
+test("comment router shell bodies consume only environment-bound workflow values", () => {
+  const workflowPath = ".github/workflows/repair-comment-router.yml";
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+
+  for (const { label, run } of workflowRunScripts(workflowPath)) {
+    assert.doesNotMatch(run, /\$\{\{/, `${label} still contains an expression`);
+  }
+  assert.equal(
+    workflow.match(/ROUTER_TARGET_REPO: \$\{\{ steps\.target\.outputs\.target_repo \}\}/g)?.length,
+    2,
+  );
+  assert.equal(workflow.match(/target_branch="\$ROUTER_TARGET_BRANCH"/g)?.length, 2);
+  assert.equal(workflow.match(/force_reprocess="\$ROUTER_FORCE_REPROCESS"/g)?.length, 2);
+});
+
+test("workflow output validators reject multiline repositories and branches", () => {
+  let repositoryOutputs = 0;
+  let branchOutputs = 0;
+  for (const workflowPath of [
+    ".github/workflows/repair-comment-router.yml",
+    ".github/workflows/sweep.yml",
+  ]) {
+    for (const { label, run } of workflowRunScripts(workflowPath)) {
+      if (run.includes('echo "target_repo=$target_repo"')) {
+        repositoryOutputs += 1;
+        assert.ok(
+          run.includes('if ! [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then'),
+          `${workflowPath}:${label} must validate the complete repository string`,
+        );
+      }
+      if (run.includes('echo "target_branch=$target_branch"')) {
+        branchOutputs += 1;
+        assert.ok(
+          run.includes('if ! [[ "$target_branch" =~ ^[A-Za-z0-9_./-]+$ ]]; then'),
+          `${workflowPath}:${label} must validate the complete branch string`,
+        );
+      }
+    }
+  }
+  assert.equal(repositoryOutputs, 5);
+  assert.equal(branchOutputs, 2);
+
+  for (const value of [
+    "openclaw/openclaw\ntarget_repo=attacker/repo",
+    "main\ntarget_branch=evil",
+  ]) {
+    const pattern = value.startsWith("openclaw/")
+      ? "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+      : "^[A-Za-z0-9_./-]+$";
+    const probe = spawnSync("bash", ["-c", '[[ "$VALUE" =~ $PATTERN ]]'], {
+      env: { ...process.env, PATTERN: pattern, VALUE: value },
+      encoding: "utf8",
+    });
+    assert.notEqual(probe.status, 0, value);
+  }
+});
+
+test("exact-review lease outputs reject multiline dispatch identities", () => {
+  const claim = workflowRunScripts(".github/workflows/sweep.yml").find(
+    ({ label }) => label === "event-review-apply/Claim exact-review queue lease",
+  );
+  assert.ok(claim);
+  assert.ok(
+    claim.run.includes('if ! [[ "$QUEUE_LEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then'),
+  );
+  assert.match(claim.run, /`lease_id=\$\{process\.env\.QUEUE_LEASE_ID\}`/);
+
+  for (const value of ["lease-123\nspoofed_output=value", "lease-123\rspoofed=value"]) {
+    const probe = spawnSync(
+      "bash",
+      ["-c", '[[ "$VALUE" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]'],
+      { env: { ...process.env, VALUE: value }, encoding: "utf8" },
+    );
+    assert.notEqual(probe.status, 0, value);
+  }
 });
 
 test("repair job restoration rejects shell metacharacters and path traversal", () => {

@@ -3,6 +3,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  realpathSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -11,7 +12,7 @@ import {
 } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { resolveSpawnCommand } from "../command.js";
 import { clawsweeperGitUserEmail, clawsweeperGitUserName } from "./process-env.js";
@@ -65,6 +66,22 @@ const GENERATED_PUBLISH_PATHS = [
   "results",
   "assets",
 ] as const;
+const STATE_RESET_OWNED_FILES = new Set([
+  "README.md",
+  "apply-report.json",
+  "repair-apply-report.json",
+]);
+const STATE_RESET_OWNED_ROOTS = [
+  "assets",
+  "jobs",
+  "ledger",
+  "logs",
+  "notifications",
+  "provider-leases",
+  "records",
+  "results",
+  "visual",
+] as const;
 const GIT_PATHSPEC_BATCH_SIZE = 256;
 const GIT_OBJECT_BATCH_SIZE = 512;
 const GIT_OBJECT_BATCH_MAX_BUFFER = 64 * 1024 * 1024;
@@ -116,6 +133,9 @@ export function runGit(args: readonly string[], options: GitRunOptions = {}): st
 }
 
 export function spawnGit(args: readonly string[], options: GitRunOptions = {}): GitRunResult {
+  if (args[0] === "reset" && args[1] === "--hard") {
+    guardStateRootHardReset(args[2] ?? "HEAD");
+  }
   recordGitProcess(args[0]);
   console.log(`$ ${formatGitDisplayCommand(options.displayArgs ?? args)}`);
   const cwd = publishRoot();
@@ -137,6 +157,47 @@ export function spawnGit(args: readonly string[], options: GitRunOptions = {}): 
     stdout: child.stdout ?? "",
     stderr: child.stderr ?? "",
   };
+}
+
+function guardStateRootHardReset(target: string): void {
+  const root = publishRoot();
+  if (!root) return;
+  const realRoot = realpathSync(root);
+  const realCwd = realpathSync(process.cwd());
+  const cwdFromRoot = relative(realRoot, realCwd);
+  if (
+    cwdFromRoot === "" ||
+    (!isAbsolute(cwdFromRoot) && cwdFromRoot !== ".." && !cwdFromRoot.startsWith(`..${sep}`))
+  ) {
+    throw new Error("Refusing hard reset: state publish root must be separate from the source cwd");
+  }
+
+  const topLevel = spawnGit(["rev-parse", "--show-toplevel"], { quiet: true });
+  if (topLevel.status !== 0 || realpathSync(topLevel.stdout.trim()) !== realRoot) {
+    throw new Error("Refusing hard reset: state publish root is not a dedicated Git worktree root");
+  }
+
+  const mergeBase = spawnGit(["merge-base", "HEAD", target], { quiet: true });
+  if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) {
+    throw new Error(`Refusing hard reset: HEAD and ${target} have no common base`);
+  }
+  const committedPaths = changedPathsBetween(mergeBase.stdout.trim(), "HEAD");
+  const dirtyPaths = runGit(["diff", "--no-renames", "--name-only", "-z", "HEAD"], {
+    quiet: true,
+  })
+    .split("\0")
+    .filter(Boolean);
+  const untrackedPaths = runGit(["ls-files", "--others", "-z"], {
+    quiet: true,
+  })
+    .split("\0")
+    .filter(Boolean);
+  const unsafePath = [...committedPaths, ...dirtyPaths, ...untrackedPaths].find(
+    (path) => !isStateResetOwnedPath(path),
+  );
+  if (unsafePath) {
+    throw new Error(`Refusing hard reset of non-state path: ${unsafePath}`);
+  }
 }
 
 function recordGitProcess(action: string | undefined): void {
@@ -281,6 +342,12 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   const commitMessage = commitMessageForPublishedPaths(options.message, options.paths);
   runGit(["commit", "-m", commitMessage]);
   let sourceCommit = runGit(["rev-parse", "HEAD"]).trim();
+  // Keep the original candidate as the three-way reconciliation source. When
+  // normalization discards the entire candidate and returns its hydrated base,
+  // the original candidate still preserves that base and the attempted tuple
+  // scope, allowing a later remote regression to be rejected. For mixed
+  // candidates, the normalized tuple-key allowlist below prevents discarded
+  // tuples from being rebuilt from this commit.
   const reconciliationSourceCommit =
     rebaseStrategy === "reconcile-records" ? sourceCommit : undefined;
   let reconciliationTupleKeys: ReadonlySet<string> | undefined;
@@ -666,6 +733,14 @@ function pathIsWithin(root: string, path: string): boolean {
 
 function isGeneratedPublishPath(path: string): boolean {
   return GENERATED_PUBLISH_PATHS.some((root) => pathIsWithin(root, path));
+}
+
+function isStateResetOwnedPath(path: string): boolean {
+  if (!path || path.includes("\\")) return false;
+  return (
+    STATE_RESET_OWNED_FILES.has(path) ||
+    STATE_RESET_OWNED_ROOTS.some((root) => pathIsWithin(root, path))
+  );
 }
 
 export function publishRoot(): string | undefined {

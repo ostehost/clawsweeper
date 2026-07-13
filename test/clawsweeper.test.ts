@@ -2379,7 +2379,11 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
 
   assert.doesNotMatch(existingRepairWorkflows, /CLAWSWEEPER_FEATURE_REPAIR_ENABLED/);
   assert.match(sweep, /pnpm run repair:comment-router -- \\\n[\s\S]*--execute/);
-  assert.match(router, /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \]; \}/);
+  assert.match(
+    router,
+    /ROUTER_EXECUTE: \$\{\{ github\.event_name == 'repository_dispatch'[\s\S]*inputs\.execute/,
+  );
+  assert.match(router, /if \[ "\$ROUTER_EXECUTE" = "true" \]; then/);
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(clusterIntake, /SCHEDULE_ENABLED/);

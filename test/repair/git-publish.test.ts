@@ -847,6 +847,12 @@ test("reconcile-records retries after a full push batch loses continuous state r
     reviewedAt: "2026-07-09T23:00:00.000Z",
     itemUpdatedAt: "2026-07-09T22:59:00Z",
   });
+  const newerBaseTuple = writeRecordTuple(work, {
+    number: 44,
+    marker: "newer base tuple",
+    reviewedAt: "2026-07-09T23:03:00.000Z",
+    itemUpdatedAt: "2026-07-09T23:02:00Z",
+  });
   run("git", ["add", "."], work);
   run("git", ["commit", "-m", "initial"], work);
   run("git", ["push", "origin", "HEAD:main"], work);
@@ -881,6 +887,12 @@ test("reconcile-records retries after a full push batch loses continuous state r
     reviewedAt: "2026-07-09T23:03:00.000Z",
     itemUpdatedAt: "2026-07-09T23:02:00Z",
   });
+  writeRecordTuple(work, {
+    number: 44,
+    marker: "stale broad reconciliation",
+    reviewedAt: "2026-07-09T23:00:00.000Z",
+    itemUpdatedAt: "2026-07-09T22:59:00Z",
+  });
   const result = withCwd(work, () =>
     publishMainCommit({
       message: "chore: publish broad reconciliation",
@@ -903,6 +915,10 @@ test("reconcile-records retries after a full push batch loses continuous state r
   assert.equal(
     run("git", ["--git-dir", origin, "show", `main:${recordsRoot}/items/43.md`], root),
     secondRemoteTuple.primary,
+  );
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", `main:${recordsRoot}/items/44.md`], root),
+    newerBaseTuple.primary,
   );
 });
 
@@ -1641,6 +1657,144 @@ test("state refresh reconciles retried direct publisher resets before broad publ
     run("git", ["--git-dir", origin, "show", `state:${concurrentJob}`], root),
     "concurrent closed job\n",
   );
+});
+
+test("state hard reset rejects a publish root nested inside another repository", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reset-guard-"));
+  const origin = path.join(root, "origin.git");
+  const state = path.join(root, "state");
+  const source = path.join(root, "source");
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  write(path.join(state, "results/base.json"), "{}\n");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial state"], state);
+  run("git", ["push", "origin", "HEAD:state"], state);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], state);
+  fs.mkdirSync(source);
+  write(path.join(state, "keep.txt"), "untracked operator file\n");
+  const before = run("git", ["rev-parse", "HEAD"], state);
+
+  assert.throws(
+    () =>
+      withEnv({ CLAWSWEEPER_STATE_DIR: path.join(state, "results") }, () =>
+        withCwd(source, () => hardResetToRemoteMain()),
+      ),
+    /state publish root is not a dedicated Git worktree root/,
+  );
+
+  assert.equal(run("git", ["rev-parse", "HEAD"], state), before);
+  assert.equal(fs.readFileSync(path.join(state, "keep.txt"), "utf8"), "untracked operator file\n");
+});
+
+test("state hard reset preserves non-generated dirty and committed paths", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reset-guard-"));
+  const origin = path.join(root, "origin.git");
+  const state = path.join(root, "state");
+  const source = path.join(root, "source");
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  write(path.join(state, "results/base.json"), "{}\n");
+  write(path.join(state, ".gitignore"), "/operator-notes.txt\n");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial state"], state);
+  run("git", ["push", "origin", "HEAD:state"], state);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], state);
+  fs.mkdirSync(source);
+  write(path.join(state, "operator-notes.txt"), "operator notes\n");
+
+  const reset = () =>
+    withEnv({ CLAWSWEEPER_STATE_DIR: state }, () => withCwd(source, () => hardResetToRemoteMain()));
+  assert.throws(reset, /Refusing hard reset of non-state path: operator-notes\.txt/);
+  assert.equal(fs.readFileSync(path.join(state, "operator-notes.txt"), "utf8"), "operator notes\n");
+
+  if (process.platform !== "win32") {
+    fs.rmSync(path.join(state, "operator-notes.txt"));
+    write(path.join(state, "records\\operator.md"), "operator notes\n");
+    assert.throws(reset, /Refusing hard reset of non-state path: records\\operator\.md/);
+    fs.rmSync(path.join(state, "records\\operator.md"));
+    write(path.join(state, "operator-notes.txt"), "operator notes\n");
+  }
+
+  run("git", ["add", "-f", "operator-notes.txt"], state);
+  run("git", ["commit", "-m", "operator state note"], state);
+  const before = run("git", ["rev-parse", "HEAD"], state);
+  assert.throws(reset, /Refusing hard reset of non-state path: operator-notes\.txt/);
+  assert.equal(run("git", ["rev-parse", "HEAD"], state), before);
+});
+
+test("state hard reset imports remote-only paths outside the state allowlist", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reset-guard-"));
+  const origin = path.join(root, "origin.git");
+  const state = path.join(root, "state");
+  const other = path.join(root, "other");
+  const source = path.join(root, "source");
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  write(path.join(state, "results/base.json"), "{}\n");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial state"], state);
+  run("git", ["push", "origin", "HEAD:state"], state);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], state);
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  write(path.join(other, "remote-operator-note.txt"), "remote-owned note\n");
+  run("git", ["add", "."], other);
+  run("git", ["commit", "-m", "remote operator note"], other);
+  run("git", ["push", "origin", "HEAD:state"], other);
+  fs.mkdirSync(source);
+
+  withEnv({ CLAWSWEEPER_STATE_DIR: state }, () => withCwd(source, () => hardResetToRemoteMain()));
+
+  assert.equal(
+    fs.readFileSync(path.join(state, "remote-operator-note.txt"), "utf8"),
+    "remote-owned note\n",
+  );
+});
+
+test("state hard reset rejects a state-root symlink or ancestor of the source cwd", () => {
+  if (process.platform === "win32") return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reset-guard-"));
+  const origin = path.join(root, "origin.git");
+  const source = path.join(root, "source");
+  const stateLink = path.join(root, "state-link");
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, source], root);
+  configureUser(source);
+  write(path.join(source, "results/base.json"), "{}\n");
+  run("git", ["add", "."], source);
+  run("git", ["commit", "-m", "initial state"], source);
+  run("git", ["push", "origin", "HEAD:state"], source);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], source);
+  fs.symlinkSync(source, stateLink, "dir");
+  const before = run("git", ["rev-parse", "HEAD"], source);
+
+  assert.throws(
+    () =>
+      withEnv({ CLAWSWEEPER_STATE_DIR: stateLink }, () =>
+        withCwd(source, () => hardResetToRemoteMain()),
+      ),
+    /state publish root must be separate from the source cwd/,
+  );
+  assert.equal(run("git", ["rev-parse", "HEAD"], source), before);
+
+  const nestedSource = path.join(source, "nested-source");
+  fs.mkdirSync(nestedSource);
+  assert.throws(
+    () =>
+      withEnv({ CLAWSWEEPER_STATE_DIR: source }, () =>
+        withCwd(nestedSource, () => hardResetToRemoteMain()),
+      ),
+    /state publish root must be separate from the source cwd/,
+  );
+  assert.equal(run("git", ["rev-parse", "HEAD"], source), before);
 });
 
 test("publishMainCommit refreshes published source paths after a state rebase", () => {
