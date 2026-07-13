@@ -6,6 +6,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { readSpooledActionEvents } from "../../dist/action-ledger.js";
+import {
+  exactHeadMergeClaimBody,
+  exactHeadMergeClaimDispatchBody,
+} from "../../dist/repair/exact-head-merge-claim.js";
 import { createReviewedTimelineCursor } from "../../dist/repair/timeline-cursor.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
@@ -1407,6 +1411,61 @@ test("repair apply retires a definitively rejected claim so the same head can re
   }
 });
 
+test("repair apply recovers a terminal pre-merge dispatch marker after proving no effect", () => {
+  const fixture = writeMergeApplyFixture({ priorWorkflowConclusion: "failure" });
+  try {
+    const request = {
+      repository: "openclaw/openclaw",
+      number: 101,
+      headSha: fixture.headSha,
+      method: "squash" as const,
+      owner: "apply_result",
+      claimant: "apply_result:9001:1",
+      appId: 3306130,
+      appSlug: "openclaw-clawsweeper",
+    };
+    fs.writeFileSync(
+      fixture.mergeClaimPath,
+      JSON.stringify([
+        {
+          id: 1001,
+          body: exactHeadMergeClaimBody(request),
+          created_at: "2026-07-13T07:01:00Z",
+          performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+          user: { login: "openclaw-clawsweeper[bot]" },
+        },
+        {
+          id: 1002,
+          body: exactHeadMergeClaimDispatchBody(
+            request,
+            1001,
+            "fix: interrupted merge\n\nno request reached GitHub",
+          ),
+          created_at: "2026-07-13T07:02:00Z",
+          performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+          user: { login: "openclaw-clawsweeper[bot]" },
+        },
+      ]),
+    );
+
+    runMergeApplyResult(fixture, { runAttempt: 2 });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.match(
+      report.actions[0].reason,
+      /failed after dispatch without an observable merge effect/i,
+    );
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 3);
+    assert.match(comments[2].body, /clawsweeper-exact-head-merge-recovery:v1 claim=1001/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply fails closed when post-claim timeline hydration reaches its cap", () => {
   const fixture = writeMergeApplyFixture({ foreignActivityBeyondTimelineCap: true });
   try {
@@ -2131,6 +2190,7 @@ function writeMergeApplyFixture(
     postClaimContentDrift?: "body" | "title" | "label" | "reaction";
     postDispatchGuardDrift?: "timeline" | "security" | "strict_base";
     postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness" | "strict_base";
+    priorWorkflowConclusion?: "failure";
   } = {},
 ): MergeFixture {
   const root = fs.realpathSync(
@@ -2250,6 +2310,7 @@ function writeMergeApplyFixture(
     postClaimContentDrift: options.postClaimContentDrift ?? null,
     postDispatchGuardDrift: options.postDispatchGuardDrift ?? null,
     postPolicyDrift: options.postPolicyDrift ?? null,
+    priorWorkflowConclusion: options.priorWorkflowConclusion ?? null,
     issueCountPath,
     policyReadPath,
   };
@@ -2319,7 +2380,12 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (apiPath === "repos/openclaw/clawsweeper/actions/runs/9001/attempts/1") {
-    write({ id: 9001, run_attempt: 1, status: "in_progress", conclusion: null });
+    write({
+      id: 9001,
+      run_attempt: 1,
+      status: data.priorWorkflowConclusion ? "completed" : "in_progress",
+      conclusion: data.priorWorkflowConclusion,
+    });
     process.exit(0);
   }
   if (apiPath.includes("/issues/101/comments")) {

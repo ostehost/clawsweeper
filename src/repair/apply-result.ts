@@ -1928,6 +1928,12 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
         ghJsonOnce(["api", path], { env: exactHeadMergeClaimWorkflowRunEnv() }),
       ),
+    dispatchedClaimEffectAbsent: () => {
+      const pullRequest = fetchPullRequestOnce(repository, number);
+      const view = fetchPullRequestViewOnce(repository, number);
+      const merged = confirmExactMergeSnapshot(pullRequest, headSha);
+      return !merged.block && !merged.mergedAt && !exactHeadPendingMerge(view, headSha);
+    },
   });
 }
 

@@ -226,6 +226,20 @@ test("definitive unconfirmed merge rejection closes the mutation receipt", () =>
   assert.equal(automergeAttemptReceiptOutcome(attempt), "rejected");
 });
 
+test("unrecognized unconfirmed merge failures remain ambiguous", () => {
+  const attempt = {
+    command_error: new Error("merge command bridge exited without a response"),
+    confirmation: {
+      mergedAt: null,
+      mergeCommitSha: null,
+      pendingReason: "",
+      block: "",
+    },
+  };
+  assert.equal(automergeUnconfirmedFailureDisposition(attempt), "waiting");
+  assert.equal(automergeAttemptReceiptOutcome(attempt), "unknown");
+});
+
 test("fresh comment-router attempts reconcile a durable claim after an unknown merge response", () => {
   const comments: Record<string, any>[] = [];
   let claimCreates = 0;

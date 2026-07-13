@@ -2,6 +2,12 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import { ghRetryKind } from "../github-retry.js";
 import { stripAnsi } from "./comment-router-utils.js";
 
+const DEFINITIVE_AUTOMERGE_REJECTION_PATTERNS = [
+  /\bPull Request is not mergeable\b[\s\S]*\bmergePullRequest\b/i,
+  /\bmergePullRequest\b[\s\S]*\bPull Request is not mergeable\b/i,
+  /\bHTTP\s*405\b[\s\S]*\bPull Request is not mergeable\b/i,
+];
+
 export type AutomergeEffectConfirmation = {
   mergedAt: string | null;
   mergeCommitSha: string | null;
@@ -189,7 +195,11 @@ export function automergeUnconfirmedFailureDisposition(
 ): "waiting" | "blocked" {
   const error =
     attempt.command_error ?? attempt.command_result?.error ?? automergeCommandFailure(attempt);
-  return ghRetryKind(error) === "none" ? "blocked" : "waiting";
+  if (ghRetryKind(error) !== "none") return "waiting";
+  const failure = automergeCommandFailure(attempt);
+  return DEFINITIVE_AUTOMERGE_REJECTION_PATTERNS.some((pattern) => pattern.test(failure))
+    ? "blocked"
+    : "waiting";
 }
 
 export function automergeAttemptReceiptOutcome(
