@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { ACTION_EVENT_TYPES } from "../../dist/action-ledger.js";
 import {
   buildApplyEvent,
   buildFixEvent,
@@ -12,6 +13,7 @@ import {
   renderClawSweeperEventMessage,
   runClawSweeperEventNotifier,
 } from "../../dist/repair/notify-events.js";
+import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
 
 test("buildApplyEvent maps ClawSweeper merge, close, and blocked events", () => {
   const merge = buildApplyEvent({
@@ -328,6 +330,68 @@ test("runClawSweeperEventNotifier retries events after dashboard ingest failures
   assert.match(report.actions[0].reason, /dashboard ingest returned 401/);
 });
 
+test("dashboard 429 receipts preserve an ambiguous mutation outcome", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-dashboard-throttle-")),
+  );
+  fs.writeFileSync(
+    path.join(root, "repair-apply-report.json"),
+    `${JSON.stringify([
+      {
+        repo: "openclaw/openclaw",
+        target: "#456",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:00:00Z",
+      },
+    ])}\n`,
+  );
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+
+  try {
+    const summary = await runClawSweeperEventNotifier(["--run-id", "987"], {
+      root,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://status.example/")) {
+          return new Response("rate limited", { status: 429 });
+        }
+        return Response.json({ runId: "hook-1" });
+      },
+      log: () => undefined,
+      env: {
+        CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+        CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+        CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+        CLAWSWEEPER_STATUS_INGEST_URL: "https://status.example/api/events",
+        CLAWSWEEPER_STATUS_INGEST_TOKEN: "status-secret",
+      },
+    });
+    assert.equal(summary.failed, 1);
+    await flushRepairActionEvents();
+
+    const events = readActionEvents(outputRoot);
+    const mutationEvents = events.filter(
+      (event) => event.event_type === ACTION_EVENT_TYPES.repairMutation,
+    );
+    assert.deepEqual(
+      mutationEvents.map((event) => event.attributes?.state),
+      ["mutation_attempted", "mutation_accepted", "mutation_attempted", "mutation_unknown"],
+    );
+    assert.equal(mutationEvents.at(-1)?.action.retryable, true);
+    const failed = events.find(
+      (event) => event.event_type === ACTION_EVENT_TYPES.notificationFailed,
+    );
+    assert.equal(failed?.attributes?.completion_reason, "mutation_outcome_unknown");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("dashboard receipt failures preserve the delivery error and continue notifications", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-dashboard-receipt-")),
@@ -494,6 +558,26 @@ function notificationWorkflowEnv(root: string, outputRoot: string) {
     GITHUB_WORKFLOW_REF:
       "openclaw/clawsweeper/.github/workflows/github-activity.yml@refs/heads/main",
   };
+}
+
+function readActionEvents(root: string): Record<string, any>[] {
+  return walk(root)
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) =>
+      fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+    );
+}
+
+function walk(root: string): string[] {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(root, entry.name);
+    return entry.isDirectory() ? walk(target) : [target];
+  });
 }
 
 function restoreEnv(previous: NodeJS.ProcessEnv) {

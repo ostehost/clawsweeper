@@ -512,7 +512,7 @@ class StatusDashboardDeliveryError extends Error {
 function isRejectedDashboardDelivery(error: unknown): boolean {
   return (
     error instanceof StatusDashboardDeliveryError &&
-    [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(error.status)
+    [400, 401, 403, 404, 405, 413, 415, 422].includes(error.status)
   );
 }
 
