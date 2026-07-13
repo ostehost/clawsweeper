@@ -1517,7 +1517,7 @@ test("review interruption recovery aggregates coordination comment mutations", (
   assert.equal(recoveredBatch.action.mutation, true);
 });
 
-test("interruption recovery preserves unresolved unknowns and ignores observed ones", () => {
+test("interruption recovery preserves unknowns across accepted retries and resolves observations", () => {
   const root = tempRoot();
   const env = workflowEnv({
     CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-unknown-then-accepted",
@@ -1695,6 +1695,7 @@ test("interruption recovery preserves unresolved unknowns and ignores observed o
     { env },
   );
   assert.ok(observed);
+  recordAttempt("a".repeat(64), "accepted", 41);
 
   assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
   const allEvents = readAllSpooledActionEvents(root);

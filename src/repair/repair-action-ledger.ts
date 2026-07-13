@@ -793,12 +793,14 @@ function repairAttemptEvents(
     repairOperationIdentity(input),
   );
   const attemptId = actionAttemptId(operationId, workflowAttemptIdentity(context?.env));
-  return repairChainEvents(
-    context?.root ?? repairActionLedgerRoot(),
-    input,
-    operation,
-    operationId,
-  ).filter((event) => event.operation_id === operationId && event.attempt_id === attemptId);
+  return repairChainEvents(context?.root ?? repairActionLedgerRoot(), input, operation, operationId)
+    .filter((event) => event.operation_id === operationId && event.attempt_id === attemptId)
+    .sort(
+      (left, right) =>
+        left.phase_seq - right.phase_seq ||
+        left.recorded_at.localeCompare(right.recorded_at) ||
+        left.event_id.localeCompare(right.event_id),
+    );
 }
 
 function nextRepairRequestAttempt(
@@ -834,15 +836,25 @@ function repairMutationState(
     if (!key) continue;
     const current = outcomes.get(key) ?? { observed: false, unknown: false, phaseSeq: 0 };
     if (event.phase_seq < current.phaseSeq) continue;
-    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+    if (completionReason === "mutation_observed") {
       outcomes.set(key, { observed: true, unknown: false, phaseSeq: event.phase_seq });
-    } else if (completionReason === "mutation_outcome_unknown" && !current.observed) {
-      outcomes.set(key, { observed: false, unknown: true, phaseSeq: event.phase_seq });
+    } else if (completionReason === "mutation_accepted") {
+      outcomes.set(key, {
+        observed: true,
+        unknown: current.unknown,
+        phaseSeq: event.phase_seq,
+      });
+    } else if (completionReason === "mutation_outcome_unknown") {
+      outcomes.set(key, {
+        observed: current.observed,
+        unknown: true,
+        phaseSeq: event.phase_seq,
+      });
     }
   }
   const states = [...outcomes.values()];
   const mutationObserved = states.some((state) => state.observed || state.unknown);
-  const uncertainMutationObserved = states.some((state) => state.unknown && !state.observed);
+  const uncertainMutationObserved = states.some((state) => state.unknown);
   return { mutationObserved, uncertainMutationObserved };
 }
 

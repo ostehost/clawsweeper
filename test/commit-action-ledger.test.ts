@@ -191,7 +191,7 @@ test("commit publication uncertainty is preserved by terminal workflow receipts"
   }
 });
 
-test("commit mutation retry resolves prior uncertainty for the same receipt key", async () => {
+test("commit mutation retry preserves prior uncertainty for the same receipt key", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-retry-ledger-")));
   const outputRoot = path.join(root, "output");
   fs.mkdirSync(outputRoot);
@@ -239,8 +239,8 @@ test("commit mutation retry resolves prior uncertainty for the same receipt key"
         event.attributes?.state === "failed",
     );
     assert.equal(failed?.action.mutation, true);
-    assert.equal(failed?.action.retryable, false);
-    assert.equal(failed?.attributes?.completion_reason, "mutation_observed");
+    assert.equal(failed?.action.retryable, true);
+    assert.equal(failed?.attributes?.completion_reason, "mutation_outcome_unknown");
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

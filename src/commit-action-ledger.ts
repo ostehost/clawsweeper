@@ -741,16 +741,26 @@ function commitMutationState(input: CommitLifecycleInput): { observed: boolean; 
     if (!key) continue;
     const current = outcomes.get(key) ?? { observed: false, unknown: false, phaseSeq: 0 };
     if (event.phase_seq < current.phaseSeq) continue;
-    if (reason === "mutation_accepted" || reason === "mutation_observed") {
+    if (reason === "mutation_observed") {
       outcomes.set(key, { observed: true, unknown: false, phaseSeq: event.phase_seq });
-    } else if (reason === "mutation_outcome_unknown" && !current.observed) {
-      outcomes.set(key, { observed: false, unknown: true, phaseSeq: event.phase_seq });
+    } else if (reason === "mutation_accepted") {
+      outcomes.set(key, {
+        observed: true,
+        unknown: current.unknown,
+        phaseSeq: event.phase_seq,
+      });
+    } else if (reason === "mutation_outcome_unknown") {
+      outcomes.set(key, {
+        observed: current.observed,
+        unknown: true,
+        phaseSeq: event.phase_seq,
+      });
     }
   }
   const states = [...outcomes.values()];
   return {
     observed: states.some((state) => state.observed || state.unknown),
-    unknown: states.some((state) => state.unknown && !state.observed),
+    unknown: states.some((state) => state.unknown),
   };
 }
 

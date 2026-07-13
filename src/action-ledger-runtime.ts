@@ -489,7 +489,7 @@ function workflowActionUnresolvedUnknownMutation(
   )) {
     const completionReason = event.attributes?.completion_reason;
     const key = event.idempotency_key_sha256;
-    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+    if (completionReason === "mutation_observed") {
       observed.add(key);
       unresolved.delete(key);
     } else if (completionReason === "mutation_outcome_unknown" && !observed.has(key)) {
