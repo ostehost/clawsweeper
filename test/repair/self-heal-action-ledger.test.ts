@@ -10,10 +10,7 @@ test("failed-run self-heal budgets retries by immutable generation", () => {
   const source = readText("src/repair/self-heal-failed-runs.ts");
 
   assert.match(source, /attemptCountsByGeneration/);
-  assert.match(
-    source,
-    /attemptCountsByGeneration\.get\(generation\)[\s\S]*maxAttemptsPerJob/,
-  );
+  assert.match(source, /attemptCountsByGeneration\.get\(generation\)[\s\S]*maxAttemptsPerJob/);
   assert.match(source, /isMissingImmutableJobError\(error\)[\s\S]*"missing_job_file"/);
   assert.match(source, /const latestByGeneration = new Map/);
   assert.match(source, /resolveRunRecordJob\(record, sourceJob\)/);
