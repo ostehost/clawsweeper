@@ -543,7 +543,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           EXPECTED_REVIEW_JOB: Review commit ${{ matrix.sha }}
-          EXPECTED_ATTEST_JOB: Attest commit ${{ matrix.sha }}
+          EXPECTED_ATTEST_JOB: Attest commit review ${{ matrix.sha }}
           CURRENT_ATTEMPT_JOBS: ${{ runner.temp }}/commit-review-current-attempt-jobs-${{ matrix.sha }}.json
         run: |
           set -euo pipefail
@@ -771,7 +771,7 @@ jobs:
 
           const commits = [...shas].sort().map((sha) => {
             const reviewJobs = jobs.filter((job) => job.name === `Review commit ${sha}`);
-            const attestJobs = jobs.filter((job) => job.name === `Attest commit ${sha}`);
+            const attestJobs = jobs.filter((job) => job.name === `Attest commit review ${sha}`);
             if (reviewJobs.length > 1 || attestJobs.length > 1) {
               throw new Error(`current commit review job provenance is ambiguous for ${sha}`);
             }

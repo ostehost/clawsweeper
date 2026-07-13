@@ -42,6 +42,7 @@ test("commit review attestation reuses prior reports only when the producer was 
   const workflow = parse(fs.readFileSync(".github/workflows/commit-review.yml", "utf8")) as {
     jobs: {
       attest: {
+        name: string;
         steps: Array<{
           env?: Record<string, string>;
           id?: string;
@@ -64,9 +65,10 @@ test("commit review attestation reuses prior reports only when the producer was 
   assert.ok(policyIndex >= 0);
   assert.ok(resolveIndex > policyIndex);
   assert.equal(policy?.id, "raw-review-provenance");
+  assert.equal(workflow.jobs.attest.name, "Attest commit review ${{ matrix.sha }}");
   assert.equal(policy?.env?.RUN_ATTEMPT, "${{ github.run_attempt }}");
   assert.equal(policy?.env?.EXPECTED_REVIEW_JOB, "Review commit ${{ matrix.sha }}");
-  assert.equal(policy?.env?.EXPECTED_ATTEST_JOB, "Attest commit ${{ matrix.sha }}");
+  assert.equal(policy?.env?.EXPECTED_ATTEST_JOB, workflow.jobs.attest.name);
   assert.match(
     policy?.run ?? "",
     /actions\/runs\/\$\{RUN_ID\}\/attempts\/\$\{RUN_ATTEMPT\}\/jobs\?per_page=100/,
@@ -83,7 +85,7 @@ test("commit review attestation reuses prior reports only when the producer was 
 
   const failedProducerRerun = runPriorArtifactPolicy(policy?.run ?? "", 2, [
     {
-      name: "Attest commit fixture-sha",
+      name: "Attest commit review fixture-sha",
       run_attempt: 2,
       status: "in_progress",
       conclusion: null,
@@ -101,7 +103,7 @@ test("commit review attestation reuses prior reports only when the producer was 
 
   const attestationOnlyRetry = runPriorArtifactPolicy(policy?.run ?? "", 2, [
     {
-      name: "Attest commit fixture-sha",
+      name: "Attest commit review fixture-sha",
       run_attempt: 2,
       status: "in_progress",
       conclusion: null,
@@ -171,7 +173,7 @@ test("commit report publication binds every artifact to its producer and attesto
     jobs: [
       workflowJob("Commit reports", 2),
       workflowJob(`Review commit ${sha1}`, 2),
-      workflowJob(`Attest commit ${sha1}`, 2, "failure"),
+      workflowJob(`Attest commit review ${sha1}`, 2, "failure"),
     ],
     cohort: [commitReviewArtifact(sha1, 1)],
   });
@@ -184,7 +186,7 @@ test("commit report publication binds every artifact to its producer and attesto
     resolveScript: resolve?.run ?? "",
     runAttempt: 2,
     shas: [sha1],
-    jobs: [workflowJob("Commit reports", 2), workflowJob(`Attest commit ${sha1}`, 2)],
+    jobs: [workflowJob("Commit reports", 2), workflowJob(`Attest commit review ${sha1}`, 2)],
     cohort: [commitReviewArtifact(sha1, 2)],
   });
   assert.equal(attestationOnlyRetry.policyStatus, 0, attestationOnlyRetry.policyStderr);
@@ -209,7 +211,7 @@ test("commit report publication binds every artifact to its producer and attesto
     jobs: [
       workflowJob("Commit reports", 2),
       workflowJob(`Review commit ${sha1}`, 2),
-      workflowJob(`Attest commit ${sha1}`, 2),
+      workflowJob(`Attest commit review ${sha1}`, 2),
     ],
     cohort: [commitReviewArtifact(sha1, 2), commitReviewArtifact(sha2, 1)],
   });
@@ -557,7 +559,7 @@ function runPriorArtifactPolicy(
       env: {
         ...process.env,
         CURRENT_ATTEMPT_JOBS: currentJobsPath,
-        EXPECTED_ATTEST_JOB: "Attest commit fixture-sha",
+        EXPECTED_ATTEST_JOB: "Attest commit review fixture-sha",
         EXPECTED_REVIEW_JOB: "Review commit fixture-sha",
         GH_FIXTURE: fixturePath,
         GH_LOG: ghLogPath,
