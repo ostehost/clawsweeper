@@ -6,6 +6,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
+  listActiveWorkflowRuns,
   parseArgs,
   parseJob,
   readMaxLiveWorkers,
@@ -16,6 +17,14 @@ import {
 import { ghErrorText, ghJson, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
+import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
+import {
+  restoreGateSequence,
+  restoreGateWithFallback,
+  type GateCleanupFailure,
+  type GateRestoreResult,
+} from "./self-heal-gate-restore.js";
+import { fetchWorkflowRunHistory } from "./workflow-run-history.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -24,6 +33,16 @@ const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
 const ACTIVE_STATUSES = new Set([...QUEUED_STATUSES, "in_progress"]);
+
+type GateState = {
+  exists: boolean;
+  value: string;
+};
+
+type GateRestore = {
+  name: string;
+  previous: GateState;
+};
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
@@ -47,6 +66,9 @@ const execute = Boolean(args.execute);
 const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
 const allowRepeat = Boolean(args["allow-repeat"]);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
+const runRecordsDir = path.resolve(
+  String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
+);
 const skippedCandidates: LooseRecord[] = [];
 
 if (!Number.isInteger(maxJobs) || maxJobs < 1) {
@@ -86,7 +108,7 @@ if (!execute) {
   process.exit(0);
 }
 
-const gateRestores: JsonValue[] = [];
+const gateRestores: GateRestore[] = [];
 const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
 const headSha = currentHeadSha();
 const ledger = readSelfHealLedger();
@@ -107,6 +129,8 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
   status: "pending",
 }));
 
+let primaryFailure: unknown = null;
+let cleanupRestoreFailures: GateCleanupFailure[] = [];
 try {
   if (openExecuteWindow) {
     openGate("CLAWSWEEPER_ALLOW_EXECUTE");
@@ -150,10 +174,26 @@ try {
   summary.batch_id = batchId;
   summary.observed_runs = attempts[0]?.observed_runs ?? [];
   console.log(JSON.stringify(summary, null, 2));
+} catch (error) {
+  primaryFailure = error;
 } finally {
-  for (const gate of gateRestores.reverse()) {
-    setGate(gate.name, gate.previous || "1");
+  const cleanupFailures = restoreOpenedGates();
+  cleanupRestoreFailures = cleanupFailures.restoreFailures;
+  for (const failure of cleanupFailures.receiptFailures) {
+    console.error(
+      `self-heal: restored ${failure.name} but failed to record its cleanup receipt: ${errorText(failure.error)}`,
+    );
   }
+  for (const failure of cleanupFailures.restoreFailures) {
+    console.error(`self-heal: failed to restore ${failure.name}: ${errorText(failure.error)}`);
+  }
+}
+if (primaryFailure !== null) throw primaryFailure;
+if (cleanupRestoreFailures.length > 0) {
+  throw new AggregateError(
+    cleanupRestoreFailures.map((failure) => failure.error),
+    "self-heal failed to restore one or more execution gates",
+  );
 }
 
 function selectCandidates() {
@@ -255,20 +295,19 @@ function sourceJobPath(sourceJob: string) {
 
 function activeRepairSourceJobs() {
   const jobs = new Map<string, string[]>();
-  let runs: LooseRecord[] = [];
   try {
-    runs = listClusterRuns();
+    const runs = listActiveWorkflowRuns({ repo, workflow });
+    for (const run of runs) {
+      if (!ACTIVE_STATUSES.has(String(run.status ?? ""))) continue;
+      const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
+      if (!sourceJob) continue;
+      const runId = String(run.databaseId ?? "");
+      jobs.set(sourceJob, [...(jobs.get(sourceJob) ?? []), runId].filter(Boolean));
+    }
   } catch (error) {
-    console.warn(`self-heal: cannot list active repair runs: ${ghErrorText(error)}`);
-    return jobs;
-  }
-
-  for (const run of runs) {
-    if (!ACTIVE_STATUSES.has(String(run.status ?? ""))) continue;
-    const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
-    if (!sourceJob) continue;
-    const runId = String(run.databaseId ?? "");
-    jobs.set(sourceJob, [...(jobs.get(sourceJob) ?? []), runId].filter(Boolean));
+    throw new Error(
+      `cannot verify active repair generations; refusing dispatch: ${ghErrorText(error)}`,
+    );
   }
   return jobs;
 }
@@ -280,32 +319,51 @@ function sourceJobFromRunTitle(title: string) {
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
-  const result = spawnSync(
-    "gh",
-    [
-      "workflow",
-      "run",
+  const commandArgs = [
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repo,
+    "-f",
+    `job=${candidate.source_job}`,
+    "-f",
+    `mode=${candidate.mode}`,
+    "-f",
+    `runner=${runner}`,
+    "-f",
+    `execution_runner=${executionRunner}`,
+    "-f",
+    `model=${model}`,
+  ];
+  runRepairMutation(selfHealDispatchLifecycle(candidate), {
+    kind: "repair_dispatch",
+    operationName: "failed_run_self_heal",
+    component: "failed_run_self_heal",
+    identity: {
+      repository: repo,
       workflow,
-      "--repo",
-      repo,
-      "-f",
-      `job=${candidate.source_job}`,
-      "-f",
-      `mode=${candidate.mode}`,
-      "-f",
-      `runner=${runner}`,
-      "-f",
-      `execution_runner=${executionRunner}`,
-      "-f",
-      `model=${model}`,
-    ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-  );
-  if (result.status !== 0) {
-    throw new Error(
-      `failed to dispatch ${candidate.source_job}: ${result.stderr || result.stdout}`,
-    );
-  }
+      sourceRunId: candidate.run_id,
+      jobPath: candidate.source_job,
+      mode: candidate.mode,
+      runner,
+      executionRunner,
+      model,
+    },
+    operation: () => {
+      const result = spawnSync("gh", commandArgs, {
+        cwd: repoRoot(),
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `failed to dispatch ${candidate.source_job}: ${result.stderr || result.stdout}`,
+        );
+      }
+      return result;
+    },
+  });
   console.log(`dispatched ${candidate.source_job} from failed run ${candidate.run_id}`);
 }
 
@@ -313,7 +371,7 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
   const deadline = Date.now() + 10 * 60 * 1000;
   let latest: JsonValue[] = [];
   while (Date.now() < deadline) {
-    latest = listClusterRuns()
+    latest = listClusterRuns({ cutoffMs: Date.parse(since) })
       .filter((run: JsonValue) => run.headSha === headSha)
       .filter((run: JsonValue) => Date.parse(run.createdAt) >= Date.parse(since))
       .sort(
@@ -351,19 +409,30 @@ function assertExecuteGateOpenIfNeeded(candidates: LooseRecord[]) {
 }
 
 function readRunRecords() {
-  const runsDir = path.join(repoRoot(), "results", "runs");
-  const records = fs.existsSync(runsDir)
+  const records = fs.existsSync(runRecordsDir)
     ? fs
-        .readdirSync(runsDir)
+        .readdirSync(runRecordsDir)
         .filter((name: string) => name.endsWith(".json"))
-        .map((name: string) => JSON.parse(fs.readFileSync(path.join(runsDir, name), "utf8")))
+        .map((name: string) => JSON.parse(fs.readFileSync(path.join(runRecordsDir, name), "utf8")))
     : [];
-  return [...records, ...liveRunRecords()];
+  return [...records, ...liveRunRecords(liveRunDiscoveryCutoffMs(records))];
 }
 
-function liveRunRecords() {
+function liveRunDiscoveryCutoffMs(records: LooseRecord[]): number {
+  const maxAgeCutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
+  let cutoffMs = maxAgeCutoffMs;
+  for (const record of records) {
+    if (recordTimestampMs(record) < maxAgeCutoffMs) continue;
+    const createdAtMs = Date.parse(String(record.workflow_created_at ?? ""));
+    if (!Number.isFinite(createdAtMs)) return 0;
+    cutoffMs = Math.min(cutoffMs, createdAtMs);
+  }
+  return cutoffMs;
+}
+
+function liveRunRecords(cutoffMs: number) {
   try {
-    return listClusterRuns()
+    return listClusterRuns({ cutoffMs })
       .map((run: LooseRecord) => {
         const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
         if (!sourceJob) return null;
@@ -378,7 +447,11 @@ function liveRunRecords() {
       })
       .filter(Boolean);
   } catch (error) {
-    console.warn(`self-heal: cannot list live repair runs: ${ghErrorText(error)}`);
+    const detail = ghErrorText(error);
+    if (execute) {
+      throw new Error(`cannot list live repair runs; refusing dispatch: ${detail}`);
+    }
+    console.warn(`self-heal: cannot list live repair runs: ${detail}`);
     return [];
   }
 }
@@ -406,23 +479,12 @@ function selfHealLedgerPath() {
   return path.join(repoRoot(), "results", "self-heal.json");
 }
 
-function listClusterRuns() {
-  const workflowName = workflowDisplayName(workflow);
-  return ghJson<LooseRecord[]>([
-    "run",
-    "list",
-    "--repo",
-    repo,
-    "--limit",
-    "200",
-    "--json",
-    "databaseId,workflowName,displayTitle,headSha,status,conclusion,createdAt,updatedAt,url",
-  ]).filter((run: LooseRecord) => run.workflowName === workflowName);
-}
-
-function workflowDisplayName(workflowNameOrFile: string): string {
-  if (workflowNameOrFile === "repair-cluster-worker.yml") return "repair cluster worker";
-  return workflowNameOrFile;
+function listClusterRuns({
+  cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000,
+}: {
+  cutoffMs?: number;
+} = {}) {
+  return fetchWorkflowRunHistory({ repo, workflow, cutoffMs });
 }
 
 function readExecuteGate() {
@@ -434,13 +496,17 @@ function readFixGate() {
 }
 
 function openGate(name: string) {
-  const previous = readGate(name);
+  const previous = readMutableGateState(name);
   gateRestores.push({ name, previous });
-  if (previous !== "1") setGate(name, "1");
+  if (!previous.exists || previous.value !== "1") setGate(name, "1");
 }
 
-function readGate(name: string) {
-  return readGateValue(name, { preferEnv: false });
+function readMutableGateState(name: string): GateState {
+  const variables = readRepoVariables({ required: true });
+  const variable = variables.find((candidate: JsonValue) => candidate.name === name);
+  return variable
+    ? { exists: true, value: String(variable.value ?? "") }
+    : { exists: false, value: "" };
 }
 
 function readGateValue(name: string, { preferEnv }: { preferEnv: boolean }) {
@@ -450,12 +516,17 @@ function readGateValue(name: string, { preferEnv }: { preferEnv: boolean }) {
   return variables.find((variable: JsonValue) => variable.name === name)?.value ?? envValue ?? "";
 }
 
-function readRepoVariables() {
+function readRepoVariables({ required = false }: { required?: boolean } = {}) {
   try {
     return ghJson<LooseRecord[]>(["variable", "list", "--repo", repo, "--json", "name,value"]);
   } catch (error) {
     const detail = ghErrorText(error);
     if (/HTTP 403|Resource not accessible by integration/i.test(detail)) {
+      if (required) {
+        throw new Error(
+          `cannot read repository variables before opening temporary execution gates: ${detail}`,
+        );
+      }
       console.warn("self-heal: cannot read repo variables; falling back to workflow env");
       return [];
     }
@@ -464,8 +535,88 @@ function readRepoVariables() {
 }
 
 function setGate(name: string, value: JsonValue) {
-  ghText(["variable", "set", name, "--repo", repo, "--body", String(value ?? "")]);
+  const normalizedValue = String(value ?? "");
+  runRepairMutation(selfHealGateLifecycle(name, normalizedValue), {
+    kind: "repository_variable_update",
+    operationName: "failed_run_self_heal_gate",
+    component: "failed_run_self_heal",
+    identity: { repository: repo, variable: name, value: normalizedValue },
+    operation: () => writeGateValue(name, normalizedValue),
+  });
+}
+
+function restoreOpenedGates(): {
+  receiptFailures: GateCleanupFailure[];
+  restoreFailures: GateCleanupFailure[];
+} {
+  return restoreGateSequence(
+    gateRestores.map((gate) => ({ name: gate.name, state: gate.previous })),
+    restoreGate,
+  );
+}
+
+function restoreGate(name: string, state: GateState): GateRestoreResult {
+  const receiptState = state.exists ? `set:${state.value}` : "delete";
+  return restoreGateWithFallback({
+    runWithReceipt: (operation) =>
+      runRepairMutation(selfHealGateLifecycle(name, receiptState), {
+        kind: "repository_variable_update",
+        operationName: "failed_run_self_heal_gate",
+        component: "failed_run_self_heal",
+        identity: {
+          repository: repo,
+          variable: name,
+          exists: state.exists,
+          value: state.value,
+        },
+        operation,
+      }),
+    writeState: () => writeGateState(name, state),
+  });
+}
+
+function writeGateState(name: string, state: GateState): string {
+  if (state.exists) return writeGateValue(name, state.value);
+  let result = "";
+  try {
+    result = ghText(["variable", "delete", name, "--repo", repo]);
+  } catch (error) {
+    if (!/\bHTTP 404\b|not found/i.test(ghErrorText(error))) throw error;
+    if (readMutableGateState(name).exists) throw error;
+  }
+  console.log(`${name}=<absent>`);
+  return result;
+}
+
+function writeGateValue(name: string, value: string): string {
+  const result = ghText(["variable", "set", name, "--repo", repo, "--body", value]);
   console.log(`${name}=${value}`);
+  return result;
+}
+
+function selfHealDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
+  return {
+    repository: repo,
+    workKey: `failed-run-self-heal:${candidate.run_id ?? "unknown"}:${candidate.source_job ?? "unknown"}`,
+    sourceRevision: String(candidate.run_id ?? ""),
+    recordPath: String(candidate.source_job ?? ""),
+    subjectKind: "workflow",
+    subjectId: `failed-repair-run-${candidate.run_id ?? "unknown"}`,
+  };
+}
+
+function selfHealGateLifecycle(name: string, value: string): RepairLifecycleInput {
+  return {
+    repository: repo,
+    workKey: `failed-run-self-heal:gate:${name}:${value}`,
+    sourceRevision: value,
+    subjectKind: "workflow",
+    subjectId: "failed-run-self-heal-gates",
+  };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function currentHeadSha() {

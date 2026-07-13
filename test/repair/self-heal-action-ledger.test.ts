@@ -6,21 +6,14 @@ function readText(path: string): string {
   return fs.readFileSync(path, "utf8");
 }
 
-test("failed-run self-heal preserves legacy retry budgets and skips removed jobs", () => {
+test("failed-run self-heal preserves retry budgets and skips removed jobs", () => {
   const source = readText("src/repair/self-heal-failed-runs.ts");
 
-  assert.match(source, /legacyAttemptCountsByJob/);
-  assert.match(source, /legacyAttemptedRunsByJob/);
-  assert.match(
-    source,
-    /\(attemptCountsByIdentity\.get\(immutableKey\) \?\? 0\) \+\s+\(legacyAttemptCountsByJob\.get\(sourceJob\) \?\? 0\)/,
-  );
-  assert.match(
-    source,
-    /reason: isMissingImmutableJobError\(error\)[\s\S]*\? "missing_job_file"[\s\S]*: "immutable_provenance_unavailable"/,
-  );
-  assert.doesNotMatch(source, /if \(!isMissingImmutableJobError\(error\)\) throw error/);
-  assert.ok(source.indexOf('"missing_job_file"') < source.indexOf("activeJobGenerations.get("));
+  assert.match(source, /attemptCountsByJob/);
+  assert.match(source, /attemptCountsByJob\.get\(sourceJob\)[\s\S]*maxAttemptsPerJob/);
+  assert.match(source, /reason: "missing_job_file"/);
+  assert.match(source, /const latestByJob = new Map/);
+  assert.match(source, /fetchWorkflowRunHistory/);
 });
 
 test("self-heal mutations emit durable action receipts", () => {
@@ -35,12 +28,15 @@ test("self-heal mutations emit durable action receipts", () => {
     failedRuns,
     /runRepairMutation\(selfHealGateLifecycle\(name, normalizedValue\),[\s\S]*kind: "repository_variable_update"/,
   );
-  assert.match(failedRuns, /immutableJobDispatchArgs\(/);
   assert.match(failedRuns, /return path\.join\(repoRoot\(\), "results", "self-heal\.json"\)/);
   assert.doesNotMatch(
     failedRuns,
     /CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH|args\["ledger-path"\]|args\.ledger_path/,
   );
+  assert.match(failedRuns, /cannot list live repair runs; refusing dispatch/);
+  assert.match(failedRuns, /cannot verify active repair generations; refusing dispatch/);
+  assert.match(failedRuns, /restoreGateSequence\(/);
+  assert.match(failedRuns, /restoreGateWithFallback\(/);
   assert.match(
     failedRuns,
     /if \(!\/\\bHTTP 404\\b\|not found\/i\.test\(ghErrorText\(error\)\)\) throw error;\s+if \(readMutableGateState\(name\)\.exists\) throw error;/,
