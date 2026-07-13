@@ -482,31 +482,20 @@ function finalizeFixPr(action: LooseRecord) {
             claimReleaseRetry: release.status === "unknown",
           };
         }
-        mergeRequestStarted = true;
-        const dispatchBoundary = markPostFlightMergeClaimDispatched(
-          parsed.number,
-          action.commit,
-          claim.claimId,
-        );
-        if (dispatchBoundary.status !== "dispatched") {
-          return {
-            policyBlock: dispatchBoundary.reason,
-            claim,
-            pull: claimedPull,
-            view: claimedView,
-            confirmation: null,
-            confirmationError: "",
-            ambiguous: false,
-            reconciliationOnly: true,
-            claimReleaseRetry: dispatchBoundary.status === "unknown",
-          };
-        }
-        mergeAttempts += 1;
         const mutation = runRepairMutation(postFlightLifecycle(null), {
           kind: "post_flight_merge",
           identity: postFlightMergeMutationIdentity(parsed.number, action.commit),
           component: "post_flight",
           operation: () => {
+            const dispatchBoundary = markPostFlightMergeClaimDispatched(
+              parsed.number,
+              action.commit,
+              claim.claimId,
+            );
+            if (dispatchBoundary.status !== "dispatched") {
+              throw new Error(dispatchBoundary.reason);
+            }
+            mergeAttempts += 1;
             let commandError: unknown = null;
             mergeRequestStarted = true;
             try {

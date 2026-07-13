@@ -219,21 +219,24 @@ test("all exact-head merge owners release unused claims and require squash auto-
   assert.match(applyExecution, /markApplyMergeClaimDispatched\(/);
   assert.match(applyExecution, /kind: "apply_result_merge"/);
   assert.ok(
-    applyExecution.indexOf("markApplyMergeClaimDispatched(") <
-      applyExecution.indexOf('kind: "apply_result_merge"'),
+    applyExecution.indexOf('kind: "apply_result_merge"') <
+      applyExecution.indexOf("markApplyMergeClaimDispatched("),
   );
   assert.match(routerExecution, /markAutomergeMergeClaimDispatched\(/);
   assert.match(routerExecution, /result = runGitHubSpawnMutation\(/);
   assert.ok(
-    routerExecution.indexOf("markAutomergeMergeClaimDispatched(") <
-      routerExecution.indexOf("result = runGitHubSpawnMutation("),
+    routerExecution.indexOf("result = runGitHubSpawnMutation(") <
+      routerExecution.indexOf("markAutomergeMergeClaimDispatched("),
   );
   assert.match(postFlightExecution, /markPostFlightMergeClaimDispatched\(/);
   assert.match(postFlightExecution, /kind: "post_flight_merge"/);
   assert.ok(
-    postFlightExecution.indexOf("markPostFlightMergeClaimDispatched(") <
-      postFlightExecution.indexOf('kind: "post_flight_merge"'),
+    postFlightExecution.indexOf('kind: "post_flight_merge"') <
+      postFlightExecution.indexOf("markPostFlightMergeClaimDispatched("),
   );
+  assert.match(applyExecution, /let mergeRequestStarted = false/);
+  assert.match(routerExecution, /let mergeRequestStarted = false/);
+  assert.match(postFlightExecution, /let mergeRequestStarted = false/);
   assert.match(apply, /validateMergeablePullRequestHard[\s\S]*squashAutomergeMethodBlock/);
   assert.match(router, /validateAutomergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);
   assert.match(postFlight, /validateFixPrMergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);

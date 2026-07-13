@@ -1034,43 +1034,22 @@ function applyMergeAction({
         merge_method: "squash",
       });
     }
-    let dispatchBoundary;
-    try {
-      dispatchBoundary = markApplyMergeClaimDispatched(
-        result.repo,
-        target,
-        authorizedHeadSha,
-        mergeClaim.claimId,
-      );
-    } catch (error) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: `exact-head merge dispatch boundary failed: ${ghErrorText(error)}`,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      };
-    }
-    if (dispatchBoundary.status !== "dispatched") {
-      return {
-        ...base,
-        status: "blocked",
-        reason: dispatchBoundary.reason,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-        ...(dispatchBoundary.status === "unknown" ? { requeue_required: true } : {}),
-      };
-    }
-    let mergeRequestStarted = true;
+    let mergeRequestStarted = false;
     try {
       runRepairMutation(applyResultLifecycle(target), {
         kind: "apply_result_merge",
         identity: applyMergeMutationIdentity(target, authorizedHeadSha),
         component: "apply_result",
         operation: () => {
+          const dispatchBoundary = markApplyMergeClaimDispatched(
+            result.repo,
+            target,
+            authorizedHeadSha,
+            mergeClaim.claimId,
+          );
+          if (dispatchBoundary.status !== "dispatched") {
+            throw new Error(dispatchBoundary.reason);
+          }
           mergeRequestStarted = true;
           return ghText(mergeArgs);
         },

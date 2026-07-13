@@ -2405,6 +2405,7 @@ function runGitHubTextMutationOnce(
 type GitHubSpawnResult = ReturnType<typeof ghSpawn>;
 
 type GitHubSpawnMutationReceipt<T> = {
+  beforeDispatch?: () => void;
   onDispatchStart?: () => void;
   reconcile: (response: { result: GitHubSpawnResult | null; error: unknown | null }) => T;
   outcome: (result: T) => "accepted" | "rejected" | "unknown";
@@ -2438,6 +2439,7 @@ function runGitHubSpawnMutation<T>(
       kind,
       identity,
       operation: () => {
+        receipt.beforeDispatch?.();
         let result: GitHubSpawnResult | null = null;
         let error: unknown | null = null;
         try {
@@ -3989,31 +3991,8 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       automergeReadinessAction(claimedReadinessBlock, waitedMs, transientObservations),
     );
   }
-  let dispatchBoundary;
-  try {
-    dispatchBoundary = markAutomergeMergeClaimDispatched(command, mergeClaim.claimId);
-  } catch (error) {
-    return {
-      action: "merge",
-      status: "waiting",
-      reason: `exact-head merge dispatch boundary failed: ${compactGhError(error)}`,
-      merge_method: "squash",
-      transient_wait_ms: waitedMs,
-      transient_observations: transientObservations,
-    };
-  }
-  if (dispatchBoundary.status !== "dispatched") {
-    return {
-      action: "merge",
-      status: dispatchBoundary.status === "unknown" ? "waiting" : "blocked",
-      reason: dispatchBoundary.reason,
-      merge_method: "squash",
-      transient_wait_ms: waitedMs,
-      transient_observations: transientObservations,
-    };
-  }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
-  let mergeRequestStarted = true;
+  let mergeRequestStarted = false;
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4034,6 +4013,12 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       }),
       {},
       {
+        beforeDispatch: () => {
+          const dispatchBoundary = markAutomergeMergeClaimDispatched(command, mergeClaim.claimId);
+          if (dispatchBoundary.status !== "dispatched") {
+            throw new Error(dispatchBoundary.reason);
+          }
+        },
         onDispatchStart: () => {
           mergeRequestStarted = true;
         },
