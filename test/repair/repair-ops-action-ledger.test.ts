@@ -396,7 +396,7 @@ test("commit review and notification workflows publish their operation receipts"
     review,
     /commit-review-raw-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
-  assert.match(review, /codex-logs-commit-review-\$\{\{ matrix\.sha \}\}/);
+  assert.match(review, /commit-review-diagnostic-\$\{\{ matrix\.sha \}\}/);
   assert.match(
     publisher,
     /if: \$\{\{ always\(\) && needs\.plan\.result == 'success' && \(needs\.plan\.outputs\.planned_count != '0'/,

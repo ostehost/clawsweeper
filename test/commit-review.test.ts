@@ -24,6 +24,11 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
   assert.match(review, /uses: actions\/upload-artifact@v7[\s\S]*if: always\(\)/);
   assert.match(review, /remote set-url origin "https:\/\/github\.com\/\$\{TARGET_REPO\}\.git"/);
   assert.doesNotMatch(review, /path: commit-work\/\*\*/);
+  assert.match(review, /path: commit-work\/\$\{\{ matrix\.sha \}\}\.diagnostic\.json/);
+  assert.doesNotMatch(
+    review,
+    /commit-work\/\$\{\{ matrix\.sha \}\}\.(?:prompt\.md|jsonl|stderr\.log|md)/,
+  );
   assert.match(attestor, /setup-action-ledger/);
   assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
   assert.match(attestor, /--report-path "\$report_path"/);
@@ -41,7 +46,7 @@ test("commit review materializes private clone data before removing review crede
   );
   const reviewCommit = review.slice(
     review.indexOf("      - name: Review commit"),
-    review.indexOf("      - name: Upload commit review Codex logs"),
+    review.indexOf("      - name: Upload commit review diagnostic"),
   );
   const materializeCommit =
     'git -C "$TARGET_NAME" diff --no-ext-diff --binary "$COMMIT_SHA^" "$COMMIT_SHA" >/dev/null';
@@ -55,7 +60,7 @@ test("commit review materializes private clone data before removing review crede
   assert.doesNotMatch(reviewCommit, /COMMIT_SWEEPER_TARGET_GH_TOKEN/);
 });
 
-test("commit review captures the complete structured Codex stream", () => {
+test("commit review retains only content-safe diagnostics", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-stream-")));
   const targetDir = path.join(root, "target");
   const reportDir = path.join(root, "reports");
@@ -74,7 +79,9 @@ test("commit review captures the complete structured Codex stream", () => {
     git(targetDir, "add", "review.txt");
     git(targetDir, "commit", "-q", "-m", "base");
     const baseSha = git(targetDir, "rev-parse", "HEAD");
-    fs.writeFileSync(path.join(targetDir, "review.txt"), "changed\n");
+    const sourceSecret = "fixture-source-private-token-123456";
+    const promptSecret = "fixture-prompt-private-token-123456";
+    fs.writeFileSync(path.join(targetDir, "review.txt"), `${sourceSecret}\n`);
     git(targetDir, "commit", "-qam", "review target");
     const sha = git(targetDir, "rev-parse", "HEAD");
     const codexHome = path.join(root, "codex-home");
@@ -127,9 +134,20 @@ if (!prompt.includes("- GitHub author: hydrated-author")) {
   process.stderr.write("GitHub author was not hydrated");
   process.exit(7);
 }
+if (!prompt.includes(${JSON.stringify(promptSecret)})) {
+  process.stderr.write("additional prompt was not forwarded");
+  process.exit(8);
+}
+const sourceSecret = fs.readFileSync(path.join(process.cwd(), "review.txt"), "utf8").trim();
 const outputIndex = args.indexOf("--output-last-message");
 const outputPath = args[outputIndex + 1];
-process.stdout.write(JSON.stringify({ type: "thread.started", marker: "stream-start", model: "private-model-name" }) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "thread.started",
+  marker: "stream-start",
+  model: "private-model-name",
+  sourceSecret,
+  promptSecret: ${JSON.stringify(promptSecret)}
+}) + "\\n");
 for (let index = 0; index < 1600; index += 1) {
   process.stdout.write(JSON.stringify({
     type: "item.completed",
@@ -138,7 +156,7 @@ for (let index = 0; index < 1600; index += 1) {
   }) + "\\n");
 }
 process.stdout.write(JSON.stringify({ type: "turn.completed", marker: "stream-end" }) + "\\n");
-process.stderr.write("stderr-start model=private-model-name\\n");
+process.stderr.write("stderr-start model=private-model-name source=" + sourceSecret + " prompt=${promptSecret}\\n");
 process.stderr.write("diagnostic\\n".repeat(7000));
 process.stderr.write("stderr-end\\n");
 fs.writeFileSync(outputPath, [
@@ -196,6 +214,7 @@ fs.writeFileSync(outputPath, [
           CODEX_HOME: codexHome,
           GH_TOKEN: "ghs_review-read-token-123456",
           COMMIT_SWEEPER_TARGET_GH_TOKEN: "ghs_review-secret-token-123456",
+          COMMIT_SWEEPER_ADDITIONAL_PROMPT: promptSecret,
           CODEX_BIN: codexPath,
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         },
@@ -207,28 +226,29 @@ fs.writeFileSync(outputPath, [
     assert.ok(invocation.includes("--json"));
     assert.doesNotMatch(invocation.join(" "), /private-model-name/);
 
-    const jsonl = fs.readFileSync(path.join(workDir, `${sha}.jsonl`), "utf8");
-    assert.doesNotMatch(jsonl, /ghs_review-read-token-123456/);
-    assert.doesNotMatch(jsonl, /ghs_review-secret-token-123456/);
-    assert.doesNotMatch(jsonl, /private-model-name/);
-    assert.match(jsonl, /\[REDACTED\]/);
-    assert.ok(Buffer.byteLength(jsonl) > 64 * 1024);
-    const events = jsonl
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.equal(events[0]?.marker, "stream-start");
-    assert.equal(events.at(-1)?.marker, "stream-end");
-    assert.equal(events.length, 1602);
-
-    const stderr = fs.readFileSync(path.join(workDir, `${sha}.stderr.log`), "utf8");
-    assert.doesNotMatch(stderr, /ghs_review-read-token-123456/);
-    assert.doesNotMatch(stderr, /ghs_review-secret-token-123456/);
-    assert.doesNotMatch(stderr, /private-model-name/);
-    assert.match(stderr, /\[REDACTED\]/);
-    assert.ok(Buffer.byteLength(stderr) > 64 * 1024);
-    assert.match(stderr, /^stderr-start model=\[REDACTED\]\n/);
-    assert.match(stderr, /stderr-end\n$/);
+    const diagnosticPath = path.join(workDir, `${sha}.diagnostic.json`);
+    const workFiles = fs.readdirSync(workDir);
+    assert.deepEqual(workFiles, [`${sha}.diagnostic.json`]);
+    const diagnosticText = fs.readFileSync(diagnosticPath, "utf8");
+    const diagnostic = JSON.parse(diagnosticText) as Record<string, unknown>;
+    assert.deepEqual(diagnostic, {
+      diagnostic_version: 1,
+      commit_sha: sha,
+      outcome: "completed",
+      failure_reason: "none",
+      exit_status: 0,
+      signal: null,
+      stdout_capture_bytes: diagnostic.stdout_capture_bytes,
+      stderr_capture_bytes: diagnostic.stderr_capture_bytes,
+      report_produced: true,
+    });
+    assert.ok(Number(diagnostic.stdout_capture_bytes) > 64 * 1024);
+    assert.ok(Number(diagnostic.stderr_capture_bytes) > 64 * 1024);
+    assert.ok(Buffer.byteLength(diagnosticText) < 1024);
+    assert.doesNotMatch(
+      diagnosticText,
+      /private-model-name|ghs_review-|fixture-source-private|fixture-prompt-private/,
+    );
     const reportPath = path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`);
     assert.ok(fs.existsSync(reportPath));
     const report = fs.readFileSync(reportPath, "utf8");
@@ -236,6 +256,9 @@ fs.writeFileSync(outputPath, [
     assert.doesNotMatch(report, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(report, /private-model-name/);
     assert.match(report, /\[REDACTED\]/);
+    const uploadedArtifactContents = [diagnosticText, report].join("\n");
+    assert.doesNotMatch(uploadedArtifactContents, new RegExp(sourceSecret));
+    assert.doesNotMatch(uploadedArtifactContents, new RegExp(promptSecret));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -265,7 +288,7 @@ test("commit review publishability failure retains a diagnostic report and fails
     const codexPath = path.join(binDir, "codex");
     fs.writeFileSync(
       codexPath,
-      "#!/usr/bin/env node\nprocess.stderr.write('synthetic Codex failure\\n');\nprocess.exit(9);\n",
+      "#!/usr/bin/env node\nprocess.stderr.write('synthetic failure fixture-source-private-token-987654\\n');\nprocess.exit(9);\n",
       { mode: 0o755 },
     );
 
@@ -307,8 +330,13 @@ test("commit review publishability failure retains a diagnostic report and fails
     assert.match(result.stderr, /commit review report result is not publishable: failed/);
     const reportPath = path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`);
     assert.equal(fs.existsSync(reportPath), true);
-    assert.match(fs.readFileSync(reportPath, "utf8"), /^result: failed$/m);
-    assert.match(fs.readFileSync(reportPath, "utf8"), /synthetic Codex failure/);
+    const report = fs.readFileSync(reportPath, "utf8");
+    assert.match(report, /^result: failed$/m);
+    assert.match(report, /reason: nonzero_exit/);
+    assert.match(report, /exit_status: 9/);
+    assert.doesNotMatch(report, /synthetic failure|fixture-source-private-token/);
+    const diagnostic = fs.readFileSync(path.join(workDir, `${sha}.diagnostic.json`), "utf8");
+    assert.doesNotMatch(diagnostic, /synthetic failure|fixture-source-private-token/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -490,16 +490,12 @@ jobs:
             --require-publishable-report \
             --defer-workflow-completion
 
-      - name: Upload commit review Codex logs
+      - name: Upload commit review diagnostic
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: codex-logs-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
-          path: |
-            commit-work/${{ matrix.sha }}.prompt.md
-            commit-work/${{ matrix.sha }}.jsonl
-            commit-work/${{ matrix.sha }}.stderr.log
-            commit-work/${{ matrix.sha }}.md
+          name: commit-review-diagnostic-${{ matrix.sha }}-${{ github.run_attempt }}
+          path: commit-work/${{ matrix.sha }}.diagnostic.json
           if-no-files-found: warn
           retention-days: 30
 

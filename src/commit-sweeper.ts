@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -21,7 +22,6 @@ import {
 } from "./commit-classifier.js";
 import { publishCheckFromReport, splitFrontMatter } from "./commit-checks.js";
 import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweeper-args.js";
-import { safeOutputTail } from "./clawsweeper-text.js";
 import {
   codexEnv,
   codexInternalModelValues,
@@ -83,6 +83,19 @@ const COMMIT_REVIEW_SUCCESS_RESULTS = new Set([
   "inconclusive",
   "skipped_non_code",
 ]);
+const COMMIT_REVIEW_DIAGNOSTIC_VERSION = 1;
+
+interface CommitReviewDiagnostic {
+  diagnostic_version: number;
+  commit_sha: string;
+  outcome: "completed" | "failed";
+  failure_reason: "none" | "timeout" | "process_error" | "nonzero_exit" | "missing_report";
+  exit_status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout_capture_bytes: number;
+  stderr_capture_bytes: number;
+  report_produced: boolean;
+}
 
 function run(command: string, commandArgs: string[], options: { cwd?: string } = {}): string {
   return runText(command, commandArgs, { cwd: options.cwd });
@@ -341,24 +354,19 @@ function runCodex(options: {
 }): string {
   const lifecycle = commitLifecycle(options.targetRepo, options.sha);
   ensureDir(options.workDir);
-  const promptPath = join(options.workDir, `${options.sha}.prompt.md`);
-  const outputPath = join(options.workDir, `${options.sha}.md`);
-  const stdoutPath = join(options.workDir, `${options.sha}.jsonl`);
-  const stderrPath = join(options.workDir, `${options.sha}.stderr.log`);
-  const rawOutputDir = mkdtempSync(join(tmpdir(), "clawsweeper-commit-review-output-"));
-  const rawOutputPath = join(rawOutputDir, `${options.sha}.md`);
-  writeFileSync(
-    promptPath,
-    promptForCommit({
-      targetDir: options.targetDir,
-      targetRepo: options.targetRepo,
-      sha: options.sha,
-      baseSha: options.baseSha,
-      metadata: options.metadata,
-      additionalPrompt: options.additionalPrompt,
-    }),
-    "utf8",
-  );
+  const diagnosticPath = join(options.workDir, `${options.sha}.diagnostic.json`);
+  const captureDir = mkdtempSync(join(tmpdir(), "clawsweeper-commit-review-"));
+  const rawOutputPath = join(captureDir, `${options.sha}.md`);
+  const stdoutPath = join(captureDir, `${options.sha}.jsonl`);
+  const stderrPath = join(captureDir, `${options.sha}.stderr.log`);
+  const prompt = promptForCommit({
+    targetDir: options.targetDir,
+    targetRepo: options.targetRepo,
+    sha: options.sha,
+    baseSha: options.baseSha,
+    metadata: options.metadata,
+    additionalPrompt: options.additionalPrompt,
+  });
   const codexConfig = [
     `model_reasoning_effort="${options.reasoningEffort}"`,
     codexLoginConfig(),
@@ -380,9 +388,10 @@ function runCodex(options: {
   const redactionSecrets = [
     ...new Set([...codexSensitiveEnvValues(process.env), ...codexInternalModelValues()]),
   ].filter((value) => value.length >= 6);
-  let rawResult: CodexProcessResult;
+  let result: CodexProcessResult;
+  let report = "";
   try {
-    rawResult = runCodexProcess({
+    result = runCodexProcess({
       args: [
         "exec",
         ...codexModelArgs(options.model),
@@ -398,112 +407,121 @@ function runCodex(options: {
       ],
       cwd: options.targetDir,
       env: processEnv,
-      input: readFileSync(promptPath, "utf8"),
+      input: prompt,
       stdoutPath,
       stderrPath,
       timeoutMs: options.timeoutMs,
       redactValues: redactionSecrets,
     });
     if (existsSync(rawOutputPath)) {
-      writeFileSync(
-        outputPath,
-        redactCommitReviewText(readFileSync(rawOutputPath, "utf8"), redactionSecrets),
-        "utf8",
-      );
+      report = redactCommitReviewText(readFileSync(rawOutputPath, "utf8"), redactionSecrets);
     }
-  } finally {
-    rmSync(rawOutputDir, { recursive: true, force: true });
-  }
-  for (const artifactPath of [promptPath, outputPath, stdoutPath, stderrPath]) {
-    redactCommitReviewFile(artifactPath, redactionSecrets);
-  }
-  const result = redactCommitReviewProcessResult(rawResult, redactionSecrets);
-  recordCommitArtifactPrepared(lifecycle, {
-    path: stdoutPath,
-    kind: "commit_review_jsonl",
-    logKind: "jsonl",
-  });
-  recordCommitArtifactPrepared(lifecycle, {
-    path: stderrPath,
-    kind: "commit_review_stderr",
-    logKind: "stderr",
-  });
-  if (result.error || result.status !== 0 || !existsSync(outputPath)) {
-    const timeout = codexProcessErrorCode(result.error) === "ETIMEDOUT";
-    const detail =
-      result.error instanceof Error
-        ? `${result.error.message}\n${safeOutputTail(result.stderr) || safeOutputTail(result.stdout)}`
-        : `exit ${result.status ?? "unknown"}\n${
-            safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."
-          }`;
+    const diagnostic = commitReviewDiagnostic({
+      sha: options.sha,
+      result,
+      reportProduced: report.length > 0,
+      stdoutPath,
+      stderrPath,
+    });
+    writeFileSync(diagnosticPath, `${JSON.stringify(diagnostic, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    recordCommitArtifactPrepared(lifecycle, {
+      path: diagnosticPath,
+      kind: "commit_review_diagnostic",
+      logKind: "diagnostic",
+    });
+    if (diagnostic.outcome === "failed") {
+      const timeout = diagnostic.failure_reason === "timeout";
+      const detail = commitReviewFailureDetail(diagnostic);
+      recordCommitLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.reviewFailed,
+        status: ACTION_EVENT_STATUSES.failed,
+        reasonCode: timeout
+          ? ACTION_EVENT_REASON_CODES.timeout
+          : ACTION_EVENT_REASON_CODES.exception,
+        mutation: false,
+        component: "commit_review",
+        state: "failed",
+        reviewMode: "commit_review",
+        eventIdentity: {
+          sha: options.sha,
+          errorKind: diagnostic.failure_reason,
+        },
+      });
+      return failureReport({
+        targetRepo: options.targetRepo,
+        sha: options.sha,
+        baseSha: options.baseSha,
+        metadata: options.metadata,
+        detail,
+        timeout,
+      });
+    }
     recordCommitLifecycleEvent(lifecycle, {
-      type: ACTION_EVENT_TYPES.reviewFailed,
-      status: ACTION_EVENT_STATUSES.failed,
-      reasonCode: timeout ? ACTION_EVENT_REASON_CODES.timeout : ACTION_EVENT_REASON_CODES.exception,
+      type: ACTION_EVENT_TYPES.reviewCompleted,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
       mutation: false,
       component: "commit_review",
-      state: "failed",
+      state: "completed",
       reviewMode: "commit_review",
-      eventIdentity: {
-        sha: options.sha,
-        errorKind: result.error instanceof Error ? result.error.name : "nonzero_exit",
-      },
+      eventIdentity: { sha: options.sha },
     });
-    return failureReport({
-      targetRepo: options.targetRepo,
-      sha: options.sha,
-      baseSha: options.baseSha,
-      metadata: options.metadata,
-      detail: detail.trim(),
-      timeout,
-    });
+    return stripMarkdownFence(report);
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
   }
-  recordCommitArtifactPrepared(lifecycle, {
-    path: outputPath,
-    kind: "commit_review_raw_report",
-  });
-  recordCommitLifecycleEvent(lifecycle, {
-    type: ACTION_EVENT_TYPES.reviewCompleted,
-    status: ACTION_EVENT_STATUSES.completed,
-    reasonCode: ACTION_EVENT_REASON_CODES.completed,
-    mutation: false,
-    component: "commit_review",
-    state: "completed",
-    reviewMode: "commit_review",
-    eventIdentity: { sha: options.sha },
-  });
-  return stripMarkdownFence(readFileSync(outputPath, "utf8"));
 }
 
 function redactCommitReviewText(value: string, secrets: readonly string[]): string {
   return secrets.reduce((redacted, secret) => redacted.split(secret).join("[REDACTED]"), value);
 }
 
-function redactCommitReviewFile(file: string, secrets: readonly string[]): void {
-  if (secrets.length === 0 || !existsSync(file)) return;
-  const contents = readFileSync(file, "utf8");
-  const redacted = redactCommitReviewText(contents, secrets);
-  if (redacted !== contents) writeFileSync(file, redacted, "utf8");
+function commitReviewDiagnostic(options: {
+  sha: string;
+  result: CodexProcessResult;
+  reportProduced: boolean;
+  stdoutPath: string;
+  stderrPath: string;
+}): CommitReviewDiagnostic {
+  const timedOut = codexProcessErrorCode(options.result.error) === "ETIMEDOUT";
+  const failureReason = timedOut
+    ? "timeout"
+    : options.result.error
+      ? "process_error"
+      : options.result.status !== 0
+        ? "nonzero_exit"
+        : !options.reportProduced
+          ? "missing_report"
+          : "none";
+  return {
+    diagnostic_version: COMMIT_REVIEW_DIAGNOSTIC_VERSION,
+    commit_sha: options.sha,
+    outcome: failureReason === "none" ? "completed" : "failed",
+    failure_reason: failureReason,
+    exit_status: options.result.status,
+    signal: options.result.signal,
+    stdout_capture_bytes: fileSize(options.stdoutPath),
+    stderr_capture_bytes: fileSize(options.stderrPath),
+    report_produced: options.reportProduced,
+  };
 }
 
-function redactCommitReviewProcessResult(
-  result: CodexProcessResult,
-  secrets: readonly string[],
-): CodexProcessResult {
-  if (secrets.length === 0) return result;
-  let error: Error | undefined;
-  if (result.error) {
-    error = new Error(redactCommitReviewText(result.error.message, secrets));
-    error.name = result.error.name;
-    const code = codexProcessErrorCode(result.error);
-    if (code) (error as NodeJS.ErrnoException).code = code;
-  }
-  return {
-    ...result,
-    ...(error ? { error } : {}),
-    stdout: redactCommitReviewText(result.stdout, secrets),
-    stderr: redactCommitReviewText(result.stderr, secrets),
-  };
+function fileSize(path: string): number {
+  return existsSync(path) ? statSync(path).size : 0;
+}
+
+function commitReviewFailureDetail(diagnostic: CommitReviewDiagnostic): string {
+  return [
+    `reason: ${diagnostic.failure_reason}`,
+    `exit_status: ${diagnostic.exit_status ?? "unknown"}`,
+    `signal: ${diagnostic.signal ?? "none"}`,
+    `stdout_capture_bytes: ${diagnostic.stdout_capture_bytes}`,
+    `stderr_capture_bytes: ${diagnostic.stderr_capture_bytes}`,
+    `report_produced: ${diagnostic.report_produced}`,
+  ].join("\n");
 }
 
 function reviewCommand(args: Args): void {
