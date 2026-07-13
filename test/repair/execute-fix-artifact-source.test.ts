@@ -200,6 +200,11 @@ test("repair Codex heartbeat wrapper uses bounded capture and isolated last-mess
     helper,
     /fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), "clawsweeper-codex-last-message-"\)\)/,
   );
+  assert.match(helper, /fs\.rmSync\(retainedPath, \{ force: true \}\)/);
+  assert.ok(
+    helper.indexOf("fs.rmSync(retainedPath, { force: true })") <
+      helper.indexOf('fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-last-message-"))'),
+  );
   assert.match(helper, /isolatedArgs\[outputIndex \+ 1\] = rawPath/);
   assert.doesNotMatch(helper, /spawnSync\("codex"/);
   assert.doesNotMatch(source, /CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);

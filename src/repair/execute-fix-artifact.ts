@@ -490,6 +490,7 @@ function isolateCodexLastMessage(args: readonly string[]) {
   const outputIndex = args.indexOf("--output-last-message");
   const retainedPath = outputIndex >= 0 ? args[outputIndex + 1] : undefined;
   if (!retainedPath) return { args: [...args], rawRoot: null, rawPath: null, retainedPath: null };
+  fs.rmSync(retainedPath, { force: true });
   const rawRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-last-message-"));
   const rawPath = path.join(rawRoot, "last-message.raw");
   const isolatedArgs = [...args];
