@@ -40,8 +40,10 @@ import {
 } from "./execution-handoff.js";
 import {
   recordRepairWorkflowEvent,
+  repairWorkflowTerminalPhase,
   runRepairMutation,
   type RepairLifecycleInput,
+  type RepairWorkflowPhase,
 } from "./repair-action-ledger.js";
 import {
   issueImplementationPublishedHeadBlock,
@@ -787,10 +789,7 @@ function postFlightLifecycle(number: number | null): RepairLifecycleInput {
   };
 }
 
-function recordPostFlightWorkflowEventSafely(
-  phase: "started" | "completed" | "failed" | "finalized",
-  error?: unknown,
-) {
+function recordPostFlightWorkflowEventSafely(phase: RepairWorkflowPhase, error?: unknown) {
   try {
     recordRepairWorkflowEvent(postFlightLifecycle(null), {
       component: "post_flight",
@@ -1191,7 +1190,7 @@ function writeReport(report: LooseRecord, resultPath: string) {
       `report_outcome=${summary.outcome}\nreport_detail=${summary.detail}\n`,
     );
   }
-  recordPostFlightWorkflowEventSafely("completed");
+  recordPostFlightWorkflowEventSafely(repairWorkflowTerminalPhase(finalReport));
   console.log(JSON.stringify(finalReport, null, 2));
   return summary;
 }

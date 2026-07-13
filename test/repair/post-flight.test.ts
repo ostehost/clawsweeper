@@ -735,14 +735,16 @@ test("issue implementation post-flight checks the publication receipt head befor
 });
 
 test("post-flight exports a blocked report before exiting unsuccessfully", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-")));
   const jobPath = path.join(tmp, "job.md");
   const runDir = path.join(tmp, "run");
   const resultPath = path.join(runDir, "result.json");
   const reportPath = path.join(runDir, "post-flight-report.json");
   const outputPath = path.join(tmp, "github-output.txt");
+  const ledgerOutputRoot = path.join(tmp, "ledger-output");
 
   fs.mkdirSync(runDir, { recursive: true });
+  fs.mkdirSync(ledgerOutputRoot);
   writeIssueImplementationJob(jobPath);
   fs.writeFileSync(
     resultPath,
@@ -759,26 +761,66 @@ test("post-flight exports a blocked report before exiting unsuccessfully", () =>
   );
 
   try {
-    runPostFlight(
-      jobPath,
-      resultPath,
-      {
-        ...process.env,
-        CLAWSWEEPER_ALLOW_EXECUTE: "1",
-        CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
-        GITHUB_OUTPUT: outputPath,
-      },
-      1,
+    const env = {
+      ...process.env,
+      CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+      CLAWSWEEPER_ACTION_LEDGER_ROOT: tmp,
+      CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ledgerOutputRoot,
+      CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight",
+      CLAWSWEEPER_ALLOW_EXECUTE: "1",
+      CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+      GITHUB_ACTION: "post_flight",
+      GITHUB_JOB: "mutate",
+      GITHUB_OUTPUT: outputPath,
+      GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_RUN_ID: "4242",
+      GITHUB_SHA: "a".repeat(40),
+      GITHUB_WORKFLOW: "repair cluster worker",
+      GITHUB_WORKFLOW_REF:
+        "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+    };
+    runPostFlight(jobPath, resultPath, env, 1);
+    execFileSync(
+      process.execPath,
+      [path.join(repoRoot, "dist/repair/action-ledger-cli.js"), "finalize"],
+      { env, stdio: "pipe" },
     );
 
     const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
     assert.equal(report.outcome, "blocked");
     assert.match(report.detail, /no fix-execution-report/);
     assert.match(fs.readFileSync(outputPath, "utf8"), /^report_outcome=blocked$/m);
+    assert.deepEqual(
+      readActionEvents(ledgerOutputRoot)
+        .filter((event) => event.event_type === "workflow.attempt")
+        .sort((left, right) => left.phase_seq - right.phase_seq)
+        .map((event) => [event.attributes?.state, event.action.status]),
+      [
+        ["started", "started"],
+        ["blocked", "blocked"],
+        ["finalized", "completed"],
+      ],
+    );
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+function readActionEvents(root: string): Record<string, any>[] {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(root, entry.name);
+    if (entry.isDirectory()) return readActionEvents(target);
+    if (!target.endsWith(".jsonl")) return [];
+    return fs
+      .readFileSync(target, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  });
+}
 
 function runPostFlight(
   jobPath: string,

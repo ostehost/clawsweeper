@@ -14,7 +14,9 @@ import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
+  recordRepairWorkflowEvent,
   repairSourceRevision,
+  repairWorkflowTerminalPhase,
   runRepairMutation,
 } from "../../dist/repair/repair-action-ledger.js";
 
@@ -496,6 +498,59 @@ test("repair source revision selects the sealed repaired source", () => {
   assert.equal(repairSourceRevision({ expected_head_sha: "b".repeat(40) }), "b".repeat(40));
   assert.equal(repairSourceRevision({ commit_sha: "c".repeat(40) }), "c".repeat(40));
   assert.equal(repairSourceRevision({}), null);
+});
+
+test("repair workflow reports map to matching terminal lifecycle phases", async () => {
+  assert.equal(repairWorkflowTerminalPhase({ status: "opened", actions: [] }), "completed");
+  assert.equal(repairWorkflowTerminalPhase({ status: "blocked", actions: [] }), "blocked");
+  assert.equal(repairWorkflowTerminalPhase({ status: "needs_human", actions: [] }), "blocked");
+  assert.equal(repairWorkflowTerminalPhase({ status: "failed", actions: [] }), "failed");
+  assert.equal(
+    repairWorkflowTerminalPhase({
+      status: "blocked",
+      actions: [{ status: "blocked", requeue_required: true }],
+    }),
+    "requeued",
+  );
+  assert.equal(repairWorkflowTerminalPhase({ outcome: "requeue", actions: [] }), "requeued");
+  assert.equal(repairWorkflowTerminalPhase(null), "failed");
+
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-terminal-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    for (const phase of ["blocked", "requeued", "failed"] as const) {
+      recordRepairWorkflowEvent(
+        { ...repairLifecycle(), workKey: `openclaw/openclaw:${phase}` },
+        { component: "repair_worker", phase },
+      );
+    }
+    await flushRepairActionEvents();
+    const terminal = readEvents(outputRoot)
+      .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+      .sort((left, right) =>
+        String(left.attributes?.state).localeCompare(String(right.attributes?.state)),
+      );
+    assert.deepEqual(
+      terminal.map((event) => [
+        event.attributes?.state,
+        event.action.status,
+        event.action.reason_code,
+        event.action.retryable,
+      ]),
+      [
+        ["blocked", "blocked", "policy_blocked", false],
+        ["failed", "failed", "exception", false],
+        ["requeued", "requeued", "retry_scheduled", true],
+      ],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("repair action ledger CLI finalizes the configured ledger root", () => {

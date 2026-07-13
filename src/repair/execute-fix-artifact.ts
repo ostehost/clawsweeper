@@ -79,8 +79,10 @@ import {
 import {
   recordRepairArtifactPublication,
   recordRepairWorkflowEvent,
+  repairWorkflowTerminalPhase,
   runRepairMutation,
   type RepairLifecycleInput,
+  type RepairWorkflowPhase,
 } from "./repair-action-ledger.js";
 import {
   beginRepairCodexAction,
@@ -415,10 +417,7 @@ function runDirectRepairMutation<T>(kind: string, identity: unknown, operation: 
   });
 }
 
-function recordRepairWorkflowEventSafely(
-  phase: "started" | "completed" | "failed" | "finalized",
-  error?: unknown,
-) {
+function recordRepairWorkflowEventSafely(phase: RepairWorkflowPhase, error?: unknown) {
   try {
     recordRepairWorkflowEvent(directRepairLifecycle(null), {
       component: "execute_fix",
@@ -4354,7 +4353,7 @@ function writeReport(report: LooseRecord, resultPath: string) {
     type: ACTION_EVENT_TYPES.reviewPublished,
     reviewMode: "repair_execution",
   });
-  recordRepairWorkflowEventSafely("completed");
+  recordRepairWorkflowEventSafely(repairWorkflowTerminalPhase(report));
   console.log("Wrote fix execution report.");
 }
 
@@ -4379,7 +4378,7 @@ function publishPersistedReport(resultPath: string) {
     type: ACTION_EVENT_TYPES.reviewPublished,
     reviewMode: "repair_execution",
   });
-  recordRepairWorkflowEventSafely("completed");
+  recordRepairWorkflowEventSafely(repairWorkflowTerminalPhase(persistedReport));
   console.log("Published deferred fix execution outcome.");
 }
 

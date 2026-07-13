@@ -188,6 +188,14 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   }
   assert.match(executor, /repairCodexAttempt\(attempt, "final"\)/);
   assert.match(executor, /repair_execution_report/);
+  assert.match(
+    executor,
+    /recordRepairWorkflowEventSafely\(repairWorkflowTerminalPhase\(report\)\)/,
+  );
+  assert.match(
+    executor,
+    /recordRepairWorkflowEventSafely\(repairWorkflowTerminalPhase\(persistedReport\)\)/,
+  );
   for (const boundary of [
     "branch_push",
     "pull_request_create",
@@ -217,6 +225,10 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("started"\)/);
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("failed", error\)/);
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("finalized"\)/);
+  assert.match(
+    postFlight,
+    /recordPostFlightWorkflowEventSafely\(repairWorkflowTerminalPhase\(finalReport\)\)/,
+  );
 });
 
 test("commit review and notification workflows publish their operation receipts", () => {

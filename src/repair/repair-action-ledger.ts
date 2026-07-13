@@ -71,6 +71,13 @@ export type RepairLifecycleFailureOptions = {
 };
 
 export type RepairMutationOutcome = "accepted" | "rejected" | "unknown";
+export type RepairWorkflowPhase =
+  | "started"
+  | "completed"
+  | "blocked"
+  | "requeued"
+  | "failed"
+  | "finalized";
 
 export type RepairMutationOptions<T> = {
   kind: string;
@@ -349,7 +356,7 @@ export function recordRepairWorkflowEvent(
   input: RepairLifecycleInput,
   options: {
     component: string;
-    phase: "started" | "completed" | "failed" | "finalized";
+    phase: RepairWorkflowPhase;
     error?: unknown;
   },
 ): void {
@@ -359,7 +366,11 @@ export function recordRepairWorkflowEvent(
       ? ACTION_EVENT_STATUSES.started
       : options.phase === "failed"
         ? ACTION_EVENT_STATUSES.failed
-        : ACTION_EVENT_STATUSES.completed;
+        : options.phase === "blocked"
+          ? ACTION_EVENT_STATUSES.blocked
+          : options.phase === "requeued"
+            ? ACTION_EVENT_STATUSES.requeued
+            : ACTION_EVENT_STATUSES.completed;
   recordRepairLifecycleEvent(input, {
     type: ACTION_EVENT_TYPES.workflowAttempt,
     status,
@@ -368,9 +379,13 @@ export function recordRepairWorkflowEvent(
         ? ACTION_EVENT_REASON_CODES.selected
         : options.phase === "failed"
           ? ACTION_EVENT_REASON_CODES.exception
-          : ACTION_EVENT_REASON_CODES.completed,
+          : options.phase === "blocked"
+            ? ACTION_EVENT_REASON_CODES.policyBlocked
+            : options.phase === "requeued"
+              ? ACTION_EVENT_REASON_CODES.retryScheduled
+              : ACTION_EVENT_REASON_CODES.completed,
     mutation: mutationState.mutationObserved,
-    retryable: mutationState.uncertainMutationObserved,
+    retryable: options.phase === "requeued" || mutationState.uncertainMutationObserved,
     component: options.component,
     state: options.phase,
     workflowPhase: options.phase,
@@ -387,6 +402,35 @@ export function recordRepairWorkflowEvent(
         : {}),
     },
   });
+}
+
+export function repairWorkflowTerminalPhase(report: unknown): RepairWorkflowPhase {
+  if (!report || typeof report !== "object" || Array.isArray(report)) return "failed";
+  const record = report as Record<string, unknown>;
+  const actions = Array.isArray(record.actions)
+    ? record.actions.filter(
+        (action): action is Record<string, unknown> =>
+          Boolean(action) && typeof action === "object" && !Array.isArray(action),
+      )
+    : [];
+  if (
+    String(record.outcome ?? "").toLowerCase() === "requeue" ||
+    actions.some((action) => action.requeue_required === true)
+  ) {
+    return "requeued";
+  }
+  const status = String(record.status ?? record.outcome ?? "").toLowerCase();
+  if (status === "failed" || actions.some((action) => action.status === "failed")) {
+    return "failed";
+  }
+  if (
+    status === "blocked" ||
+    status === "needs_human" ||
+    actions.some((action) => action.status === "blocked" || action.status === "needs_human")
+  ) {
+    return "blocked";
+  }
+  return "completed";
 }
 
 export function recordRepairLifecycleFailure(
