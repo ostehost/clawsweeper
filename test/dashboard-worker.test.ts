@@ -4716,7 +4716,6 @@ test("dashboard reads stored CI status for active PR rows", async () => {
             total: 12,
             failing: 0,
             pending: 0,
-            updated_at: new Date().toISOString(),
           },
         }),
       }),
@@ -4780,7 +4779,6 @@ test("dashboard falls back to edge cache storage when KV is not bound", async ()
             total: 12,
             failing: 0,
             pending: 2,
-            updated_at: new Date().toISOString(),
           },
         }),
       }),
@@ -5442,7 +5440,7 @@ function createCiProjectionHarness() {
     idempotencyKey: string;
     state: string;
     title: string;
-    updatedAt: string;
+    updatedAt?: string;
   }) => {
     const response = await worker.fetch(
       new Request("https://clawsweeper.openclaw.ai/api/events", {
@@ -5464,7 +5462,7 @@ function createCiProjectionHarness() {
             state,
             source: "github-checks",
             head_sha: `${idempotencyKey}-${state}`,
-            updated_at: updatedAt,
+            ...(updatedAt ? { updated_at: updatedAt } : {}),
           },
         }),
       }),
@@ -5528,7 +5526,36 @@ test("dashboard CI projection ignores delayed distinct keys and malformed source
   );
 });
 
-test("dashboard CI projection resolves equal source timestamps by stable event key", async () => {
+test("dashboard CI projection preserves first-seen order when timestamps are omitted", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.ingest({
+    idempotencyKey: "ci-a",
+    state: "red",
+    title: "Older CI",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await harness.ingest({
+    idempotencyKey: "ci-b",
+    state: "green",
+    title: "Newer CI",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await harness.ingest({
+    idempotencyKey: "ci-a",
+    state: "pending",
+    title: "Older CI retry",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "ci-b-green");
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Newer CI", "Older CI retry"],
+  );
+});
+
+test("dashboard CI projection resolves equal source timestamps by first-seen order", async () => {
   const runOrder = async (keys: string[]) => {
     const harness = createCiProjectionHarness();
     for (const key of keys) {
@@ -5538,6 +5565,7 @@ test("dashboard CI projection resolves equal source timestamps by stable event k
         title: `CI ${key}`,
         updatedAt: "2026-07-13T10:02:00.000Z",
       });
+      await new Promise((resolve) => setTimeout(resolve, 2));
     }
     const projected = await harness.projection();
     return {
@@ -5548,8 +5576,8 @@ test("dashboard CI projection resolves equal source timestamps by stable event k
   };
 
   assert.deepEqual(await runOrder(["ci-z", "ci-a"]), {
-    state: "green",
-    head_sha: "ci-z-green",
+    state: "red",
+    head_sha: "ci-a-red",
     eventCount: 2,
   });
   assert.deepEqual(await runOrder(["ci-a", "ci-z"]), {
