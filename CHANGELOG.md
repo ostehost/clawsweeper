@@ -98,6 +98,10 @@ checkpoint, and status-only commits are intentionally omitted.
   addition, and replacement-label cleanup. Definite pre-write rejection remains
   non-mutating, while transport and server uncertainty remains retryable and
   cannot be rewritten as a clean failure.
+- Added separate repair-result receipts for blocked-merge label creation and
+  addition, closeout-comment creation, and issue or pull-request close.
+  Closeout comments are one-shot on transport uncertainty so reruns reconcile
+  the marker instead of risking duplicate user-visible comments.
 - Required every mutable `repair:publish-main` call to declare a canonical
   publication receipt, with receipt-free operation limited to path sets wholly
   under immutable `ledger/`. Added workflow guards for setup, finalization,

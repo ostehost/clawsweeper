@@ -350,7 +350,11 @@ The current implementation instruments these production surfaces:
 
 - Review and apply workflows record review batches, selected items, retries,
   Codex log publication, durable review-comment publication, apply actions,
-  apply batches, apply reports, and interrupted or failed terminals.
+  apply batches, apply reports, and interrupted or failed terminals. The repair
+  result applicator also records blocked-merge label creation/addition,
+  closeout-comment creation, and target close as distinct request boundaries.
+  Ambiguous comment creation is one-shot so a workflow rerun can reconcile the
+  durable marker without risking a duplicate comment.
 - Exact-review queue admission records enqueue, claim, completion, and
   reconciliation request boundaries with stable business idempotency across
   wire retries. Queue URLs, credentials, lease identifiers, and prompts are
