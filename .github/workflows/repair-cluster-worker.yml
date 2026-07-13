@@ -383,10 +383,12 @@ jobs:
         run: pnpm run repair:conflict-self-heal -- --verify-job-head "${{ inputs.job }}"
 
       - name: Run worker
+        id: run_worker
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION: repair-worker-codex
         run: |
           worker_mode="${{ inputs.mode }}"
           if [ "$worker_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then

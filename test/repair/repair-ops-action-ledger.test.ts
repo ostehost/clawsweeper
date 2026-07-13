@@ -88,6 +88,10 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     cluster.indexOf("- name: Register repair lifecycle"),
     cluster.indexOf("- name: Verify GitHub read token"),
   );
+  const clusterWorker = cluster.slice(
+    cluster.indexOf("- name: Run worker"),
+    cluster.indexOf("- name: Review worker result"),
+  );
   const mutationRegistration = mutate.slice(
     mutate.indexOf("- name: Resume repair lifecycle"),
     mutate.indexOf("- name: Create exact-repository mutation token"),
@@ -97,6 +101,16 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(cluster, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(cluster, /Finalize cluster repair action ledger/);
   assert.match(cluster, /clawsweeper-repair-worker-action-ledger-cluster-/);
+  assert.match(clusterWorker, /id: run_worker/);
+  assert.match(clusterWorker, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: repair-worker-codex/);
+  assert.ok(
+    cluster.indexOf("uses: ./.github/actions/setup-action-ledger") <
+      cluster.indexOf("- name: Run worker"),
+  );
+  assert.ok(
+    cluster.indexOf("- name: Run worker") <
+      cluster.indexOf("- name: Finalize cluster repair action ledger"),
+  );
   assert.match(clusterRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
   assert.match(
     clusterRegistration,
@@ -207,6 +221,7 @@ test("repair ledger collector preserves valid lanes but fails closed on a forged
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
   const ledger = readText("src/repair/repair-action-ledger.ts");
   const codexLedger = readText("src/repair/repair-codex-action-ledger.ts");
+  const worker = readText("src/repair/run-worker.ts");
   const handoff = readText("src/repair/execution-handoff.ts");
   const executor = readText("src/repair/execute-fix-artifact.ts");
   const github = readText("src/repair/execute-fix-github.ts");
@@ -232,6 +247,8 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   }
   assert.match(executor, /beginRepairCodexAction/);
   for (const action of [
+    "repair_plan",
+    "repair_result_repair",
     "repair_edit",
     "repair_write_preflight",
     "repair_base_reconcile",
@@ -240,8 +257,24 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
     "repair_validation_fix",
   ]) {
     assert.match(codexLedger, new RegExp(`"${action}"`));
-    assert.match(executor, new RegExp(`action: "${action}"`));
+    assert.match(
+      ["repair_plan", "repair_result_repair"].includes(action) ? worker : executor,
+      new RegExp(`action: "${action}"`),
+    );
   }
+  assert.equal([...worker.matchAll(/beginRepairCodexAction\(/g)].length, 2);
+  assert.match(
+    worker,
+    /action: "repair_plan"[\s\S]*paths: \{ jsonl: transcriptPath, stderr: codexStderrPath \}/,
+  );
+  assert.match(
+    worker,
+    /action: "repair_result_repair"[\s\S]*paths: \{ jsonl: repairTranscriptPath, stderr: repairStderrPath \}/,
+  );
+  assert.match(worker, /plannerAction\.complete\(\)/);
+  assert.match(worker, /plannerAction\.fail\(/);
+  assert.match(worker, /repairAction\.complete\(\)/);
+  assert.match(worker, /repairAction\.fail\(/);
   assert.match(executor, /repairCodexAttempt\(attempt, "final"\)/);
   assert.match(executor, /repair_execution_report/);
   assert.match(

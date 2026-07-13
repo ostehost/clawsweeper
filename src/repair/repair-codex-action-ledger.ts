@@ -10,6 +10,8 @@ import {
 } from "./repair-action-ledger.js";
 
 export type RepairCodexAction =
+  | "repair_plan"
+  | "repair_result_repair"
   | "repair_edit"
   | "repair_write_preflight"
   | "repair_base_reconcile"
@@ -63,6 +65,7 @@ export function beginRepairCodexAction(
     mode: string;
     attempt: RepairCodexAttemptIdentity;
     paths: RepairCodexArtifactPaths;
+    component?: string;
     report?: (message: string) => void;
   },
 ) {
@@ -113,6 +116,7 @@ function recordLifecycleSafely(
     action: RepairCodexAction;
     mode: string;
     attempt: RepairCodexAttemptIdentity;
+    component?: string;
   },
   phase: "started" | "completed" | "failed",
   error: unknown,
@@ -139,7 +143,7 @@ function recordLifecycleSafely(
             ? ACTION_EVENT_REASON_CODES.completed
             : ACTION_EVENT_REASON_CODES.exception,
       mutation: false,
-      component: "execute_fix_codex",
+      component: options.component ?? "execute_fix_codex",
       state: phase,
       reviewMode: options.action,
       eventIdentity: {
@@ -170,6 +174,7 @@ function publishArtifactsSafely(
   options: {
     action: RepairCodexAction;
     paths: RepairCodexArtifactPaths;
+    component?: string;
   },
   report: (message: string) => void,
 ): void {
@@ -179,7 +184,7 @@ function publishArtifactsSafely(
       recordRepairArtifactPrepared(input, {
         path: artifactPath,
         kind: `${options.action}_${kind}`,
-        component: "execute_fix_codex",
+        component: options.component ?? "execute_fix_codex",
         reviewMode: options.action,
       });
     } catch (receiptError) {

@@ -29,6 +29,8 @@ import {
   repairCodexReasoningEffort,
   repairCodexServiceTier,
 } from "./process-env.js";
+import { beginRepairCodexAction, repairCodexAttempt } from "./repair-codex-action-ledger.js";
+import { repairSourceRevision, type RepairLifecycleInput } from "./repair-action-ledger.js";
 import { sanitizeResultEvidence } from "./url-safety.js";
 
 const args = parseArgs(process.argv.slice(2));
@@ -88,6 +90,7 @@ const runDir = makeRunDir(job, mode);
 const promptPath = path.join(runDir, "prompt.md");
 const resultPath = path.join(runDir, "result.json");
 const transcriptPath = path.join(runDir, "codex.jsonl");
+const codexStderrPath = path.join(runDir, "codex.stderr.log");
 const promptContext: Record<string, string> = {};
 const targetCheckout = dryRun ? "" : prepareTargetCheckout(job);
 if (targetCheckout) {
@@ -165,22 +168,38 @@ if (dryRun) {
   process.exit(0);
 }
 
-const child = await runCodex({
-  input: prompt,
-  outputPath: resultPath,
-  transcriptPath,
-  stderrPath: path.join(runDir, "codex.stderr.log"),
-  timeoutMs: codexTimeoutMs,
+const plannerAction = beginRepairCodexAction(repairWorkerLifecycle(), {
+  action: "repair_plan",
+  mode: String(mode),
+  attempt: repairCodexAttempt(1),
+  paths: { jsonl: transcriptPath, stderr: codexStderrPath },
+  component: "repair_worker_codex",
 });
+let child: LooseRecord;
+try {
+  child = await runCodex({
+    input: prompt,
+    outputPath: resultPath,
+    transcriptPath,
+    stderrPath: codexStderrPath,
+    timeoutMs: codexTimeoutMs,
+  });
+} catch (error) {
+  plannerAction.fail(error);
+  throw error;
+}
 
 if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
-  writeBlockedResult(`Codex worker timed out after ${codexTimeoutMs}ms`);
-  console.error(`Codex worker timed out after ${codexTimeoutMs}ms`);
+  const detail = `Codex worker timed out after ${codexTimeoutMs}ms`;
+  plannerAction.fail(new Error(detail));
+  writeBlockedResult(detail);
+  console.error(detail);
   process.exit(1);
 }
 
 if (child.error) {
   const detail = child.error.message || String(child.error);
+  plannerAction.fail(new Error(detail));
   writeBlockedResult(`Codex worker failed: ${detail}`);
   console.error(detail);
   process.exit(1);
@@ -188,16 +207,25 @@ if (child.error) {
 
 if (child.status !== 0) {
   const detail = child.stderr || child.stdout || `Codex worker exited ${child.status}`;
+  plannerAction.fail(new Error(detail.trim()));
   writeBlockedResult(detail.trim());
   console.error(detail);
   process.exit(1);
 }
 
 if (!fs.existsSync(resultPath)) {
-  writeBlockedResult("Codex worker completed without a structured result.json artifact.");
+  const detail = "Codex worker completed without a structured result.json artifact.";
+  plannerAction.fail(new Error(detail));
+  writeBlockedResult(detail);
   process.exit(1);
 }
-sanitizeResultFile(resultPath);
+try {
+  sanitizeResultFile(resultPath);
+  plannerAction.complete();
+} catch (error) {
+  plannerAction.fail(error);
+  throw error;
+}
 await repairResultIfNeeded();
 sanitizeResultFile(resultPath);
 
@@ -382,24 +410,48 @@ async function repairResultIfNeeded() {
       "```",
     ].join("\n");
 
-    const repair = await runCodex({
-      input: repairPrompt,
-      outputPath: resultPath,
-      transcriptPath: path.join(runDir, `codex-repair-${attempt}.jsonl`),
-      stderrPath: path.join(runDir, `codex-repair-${attempt}.stderr.log`),
-      timeoutMs: resultRepairTimeoutMs,
+    const repairTranscriptPath = path.join(runDir, `codex-repair-${attempt}.jsonl`);
+    const repairStderrPath = path.join(runDir, `codex-repair-${attempt}.stderr.log`);
+    const repairAction = beginRepairCodexAction(repairWorkerLifecycle(), {
+      action: "repair_result_repair",
+      mode: String(mode),
+      attempt: repairCodexAttempt(attempt),
+      paths: { jsonl: repairTranscriptPath, stderr: repairStderrPath },
+      component: "repair_worker_codex",
     });
+    let repair: LooseRecord;
+    try {
+      repair = await runCodex({
+        input: repairPrompt,
+        outputPath: resultPath,
+        transcriptPath: repairTranscriptPath,
+        stderrPath: repairStderrPath,
+        timeoutMs: resultRepairTimeoutMs,
+      });
+    } catch (error) {
+      repairAction.fail(error);
+      throw error;
+    }
     if ((repair.error as JsonValue)?.code === "ETIMEDOUT") {
-      console.error(`Codex result repair timed out after ${resultRepairTimeoutMs}ms`);
+      const detail = `Codex result repair timed out after ${resultRepairTimeoutMs}ms`;
+      repairAction.fail(new Error(detail));
+      console.error(detail);
       return;
     }
     if (repair.status !== 0) {
-      console.error(
-        repair.stderr || repair.stdout || `Codex result repair exited ${repair.status}`,
-      );
+      const detail =
+        repair.stderr || repair.stdout || `Codex result repair exited ${repair.status}`;
+      repairAction.fail(new Error(detail));
+      console.error(detail);
       return;
     }
-    sanitizeResultFile(resultPath);
+    try {
+      sanitizeResultFile(resultPath);
+      repairAction.complete();
+    } catch (error) {
+      repairAction.fail(error);
+      throw error;
+    }
   }
 }
 
@@ -417,6 +469,15 @@ function reviewResult() {
 
 function codexEnv() {
   return codexSubprocessEnv();
+}
+
+function repairWorkerLifecycle(): RepairLifecycleInput {
+  return {
+    repository: String(job.frontmatter.repo ?? ""),
+    workKey: `${String(job.frontmatter.repo ?? "")}:${String(job.frontmatter.cluster_id ?? "")}`,
+    clusterId: String(job.frontmatter.cluster_id ?? ""),
+    sourceRevision: repairSourceRevision(job.frontmatter),
+  };
 }
 
 function prepareTargetCheckout(job: LooseRecord): string {
