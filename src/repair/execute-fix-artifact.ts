@@ -35,7 +35,10 @@ import {
   isTerminalCodexErrorMessage,
 } from "../codex-transient.js";
 import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
-import { redactCodexOutputLastMessage } from "../codex-output-capture.js";
+import {
+  publishRedactedCodexOutputLastMessage,
+  redactCodexOutputLastMessage,
+} from "../codex-output-capture.js";
 import {
   branchHasBaseDiff,
   completeRebaseIfResolved,
@@ -417,11 +420,14 @@ function currentCodexTimeoutMs(preserveLateWorkerBudget = false) {
 
 function spawnCodexSyncWithHeartbeat(
   label: string,
-  args: string[],
+  originalArgs: string[],
   options: SpawnSyncOptionsWithStringEncoding & { stdoutPath?: string; stderrPath?: string },
 ) {
   const heartbeat = startCodexHeartbeat(label);
+  let lastMessage: ReturnType<typeof isolateCodexLastMessage> | null = null;
   try {
+    lastMessage = isolateCodexLastMessage(originalArgs);
+    const args = lastMessage.args;
     if (typeof options.cwd !== "string" || typeof options.input !== "string") {
       throw new Error(`${label} requires string cwd and input.`);
     }
@@ -439,10 +445,30 @@ function spawnCodexSyncWithHeartbeat(
       redactValues,
     });
     redactCodexOutputLastMessage(args, redactValues);
+    if (lastMessage.rawPath && lastMessage.retainedPath) {
+      publishRedactedCodexOutputLastMessage(
+        lastMessage.rawPath,
+        lastMessage.retainedPath,
+        redactValues,
+      );
+    }
     return result;
   } finally {
+    if (lastMessage?.rawRoot) fs.rmSync(lastMessage.rawRoot, { recursive: true, force: true });
     stopCodexHeartbeat(heartbeat);
   }
+}
+
+function isolateCodexLastMessage(args: readonly string[]) {
+  const outputIndex = args.indexOf("--output-last-message");
+  const retainedPath = outputIndex >= 0 ? args[outputIndex + 1] : undefined;
+  if (!retainedPath) return { args: [...args], rawRoot: null, rawPath: null, retainedPath: null };
+  fs.rmSync(retainedPath, { force: true });
+  const rawRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-last-message-"));
+  const rawPath = path.join(rawRoot, "last-message.raw");
+  const isolatedArgs = [...args];
+  isolatedArgs[outputIndex + 1] = rawPath;
+  return { args: isolatedArgs, rawRoot, rawPath, retainedPath };
 }
 
 function startCodexHeartbeat(label: string) {

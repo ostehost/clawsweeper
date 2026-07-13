@@ -121,7 +121,8 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   const preparedPushIndex = preparedReplacement.indexOf(
     "pushRecoverableBranch({ targetDir, branch });",
   );
-  const preparedCreateIndex = preparedReplacement.indexOf('"pr",\n        "create"');
+  const preparedCreateMatch = /"pr",\s+"create"/.exec(preparedReplacement);
+  const preparedCreateIndex = preparedCreateMatch?.index ?? -1;
   assert.notEqual(preparedSkipIndex, -1);
   assert.notEqual(preparedPushIndex, -1);
   assert.notEqual(preparedCreateIndex, -1);
@@ -170,7 +171,7 @@ test("terminal Codex and persistent setup failures do not request repair requeue
   assert.match(source, /sandbox \(\?:wrapper\|startup\)/);
 });
 
-test("repair Codex heartbeat wrapper uses bounded process capture", () => {
+test("repair Codex heartbeat wrapper uses bounded process capture and isolated last-message retention", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
   const helperStart = source.indexOf("function spawnCodexSyncWithHeartbeat(");
@@ -179,9 +180,37 @@ test("repair Codex heartbeat wrapper uses bounded process capture", () => {
   assert.notEqual(helperStart, -1);
   assert.notEqual(helperEnd, -1);
   const helper = source.slice(helperStart, helperEnd);
-  assert.match(helper, /return runCodexProcess\(\{/);
+  assert.match(helper, /lastMessage = isolateCodexLastMessage\(originalArgs\);/);
+  assert.match(helper, /const args = lastMessage\.args;/);
+  assert.match(helper, /const result = runCodexProcess\(\{/);
+  assert.match(helper, /redactCodexOutputLastMessage\(args, redactValues\)/);
   assert.match(helper, /\{ stdoutPath: options\.stdoutPath \}/);
   assert.match(helper, /\{ stderrPath: options\.stderrPath \}/);
+  assert.match(
+    helper,
+    /publishRedactedCodexOutputLastMessage\(\s*lastMessage\.rawPath,\s*lastMessage\.retainedPath,\s*redactValues,\s*\)/,
+  );
+  assert.ok(
+    helper.indexOf("redactCodexOutputLastMessage(args, redactValues)") <
+      helper.indexOf("publishRedactedCodexOutputLastMessage(") &&
+      helper.indexOf("publishRedactedCodexOutputLastMessage(") < helper.indexOf("return result;"),
+    "the isolated last message must be sanitized, atomically published, then returned",
+  );
+  assert.match(
+    helper,
+    /finally \{[\s\S]*fs\.rmSync\(lastMessage\.rawRoot, \{ recursive: true, force: true \}\)/,
+  );
+  assert.match(helper, /function isolateCodexLastMessage\(args: readonly string\[\]\)/);
+  assert.match(
+    helper,
+    /fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), "clawsweeper-codex-last-message-"\)\)/,
+  );
+  assert.match(helper, /fs\.rmSync\(retainedPath, \{ force: true \}\)/);
+  assert.ok(
+    helper.indexOf("fs.rmSync(retainedPath, { force: true })") <
+      helper.indexOf('fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-last-message-"))'),
+  );
+  assert.match(helper, /isolatedArgs\[outputIndex \+ 1\] = rawPath/);
   assert.doesNotMatch(helper, /spawnSync\("codex"/);
   assert.doesNotMatch(source, /CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);
   assert.doesNotMatch(source, /writeFileSync\([^)]*codexResult\.stdout/);
@@ -266,7 +295,7 @@ test("final synchronized tree is reviewed and reports persist before publication
   assert.match(source, /reviewAfterFinalBaseSync\(\{/);
   assert.match(source, /validateAndReviewSynchronizedTree\(\{/);
   assert.match(source, /repairDeltaPaths: finalSyncRepairDeltaPaths/);
-  assert.match(source, /attempt: "final-sync"/);
+  assert.match(source, /attempt: repairCodexAttempt\(1, "final_sync"\)/);
   assert.match(source, /finalizeExecutionReport\(\{/);
 });
 

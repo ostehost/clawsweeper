@@ -29,8 +29,12 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   const finalizeStart = workflow.indexOf("- name: Finalize repair requeue action ledger");
   const publishStart = workflow.indexOf("- name: Publish immutable repair requeue action ledger");
   const nextStep = workflow.indexOf("- name: Record requeued work", publishStart);
+  const executeJobStart = workflow.indexOf("\n  execute:");
   const executeFixStart = workflow.indexOf("- name: Execute credited fix artifact");
-  const ledgerSetupStart = workflow.indexOf("- uses: ./.github/actions/setup-action-ledger");
+  const ledgerSetupStart = workflow.indexOf(
+    "- uses: ./.github/actions/setup-action-ledger",
+    executeJobStart,
+  );
   const requeueStart = workflow.indexOf("- name: Requeue source-head repair races");
   const finalizeStep = workflow.slice(finalizeStart, publishStart);
   const publishStep = workflow.slice(publishStart, nextStep);
@@ -45,7 +49,9 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(source, /`job=\$\{jobPath\}`/);
   assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
   assert.match(source, /operationKey: `repair-requeue:/);
-  assert.match(source, /sourceRevision: authorizationSha256/);
+  assert.match(source, /sourceRevision: immutableJob\.stateRevision/);
+  assert.match(source, /immutableJob\.identityKey/);
+  assert.match(source, /sourceJobSha256: authorizationSha256/);
   assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
@@ -53,17 +59,17 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
   assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
-  assert.ok(executeFixStart < ledgerSetupStart && ledgerSetupStart < requeueStart);
+  assert.ok(ledgerSetupStart < executeFixStart && executeFixStart < requeueStart);
   assert.ok(finalizeStart >= 0);
   assert.ok(publishStart > finalizeStart);
   assert.ok(nextStep > publishStart);
   assert.match(
     finalizeStep,
-    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.execute-action-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.execute-action-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);
