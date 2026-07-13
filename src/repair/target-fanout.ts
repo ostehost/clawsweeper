@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+  type ActionEventSubject,
+} from "../action-ledger.js";
+import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
 import { resolveCommand } from "../command.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
@@ -52,6 +60,26 @@ interface FanoutOptions {
   owners: readonly string[] | undefined;
 }
 
+interface FanoutActionLedger {
+  operationIdentity: {
+    repository: string;
+    mode: FanoutMode;
+    limit: number;
+  };
+  subject: ActionEventSubject;
+  queueStartEventId: string | null;
+  lastEventId: string | null;
+  nextPhaseSeq: number;
+  startedAtMs: number;
+  inventoryCount: number;
+  selectedCount: number;
+  dispatchedCount: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  uncertainCompletionReason: "dispatch_outcome_unknown" | "mutation_outcome_unknown" | null;
+  terminal: boolean;
+}
+
 const DEFAULT_CURSOR_DIR = join(repoRoot(), "results", "target-fanout-cursors");
 const PUBLIC_INVENTORY_TOKEN = "__public__";
 
@@ -70,57 +98,533 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     owners: csvArg(args.owners),
   };
 
-  const repositories = await loadEligibleRepositories(config, options.owners);
-  const selection = selectRepositories(repositories, {
-    limit: options.limit,
-    cursor: readCursor(options.cursorPath),
-  });
-
-  const commands = selection.repositories.map((repository) =>
-    workflowDispatchArgs(repository, options),
-  );
-
-  if (args._[0] === "list") {
-    process.stdout.write(
-      `${JSON.stringify({ total: repositories.length, repositories }, null, 2)}\n`,
+  if (args._[0] === "list" || args._[0] === "plan") {
+    const repositories = await loadEligibleRepositories(config, options.owners);
+    const selection = selectRepositories(repositories, {
+      limit: options.limit,
+      cursor: readCursor(options.cursorPath),
+    });
+    const commands = selection.repositories.map((repository) =>
+      workflowDispatchArgs(repository, options),
     );
-    return;
-  }
-
-  if (args._[0] === "plan") {
-    process.stdout.write(`${JSON.stringify({ ...selection, commands }, null, 2)}\n`);
-    return;
-  }
-
-  const dispatched: string[] = [];
-  for (const [index, repository] of selection.repositories.entries()) {
-    const commandArgs = commands[index];
-    if (!commandArgs) continue;
-    if (options.dryRun) {
-      console.log(`dry-run ${commandArgs.join(" ")}`);
+    if (args._[0] === "list") {
+      process.stdout.write(
+        `${JSON.stringify({ total: repositories.length, repositories }, null, 2)}\n`,
+      );
     } else {
-      runGh(commandArgs, dispatchEnv());
+      process.stdout.write(`${JSON.stringify({ ...selection, commands }, null, 2)}\n`);
     }
-    dispatched.push(repository.targetRepo);
+    return;
   }
 
-  if (!options.dryRun) {
-    writeCursor(options.cursorPath, selection.cursor);
+  const ledger = startFanoutActionLedger(options);
+  let primaryError: unknown = null;
+  try {
+    const repositories = await loadEligibleRepositories(config, options.owners);
+    const selection = selectRepositories(repositories, {
+      limit: options.limit,
+      cursor: readCursor(options.cursorPath),
+    });
+    recordFanoutSelection(ledger, repositories.length, selection.repositories.length);
+    const commands = selection.repositories.map((repository) =>
+      workflowDispatchArgs(repository, options),
+    );
+
+    const dispatched: string[] = [];
+    for (const [index, repository] of selection.repositories.entries()) {
+      const commandArgs = commands[index];
+      if (!commandArgs) continue;
+      if (options.dryRun) {
+        console.log(`dry-run ${commandArgs.join(" ")}`);
+        recordFanoutDispatchSkipped(ledger, repository, options);
+      } else {
+        recordFanoutDispatch(ledger, repository, options, () => runGh(commandArgs, dispatchEnv()));
+      }
+      dispatched.push(repository.targetRepo);
+    }
+
+    if (!options.dryRun) {
+      recordFanoutCursorPublication(ledger, options, selection.cursor);
+    }
+    finishFanoutActionLedger(ledger, { dryRun: options.dryRun });
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          mode: options.mode,
+          total: selection.total,
+          dispatched,
+          next_cursor: selection.cursor,
+          dry_run: options.dryRun,
+          cursor_written: !options.dryRun,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  } catch (error) {
+    primaryError = error;
+    try {
+      finishFanoutActionLedger(ledger, { dryRun: options.dryRun, error });
+    } catch (receiptError) {
+      console.error(
+        `[target-fanout] failed to record terminal action receipt: ${errorMessage(receiptError)}`,
+      );
+    }
   }
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        mode: options.mode,
-        total: selection.total,
-        dispatched,
-        next_cursor: selection.cursor,
-        dry_run: options.dryRun,
-        cursor_written: !options.dryRun,
+  let flushError: unknown = null;
+  try {
+    await flushWorkflowActionEvents(repoRoot());
+  } catch (error) {
+    flushError = error;
+  }
+  if (primaryError) {
+    if (flushError) {
+      console.error(
+        `[target-fanout] failed to flush action receipts after the primary failure: ${errorMessage(flushError)}`,
+      );
+    }
+    throw primaryError;
+  }
+  if (flushError) throw flushError;
+}
+
+function startFanoutActionLedger(options: FanoutOptions): FanoutActionLedger {
+  const repository = options.dispatchRepo.trim().toLowerCase();
+  const operationIdentity = {
+    repository,
+    mode: options.mode,
+    limit: options.limit,
+  };
+  const subject: ActionEventSubject = {
+    repository,
+    kind: "workflow",
+    subjectId: `target-fanout-${options.mode}`,
+  };
+  const start = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.queueLifecycle,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "fanout_queue_start" },
+    operation: "target_fanout",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "fanout_queue_start" },
+    component: "target_fanout",
+    subject,
+    attributes: {
+      batch_size: options.limit,
+      queue_kind: "target_fanout",
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  return {
+    operationIdentity,
+    subject,
+    queueStartEventId: start?.event_id ?? null,
+    lastEventId: start?.event_id ?? null,
+    nextPhaseSeq: 2,
+    startedAtMs: Date.now(),
+    inventoryCount: 0,
+    selectedCount: 0,
+    dispatchedCount: 0,
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+    uncertainCompletionReason: null,
+    terminal: false,
+  };
+}
+
+function recordFanoutSelection(
+  ledger: FanoutActionLedger,
+  inventoryCount: number,
+  selectedCount: number,
+): void {
+  ledger.inventoryCount = inventoryCount;
+  ledger.selectedCount = selectedCount;
+  const event = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.queueLifecycle,
+    status: ACTION_EVENT_STATUSES.queued,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "fanout_queue_selected" },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "fanout_queue_selected",
+    },
+    component: "target_fanout",
+    subject: ledger.subject,
+    attributes: {
+      candidate_count: inventoryCount,
+      item_count: selectedCount,
+      queue_depth: selectedCount,
+      queue_kind: "target_fanout",
+      work_kind: ledger.operationIdentity.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function recordFanoutDispatch(
+  ledger: FanoutActionLedger,
+  repository: SelectedRepository,
+  options: FanoutOptions,
+  dispatch: () => void,
+): void {
+  const request = fanoutDispatchRequestIdentity(repository, options);
+  const idempotencyIdentity = {
+    operationIdentity: ledger.operationIdentity,
+    slot: "fanout_dispatch",
+    request,
+  };
+  const subject: ActionEventSubject = {
+    repository: repository.targetRepo,
+    kind: "repository",
+  };
+  const attempt = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: true,
+    mutation: false,
+    identity: { slot: "fanout_dispatch_attempt", targetRepo: repository.targetRepo },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity,
+    component: "target_fanout",
+    subject,
+    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+    attributes: {
+      attempt: 1,
+      completion_reason: "dispatch_attempted",
+      dispatch_kind: fanoutDispatchKind(options.mode),
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
+  try {
+    dispatch();
+  } catch (error) {
+    const failed = recordWorkflowPhaseEvent(repoRoot(), {
+      phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: false,
+      mutation: true,
+      identity: {
+        slot: "fanout_dispatch_outcome",
+        targetRepo: repository.targetRepo,
+        outcome: "failed",
       },
-      null,
-      2,
-    )}\n`,
-  );
+      operation: "target_fanout",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: attempt?.event_id ?? ledger.lastEventId,
+      phaseSeq: nextFanoutPhaseSeq(ledger),
+      idempotencyIdentity,
+      component: "target_fanout",
+      subject,
+      evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+      attributes: {
+        attempt: 1,
+        completion_reason: "dispatch_outcome_unknown",
+        dispatch_kind: fanoutDispatchKind(options.mode),
+        failed_count: 1,
+        work_kind: options.mode,
+      },
+      privacy: fanoutActionLedgerPrivacy(),
+    });
+    ledger.lastEventId = failed?.event_id ?? ledger.lastEventId;
+    ledger.mutationObserved = true;
+    ledger.uncertainMutationObserved = true;
+    ledger.uncertainCompletionReason = "dispatch_outcome_unknown";
+    throw error;
+  }
+  const completed = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+    status: ACTION_EVENT_STATUSES.dispatched,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    retryable: false,
+    mutation: true,
+    identity: {
+      slot: "fanout_dispatch_outcome",
+      targetRepo: repository.targetRepo,
+      outcome: "accepted",
+    },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: attempt?.event_id ?? ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity,
+    component: "target_fanout",
+    subject,
+    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+    attributes: {
+      attempt: 1,
+      completion_reason: "mutation_accepted",
+      dispatch_kind: fanoutDispatchKind(options.mode),
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = completed?.event_id ?? ledger.lastEventId;
+  ledger.dispatchedCount += 1;
+  ledger.mutationObserved = true;
+}
+
+function recordFanoutDispatchSkipped(
+  ledger: FanoutActionLedger,
+  repository: SelectedRepository,
+  options: FanoutOptions,
+): void {
+  const request = fanoutDispatchRequestIdentity(repository, options);
+  const event = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+    status: ACTION_EVENT_STATUSES.skipped,
+    reasonCode: ACTION_EVENT_REASON_CODES.dryRun,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "fanout_dispatch_skipped", targetRepo: repository.targetRepo },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "fanout_dispatch",
+      request,
+    },
+    component: "target_fanout",
+    subject: {
+      repository: repository.targetRepo,
+      kind: "repository",
+    },
+    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+    attributes: {
+      attempt: 1,
+      completion_reason: "dry_run",
+      dispatch_kind: fanoutDispatchKind(options.mode),
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function recordFanoutCursorPublication(
+  ledger: FanoutActionLedger,
+  options: FanoutOptions,
+  cursor: number,
+): void {
+  const content = cursorContent(cursor);
+  const cursorSha256 = sha256(content);
+  const idempotencyIdentity = {
+    operationIdentity: ledger.operationIdentity,
+    slot: "fanout_cursor_publication",
+    cursorSha256,
+  };
+  const subject: ActionEventSubject = {
+    repository: ledger.operationIdentity.repository,
+    kind: "publication",
+    subjectId: `target-fanout-cursor-${options.mode}`,
+  };
+  const attempt = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.publicationLifecycle,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: true,
+    mutation: false,
+    identity: { slot: "fanout_cursor_publication_attempt" },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity,
+    component: "target_fanout",
+    subject,
+    evidence: [{ kind: "fanout_cursor_state", sha256: cursorSha256 }],
+    attributes: {
+      completion_reason: "mutation_attempted",
+      publication_kind: "target_fanout_cursor",
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
+  try {
+    writeFileSyncWithDirs(options.cursorPath, content);
+  } catch (error) {
+    const failed = recordWorkflowPhaseEvent(repoRoot(), {
+      phase: ACTION_EVENT_TYPES.publicationLifecycle,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: false,
+      mutation: true,
+      identity: { slot: "fanout_cursor_publication_outcome", outcome: "unknown" },
+      operation: "target_fanout",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: attempt?.event_id ?? ledger.lastEventId,
+      phaseSeq: nextFanoutPhaseSeq(ledger),
+      idempotencyIdentity,
+      component: "target_fanout",
+      subject,
+      evidence: [{ kind: "fanout_cursor_state", sha256: cursorSha256 }],
+      attributes: {
+        completion_reason: "mutation_outcome_unknown",
+        failed_count: 1,
+        publication_kind: "target_fanout_cursor",
+        work_kind: options.mode,
+      },
+      privacy: fanoutActionLedgerPrivacy(),
+    });
+    ledger.lastEventId = failed?.event_id ?? ledger.lastEventId;
+    ledger.mutationObserved = true;
+    ledger.uncertainMutationObserved = true;
+    ledger.uncertainCompletionReason = "mutation_outcome_unknown";
+    throw error;
+  }
+  const completed = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.publicationLifecycle,
+    status: ACTION_EVENT_STATUSES.published,
+    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    retryable: false,
+    mutation: true,
+    identity: { slot: "fanout_cursor_publication_outcome", outcome: "accepted" },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: attempt?.event_id ?? ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity,
+    component: "target_fanout",
+    subject,
+    evidence: [{ kind: "fanout_cursor_state", sha256: cursorSha256 }],
+    attributes: {
+      completion_reason: "mutation_accepted",
+      publication_kind: "target_fanout_cursor",
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = completed?.event_id ?? ledger.lastEventId;
+  ledger.mutationObserved = true;
+}
+
+function finishFanoutActionLedger(
+  ledger: FanoutActionLedger,
+  options: { dryRun: boolean; error?: unknown },
+): void {
+  if (ledger.terminal) return;
+  const failed = options.error !== undefined;
+  const event = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.queueLifecycle,
+    status: failed ? ACTION_EVENT_STATUSES.failed : ACTION_EVENT_STATUSES.completed,
+    reasonCode: failed
+      ? ACTION_EVENT_REASON_CODES.exception
+      : options.dryRun
+        ? ACTION_EVENT_REASON_CODES.dryRun
+        : ACTION_EVENT_REASON_CODES.completed,
+    retryable: failed && !ledger.mutationObserved && !ledger.uncertainMutationObserved,
+    mutation: ledger.mutationObserved || ledger.uncertainMutationObserved,
+    identity: { slot: "fanout_queue_terminal", outcome: failed ? "failed" : "completed" },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId ?? ledger.queueStartEventId,
+    phaseSeq: 1_000_000,
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "fanout_queue_terminal",
+    },
+    component: "target_fanout",
+    subject: ledger.subject,
+    attributes: {
+      candidate_count: ledger.inventoryCount,
+      item_count: ledger.selectedCount,
+      processed_count: ledger.dispatchedCount,
+      failed_count: failed ? 1 : 0,
+      skipped_count: options.dryRun ? ledger.selectedCount : 0,
+      duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
+      partial: failed && (ledger.mutationObserved || ledger.uncertainMutationObserved),
+      completion_reason: failed
+        ? (ledger.uncertainCompletionReason ?? "failed")
+        : options.dryRun
+          ? "dry_run"
+          : "completed",
+      queue_kind: "target_fanout",
+      work_kind: ledger.operationIdentity.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+  ledger.terminal = true;
+}
+
+function nextFanoutPhaseSeq(ledger: FanoutActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function fanoutDispatchRequestIdentity(
+  repository: SelectedRepository,
+  options: FanoutOptions,
+): {
+  dispatchRepository: string;
+  targetRepository: string;
+  targetBranch: string;
+  mode: FanoutMode;
+  dispatchKind: "repository_dispatch" | "workflow_dispatch";
+  workflow?: string;
+  ref?: string;
+} {
+  return {
+    dispatchRepository: options.dispatchRepo.toLowerCase(),
+    targetRepository: repository.targetRepo,
+    targetBranch: repository.defaultBranch || "main",
+    mode: options.mode,
+    dispatchKind: fanoutDispatchKind(options.mode),
+    ...(options.mode === "audit" ? { workflow: options.workflow, ref: options.ref } : {}),
+  };
+}
+
+function fanoutDispatchKind(mode: FanoutMode): "repository_dispatch" | "workflow_dispatch" {
+  return mode === "audit" ? "workflow_dispatch" : "repository_dispatch";
+}
+
+function fanoutActionLedgerPrivacy() {
+  return {
+    classification: "internal" as const,
+    redactionVersion: "v1",
+    fieldsDropped: [
+      "client_payload",
+      "command_arguments",
+      "credentials",
+      "cursor_path",
+      "raw_url",
+      "token",
+    ],
+  };
+}
+
+function cursorContent(cursor: number): string {
+  return `${JSON.stringify({ next_cursor: cursor }, null, 2)}\n`;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function readInventoryConfig(
@@ -276,10 +780,6 @@ function readCursor(cursorPath: string): number {
   return typeof cursor.next_cursor === "number" && Number.isInteger(cursor.next_cursor)
     ? cursor.next_cursor
     : 0;
-}
-
-function writeCursor(cursorPath: string, cursor: number): void {
-  writeFileSyncWithDirs(cursorPath, `${JSON.stringify({ next_cursor: cursor }, null, 2)}\n`);
 }
 
 function writeFileSyncWithDirs(filePath: string, content: string): void {

@@ -1361,10 +1361,15 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-state
+        id: setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -1402,11 +1407,45 @@ jobs:
             --workflow sweep.yml \
             --ref main
 
-      - name: Publish fanout cursor
+      - name: Publish fanout cursor and action ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "Target fanout completed without immutable action ledger shards." >&2
+            exit 1
+          fi
+          import_result_file=".artifacts/target-fanout-action-ledger-import.json"
+          event_paths_file=".artifacts/target-fanout-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job target-fanout \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Target fanout action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          publish_args=()
+          if [ -d results/target-fanout-cursors ]; then
+            mkdir -p "$CLAWSWEEPER_STATE_DIR/results/target-fanout-cursors"
+            cp -R results/target-fanout-cursors/. \
+              "$CLAWSWEEPER_STATE_DIR/results/target-fanout-cursors/"
+            publish_args+=(--path results/target-fanout-cursors)
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            publish_args+=(--path "$event_path")
+          done < "$event_paths_file"
           pnpm run repair:publish-main -- \
-            --message "chore: update target fanout cursor" \
-            --path results/target-fanout-cursors \
+            --message "chore: publish target fanout state" \
+            "${publish_args[@]}" \
             --rebase-strategy theirs
 
   plan:
