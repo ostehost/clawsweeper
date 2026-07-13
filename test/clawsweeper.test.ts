@@ -2093,11 +2093,9 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
-  assert.equal(
-    workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
-      ?.length,
-    2,
-  );
+  assert.equal(workflow.match(/uses: \.\/\.github\/actions\/setup-state/g)?.length, 2);
+  assert.match(workflow, /sparse-checkout: jobs/);
+  assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
   assert.match(workflow, /CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(workflow, /actions\/cache\/restore@v6/);
   assert.match(workflow, /actions\/cache\/save@v6/);
@@ -2108,7 +2106,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /\.status == "ready"/);
   assert.match(
     workflow,
-    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.execute-action-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assert.match(
     workflow,

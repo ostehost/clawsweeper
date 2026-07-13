@@ -176,6 +176,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 - Pinned GitHub Actions repair planning to Codex's read-only sandbox and removed
   the dispatch-time override that could widen planning privileges.
+- Restored secret redaction for executor Codex last-message artifacts and kept
+  edit and review subprocesses in workspace-write and read-only sandboxes.
 - Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
 - Made commit-review matrix ledger producers unique per commit SHA, preserved

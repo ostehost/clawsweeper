@@ -35,6 +35,7 @@ import {
   isTerminalCodexErrorMessage,
 } from "../codex-transient.js";
 import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
+import { redactCodexOutputLastMessage } from "../codex-output-capture.js";
 import {
   branchHasBaseDiff,
   completeRebaseIfResolved,
@@ -60,6 +61,7 @@ import {
   codexLoginConfig,
   codexSubprocessEnv as codexEnv,
   codexModelArgs,
+  repairCodexRedactValues,
   repairCodexReasoningEffort,
   repairGhEnv as ghEnv,
   repairCodexServiceTier,
@@ -235,13 +237,11 @@ const fixDebugMaxBytes = Math.max(
 const configuredStrictTargetValidation =
   process.env.CLAWSWEEPER_STRICT_TARGET_VALIDATION === "1" ||
   String(process.env.CLAWSWEEPER_TARGET_VALIDATION_MODE ?? "changed-only") === "strict";
-const defaultCodexWriteSandbox =
-  process.env.GITHUB_ACTIONS === "true" ? "danger-full-access" : "workspace-write";
+const defaultCodexWriteSandbox = "workspace-write";
 const codexWriteSandbox = String(
   process.env.CLAWSWEEPER_CODEX_WRITE_SANDBOX ?? defaultCodexWriteSandbox,
 );
-const defaultCodexReviewSandbox =
-  process.env.GITHUB_ACTIONS === "true" ? "danger-full-access" : "read-only";
+const defaultCodexReviewSandbox = "read-only";
 const codexReviewSandbox = String(
   process.env.CLAWSWEEPER_CODEX_REVIEW_SANDBOX ?? defaultCodexReviewSandbox,
 );
@@ -426,7 +426,8 @@ function spawnCodexSyncWithHeartbeat(
       throw new Error(`${label} requires string cwd and input.`);
     }
     const appServer = codexAppServerProcessOptionsFromEnv(label);
-    return runCodexProcess({
+    const redactValues = repairCodexRedactValues();
+    const result = runCodexProcess({
       args,
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -435,7 +436,10 @@ function spawnCodexSyncWithHeartbeat(
       ...(options.stdoutPath ? { stdoutPath: options.stdoutPath } : {}),
       ...(options.stderrPath ? { stderrPath: options.stderrPath } : {}),
       ...(appServer ? { appServer } : {}),
+      redactValues,
     });
+    redactCodexOutputLastMessage(args, redactValues);
+    return result;
   } finally {
     stopCodexHeartbeat(heartbeat);
   }
