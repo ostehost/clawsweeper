@@ -193,6 +193,7 @@ jobs:
           mkdir -p .artifacts
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane github-activity \
+            --allow-empty \
             > .artifacts/github-activity-action-ledger-manifest.json
 
       - name: Publish immutable GitHub activity notification action ledger
@@ -209,13 +210,16 @@ jobs:
           pnpm run --silent repair:action-ledger -- publish \
             --repair-lane github-activity \
             --manifest "$manifest_file" \
+            --allow-empty \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
           jq -e --slurpfile manifest "$manifest_file" \
             '.eventPaths == $manifest[0].event_paths' \
             "$import_result_file" >/dev/null
           jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
-          test -s "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            exit 0
+          fi
           action_ledger_args=()
           while IFS= read -r event_path; do
             durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"

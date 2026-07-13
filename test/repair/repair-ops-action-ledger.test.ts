@@ -331,6 +331,8 @@ test("commit review and notification workflows publish their operation receipts"
     assert.match(workflow, /repair:action-ledger -- finalize/);
     assert.match(workflow, /repair:action-ledger -- publish/);
   }
+  assert.ok((activity.match(/--allow-empty/g) ?? []).length >= 2);
+  assert.match(activity, /if \[ ! -s "\$paths_file" \]; then[\s\S]*exit 0/);
 });
 
 test("issue implementation intake finalizes and publishes source-bound status receipts", () => {
@@ -364,6 +366,46 @@ test("issue implementation intake finalizes and publishes source-bound status re
   assert.match(dispatcher, /runRepairMutation\(dispatchLifecycle\(jobPath\)/);
   assert.match(dispatcher, /kind: "repair_dispatch"/);
   assert.match(dispatcher, /repairSourceRevision\(job\.frontmatter\)/);
+});
+
+test("commit finding and cluster intake publish their dispatch receipts", () => {
+  const workflows = [
+    {
+      path: ".github/workflows/repair-commit-finding-intake.yml",
+      label: "commit finding intake",
+      lane: "commit-finding-intake",
+      decision: "steps.prepare.outputs.should_repair",
+      dispatch: "Dispatch sealed repair worker",
+    },
+    {
+      path: ".github/workflows/repair-cluster-intake.yml",
+      label: "cluster intake",
+      lane: "cluster-intake",
+      decision: "steps.import.outputs.should_dispatch",
+      dispatch: "Dispatch imported cluster repair",
+    },
+  ] as const;
+
+  for (const expected of workflows) {
+    const workflow = readText(expected.path);
+    assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+    assert.match(workflow, new RegExp(`Finalize ${expected.label} action ledger`));
+    assert.match(workflow, new RegExp(`--repair-lane ${expected.lane}`));
+    assert.match(
+      workflow,
+      new RegExp(`${expected.decision.replaceAll(".", "\\.")}[^\\n]*!= "true"`),
+    );
+    assert.match(workflow, /allow_empty_args\+=\(--allow-empty\)/);
+    assert.match(workflow, new RegExp(`Publish immutable ${expected.label} action ledger`));
+    assert.match(workflow, /repair:action-ledger -- publish/);
+    assert.match(workflow, /\.eventPaths == \$manifest\[0\]\.event_paths/);
+    assert.match(workflow, /jq -r '\.paths\[\]\?'/);
+    assert.match(workflow, new RegExp(`append ${expected.label} action ledger`));
+    assert.ok(
+      workflow.indexOf(expected.dispatch) <
+        workflow.indexOf(`Finalize ${expected.label} action ledger`),
+    );
+  }
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {
@@ -408,6 +450,8 @@ test("repair and commit publishers require canonical exact manifests", () => {
     ".github/workflows/github-activity.yml",
     ".github/workflows/maintainer-report-discord.yml",
     ".github/workflows/repair-cluster-worker.yml",
+    ".github/workflows/repair-cluster-intake.yml",
+    ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/repair-finalize-open-prs.yml",
     ".github/workflows/repair-issue-implementation-intake.yml",
     ".github/workflows/repair-publish-results.yml",

@@ -94,8 +94,13 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-pnpm
+        id: intake-setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Setup cluster intake action ledger
+        id: intake-action-ledger
+        uses: ./.github/actions/setup-action-ledger
 
       - name: Create state token
         id: state-token
@@ -282,3 +287,66 @@ jobs:
             --execution-runner "$EXECUTION_RUNNER" \
             --model "$MODEL" \
             --ref main
+
+      - name: Finalize cluster intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane cluster-intake \
+            "${allow_empty_args[@]}" \
+            > .artifacts/cluster-intake-action-ledger-manifest.json
+
+      - name: Publish immutable cluster intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/cluster-intake-action-ledger-manifest.json"
+          event_paths_file=".artifacts/cluster-intake-action-ledger-paths.txt"
+          import_result_file=".artifacts/cluster-intake-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane cluster-intake \
+            --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+               [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+              exit 0
+            fi
+            echo "Cluster intake action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append cluster intake action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

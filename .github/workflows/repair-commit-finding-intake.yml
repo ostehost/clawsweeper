@@ -144,8 +144,13 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-pnpm
+        id: intake-setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Setup commit finding intake action ledger
+        id: intake-action-ledger
+        uses: ./.github/actions/setup-action-ledger
 
       - name: Create read-only intake token
         id: intake-token
@@ -250,3 +255,66 @@ jobs:
             --execution-runner "$EXECUTION_RUNNER" \
             --model internal \
             --ref main
+
+      - name: Finalize commit finding intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane commit-finding-intake \
+            "${allow_empty_args[@]}" \
+            > .artifacts/commit-finding-intake-action-ledger-manifest.json
+
+      - name: Publish immutable commit finding intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/commit-finding-intake-action-ledger-manifest.json"
+          event_paths_file=".artifacts/commit-finding-intake-action-ledger-paths.txt"
+          import_result_file=".artifacts/commit-finding-intake-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane commit-finding-intake \
+            --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+               [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+              exit 0
+            fi
+            echo "Commit finding intake action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append commit finding intake action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal
