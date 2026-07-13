@@ -6,10 +6,18 @@ import { repoRoot } from "./paths.js";
 import { DEFAULT_TRUSTED_BOTS } from "./config.js";
 import {
   commaSet,
+  commentBodySha256,
   isAllowedMutationActor,
   issueNumberFromUrl,
   writePayload,
 } from "./comment-router-utils.js";
+import {
+  flushCommandActionEvents,
+  recordCommandLifecycleFailure,
+  recordCommandProgress,
+  runCommandLifecycleMutation,
+  type CommandLifecycleInput,
+} from "./command-action-ledger.js";
 
 const PROGRESS_START = "<!-- clawsweeper-command-progress:start -->";
 const PROGRESS_END = "<!-- clawsweeper-command-progress:end -->";
@@ -28,32 +36,107 @@ type Options = {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const options = parseOptions(process.argv.slice(2));
-  await updateCommandStatus(options);
+  await runCommandStatusUpdate(options);
 }
 
 async function updateCommandStatus(options: Options) {
-  if (!options.marker && !options.statusCommentId) return;
+  const lifecycle = commandStatusLifecycle(options);
+  if (!options.marker && !options.statusCommentId) {
+    recordCommandProgress(lifecycle, {
+      state: options.state,
+      status: "skipped",
+      mutation: false,
+    });
+    return;
+  }
   validateRepo(options.repo);
   validateItemNumber(options.itemNumber);
-  const comment = await findCommandStatusComment(options);
+  const comment = await findCommandStatusComment(options, lifecycle);
   if (!comment?.id || typeof comment.body !== "string") {
     console.warn(`No command status comment found for ${options.repo}#${options.itemNumber}.`);
+    recordCommandProgress(lifecycle, {
+      state: options.state,
+      status: "skipped",
+      mutation: false,
+    });
     return;
   }
   const body = mergeCommandProgressSection(comment.body, options);
-  if (body === comment.body) return;
+  if (body === comment.body) {
+    recordCommandProgress(lifecycle, {
+      state: options.state,
+      status: "unchanged",
+      mutation: false,
+    });
+    return;
+  }
   const payload = writePayload(repoRoot(), `command-status-progress-${comment.id}`, { body });
-  ghText([
-    "api",
-    `repos/${options.repo}/issues/comments/${comment.id}`,
-    "--method",
-    "PATCH",
-    "--input",
-    payload,
-  ]);
+  runCommandLifecycleMutation(lifecycle, {
+    kind: "status_comment_update",
+    identity: {
+      repository: options.repo,
+      commentId: comment.id,
+      bodySha256: commentBodySha256(body),
+    },
+    component: "command_status",
+    operation: () =>
+      ghText([
+        "api",
+        `repos/${options.repo}/issues/comments/${comment.id}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payload,
+      ]),
+  });
+  recordCommandProgress(lifecycle, {
+    state: options.state,
+    status: "completed",
+    mutation: true,
+  });
 }
 
-async function findCommandStatusComment(options: Options): Promise<LooseRecord | null> {
+async function runCommandStatusUpdate(options: Options) {
+  let commandError: unknown = null;
+  try {
+    await updateCommandStatus(options);
+  } catch (error) {
+    commandError = error;
+    recordCommandLifecycleFailure(commandStatusLifecycle(options), {
+      component: "command_status",
+      error,
+    });
+  }
+  try {
+    await flushCommandActionEvents();
+  } catch (error) {
+    if (commandError) {
+      console.error(
+        `[action-ledger] failed to finalize command status receipts: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } else {
+      commandError = error;
+    }
+  }
+  if (commandError) throw commandError;
+}
+
+function commandStatusLifecycle(options: Options): CommandLifecycleInput {
+  return {
+    repository: options.repo,
+    number: Number(options.itemNumber),
+    operationKey: `command-status:${
+      options.marker || options.statusCommentId || `${options.repo}#${options.itemNumber}`
+    }`,
+  };
+}
+
+async function findCommandStatusComment(
+  options: Options,
+  lifecycle: CommandLifecycleInput,
+): Promise<LooseRecord | null> {
   const deadline = Date.now() + Math.max(0, options.waitMs);
   while (true) {
     const exact = fetchExactStatusComment(options);
@@ -76,7 +159,7 @@ async function findCommandStatusComment(options: Options): Promise<LooseRecord |
     }
     const match = selectCommandStatusComment(comments, options);
     if (match) {
-      pruneDuplicateCommandAckComments({ comments, keep: match, options });
+      pruneDuplicateCommandAckComments({ comments, keep: match, options, lifecycle });
       return match;
     }
     if (exact && !statusMarkerDiffersFromRequested(exact.body, options.marker)) return exact;
@@ -152,10 +235,12 @@ function pruneDuplicateCommandAckComments({
   comments,
   keep,
   options,
+  lifecycle,
 }: {
   comments: LooseRecord[];
   keep: LooseRecord;
   options: Pick<Options, "marker" | "repo" | "trustedBots">;
+  lifecycle: CommandLifecycleInput;
 }) {
   const marker = commandAckMarkerFromBody(keep.body);
   if (!marker) return;
@@ -166,7 +251,14 @@ function pruneDuplicateCommandAckComments({
     if (id <= 0 || id === keepId) continue;
     if (!isPrunableCommandAckDuplicate(comment, options.marker)) continue;
     try {
-      ghText(["api", `repos/${options.repo}/issues/comments/${id}`, "--method", "DELETE"]);
+      runCommandLifecycleMutation(lifecycle, {
+        kind: "ack_comment_delete",
+        identity: { repository: options.repo, commentId: id },
+        component: "command_status",
+        operation: () =>
+          ghText(["api", `repos/${options.repo}/issues/comments/${id}`, "--method", "DELETE"]),
+        knownNoMutation: (error) => /\b404\b|Not Found/i.test(String(error)),
+      });
     } catch (error) {
       if (!/\b404\b|Not Found/i.test(String(error))) throw error;
     }

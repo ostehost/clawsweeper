@@ -20,6 +20,16 @@ export type GhRetryOptions = GhRunOptions & {
   attempts?: number;
 };
 
+export type GhSpawnMutationOutcome = "accepted" | "rejected" | "unknown";
+
+type GhSpawnResult = {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+  stdout?: string | null;
+  stderr?: string | null;
+};
+
 export function ghJson<T = JsonValue>(ghArgs: string[], options: GhRunOptions = {}): T {
   return JSON.parse(ghText(ghArgs, options) || "null") as T;
 }
@@ -250,6 +260,32 @@ export function ghSpawn(ghArgs: string[], options: GhRunOptions = {}) {
     ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
 }
+
+export function ghSpawnMutationOutcome(result: GhSpawnResult): GhSpawnMutationOutcome {
+  if (result.signal) return "unknown";
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code;
+    return code && DEFINITE_PRE_SPAWN_ERROR_CODES.has(code) ? "rejected" : "unknown";
+  }
+  if (result.status === 0) return "accepted";
+  if (result.status === null) return "unknown";
+  const detail = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+  if (ghRetryKind(new Error(detail || `GitHub command exited ${result.status}`)) !== "none") {
+    return "unknown";
+  }
+  return /\b(?:HTTP|status(?: code)?)\s*:?\s*4\d\d\b/i.test(detail) ? "rejected" : "unknown";
+}
+
+const DEFINITE_PRE_SPAWN_ERROR_CODES = new Set([
+  "E2BIG",
+  "EACCES",
+  "EISDIR",
+  "ELOOP",
+  "ENAMETOOLONG",
+  "ENOENT",
+  "ENOTDIR",
+  "EPERM",
+]);
 
 export function ghEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return ghCliEnv(overrides);

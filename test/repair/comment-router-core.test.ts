@@ -1944,7 +1944,7 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   );
   const claimIndex = executeBlock.indexOf("claimDispatchCommands(actionable)");
   const ackIndex = executeBlock.indexOf("convergePrecreatedCommandAckComments(command)");
-  const executeIndex = executeBlock.indexOf("executeCommand(command)");
+  const executeIndex = executeBlock.indexOf("executeCommandWithReceipt(command)");
   const claimFunction = source.slice(
     source.indexOf("function claimDispatchCommands"),
     source.indexOf("function assertMutationActorIsClawsweeperBot"),
@@ -1986,6 +1986,28 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.match(repairWorkflow, /dispatch-receipt-owner\.sh/);
   assert.match(repairWorkflow, /repair-cluster-worker\.yml.*Plan and review cluster/s);
   assert.match(repairWorkflow, /dispatch_key:/);
+});
+
+test("review dispatch fallback requires a definitely rejected repository dispatch", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const reviewDispatch = source.slice(
+    source.indexOf("function dispatchClawSweeperReview"),
+    source.indexOf("function dispatchClawSweeperAssist"),
+  );
+  const outcomeIndex = reviewDispatch.indexOf(
+    "const repositoryDispatchOutcome = ghSpawnMutationOutcome(result)",
+  );
+  const unknownGuardIndex = reviewDispatch.indexOf('if (repositoryDispatchOutcome === "unknown")');
+  const rejectedGuardIndex = reviewDispatch.indexOf(
+    'if (repositoryDispatchOutcome === "rejected")',
+  );
+  const fallbackIndex = reviewDispatch.indexOf("const fallback = runGitHubSpawnMutation");
+
+  assert.ok(outcomeIndex >= 0);
+  assert.ok(unknownGuardIndex > outcomeIndex);
+  assert.ok(rejectedGuardIndex > unknownGuardIndex);
+  assert.ok(fallbackIndex > rejectedGuardIndex);
+  assert.match(reviewDispatch, /refusing workflow_dispatch fallback/);
 });
 
 test("exact comment fast path converges terminal acknowledgement before own reaction cleanup", () => {
@@ -2057,7 +2079,7 @@ test("exact comment fast path converges terminal acknowledgement before own reac
   assert.match(ackConvergence, /exactCommentVersionMissingTerminalBody\(command\)/);
   assert.match(ackConvergence, /commandResponseMarker\(\{/);
   assert.match(ackConvergence, /"--method",\s*"PATCH"/);
-  assert.match(ackConvergence, /\\b404\\b\|not found/);
+  assert.match(ackConvergence, /githubNotFoundNoMutation/);
   assert.doesNotMatch(ackConvergence, /renderResponse\(/);
   assert.doesNotMatch(ackConvergence, /"DELETE"/);
   assert.doesNotMatch(ackConvergence, /clearTerminalMaintainerCommandReaction/);

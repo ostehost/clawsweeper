@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import YAML from "yaml";
 
 import { makeTreeReadOnlyForTest, restoreTreeModesForTest } from "../dist/clawsweeper.js";
 import { readText, tmpPrefix } from "./helpers.ts";
@@ -19,6 +20,222 @@ test("sweep keeps optional media tooling out of review startup", () => {
   const workflow = readText(".github/workflows/sweep.yml");
 
   assert.doesNotMatch(workflow, /setup-media-proof-tools/);
+});
+
+test("ledger-producing jobs initialize immutable workflow context", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  for (const jobName of [
+    "event-review-apply",
+    "review",
+    "publish",
+    "retry-failed-reviews",
+    "apply-proof",
+    "apply-existing",
+  ]) {
+    const start = workflow.indexOf(`\n  ${jobName}:`);
+    assert.notEqual(start, -1, `missing ${jobName} job`);
+    const remaining = workflow.slice(start + 1);
+    const nextJob = remaining.match(/\n  [a-z0-9_-]+:\n/);
+    const end = nextJob?.index === undefined ? workflow.length : start + 1 + nextJob.index;
+    const job = workflow.slice(start, end);
+    assert.match(
+      job,
+      /uses: \.\/(?:clawsweeper\/)?\.github\/actions\/setup-action-ledger/,
+      `${jobName} must initialize the action ledger`,
+    );
+  }
+
+  const action = readText(".github/actions/setup-action-ledger/action.yml");
+  assert.match(action, /actions\/runs\/\$\{GITHUB_RUN_ID\}/);
+  assert.match(
+    action,
+    /RUNNER_TEMP\/clawsweeper-action-ledger\/\$\{GITHUB_RUN_ID\}\/\$\{GITHUB_RUN_ATTEMPT\}\/\$\{GITHUB_JOB\}/,
+  );
+  assert.doesNotMatch(action, /GITHUB_WORKSPACE/);
+  assert.match(action, /CLAWSWEEPER_ACTION_LEDGER_FORCE=1/);
+  assert.match(action, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
+  assert.match(action, /GITHUB_RUN_STARTED_AT=\$run_started_at/);
+});
+
+test("review and apply primary boundaries ignore ledger-only failures", () => {
+  type WorkflowStep = {
+    name?: string;
+    uses?: string;
+    id?: string;
+    if?: string;
+    run?: string;
+    env?: Record<string, string>;
+    "continue-on-error"?: boolean;
+  };
+  type WorkflowJob = {
+    if?: string;
+    steps: WorkflowStep[];
+  };
+
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<string, WorkflowJob>;
+  };
+  const job = (name: string): WorkflowJob => {
+    const value = workflow.jobs[name];
+    assert.ok(value, `missing ${name} job`);
+    return value;
+  };
+  const step = (jobName: string, name: string): WorkflowStep => {
+    const value = job(jobName).steps.find((candidate) => candidate.name === name);
+    assert.ok(value, `missing ${jobName} step ${name}`);
+    return value;
+  };
+  const setupLedger = (jobName: string): WorkflowStep => {
+    const value = job(jobName).steps.find((candidate) =>
+      candidate.uses?.endsWith("/setup-action-ledger"),
+    );
+    assert.ok(value, `missing ${jobName} ledger setup`);
+    return value;
+  };
+
+  for (const jobName of [
+    "event-review-apply",
+    "review",
+    "publish",
+    "retry-failed-reviews",
+    "apply-proof",
+    "apply-existing",
+  ]) {
+    assert.equal(
+      setupLedger(jobName)["continue-on-error"],
+      true,
+      `${jobName} ledger setup must fail open`,
+    );
+  }
+  for (const [jobName, stepName] of [
+    ["event-review-apply", "Finalize exact event action ledger"],
+    ["review", "Finalize review action ledger"],
+  ] as const) {
+    assert.equal(
+      step(jobName, stepName)["continue-on-error"],
+      true,
+      `${stepName} must not poison primary review publication`,
+    );
+  }
+
+  const exactPublish = step("event-review-apply", "Publish event result and apply safe close");
+  assert.match(exactPublish.if ?? "", /always\(\) && !cancelled\(\)/);
+  assert.match(exactPublish.if ?? "", /review-exact-event-item\.outcome == 'success'/);
+  assert.match(exactPublish.if ?? "", /setup-state\.outcome == 'success'/);
+  assert.doesNotMatch(exactPublish.if ?? "", /action-ledger/);
+  const terminalCommandStateCondition =
+    "${{ always() && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}";
+  const exactStateToken = step("event-review-apply", "Create state token");
+  const exactSetupState = job("event-review-apply").steps.find(
+    (candidate) => candidate.id === "setup-state",
+  );
+  assert.ok(exactSetupState);
+  assert.equal(exactStateToken.if, terminalCommandStateCondition);
+  assert.equal(exactSetupState.if, terminalCommandStateCondition);
+  const exactStatusIndex = job("event-review-apply").steps.findIndex(
+    (candidate) => candidate.name === "Mark re-review complete",
+  );
+  const exactLedgerPublishIndex = job("event-review-apply").steps.findIndex(
+    (candidate) => candidate.name === "Publish exact event action ledger",
+  );
+  assert.ok(exactStatusIndex >= 0);
+  assert.ok(exactLedgerPublishIndex > exactStatusIndex);
+  assert.match(
+    step("event-review-apply", "Publish exact event action ledger").if ?? "",
+    /always\(\) && steps\.setup-state\.outcome == 'success'/,
+  );
+  const exactPrimary = step("event-review-apply", "Export exact review primary result");
+  const exactQueue = step("event-review-apply", "Complete exact-review queue lease");
+  assert.equal(exactPrimary.env?.PRIMARY_JOB_STATUS, "${{ job.status }}");
+  assert.equal(exactPrimary.env?.JOB_CANCELLED, undefined);
+  assert.match(exactPrimary.run ?? "", /outcome=(?:failure|cancelled|success)/);
+  assert.match(exactPrimary.run ?? "", /PRIMARY_JOB_STATUS.*cancelled/);
+  assert.match(exactPrimary.run ?? "", /PRIMARY_JOB_STATUS.*success/);
+  assert.match(exactQueue.env?.PRIMARY_OUTCOME ?? "", /exact-review-primary-result/);
+  assert.doesNotMatch(exactQueue.run ?? "", /JOB_STATUS|job\.status/);
+
+  const ledgerDownload = job("publish").steps.find(
+    (candidate) => candidate.id === "download-review-action-ledger",
+  );
+  assert.ok(ledgerDownload);
+  assert.equal(ledgerDownload["continue-on-error"], true);
+  for (const name of [
+    "Import immutable review action events",
+    "Publish immutable review action ledger",
+  ]) {
+    assert.equal(step("publish", name)["continue-on-error"], true, `${name} must fail open`);
+  }
+  const artifactSync = step("publish", "Sync before applying artifacts");
+  assert.match(artifactSync.if ?? "", /setup-publish-state\.outcome == 'success'/);
+  assert.match(artifactSync.if ?? "", /setup-publish-pnpm\.outcome == 'success'/);
+  assert.match(artifactSync.if ?? "", /download-review-artifacts\.outcome == 'success'/);
+  assert.doesNotMatch(artifactSync.if ?? "", /action-ledger/);
+  const artifactApply = step("publish", "Apply review artifacts");
+  assert.match(artifactApply.if ?? "", /sync-review-artifacts\.outcome == 'success'/);
+  assert.match(artifactApply.run ?? "", /review_batch_succeeded=/);
+  assert.match(artifactApply.run ?? "", /artifacts_applied=true/);
+  const artifactLedger = step("publish", "Publish review artifact action ledger");
+  assert.match(artifactLedger.if ?? "", /apply-review-artifacts\.outputs\.artifacts_applied/);
+  const recordPublish = step("publish", "Commit review records");
+  assert.match(recordPublish.if ?? "", /always\(\) && !cancelled\(\)/);
+  assert.match(recordPublish.if ?? "", /apply-review-artifacts\.outputs\.artifacts_applied/);
+  assert.match(recordPublish.run ?? "", /records_published=true/);
+
+  for (const name of [
+    "Dispatch reproducible bug implementation candidates",
+    "Dispatch vision-fit implementation candidates",
+    "Backfill viable open issue implementation candidates",
+    "Dispatch background review comment sync",
+    "Sync selected review comments",
+  ]) {
+    const condition = step("publish", name).if ?? "";
+    assert.match(condition, /always\(\) && !cancelled\(\)/, name);
+    assert.match(condition, /commit-review-records\.outputs\.records_published == 'true'/, name);
+    assert.doesNotMatch(condition, /success\(\)|action-ledger/, name);
+  }
+  const selectedApply = step("publish", "Dispatch selected safe close proposals to isolated apply");
+  assert.match(selectedApply.if ?? "", /sync-selected-review-comments\.outputs\.sync_succeeded/);
+  assert.doesNotMatch(selectedApply.if ?? "", /success\(\)|action-ledger/);
+  const reviewContinuation = step("publish", "Continue sweep");
+  assert.match(
+    reviewContinuation.if ?? "",
+    /apply-review-artifacts\.outputs\.review_batch_succeeded/,
+  );
+  assert.match(reviewContinuation.if ?? "", /commit-review-records\.outputs\.records_published/);
+  assert.doesNotMatch(reviewContinuation.if ?? "", /success\(\)|action-ledger/);
+
+  const proofMarker = step("apply-proof", "Export primary apply proof result");
+  assert.match(proofMarker.if ?? "", /always\(\) && !cancelled\(\)/);
+  assert.match(proofMarker.if ?? "", /proof-select\.outcome == 'success'/);
+  assert.match(proofMarker.if ?? "", /generate-apply-proofs\.outcome == 'success'/);
+  assert.doesNotMatch(proofMarker.if ?? "", /success\(\)|action-ledger/);
+  assert.match(job("apply-existing").if ?? "", /needs\.apply-proof\.outputs\.proof_ready/);
+  assert.doesNotMatch(
+    job("apply-existing").if ?? "",
+    /needs\.apply-proof\.result|publish-apply-proof-action-ledger/,
+  );
+
+  const applySteps = job("apply-existing").steps;
+  const applyMarkerIndex = applySteps.findIndex(
+    (candidate) => candidate.name === "Export primary apply result",
+  );
+  const applyFinalizerIndex = applySteps.findIndex(
+    (candidate) => candidate.name === "Finalize apply action ledger",
+  );
+  assert.ok(applyMarkerIndex >= 0);
+  assert.ok(applyFinalizerIndex > applyMarkerIndex);
+  const applyMarker = applySteps[applyMarkerIndex]!;
+  assert.match(applyMarker.if ?? "", /apply-existing-run\.outcome == 'success'/);
+  for (const name of [
+    "Retry final apply status publication",
+    "Continue apply sweep",
+    "Queue review backstops",
+  ]) {
+    const condition = step("apply-existing", name).if ?? "";
+    assert.match(condition, /always\(\) && !cancelled\(\)/, name);
+    assert.match(condition, /primary-apply-result\.outputs\.succeeded == 'true'/, name);
+    assert.doesNotMatch(condition, /success\(\)|action-ledger/, name);
+  }
 });
 
 test("review workflow gives Codex a read-only inspection token", () => {
@@ -49,6 +266,9 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.match(exactReviewStep, /Exact review produced no artifact for open item/);
   assert.match(reviewJob, /uses: \.\/clawsweeper\/\.github\/actions\/setup-codex/);
   assert.doesNotMatch(reviewJob, /uses: \.\/\.github\/actions\/setup-codex/);
+  assert.match(exactReviewStep, /--codex-sandbox read-only/);
+  assert.match(reviewJob, /--codex-sandbox read-only/);
+  assert.doesNotMatch(workflow, /--codex-sandbox danger-full-access/);
 });
 
 test("review execution tokens can read check runs and commit statuses", () => {
@@ -131,6 +351,7 @@ test("exact event publish and routing require a successful fresh review artifact
   );
   const routeStart = eventReviewJob.indexOf("- name: Queue exact verdict router");
   const reactStart = eventReviewJob.indexOf("- name: React to target item completion");
+  const primaryResultStart = eventReviewJob.indexOf("- name: Export exact review primary result");
   const releaseLeaseStart = eventReviewJob.indexOf("- name: Release terminal review leases");
   const confirmTerminalStart = eventReviewJob.indexOf(
     "- name: Confirm terminal item remains closed",
@@ -147,7 +368,7 @@ test("exact event publish and routing require a successful fresh review artifact
   const publishStep = eventReviewJob.slice(publishStart, releaseUnsuccessfulStart);
   const releaseUnsuccessfulStep = eventReviewJob.slice(releaseUnsuccessfulStart, routeStart);
   const routeStep = eventReviewJob.slice(routeStart, releaseLeaseStart);
-  const reactStep = eventReviewJob.slice(reactStart, failStart);
+  const reactStep = eventReviewJob.slice(reactStart, primaryResultStart);
   const releaseLeaseStep = eventReviewJob.slice(releaseLeaseStart, confirmTerminalStart);
   const confirmTerminalStep = eventReviewJob.slice(confirmTerminalStart, completeStart);
   const failStep = eventReviewJob.slice(failStart, leaseCompleteStart);
@@ -187,7 +408,10 @@ test("exact event publish and routing require a successful fresh review artifact
   );
   assert.match(setupCodexStep, /if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \}\}/);
   assert.match(exactReviewStep, /if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \}\}/);
-  assert.match(publishStep, /if: \$\{\{ steps\.review-exact-event-item\.outcome == 'success' \}\}/);
+  assert.match(
+    publishStep,
+    /if: \$\{\{ always\(\) && !cancelled\(\) && steps\.review-exact-event-item\.outcome == 'success' && steps\.setup-state\.outcome == 'success' \}\}/,
+  );
   assert.match(publishStep, /if \[ ! -f "artifacts\/event\/\$ITEM_NUMBER\.md" \]/);
   assert.match(publishStep, /live_state="\$\(gh api/);
   assert.match(publishStep, /echo "terminal_noop=true" >> "\$GITHUB_OUTPUT"/);
@@ -539,10 +763,18 @@ test("publish workflow dispatches immediate apply through the isolated lane", ()
   );
   const dispatchEnd = publishJob.indexOf("\n      - ", dispatchStart + 1);
   const dispatchStep = publishJob.slice(dispatchStart, dispatchEnd);
+  const dispatchCondition = dispatchStep.match(/^\s+if: (.+)$/m)?.[1] ?? "";
 
   assert.doesNotMatch(publishJob, /setup-codex/);
   assert.match(publishJob, /name: Dispatch selected safe close proposals to isolated apply/);
   assert.doesNotMatch(dispatchStep, /pnpm run apply-decisions/);
+  assert.match(
+    dispatchCondition,
+    /^\$\{\{ always\(\) && !cancelled\(\) && steps\.sync-selected-review-comments\.outputs\.sync_succeeded == 'true'/,
+  );
+  assert.doesNotMatch(dispatchCondition, /sync-selected-review-comments\.outcome/);
+  assert.doesNotMatch(dispatchCondition, /finalize-selected-review-comment-action-ledger/);
+  assert.doesNotMatch(dispatchCondition, /publish-selected-review-comment-action-ledger/);
   assert.match(dispatchStep, /gh workflow run sweep\.yml/);
   assert.match(dispatchStep, /-f apply_existing=true/);
   assert.match(dispatchStep, /-f apply_item_numbers="\$item_numbers"/);
@@ -552,6 +784,69 @@ test("publish workflow dispatches immediate apply through the isolated lane", ()
   );
   assert.match(publishJob, /cancel-in-progress: false/);
   assert.match(publishJob, /queue: max/);
+});
+
+test("selected comment sync finalizes interrupted receipts before publication", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const publishJobStart = workflow.indexOf("\n  publish:");
+  const recoverJobStart = workflow.indexOf("\n  recover-review-failures:", publishJobStart);
+  const publishJob = workflow.slice(publishJobStart, recoverJobStart);
+  const syncStart = publishJob.indexOf("- name: Sync selected review comments");
+  const finalizerStart = publishJob.indexOf(
+    "- name: Finalize selected review comment action ledger",
+  );
+  const publicationStart = publishJob.indexOf(
+    "- name: Publish selected review comment action ledger",
+  );
+  const primarySyncSuccess = publishJob.indexOf(
+    'echo "sync_succeeded=true" >> "$GITHUB_OUTPUT"',
+    syncStart,
+  );
+  const statusPublishStart = publishJob.indexOf("pnpm run status --", syncStart);
+
+  assert.ok(syncStart >= 0);
+  assert.ok(primarySyncSuccess > syncStart);
+  assert.ok(statusPublishStart > primarySyncSuccess);
+  assert.ok(finalizerStart > syncStart);
+  assert.ok(publicationStart > finalizerStart);
+  assert.match(
+    publishJob.slice(syncStart, finalizerStart),
+    /timeout --kill-after=30s 840s pnpm run apply-decisions[\s\S]*echo "exit_code=\$selected_comment_exit_code" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$selected_comment_exit_code"/,
+  );
+  assert.match(
+    publishJob.slice(finalizerStart, publicationStart),
+    /if: \$\{\{ always\(\)[\s\S]*SELECTED_COMMENT_EXIT_CODE:[\s\S]*--interrupt-open-attempts --reason cancelled[\s\S]*--interrupt-open-attempts --reason timeout[\s\S]*--interrupt-open-attempts --reason workflow_failed[\s\S]*finalize-action-events/,
+  );
+  assert.match(
+    publishJob.slice(publicationStart, publicationStart + 400),
+    /steps\.finalize-selected-review-comment-action-ledger\.outcome == 'success'/,
+  );
+});
+
+test("failed-review retry cleanup restores the captured command failure", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const retryJobStart = workflow.indexOf("\n  retry-failed-reviews:");
+  const auditJobStart = workflow.indexOf("\n  audit-dashboard:", retryJobStart);
+  const retryJob = workflow.slice(retryJobStart, auditJobStart);
+  const commandStart = retryJob.indexOf("- name: Plan or dispatch failed-review retries");
+  const finalizerStart = retryJob.indexOf("- name: Finalize failed-review retry action ledger");
+  const publicationStart = retryJob.indexOf("- name: Publish failed-review retry action ledger");
+  const artifactStart = retryJob.indexOf("uses: actions/upload-artifact@v7", publicationStart);
+  const restoreStart = retryJob.indexOf("- name: Restore failed-review retry outcome");
+
+  assert.ok(commandStart >= 0);
+  assert.ok(finalizerStart > commandStart);
+  assert.ok(publicationStart > finalizerStart);
+  assert.ok(artifactStart > publicationStart);
+  assert.ok(restoreStart > artifactStart);
+  assert.match(
+    retryJob.slice(commandStart, finalizerStart),
+    /continue-on-error: true[\s\S]*echo "exit_code=\$retry_exit_code" >> "\$GITHUB_OUTPUT"[\s\S]*exit "\$retry_exit_code"/,
+  );
+  assert.match(
+    retryJob.slice(restoreStart),
+    /steps\.retry-failed-reviews-run\.outcome != 'success'[\s\S]*RETRY_EXIT_CODE:[\s\S]*exit "\$retry_exit_code"/,
+  );
 });
 
 test("broad record publishers isolate tuple reconciliation from status and auxiliary state", () => {
@@ -596,15 +891,25 @@ test("apply workflow isolates Codex proof from the credentialed mutation runner"
     workflow.indexOf("\njobs:"),
   );
   const proofJobStart = workflow.indexOf("\n  apply-proof:");
+  const proofPublisherStart = workflow.indexOf("\n  publish-apply-proof-action-ledger:");
   const applyJobStart = workflow.indexOf("\n  apply-existing:");
   assert.notEqual(proofJobStart, -1);
+  assert.notEqual(proofPublisherStart, -1);
   assert.notEqual(applyJobStart, -1);
   assert.doesNotMatch(workflowConcurrency, /queue: max/);
   assert.match(workflowConcurrency, /cancel-in-progress: false/);
-  const proofJob = workflow.slice(proofJobStart, applyJobStart);
+  const proofJob = workflow.slice(proofJobStart, proofPublisherStart);
+  const proofPublisherJob = workflow.slice(proofPublisherStart, applyJobStart);
   const applyJob = workflow.slice(applyJobStart);
+  const applyCondition = applyJob.match(/^\s+if: (.+)$/m)?.[1] ?? "";
+  const proofGenerationStart = proofJob.indexOf("- name: Generate bound close coverage proofs");
+  const primaryProofResultStart = proofJob.indexOf("- name: Export primary apply proof result");
+  const proofFinalizerStart = proofJob.indexOf("- name: Finalize apply proof action ledger");
 
-  assert.match(proofJob, /permissions:\s+contents: read\s+issues: read\s+pull-requests: read/);
+  assert.match(
+    proofJob,
+    /permissions:\s+actions: read\s+contents: read\s+issues: read\s+pull-requests: read/,
+  );
   assert.match(proofJob, /persist-credentials: false/);
   assert.match(proofJob, /persist-credentials: "false"/);
   assert.doesNotMatch(proofJob, /Create target write token|Create state token/);
@@ -619,16 +924,64 @@ test("apply workflow isolates Codex proof from the credentialed mutation runner"
   assert.match(proofJob, /artifact_name: \$\{\{ steps\.proof-artifact\.outputs\.name \}\}/);
   assert.match(
     proofJob,
+    /action_ledger_artifact_name: \$\{\{ steps\.publishable-action-ledger\.outputs\.name \}\}/,
+  );
+  assert.match(proofJob, /proof_ready: \$\{\{ steps\.primary-proof-result\.outputs\.ready \}\}/);
+  assert.match(
+    proofJob,
     /name=apply-coverage-proofs-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
   assert.match(proofJob, /name: \$\{\{ steps\.proof-artifact\.outputs\.name \}\}/);
+  assert.match(
+    proofJob,
+    /action_ledger_name=action-ledger-apply-proof-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  assert.match(proofJob, /id: upload-action-events/);
+  assert.match(proofJob, /name: \$\{\{ steps\.proof-artifact\.outputs\.action_ledger_name \}\}/);
+  assert.match(
+    proofJob,
+    /path: \$\{\{ runner\.temp \}\}\/clawsweeper-action-ledger\/\$\{\{ github\.run_id \}\}\/\$\{\{ github\.run_attempt \}\}\/\$\{\{ github\.job \}\}\/\*\*/,
+  );
+  assert.match(proofJob, /include-hidden-files: true/);
+  assert.match(proofJob, /if-no-files-found: error/);
+  assert.ok(proofGenerationStart >= 0);
+  assert.ok(primaryProofResultStart > proofGenerationStart);
+  assert.ok(proofFinalizerStart > primaryProofResultStart);
+  assert.match(
+    proofJob,
+    /id: primary-proof-result[\s\S]*if: \$\{\{ always\(\) && !cancelled\(\) && steps\.proof-select\.outcome == 'success' && \(steps\.proof-select\.outputs\.item_numbers == '' \|\| steps\.generate-apply-proofs\.outcome == 'success'\) \}\}[\s\S]*echo "ready=true" >> "\$GITHUB_OUTPUT"/,
+  );
+  assert.match(
+    proofJob,
+    /if: \$\{\{ always\(\) && steps\.upload-action-events\.outputs\.artifact-id != '' \}\}/,
+  );
 
-  assert.match(applyJob, /needs: apply-proof/);
+  assert.match(proofPublisherJob, /needs: apply-proof/);
+  assert.match(
+    proofPublisherJob,
+    /if: \$\{\{ always\(\) && needs\.apply-proof\.result != 'skipped' \}\}/,
+  );
+  assert.match(
+    proofPublisherJob,
+    /name: \$\{\{ needs\.apply-proof\.outputs\.action_ledger_artifact_name \}\}/,
+  );
+  assert.match(proofPublisherJob, /path: \.clawsweeper-repair\/action-ledger-proof/);
+  assert.match(proofPublisherJob, /Publish apply proof action events/);
+  assert.doesNotMatch(proofPublisherJob, /github\.run_attempt/);
+
+  assert.match(applyJob, /needs: \[apply-proof, publish-apply-proof-action-ledger\]/);
+  assert.match(
+    applyCondition,
+    /^\$\{\{ always\(\) && !cancelled\(\) && needs\.apply-proof\.outputs\.proof_ready == 'true' &&/,
+  );
+  assert.doesNotMatch(applyCondition, /needs\.apply-proof\.result/);
+  assert.doesNotMatch(applyCondition, /needs\.publish-apply-proof-action-ledger/);
   assert.doesNotMatch(applyJob, /setup-codex|OPENAI_API_KEY|CLAWSWEEPER_INTERNAL_MODEL/);
   assert.match(applyJob, /Create target write token/);
   assert.match(applyJob, /Create state token/);
   assert.match(applyJob, /actions\/download-artifact@v8/);
   assert.match(applyJob, /name: \$\{\{ needs\.apply-proof\.outputs\.artifact_name \}\}/);
+  assert.doesNotMatch(applyJob, /action-ledger-proof/);
   assert.match(applyJob, /validate_coverage_proof_tree .* 8 262144 2097152/);
   assert.doesNotMatch(applyJob, /COVERAGE_PROOF_TRUSTED_STARTED_AT|proof-trust/);
   assert.match(applyJob, /target_repo.*PROOF_TARGET_REPO/);
@@ -1027,12 +1380,15 @@ test("apply workflow finalization retries only target status after checkpointed 
     "- name: Apply unchanged proposed decisions with checkpoints",
   );
   const finalStatusStart = applyJob.indexOf("- name: Retry final apply status publication");
+  const actionLedgerStart = applyJob.indexOf("- name: Publish apply action events");
   const continueStart = applyJob.indexOf("- name: Continue apply sweep");
   assert.ok(applyStart !== -1);
   assert.ok(finalStatusStart > applyStart);
-  assert.ok(continueStart > finalStatusStart);
+  assert.ok(actionLedgerStart > finalStatusStart);
+  assert.ok(continueStart > actionLedgerStart);
   const applyStep = applyJob.slice(applyStart, finalStatusStart);
-  const finalStatusStep = applyJob.slice(finalStatusStart, continueStart);
+  const finalStatusStep = applyJob.slice(finalStatusStart, actionLedgerStart);
+  const actionLedgerStep = applyJob.slice(actionLedgerStart, continueStart);
 
   const commentCheckpoint = applyStep.indexOf(
     'publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors',
@@ -1066,6 +1422,18 @@ test("apply workflow finalization retries only target status after checkpointed 
   assert.doesNotMatch(finalStatusStep, /--path\s+"?records(?:\/|\s)/);
   assert.doesNotMatch(finalStatusStep, /apply-report\.json/);
   assert.doesNotMatch(finalStatusStep, /results\/(?:apply|comment-sync)-cursors/);
+  assert.match(actionLedgerStep, /publish-action-events/);
+  assert.doesNotMatch(actionLedgerStep, /action-ledger-proof/);
+  assert.match(actionLedgerStep, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/);
+  assert.match(actionLedgerStep, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
+  assert.match(actionLedgerStep, /--expected-producer-job "\$GITHUB_JOB"/);
+  assert.match(actionLedgerStep, /cp "\$durable_event_path" "\$event_path"/);
+  assert.match(actionLedgerStep, /--message "chore: append apply action ledger"/);
+  assert.match(actionLedgerStep, /publish-action-event-paths/);
+  assert.match(actionLedgerStep, /--paths-file "\$event_paths_file"/);
+  assert.doesNotMatch(actionLedgerStep, /repair:publish-main/);
+  assert.doesNotMatch(actionLedgerStep, /continue-on-error: true/);
+  assert.match(actionLedgerStep, /no paths were imported[\s\S]*exit 1/i);
 });
 
 test("apply workflow does not queue runtime-yield continuation without cursor progress", () => {
@@ -1178,10 +1546,12 @@ test("apply workflow drops a coverage-proof tail only after exact trace examinat
 test("apply proof and mutation start from fresh non-persisted source checkouts", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const proofJobStart = workflow.indexOf("\n  apply-proof:");
+  const proofPublisherStart = workflow.indexOf("\n  publish-apply-proof-action-ledger:");
   const applyJobStart = workflow.indexOf("\n  apply-existing:");
   assert.notEqual(proofJobStart, -1);
+  assert.notEqual(proofPublisherStart, -1);
   assert.notEqual(applyJobStart, -1);
-  const proofJob = workflow.slice(proofJobStart, applyJobStart);
+  const proofJob = workflow.slice(proofJobStart, proofPublisherStart);
   const applyJob = workflow.slice(applyJobStart);
 
   assert.match(proofJob, /actions\/checkout@v7[\s\S]*?persist-credentials: false/);
@@ -1231,17 +1601,17 @@ test("sweep target tokens fall back when an org app installation is missing", ()
   );
   assert.ok(
     workflow.includes(
-      "if: ${{ success() && steps.target-write-token.outputs.token != '' && needs.plan.outputs.hot_intake != 'true'",
+      "if: ${{ always() && !cancelled() && steps.commit-review-records.outputs.records_published == 'true' && steps.target-write-token.outputs.token != '' && needs.plan.outputs.hot_intake != 'true'",
     ),
   );
   assert.ok(
     workflow.includes(
-      "if: ${{ success() && steps.target-write-token.outputs.token != '' && ((github.event_name == 'repository_dispatch'",
+      "if: ${{ always() && !cancelled() && steps.commit-review-records.outputs.records_published == 'true' && steps.target-write-token.outputs.token != '' && ((github.event_name == 'repository_dispatch'",
     ),
   );
   assert.ok(
     workflow.includes(
-      "if: ${{ success() && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}",
+      "if: ${{ always() && !cancelled() && steps.sync-selected-review-comments.outputs.sync_succeeded == 'true' && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}",
     ),
   );
   assert.doesNotMatch(workflow, new RegExp("OPENCLAW_" + "GH_TOKEN"));
@@ -1388,14 +1758,15 @@ test("event re-review status lets the durable queue reconcile interruptions", ()
   assert.doesNotMatch(block, /state="Superseded"/);
 });
 
-test("trusted comment router owns event ledger publication and capacity retries", () => {
+test("trusted comment router owns command ledger capacity retries", () => {
   const sweepWorkflow = readText(".github/workflows/sweep.yml");
   const routerWorkflow = readText(".github/workflows/repair-comment-router.yml");
   const eventStart = sweepWorkflow.indexOf("\n  event-review-apply:");
   const eventEnd = sweepWorkflow.indexOf("\n  target-fanout:", eventStart);
   const eventJob = sweepWorkflow.slice(eventStart, eventEnd);
 
-  assert.doesNotMatch(eventJob, /repair:publish-main/);
+  assert.match(eventJob, /publish-action-events/);
+  assert.match(eventJob, /publish-action-event-paths/);
   assert.doesNotMatch(eventJob, /count-command-actions/);
   assert.doesNotMatch(eventJob, /--wait-for-capacity/);
   assert.match(routerWorkflow, /Commit comment router ledger/);
@@ -1732,8 +2103,12 @@ test("target review queues coalesce background work without delaying exact plann
     workflow.indexOf("\n    outputs:", workflow.indexOf("\n  plan:")),
   );
 
-  assert.match(concurrencyBlock, /format\('clawsweeper-intake-v2-\{0\}', github\.run_id\)/);
-  assert.match(concurrencyBlock, /format\('clawsweeper-review-\{0\}', github\.run_id\)/);
+  assert.match(concurrencyBlock, /&& 'clawsweeper-intake-v2'/);
+  assert.match(concurrencyBlock, /\|\| 'clawsweeper-review'/);
+  assert.doesNotMatch(
+    concurrencyBlock,
+    /format\('clawsweeper-(?:intake-v2|review)-\{0\}', github\.run_id\)/,
+  );
   assert.match(
     concurrencyBlock,
     /github\.event\.client_payload\.queue_lease_id \|\| github\.event\.client_payload\.item_number/,
@@ -1877,9 +2252,44 @@ test("sweep exact event reviews consume only the immutable claimed decision", ()
   assert.match(reviewBlock, /detected media allowance \$\{media_proof_timeout_seconds\}s/);
   assert.doesNotMatch(reviewBlock, /review_timeout_seconds=.*media_proof_timeout_seconds/);
   assert.match(reviewBlock, /timeout --kill-after=30s "\$\{review_timeout_seconds\}s"/);
+  assert.match(reviewBlock, /echo "exit_code=\$review_exit_code" >> "\$GITHUB_OUTPUT"/);
   assert.match(reviewBlock, /--codex-timeout-ms "\$codex_timeout_ms"/);
   assert.doesNotMatch(reviewBlock, /timeout --kill-after=30s 12m/);
   assert.doesNotMatch(reviewBlock, /--codex-timeout-ms 600000/);
+});
+
+test("review finalizers recover start-only ledger attempts after hard timeout", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  for (const finalizerName of [
+    "Finalize exact event action ledger",
+    "Finalize review action ledger",
+  ]) {
+    const start = workflow.indexOf(`- name: ${finalizerName}`);
+    assert.ok(start >= 0, `missing ${finalizerName}`);
+    const block = workflow.slice(start, workflow.indexOf("\n      - name:", start + 1));
+    assert.match(block, /REVIEW_EXIT_CODE:/);
+    assert.match(block, /"124"/);
+    assert.match(block, /"137"/);
+    assert.match(block, /--interrupt-open-attempts --reason timeout/);
+    assert.match(block, /--interrupt-open-attempts --reason cancelled/);
+    assert.match(block, /--interrupt-open-attempts --reason workflow_failed/);
+    assert.ok(
+      block.indexOf("--reason cancelled") < block.indexOf("--reason timeout"),
+      "explicit cancellation must outrank timeout-like signal exits",
+    );
+  }
+});
+
+test("every action-ledger publication authenticates the expected producer job", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const commands = workflow.match(
+    /pnpm run --silent publish-action-events -- \\\n(?:\s+.*\\\n)*\s+--expected-producer-job [^\n]+/g,
+  );
+  assert.ok(commands);
+  assert.equal(commands.length, 8);
+  assert.ok(commands.every((command) => command.includes("--expected-producer-job")));
+  assert.match(workflow, /--expected-producer-job review/);
+  assert.match(workflow, /--expected-producer-job apply-proof/);
 });
 
 test("sweep exact event reviews preserve the configured fallback without an adaptive payload", () => {

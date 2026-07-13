@@ -17,7 +17,9 @@ import {
 } from "./action-ledger-files.js";
 import {
   ACTION_LEDGER_CANONICAL_JSON_LIMITS,
+  ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_SHARD_FILE_LIMITS,
+  ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
   actionEventShardsReplayEquivalent,
   actionAttemptId,
@@ -101,6 +103,9 @@ export const ACTION_EVENT_SHARD_IMPORT_LIMITS = {
   maxCausalBindings: 256 * ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents,
 } as const;
 
+export const ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS =
+  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents + ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * 4;
+
 export type WorkflowActionEventInput = {
   scope: string;
   identity: unknown;
@@ -141,7 +146,19 @@ export type WorkflowActionPhaseEventInput = Omit<
 export type ActionEventShardImportResult = {
   created: number;
   unchanged: number;
+  eventPaths: string[];
+  reservationPaths: string[];
+  completionPaths: string[];
   paths: string[];
+};
+
+export type ExpectedActionEventProducer = {
+  repository: string;
+  sha: string;
+  workflow: string;
+  job: string;
+  runId: string;
+  runAttempt: number;
 };
 
 type ImportedActionEventShard = {
@@ -215,7 +232,7 @@ type ActionEventLock = {
 
 export function workflowActionEventsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.CLAWSWEEPER_ACTION_LEDGER_DISABLED === "1") return false;
-  return env.GITHUB_ACTIONS === "true" || env.CLAWSWEEPER_ACTION_LEDGER_FORCE === "1";
+  return env.CLAWSWEEPER_ACTION_LEDGER_FORCE === "1";
 }
 
 export function workflowActionProducer(
@@ -406,6 +423,373 @@ export async function flushWorkflowActionEvents(
     paths.add(relativePath);
   }
   return [...paths].sort();
+}
+
+function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
+  return (
+    event.action.status === ACTION_EVENT_STATUSES.started &&
+    (event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+      event.event_type === ACTION_EVENT_TYPES.reviewItem ||
+      event.event_type === ACTION_EVENT_TYPES.reviewRetry ||
+      event.event_type === ACTION_EVENT_TYPES.applyBatch ||
+      event.event_type === ACTION_EVENT_TYPES.applyAction ||
+      event.event_type === ACTION_EVENT_TYPES.commandMutation)
+  );
+}
+
+function workflowActionEventIsUncertainMutationStart(event: ActionEvent): boolean {
+  return (
+    event.action.status === ACTION_EVENT_STATUSES.started &&
+    (event.event_type === ACTION_EVENT_TYPES.commandMutation ||
+      event.attributes?.completion_reason === "mutation_attempted" ||
+      event.attributes?.completion_reason === "dispatch_attempted")
+  );
+}
+
+function workflowActionEventIsMutationOutcome(event: ActionEvent): boolean {
+  return (
+    event.attributes?.completion_reason === "mutation_accepted" ||
+    event.attributes?.completion_reason === "mutation_rejected" ||
+    event.attributes?.completion_reason === "mutation_outcome_unknown"
+  );
+}
+
+function workflowActionRecoveryPriority(event: ActionEvent): number {
+  if (workflowActionEventIsUncertainMutationStart(event)) return 0;
+  if (
+    event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+    event.event_type === ACTION_EVENT_TYPES.applyBatch ||
+    (event.event_type === ACTION_EVENT_TYPES.reviewRetry && event.subject.kind === "workflow")
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+function workflowActionEventClosesLifecycle(start: ActionEvent, event: ActionEvent): boolean {
+  if (event.phase_seq <= start.phase_seq) return false;
+  if (event.action.status === ACTION_EVENT_STATUSES.started) return false;
+  if (workflowActionEventIsUncertainMutationStart(start)) {
+    return (
+      event.parent_event_id === start.event_id &&
+      event.idempotency_key_sha256 === start.idempotency_key_sha256
+    );
+  }
+  if (
+    (start.event_type === ACTION_EVENT_TYPES.applyAction ||
+      start.event_type === ACTION_EVENT_TYPES.reviewItem) &&
+    workflowActionEventIsMutationOutcome(event) &&
+    event.idempotency_key_sha256 !== start.idempotency_key_sha256
+  ) {
+    return false;
+  }
+  return !(
+    event.event_type === ACTION_EVENT_TYPES.applyAction &&
+    event.action.status === ACTION_EVENT_STATUSES.executed &&
+    !workflowActionEventIsUncertainMutationStart(start)
+  );
+}
+
+function interruptedWorkflowPhaseSeq(
+  current: readonly ActionEvent[],
+  start: ActionEvent,
+  parentEventId: string,
+): number {
+  const parent = current.find((event) => event.event_id === parentEventId);
+  const reservedTerminalPhase =
+    start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+    start.event_type === ACTION_EVENT_TYPES.applyBatch ||
+    (start.event_type === ACTION_EVENT_TYPES.reviewRetry && start.subject.kind === "workflow")
+      ? 1_000_000
+      : 0;
+  let phaseSeq = Math.max(
+    reservedTerminalPhase,
+    start.phase_seq + 1,
+    (parent?.phase_seq ?? start.phase_seq) + 1,
+  );
+  const occupied = new Set(
+    current
+      .filter(
+        (event) =>
+          event.operation_id === start.operation_id && event.attempt_id === start.attempt_id,
+      )
+      .map((event) => event.phase_seq),
+  );
+  while (occupied.has(phaseSeq)) {
+    if (phaseSeq === Number.MAX_SAFE_INTEGER) {
+      throw new Error("action event phase sequence exhausted during interruption recovery");
+    }
+    phaseSeq += 1;
+  }
+  return phaseSeq;
+}
+
+export function interruptOpenWorkflowActionEvents(
+  root: string,
+  options: {
+    env?: NodeJS.ProcessEnv;
+    now?: () => Date;
+    fetchImpl?: typeof fetch;
+    reasonCode?: ActionEventReasonCode;
+    eventTypes?: readonly string[];
+  } = {},
+): number {
+  const env = options.env ?? process.env;
+  if (!workflowActionEventsEnabled(env)) return 0;
+  const reasonCode = options.reasonCode ?? ACTION_EVENT_REASON_CODES.timeout;
+  if (
+    reasonCode !== ACTION_EVENT_REASON_CODES.timeout &&
+    reasonCode !== ACTION_EVENT_REASON_CODES.cancelled &&
+    reasonCode !== ACTION_EVENT_REASON_CODES.workflowFailed
+  ) {
+    throw new Error(`unsupported interrupted workflow action reason: ${reasonCode}`);
+  }
+  const eventTypes = options.eventTypes ? new Set(options.eventTypes) : null;
+  const recoverableStart = (event: ActionEvent) =>
+    workflowActionEventIsRecoverableStart(event) &&
+    (eventTypes === null || eventTypes.has(event.event_type));
+  const safeRoot = prepareSafeReadRoot(root, "action event spool");
+  const groups = [...groupWorkflowActionEvents(readAllSpooledActionEvents(safeRoot)).values()]
+    .filter((group) => group.some(recoverableStart))
+    .sort((left, right) => {
+      const leftKey = actionLedgerJson(left[0]!.producer);
+      const rightKey = actionLedgerJson(right[0]!.producer);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  let interrupted = 0;
+  for (const group of groups) {
+    const producer = group[0]!.producer;
+    interrupted += withWorkflowProducerLock(root, producer, () => {
+      const current = readAllSpooledActionEvents(safeRoot).filter(
+        (event) => actionLedgerJson(event.producer) === actionLedgerJson(producer),
+      );
+      const starts = current
+        .filter(recoverableStart)
+        .sort(
+          (left, right) =>
+            workflowActionRecoveryPriority(left) - workflowActionRecoveryPriority(right) ||
+            left.phase_seq - right.phase_seq ||
+            left.event_id.localeCompare(right.event_id),
+        );
+      let written = 0;
+      for (const start of starts) {
+        const lifecycleKey = workflowActionLifecycleKey(start);
+        const lifecycleEvents = current.filter(
+          (event) =>
+            event.event_id !== start.event_id && workflowActionLifecycleKey(event) === lifecycleKey,
+        );
+        if (lifecycleEvents.some((event) => workflowActionEventClosesLifecycle(start, event))) {
+          continue;
+        }
+        const uncertainMutationStarts = current
+          .filter(
+            (event) =>
+              event.operation_id === start.operation_id &&
+              event.attempt_id === start.attempt_id &&
+              (start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+                start.event_type === ACTION_EVENT_TYPES.applyBatch ||
+                (start.event_type === ACTION_EVENT_TYPES.reviewRetry &&
+                  start.subject.kind === "workflow") ||
+                actionLedgerJson(workflowActionSubjectIdentity(event)) ===
+                  actionLedgerJson(workflowActionSubjectIdentity(start))) &&
+              workflowActionEventIsUncertainMutationStart(event),
+          )
+          .sort(
+            (left, right) =>
+              left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+          );
+        const mutationEvents = current
+          .filter(
+            (event) =>
+              event.operation_id === start.operation_id &&
+              event.attempt_id === start.attempt_id &&
+              event.action.mutation,
+          )
+          .sort(
+            (left, right) =>
+              left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+          );
+        const lifecycleMutations = lifecycleEvents
+          .filter((event) => event.action.mutation)
+          .sort(
+            (left, right) =>
+              left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+          );
+        const lifecycleMutation = lifecycleMutations.at(-1);
+        const lifecycleOutcome = lifecycleEvents
+          .filter(workflowActionEventIsMutationOutcome)
+          .sort(
+            (left, right) =>
+              left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+          )
+          .at(-1);
+        const openUncertainMutationStarts = uncertainMutationStarts.filter((event) => {
+          const eventLifecycleKey = workflowActionLifecycleKey(event);
+          return !current.some(
+            (candidate) =>
+              candidate.event_id !== event.event_id &&
+              workflowActionLifecycleKey(candidate) === eventLifecycleKey &&
+              workflowActionEventClosesLifecycle(event, candidate),
+          );
+        });
+        const openUncertainMutation =
+          workflowActionEventIsUncertainMutationStart(start) ||
+          openUncertainMutationStarts.length > 0;
+        const aggregatesChildMutations =
+          start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+          start.event_type === ACTION_EVENT_TYPES.applyBatch ||
+          (start.event_type === ACTION_EVENT_TYPES.reviewRetry &&
+            start.subject.kind === "workflow");
+        const relevantMutationEvents = aggregatesChildMutations
+          ? mutationEvents
+          : lifecycleMutations;
+        const unknownMutationOutcome = relevantMutationEvents
+          .filter(
+            (event) =>
+              event.attributes?.completion_reason === "mutation_outcome_unknown" ||
+              event.attributes?.completion_reason === "dispatch_outcome_unknown",
+          )
+          .at(-1);
+        const uncertainMutation = openUncertainMutation || unknownMutationOutcome !== undefined;
+        const mutationOccurred =
+          workflowActionEventIsUncertainMutationStart(start) ||
+          (aggregatesChildMutations
+            ? mutationEvents.length > 0 || openUncertainMutation
+            : lifecycleMutation !== undefined || openUncertainMutation);
+        const openReceipt = workflowActionEventIsUncertainMutationStart(start)
+          ? start
+          : openUncertainMutationStarts.at(-1);
+        const parentEventId =
+          openReceipt?.event_id ??
+          (unknownMutationOutcome
+            ? unknownMutationOutcome.event_id
+            : start.event_type === ACTION_EVENT_TYPES.applyAction && lifecycleMutation
+              ? lifecycleMutation.event_id
+              : (lifecycleOutcome?.event_id ?? start.event_id));
+        const eventInput: ActionEventInput = {
+          eventKey: actionEventKey("workflow.interrupted", {
+            startEventId: start.event_id,
+            reasonCode,
+            mutationOccurred,
+          }),
+          operationId: start.operation_id,
+          attemptId: start.attempt_id,
+          parentEventId,
+          phaseSeq: interruptedWorkflowPhaseSeq(current, start, parentEventId),
+          idempotencyKeySha256:
+            workflowActionEventIsUncertainMutationStart(start) ||
+            start.event_type === ACTION_EVENT_TYPES.applyAction
+              ? start.idempotency_key_sha256
+              : actionIdempotencyKey({
+                  operationId: start.operation_id,
+                  slot: "interrupted_terminal",
+                  eventType: start.event_type,
+                  subject: workflowActionSubjectIdentity(start),
+                }),
+          type: start.event_type,
+          producer: workflowActionProducerInput(start.producer),
+          subject: workflowActionSubjectInput(start.subject),
+          action: {
+            name: start.event_type,
+            status:
+              reasonCode === ACTION_EVENT_REASON_CODES.cancelled
+                ? ACTION_EVENT_STATUSES.cancelled
+                : ACTION_EVENT_STATUSES.failed,
+            reasonCode,
+            retryable:
+              uncertainMutation && start.event_type === ACTION_EVENT_TYPES.commandMutation
+                ? true
+                : !uncertainMutation,
+            mutation: mutationOccurred,
+          },
+          ...(start.evidence === undefined
+            ? {}
+            : {
+                evidence: start.evidence.map((entry) => ({
+                  kind: entry.kind,
+                  ...(entry.sha256 === undefined ? {} : { sha256: entry.sha256 }),
+                  ...(entry.report_path === undefined ? {} : { reportPath: entry.report_path }),
+                  ...(entry.run_url === undefined ? {} : { runUrl: entry.run_url }),
+                  ...(entry.snapshot_id === undefined ? {} : { snapshotId: entry.snapshot_id }),
+                })),
+              }),
+          attributes: {
+            completion_reason: uncertainMutation
+              ? start.event_type === ACTION_EVENT_TYPES.reviewRetry
+                ? "dispatch_outcome_unknown"
+                : "mutation_outcome_unknown"
+              : reasonCode === ACTION_EVENT_REASON_CODES.timeout
+                ? "timeout"
+                : reasonCode === ACTION_EVENT_REASON_CODES.cancelled
+                  ? "cancelled"
+                  : "workflow_failed",
+            failed_count: 1,
+            ...(mutationOccurred ? { action_count: 1 } : {}),
+            partial: true,
+          },
+          privacy: {
+            classification: start.privacy.classification,
+            redactionVersion: start.privacy.redaction_version,
+            fieldsDropped: start.privacy.fields_dropped,
+          },
+        };
+        const writeOptions = { now: options.now ?? (() => new Date()) };
+        const candidate = createActionEvent(eventInput, writeOptions);
+        assertWorkflowProducerAcceptsEvent(root, candidate);
+        const partitionDate = readWorkflowPartitionDate(safeRoot, start.producer);
+        ensureWorkflowPartitionDateValue(root, start.producer, partitionDate);
+        const event = writeActionEvent(root, eventInput, writeOptions).event;
+        queueCrabFleetEvent(root, event, env, options.fetchImpl ?? fetch);
+        current.push(event);
+        written += 1;
+      }
+      return written;
+    });
+  }
+  return interrupted;
+}
+
+function workflowActionLifecycleKey(event: ActionEvent): string {
+  return actionLedgerJson({
+    operationId: event.operation_id,
+    attemptId: event.attempt_id,
+    eventType: event.event_type,
+    subject: workflowActionSubjectIdentity(event),
+  });
+}
+
+function workflowActionSubjectIdentity(event: ActionEvent) {
+  return {
+    repository: event.subject.repository,
+    kind: event.subject.kind,
+    ...(event.subject.subject_id === undefined ? {} : { subjectId: event.subject.subject_id }),
+    ...(event.subject.number === undefined ? {} : { number: event.subject.number }),
+    ...(event.subject.cluster_id === undefined ? {} : { clusterId: event.subject.cluster_id }),
+  };
+}
+
+function workflowActionProducerInput(producer: ActionEvent["producer"]): ActionEventProducer {
+  return {
+    repository: producer.repository,
+    sha: producer.sha,
+    workflow: producer.workflow,
+    job: producer.job,
+    runId: producer.run_id,
+    runAttempt: producer.run_attempt,
+    component: producer.component,
+  };
+}
+
+function workflowActionSubjectInput(subject: ActionEvent["subject"]): ActionEventSubject {
+  return {
+    repository: subject.repository,
+    kind: subject.kind,
+    ...(subject.subject_id === undefined ? {} : { subjectId: subject.subject_id }),
+    ...(subject.number === undefined ? {} : { number: subject.number }),
+    ...(subject.cluster_id === undefined ? {} : { clusterId: subject.cluster_id }),
+    ...(subject.source_revision === undefined ? {} : { sourceRevision: subject.source_revision }),
+    ...(subject.record_path === undefined ? {} : { recordPath: subject.record_path }),
+  };
 }
 
 function finalizeWorkflowActionEventSpool(
@@ -599,22 +983,49 @@ function startActionEventCrabFleetPost(
 export function importActionEventShards(
   sourceRoot: string,
   destinationRoot: string,
+  options: {
+    expectedProducer?: ExpectedActionEventProducer | undefined;
+    expectedEventPaths?: readonly string[] | undefined;
+  } = {},
 ): ActionEventShardImportResult {
+  const emptyResult = (): ActionEventShardImportResult => ({
+    created: 0,
+    unchanged: 0,
+    eventPaths: [],
+    reservationPaths: [],
+    completionPaths: [],
+    paths: [],
+  });
+  const expectedEventPaths = options.expectedEventPaths
+    ? validateExpectedActionEventPaths(options.expectedEventPaths)
+    : null;
   let safeSource: SafeReadRoot;
   try {
     safeSource = prepareSafeReadRoot(sourceRoot, "action event shard import source");
   } catch (error) {
-    if (isNotFoundError(error)) return { created: 0, unchanged: 0, paths: [] };
+    if (isNotFoundError(error) && expectedEventPaths === null) return emptyResult();
+    if (isNotFoundError(error)) {
+      throw new Error("action event shard manifest source root is missing");
+    }
     throw error;
   }
   let relativePaths: string[];
-  try {
-    relativePaths = collectActionEventShardFiles(safeSource);
-  } catch (error) {
-    if (isNotFoundError(error)) return { created: 0, unchanged: 0, paths: [] };
-    throw error;
+  if (expectedEventPaths) {
+    relativePaths = expectedEventPaths;
+  } else {
+    try {
+      relativePaths = collectActionEventShardFiles(safeSource);
+    } catch (error) {
+      if (isNotFoundError(error)) return emptyResult();
+      throw error;
+    }
   }
-  const shards = readImportedActionEventShards(safeSource, relativePaths);
+  const shards = readImportedActionEventShards(safeSource, relativePaths, {
+    requireManifestPaths: expectedEventPaths !== null,
+  });
+  if (options.expectedProducer) {
+    validateImportedActionEventProducer(shards, options.expectedProducer);
+  }
   const safeDestination = prepareSafeReadRoot(destinationRoot, "action event shard import");
   return withActionEventLock(
     safeDestination.path,
@@ -685,9 +1096,49 @@ export function importActionEventShards(
       for (const binding of bindings.completions) {
         publishActionEventShardImportBinding(binding);
       }
-      return { created, unchanged, paths: relativePaths };
+      const eventPaths = [...relativePaths].sort();
+      const reservationPaths = bindings.reservations.map((binding) => binding.relativePath).sort();
+      const completionPaths = bindings.completions.map((binding) => binding.relativePath).sort();
+      const paths = [...new Set([...reservationPaths, ...eventPaths, ...completionPaths])].sort();
+      if (paths.length > ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS) {
+        throw new Error(
+          `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS} publish path limit`,
+        );
+      }
+      return {
+        created,
+        unchanged,
+        eventPaths,
+        reservationPaths,
+        completionPaths,
+        paths,
+      };
     },
   );
+}
+
+function validateImportedActionEventProducer(
+  shards: readonly ImportedActionEventShard[],
+  expected: ExpectedActionEventProducer,
+): void {
+  for (const shard of shards) {
+    const actual = shard.identity;
+    const mismatched = (
+      [
+        ["repository", actual.repository, expected.repository],
+        ["sha", actual.sha, expected.sha],
+        ["workflow", actual.workflow, expected.workflow],
+        ["job", actual.job, expected.job],
+        ["run_id", actual.runId, expected.runId],
+        ["run_attempt", actual.runAttempt, expected.runAttempt],
+      ] as const
+    ).find(([, value, expectedValue]) => value !== expectedValue);
+    if (mismatched) {
+      throw new Error(
+        `action event shard producer provenance mismatch for ${mismatched[0]}: expected ${mismatched[2]}, got ${mismatched[1]}`,
+      );
+    }
+  }
 }
 
 function prepareActionEventShardImportBindings(
@@ -729,7 +1180,7 @@ function actionEventShardImportBindings(
       throw new Error("action event shard batch splits one producer run across partition dates");
     }
     producerRuns.set(producerKey, {
-      relativePath: path.join(
+      relativePath: path.posix.join(
         "ledger",
         "v1",
         "import-bindings",
@@ -882,7 +1333,7 @@ function importedActionEventIdentityBinding(
 }
 
 function importedActionEventIdentityBindingRelativePath(eventId: string): string {
-  return path.join("ledger", "v1", "import-bindings", "events", `${eventId}.json`);
+  return path.posix.join("ledger", "v1", "import-bindings", "events", `${eventId}.json`);
 }
 
 function readImportedActionEventIdentityBinding(
@@ -933,6 +1384,7 @@ function readImportedActionEventIdentityBinding(
 function readImportedActionEventShards(
   source: SafeReadRoot,
   relativePaths: readonly string[],
+  options: { requireManifestPaths?: boolean } = {},
 ): ImportedActionEventShard[] {
   let totalBytes = 0;
   const contents = relativePaths.map((relativePath) => {
@@ -940,7 +1392,15 @@ function readImportedActionEventShards(
       throw new Error(`invalid action event shard path: ${relativePath}`);
     }
     const target = prepareSafeReadTarget(source, relativePath, "action event shard import source");
-    const content = readUtf8FileNoFollow(target, ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes);
+    let content: string;
+    try {
+      content = readUtf8FileNoFollow(target, ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes);
+    } catch (error) {
+      if (options.requireManifestPaths && isNotFoundError(error)) {
+        throw new Error(`action event shard manifest path is missing: ${relativePath}`);
+      }
+      throw error;
+    }
     const bytes = Buffer.byteLength(content, "utf8");
     totalBytes += bytes;
     if (totalBytes > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes) {
@@ -973,6 +1433,30 @@ function readImportedActionEventShards(
   }));
   validateCanonicalImportedShardBatch(validated);
   return validated;
+}
+
+function validateExpectedActionEventPaths(paths: readonly string[]): string[] {
+  if (paths.length === 0) {
+    throw new Error("action event shard manifest is empty");
+  }
+  if (paths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+    throw new Error(
+      `action event shard manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} event paths`,
+    );
+  }
+  const canonical = [...new Set(paths)].sort();
+  if (
+    canonical.length !== paths.length ||
+    canonical.some((value, index) => value !== paths[index])
+  ) {
+    throw new Error("action event shard manifest paths must be sorted and unique");
+  }
+  for (const relativePath of canonical) {
+    if (!ACTION_EVENT_SHARD_PATH_PATTERN.test(relativePath)) {
+      throw new Error(`invalid action event shard manifest path: ${relativePath}`);
+    }
+  }
+  return canonical;
 }
 
 function importedShardReplayEquivalent(
@@ -1983,7 +2467,7 @@ function collectActionEventShardFiles(root: SafeReadRoot): string[] {
       throw new Error(`refusing unsafe action event shard import entry: ${relativePath}`);
     }
   };
-  visit(path.join("ledger", "v1", "events"), 0);
+  visit(path.posix.join("ledger", "v1", "events"), 0);
   return files.sort();
 }
 

@@ -183,6 +183,25 @@ import {
   type ReviewHistoryLedger,
 } from "./review-history.js";
 import { trailingHtmlComments } from "./review-comment-markers.js";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+  type ActionEvent,
+  type ActionEventEvidence,
+  type ActionEventReasonCode,
+  type ActionEventStatus,
+  type ActionEventSubject,
+} from "./action-ledger.js";
+import {
+  ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS,
+  flushWorkflowActionEvents,
+  importActionEventShards,
+  interruptOpenWorkflowActionEvents,
+  recordWorkflowPhaseEvent,
+  workflowActionProducer,
+} from "./action-ledger-runtime.js";
+import { publishMainCommit } from "./repair/git-publish.js";
 
 export {
   codexEnv,
@@ -241,6 +260,7 @@ type FailedReviewRetryAction =
   | "skipped_retry_exhausted"
   | "skipped_live_fetch_failed"
   | "skipped_dispatch_failed"
+  | "skipped_retry_dispatch_uncertain"
   | "skipped_runtime_budget";
 type TriagePriority = "P0" | "P1" | "P2" | "P3" | "none";
 type ImpactLabelName =
@@ -378,6 +398,7 @@ type ActionTaken =
   | "skipped_maintainer_authored"
   | "skipped_protected_label"
   | "skipped_close_exempt_label"
+  | "skipped_low_signal_live_guard"
   | "skipped_pr_close_coverage_proof"
   | "retry_pr_close_coverage_proof"
   | "retry_stale_canonical_comment_sync"
@@ -442,8 +463,22 @@ type AcquiredReviewStartLease = {
 };
 
 type ReviewStartStatusCommentResult =
-  | { status: "posted"; lease: AcquiredReviewStartLease }
-  | { status: "held"; lease: null; retryAt: string };
+  | { status: "posted"; lease: AcquiredReviewStartLease; didMutate: true }
+  | { status: "held"; lease: null; retryAt: string; didMutate: boolean };
+
+function heldReviewStartStatusCommentResult(
+  retryAt: string,
+  didMutate: boolean,
+): ReviewStartStatusCommentResult {
+  return { status: "held", lease: null, retryAt, didMutate };
+}
+
+export function heldReviewStartStatusCommentResultForTest(
+  retryAt: string,
+  didMutate: boolean,
+): ReviewStartStatusCommentResult {
+  return heldReviewStartStatusCommentResult(retryAt, didMutate);
+}
 
 interface ExistingReview {
   path: string;
@@ -981,6 +1016,8 @@ interface ApplyResult {
   number: number;
   action: ActionTaken;
   reason: string;
+  mutationOccurred?: boolean;
+  commentMutationOccurred?: boolean;
   durableReviewSynced?: boolean;
   terminalMissingVerified?: boolean;
   terminalStateVerified?: boolean;
@@ -1795,6 +1832,7 @@ const EVENT_GUARDED_OPEN_ACTIONS = new Set<string>([
   "skipped_open_closing_pr",
   "skipped_protected_label",
   "skipped_close_exempt_label",
+  "skipped_low_signal_live_guard",
   "skipped_same_author_pair",
 ]);
 
@@ -2336,6 +2374,7 @@ interface GitHubRuntimeBudget {
   startedAtMs: number;
   maxRuntimeMs: number;
   onYield?: (reason: string, resumeCurrent?: boolean) => void;
+  onFailure?: (error: unknown) => void;
   yieldReason?: string;
 }
 
@@ -2416,10 +2455,13 @@ function sleepBeforeGitHubRetry(waitMs: number): void {
   sleepMs(waitMs);
 }
 
-function gh(args: string[]): string {
-  const timeoutMs = githubCommandTimeoutMs();
+function ghWithPreparedTimeout(args: string[], timeoutMs: number | undefined): string {
   if (args[0] === "api") return run("gh", args, { timeoutMs });
   return run("gh", ["--repo", targetRepo(), ...args], { timeoutMs });
+}
+
+function gh(args: string[]): string {
+  return ghWithPreparedTimeout(args, githubCommandTimeoutMs());
 }
 
 function ghOnce(args: string[], timeoutMs: number): string {
@@ -2455,6 +2497,35 @@ function ghOnce(args: string[], timeoutMs: number): string {
 function sleepMs(milliseconds: number): void {
   if (milliseconds <= 0) return;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function untrustedCodexEnv(
+  options: {
+    ghToken?: string | undefined;
+    preserveCodexAuth?: boolean | undefined;
+  } = {},
+): NodeJS.ProcessEnv {
+  const env = codexEnv(options);
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("CLAWSWEEPER_ACTION_LEDGER_")) delete env[key];
+  }
+  return env;
+}
+
+export function untrustedCodexEnvForTest(
+  env: NodeJS.ProcessEnv,
+  options: {
+    ghToken?: string | undefined;
+    preserveCodexAuth?: boolean | undefined;
+  } = {},
+): NodeJS.ProcessEnv {
+  const previousEnv = process.env;
+  try {
+    process.env = { ...env };
+    return untrustedCodexEnv(options);
+  } finally {
+    process.env = previousEnv;
+  }
 }
 
 let lastThrottleHeartbeatAt = 0;
@@ -2526,11 +2597,16 @@ function maybePublishThrottleHeartbeat(options: {
   }
 }
 
-function ghWithRetry(args: string[], attempts = 12): string {
+type GitHubRetryOptions = {
+  request?: ((args: string[], attempt: number) => string) | undefined;
+  sleepBeforeRetry?: ((waitMs: number) => void) | undefined;
+};
+
+function ghWithRetry(args: string[], attempts = 12, options: GitHubRetryOptions = {}): string {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      return gh(args);
+      return options.request?.(args, attempt) ?? gh(args);
     } catch (error) {
       if (error instanceof GitHubRuntimeBudgetError) throw error;
       lastError = error;
@@ -2547,17 +2623,207 @@ function ghWithRetry(args: string[], attempts = 12): string {
       if (retryKind === "throttle") {
         maybePublishThrottleHeartbeat({ args, attempt, attempts, waitMs });
       }
-      sleepBeforeGitHubRetry(waitMs);
+      if (options.sleepBeforeRetry) options.sleepBeforeRetry(waitMs);
+      else sleepBeforeGitHubRetry(waitMs);
     }
   }
   throw lastError;
 }
 
-function ghRawOnceWithCheckpoint(args: string[], onBeforeRun: () => void): string {
+type MutationRunner = <T>(options: {
+  identity: string;
+  idempotencyIdentity: string;
+  operation: () => T;
+  didMutate?: ((result: T) => boolean) | undefined;
+  knownNoMutation?: ((error: unknown) => boolean) | undefined;
+}) => T;
+
+let activeApplyMutationRunner: MutationRunner | null = null;
+let activeReviewMutationRunner: MutationRunner | null = null;
+
+function mutationErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function runObservedApplyMutation<T>(options: {
+  identity: string;
+  idempotencyIdentity?: string | undefined;
+  operation: () => T;
+  onMutation?: (() => void) | undefined;
+  didMutate?: ((result: T) => boolean) | undefined;
+  knownNoMutation?: ((error: unknown) => boolean) | undefined;
+}): T {
+  const runner = activeApplyMutationRunner ?? activeReviewMutationRunner;
+  if (runner) {
+    return runner({
+      identity: options.identity,
+      idempotencyIdentity: options.idempotencyIdentity ?? options.identity,
+      operation: options.operation,
+      ...(options.didMutate ? { didMutate: options.didMutate } : {}),
+      ...(options.knownNoMutation ? { knownNoMutation: options.knownNoMutation } : {}),
+    });
+  }
+  const result = options.operation();
+  if (options.didMutate?.(result) ?? true) options.onMutation?.();
+  return result;
+}
+
+function ghObservedMutationCommand(options: {
+  identity: string;
+  args: string[];
+  attempts?: number | undefined;
+  onMutation?: (() => void) | undefined;
+  didMutate?: ((result: string) => boolean) | undefined;
+  knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  request?: ((args: string[], attempt: number) => string) | undefined;
+  prepareRequest?: ((args: string[], attempt: number) => () => string) | undefined;
+  sleepBeforeRetry?: ((waitMs: number) => void) | undefined;
+}): string {
+  return ghWithRetry(options.args, options.attempts ?? 12, {
+    request: (args, attempt) => {
+      let operation: () => string;
+      if (options.prepareRequest) {
+        operation = options.prepareRequest(args, attempt);
+      } else if (options.request) {
+        const request = options.request;
+        operation = () => request(args, attempt);
+      } else {
+        const timeoutMs = githubCommandTimeoutMs();
+        operation = () => ghWithPreparedTimeout(args, timeoutMs);
+      }
+      return runObservedApplyMutation({
+        identity: `${options.identity}:request_attempt:${attempt + 1}`,
+        idempotencyIdentity: options.identity,
+        operation,
+        ...(options.onMutation ? { onMutation: options.onMutation } : {}),
+        ...(options.didMutate ? { didMutate: options.didMutate } : {}),
+        ...(options.knownNoMutation ? { knownNoMutation: options.knownNoMutation } : {}),
+      });
+    },
+    ...(options.sleepBeforeRetry ? { sleepBeforeRetry: options.sleepBeforeRetry } : {}),
+  });
+}
+
+export function observedGitHubMutationAttemptsForTest(
+  outcomes: readonly ("not_started" | "transient" | "accepted" | "already_exists")[],
+): Array<{
+  identity: string;
+  idempotencyIdentity: string;
+  outcome: "accepted" | "rejected" | "unknown";
+}> {
+  const receipts: Array<{
+    identity: string;
+    idempotencyIdentity: string;
+    outcome: "accepted" | "rejected" | "unknown";
+  }> = [];
+  const previousRunner = activeApplyMutationRunner;
+  activeApplyMutationRunner = <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    try {
+      const result = options.operation();
+      receipts.push({
+        identity: options.identity,
+        idempotencyIdentity: options.idempotencyIdentity,
+        outcome: options.didMutate?.(result) === false ? "rejected" : "accepted",
+      });
+      return result;
+    } catch (error) {
+      receipts.push({
+        identity: options.identity,
+        idempotencyIdentity: options.idempotencyIdentity,
+        outcome: options.knownNoMutation?.(error) === true ? "rejected" : "unknown",
+      });
+      throw error;
+    }
+  };
+  try {
+    ghObservedMutationCommand({
+      identity: "test_mutation",
+      args: ["api", "test"],
+      attempts: outcomes.length,
+      knownNoMutation: labelAlreadyExistsError,
+      prepareRequest: (_args, attempt) => {
+        const outcome = outcomes[attempt];
+        if (outcome === "not_started") {
+          throw new GitHubRuntimeBudgetError("max runtime reached before GitHub operation");
+        }
+        return () => {
+          if (outcome === "accepted") return "ok";
+          if (outcome === "already_exists") throw new Error("label already exists");
+          throw new Error("HTTP 502: transient upstream failure");
+        };
+      },
+      sleepBeforeRetry: () => {},
+    });
+  } catch {
+    // The receipts are the assertion surface for rejected terminal attempts.
+  } finally {
+    activeApplyMutationRunner = previousRunner;
+  }
+  return receipts;
+}
+
+export type GitHubDispatchOutcome =
+  | "definitely_not_dispatched"
+  | "ambiguous_transport"
+  | "accepted";
+
+class GitHubDispatchError extends Error {
+  readonly outcome: Exclude<GitHubDispatchOutcome, "accepted">;
+  readonly cause: unknown;
+
+  constructor(outcome: Exclude<GitHubDispatchOutcome, "accepted">, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "GitHubDispatchError";
+    this.outcome = outcome;
+    this.cause = cause;
+  }
+}
+
+function classifyGitHubDispatchResult(options: {
+  status: number | null;
+  signal?: NodeJS.Signals | null | undefined;
+  errorCode?: string | undefined;
+  stderr?: string | undefined;
+}): GitHubDispatchOutcome {
+  if (options.signal) return "ambiguous_transport";
+  if (options.errorCode) {
+    return options.errorCode === "ETIMEDOUT" || options.errorCode === "ENOBUFS"
+      ? "ambiguous_transport"
+      : "definitely_not_dispatched";
+  }
+  if (options.status === 0) return "accepted";
+  if (options.status === null) return "ambiguous_transport";
+  const error = new Error(options.stderr?.trim() || `GitHub dispatch exited ${options.status}`);
+  return ghRetryKind(error) === "none" ? "definitely_not_dispatched" : "ambiguous_transport";
+}
+
+export function classifyGitHubDispatchResultForTest(options: {
+  status: number | null;
+  signal?: NodeJS.Signals | null | undefined;
+  errorCode?: string | undefined;
+  stderr?: string | undefined;
+}): GitHubDispatchOutcome {
+  return classifyGitHubDispatchResult(options);
+}
+
+function ghRawOnceWithCheckpoint(
+  args: string[],
+  onBeforeRun: () => void,
+): { outcome: "accepted"; output: string } {
   const env = { ...process.env };
   const command = resolveSpawnCommand("gh", args, { cwd: ROOT, env });
   const timeoutMs = githubCommandTimeoutMs();
-  onBeforeRun();
+  try {
+    onBeforeRun();
+  } catch (error) {
+    throw new GitHubDispatchError("definitely_not_dispatched", error);
+  }
   const result = spawnSync(command.command, command.args, {
     cwd: ROOT,
     encoding: "utf8",
@@ -2568,16 +2834,37 @@ function ghRawOnceWithCheckpoint(args: string[], onBeforeRun: () => void): strin
     ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   if (result.error) {
+    const errorCode = (result.error as NodeJS.ErrnoException).code;
     if (timeoutMs !== undefined && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-      throw githubRuntimeBudgetError("during GitHub dispatch");
+      throw new GitHubDispatchError(
+        "ambiguous_transport",
+        githubRuntimeBudgetError("during GitHub dispatch"),
+      );
     }
-    throw result.error;
+    throw new GitHubDispatchError(
+      classifyGitHubDispatchResult({
+        status: result.status,
+        signal: result.signal,
+        ...(errorCode ? { errorCode } : {}),
+      }) as Exclude<GitHubDispatchOutcome, "accepted">,
+      result.error,
+    );
   }
   if (result.status !== 0) {
     const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-    throw new Error([`Command failed: gh ${args.join(" ")}`, stderr].filter(Boolean).join("\n"));
+    const error = new Error(
+      [`Command failed: gh ${args.join(" ")}`, stderr].filter(Boolean).join("\n"),
+    );
+    throw new GitHubDispatchError(
+      classifyGitHubDispatchResult({
+        status: result.status,
+        signal: result.signal,
+        stderr,
+      }) as Exclude<GitHubDispatchOutcome, "accepted">,
+      error,
+    );
   }
-  return (result.stdout ?? "").trim();
+  return { outcome: "accepted", output: (result.stdout ?? "").trim() };
 }
 
 function ghJson<T>(args: string[]): T {
@@ -6465,8 +6752,9 @@ function isRetryableCloseSkipReport(markdown: string): boolean {
 }
 
 function isRetryableKeptOpenCloseReport(markdown: string): boolean {
+  const action = frontMatterValue(markdown, "action_taken");
   return (
-    frontMatterValue(markdown, "action_taken") === "kept_open" &&
+    (action === "kept_open" || action === "skipped_low_signal_live_guard") &&
     hasHighConfidenceAllowedCloseMetadata(markdown)
   );
 }
@@ -6982,6 +7270,21 @@ function failedReviewRetryEligibility(options: {
     reportRevision.kind === "pull_head_sha"
       ? `head ${reportRevision.value}`
       : `source revision ${reportRevision.value}`;
+  const storedRevision = storedFailedReviewRetryRevision(options.markdown);
+  if (
+    frontMatterValue(options.markdown, "failed_review_retry_status") === "dispatching" &&
+    storedRevision &&
+    sameFailedReviewRetryRevision(storedRevision, reportRevision)
+  ) {
+    return {
+      repo,
+      number,
+      action: "skipped_retry_dispatch_uncertain",
+      reason: `dispatch outcome is uncertain for ${revisionDescription}; refusing a duplicate launch`,
+      ...failedReviewRetryResultRevision(reportRevision),
+      attempts,
+    };
+  }
   if (attempts >= options.maxAttempts) {
     return {
       repo,
@@ -8996,6 +9299,55 @@ class CodexReviewError extends Error {
   }
 }
 
+function codexReviewFailureRetryable(error: unknown): boolean {
+  return error instanceof CodexReviewError ? error.retryable : true;
+}
+
+function combinedCodexReviewError(
+  initialError: CodexReviewError,
+  retryError: CodexReviewError,
+  reasoningEffort: string,
+): CodexReviewError {
+  return new CodexReviewError({
+    message: `${initialError.message}\nFinal ${reasoningEffort}-reasoning retry also failed: ${retryError.message}`,
+    status: retryError.status ?? initialError.status,
+    stdout: retryError.stdout || initialError.stdout,
+    stderr: initialError.stderr || retryError.stderr,
+    errorCode: initialError.errorCode ?? retryError.errorCode,
+    signal: initialError.signal ?? retryError.signal,
+    retryable: retryError.retryable,
+  });
+}
+
+export function codexReviewFailureRetryableForTest(retryable: boolean): boolean {
+  return codexReviewFailureRetryable(
+    new CodexReviewError({
+      message: "test Codex failure",
+      status: 1,
+      retryable,
+    }),
+  );
+}
+
+export function combinedCodexReviewRetryableForTest(
+  initialRetryable: boolean,
+  finalRetryable: boolean,
+): boolean {
+  return combinedCodexReviewError(
+    new CodexReviewError({
+      message: "initial Codex failure",
+      status: 1,
+      retryable: initialRetryable,
+    }),
+    new CodexReviewError({
+      message: "final Codex failure",
+      status: 1,
+      retryable: finalRetryable,
+    }),
+    "high",
+  ).retryable;
+}
+
 function openclawDirtyStatus(openclawDir: string): string {
   return run("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
     cwd: openclawDir,
@@ -9151,7 +9503,7 @@ export function runCodex(options: {
         ],
         cwd: options.openclawDir,
         env: {
-          ...codexEnv({
+          ...untrustedCodexEnv({
             ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN,
             preserveCodexAuth: options.preserveCodexAuth,
           }),
@@ -9267,15 +9619,7 @@ export function runCodex(options: {
       return runReviewPass(options.reasoningEffort, 1);
     } catch (retryError) {
       if (!(retryError instanceof CodexReviewError)) throw retryError;
-      throw new CodexReviewError({
-        message: `${error.message}\nFinal ${options.reasoningEffort}-reasoning retry also failed: ${retryError.message}`,
-        status: retryError.status ?? error.status,
-        stdout: retryError.stdout || error.stdout,
-        stderr: error.stderr || retryError.stderr,
-        errorCode: error.errorCode ?? retryError.errorCode,
-        signal: error.signal ?? retryError.signal,
-        retryable: error.retryable,
-      });
+      throw combinedCodexReviewError(error, retryError, options.reasoningEffort);
     }
   }
 }
@@ -9495,7 +9839,7 @@ function runCodexAssist(options: {
       "-",
     ],
     cwd: ROOT,
-    env: { ...codexEnv(), GH_CONFIG_DIR: emptyGitHubConfigDir },
+    env: { ...untrustedCodexEnv(), GH_CONFIG_DIR: emptyGitHubConfigDir },
     input: prompt,
     timeoutMs: options.timeoutMs,
   });
@@ -12912,24 +13256,61 @@ export function mergeRiskLabelsForTest(
   );
 }
 
-function ensurePriorityLabel(label: PriorityLabelSpec): void {
+function removeIssueLabel(number: number, label: string, onMutation?: () => void): void {
+  ghObservedMutationCommand({
+    identity: `issue_label_remove:${number}:${label}`,
+    args: ["issue", "edit", String(number), "--remove-label", label],
+    onMutation,
+  });
+}
+
+function addIssueLabel(number: number, label: string, onMutation?: () => void): void {
+  ghObservedMutationCommand({
+    identity: `issue_label_add:${number}:${label}`,
+    args: ["issue", "edit", String(number), "--add-label", label],
+    onMutation,
+    knownNoMutation: (error) => missingLabelError(error, label) || labelCapacityError(error),
+  });
+}
+
+function labelAlreadyExistsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already exists/i.test(message);
+}
+
+export function isGitHubLabelAlreadyExistsErrorForTest(message: string): boolean {
+  return labelAlreadyExistsError(new Error(message));
+}
+
+function ensurePriorityLabel(label: PriorityLabelSpec, onMutation?: () => void): void {
   try {
-    ghWithRetry(
-      ["label", "create", label.name, "--color", label.color, "--description", label.description],
-      2,
-    );
+    ghObservedMutationCommand({
+      identity: `label_create:${label.name}`,
+      args: [
+        "label",
+        "create",
+        label.name,
+        "--color",
+        label.color,
+        "--description",
+        label.description,
+      ],
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
-function ensureImpactLabel(name: ImpactLabelName): void {
+function ensureImpactLabel(name: ImpactLabelName, onMutation?: () => void): void {
   const definition = IMPACT_LABELS.find((label) => label.name === name);
   if (!definition) return;
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -12938,20 +13319,22 @@ function ensureImpactLabel(name: ImpactLabelName): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
-function ensureMergeRiskLabel(name: MergeRiskLabelName): void {
+function ensureMergeRiskLabel(name: MergeRiskLabelName, onMutation?: () => void): void {
   const definition = MERGE_RISK_LABELS.find((label) => label.name === name);
   if (!definition) return;
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -12960,11 +13343,12 @@ function ensureMergeRiskLabel(name: MergeRiskLabelName): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
@@ -13238,7 +13622,7 @@ function issueAdvisoryLabelStateFromReport(
   };
 }
 
-function ensureIssueAdvisorySyncLabel(name: string): void {
+function ensureIssueAdvisorySyncLabel(name: string, onMutation?: () => void): void {
   const definition =
     ISSUE_ADVISORY_LABELS.find((label) => label.name === name) ??
     (name.toLowerCase() === GOOD_FIRST_ISSUE_LABEL
@@ -13249,8 +13633,9 @@ function ensureIssueAdvisorySyncLabel(name: string): void {
       : undefined);
   if (!definition) return;
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -13259,20 +13644,22 @@ function ensureIssueAdvisorySyncLabel(name: string): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
-function ensureMaturityLabel(name: MaturityLabelName): void {
+function ensureMaturityLabel(name: MaturityLabelName, onMutation?: () => void): void {
   const definition = MATURITY_LABELS.find((label) => label.name === name);
   if (!definition) return;
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -13281,11 +13668,12 @@ function ensureMaturityLabel(name: MaturityLabelName): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
@@ -13294,6 +13682,7 @@ function syncPriorityLabel(options: {
   labels: readonly string[];
   triagePriority: TriagePriority;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextPriorityLabels(options.labels, options.triagePriority);
   const labelsToRemove = options.labels.filter(
@@ -13307,10 +13696,10 @@ function syncPriorityLabel(options: {
   if (options.dryRun) return { labels: nextLabels, changed };
   if (labelToAdd) {
     const priorityLabel = PRIORITY_LABELS.find((label) => label.name === labelToAdd);
-    if (priorityLabel) ensurePriorityLabel(priorityLabel);
+    if (priorityLabel) ensurePriorityLabel(priorityLabel, options.onMutation);
   }
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   const added =
@@ -13319,6 +13708,7 @@ function syncPriorityLabel(options: {
       number: options.number,
       label: labelToAdd,
       currentLabels: syncedLabels,
+      onMutation: options.onMutation,
     });
   if (added) syncedLabels.push(labelToAdd);
   return { labels: syncedLabels, changed: labelsToRemove.length > 0 || added };
@@ -13329,6 +13719,7 @@ function syncImpactLabels(options: {
   labels: readonly string[];
   impactLabels: readonly ImpactLabelName[];
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextImpactLabels(options.labels, options.impactLabels);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13344,13 +13735,20 @@ function syncImpactLabels(options: {
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   let added = false;
   for (const label of labelsToAdd) {
-    ensureImpactLabel(label);
-    if (tryAddOptionalLabel({ number: options.number, label, currentLabels: syncedLabels })) {
+    ensureImpactLabel(label, options.onMutation);
+    if (
+      tryAddOptionalLabel({
+        number: options.number,
+        label,
+        currentLabels: syncedLabels,
+        onMutation: options.onMutation,
+      })
+    ) {
       syncedLabels.push(label);
       added = true;
     }
@@ -13363,6 +13761,7 @@ function syncMaturityLabels(options: {
   labels: readonly string[];
   maturityLabels: readonly MaturityLabelName[];
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextMaturityLabels(options.labels, options.maturityLabels);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13378,13 +13777,20 @@ function syncMaturityLabels(options: {
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   let added = false;
   for (const label of labelsToAdd) {
-    ensureMaturityLabel(label);
-    if (tryAddOptionalLabel({ number: options.number, label, currentLabels: syncedLabels })) {
+    ensureMaturityLabel(label, options.onMutation);
+    if (
+      tryAddOptionalLabel({
+        number: options.number,
+        label,
+        currentLabels: syncedLabels,
+        onMutation: options.onMutation,
+      })
+    ) {
       syncedLabels.push(label);
       added = true;
     }
@@ -13397,6 +13803,7 @@ function syncMergeRiskLabels(options: {
   labels: readonly string[];
   mergeRiskLabels: readonly MergeRiskLabelName[];
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextMergeRiskLabels(options.labels, options.mergeRiskLabels);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13412,13 +13819,20 @@ function syncMergeRiskLabels(options: {
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   let added = false;
   for (const label of labelsToAdd) {
-    ensureMergeRiskLabel(label);
-    if (tryAddOptionalLabel({ number: options.number, label, currentLabels: syncedLabels })) {
+    ensureMergeRiskLabel(label, options.onMutation);
+    if (
+      tryAddOptionalLabel({
+        number: options.number,
+        label,
+        currentLabels: syncedLabels,
+        onMutation: options.onMutation,
+      })
+    ) {
       syncedLabels.push(label);
       added = true;
     }
@@ -13431,6 +13845,7 @@ function syncIssueAdvisoryLabels(options: {
   labels: readonly string[];
   state: IssueAdvisoryLabelState;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextIssueAdvisoryLabels(options.labels, options.state);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13453,13 +13868,20 @@ function syncIssueAdvisoryLabels(options: {
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   let added = false;
   for (const label of labelsToAdd) {
-    ensureIssueAdvisorySyncLabel(label);
-    if (tryAddOptionalLabel({ number: options.number, label, currentLabels: syncedLabels })) {
+    ensureIssueAdvisorySyncLabel(label, options.onMutation);
+    if (
+      tryAddOptionalLabel({
+        number: options.number,
+        label,
+        currentLabels: syncedLabels,
+        onMutation: options.onMutation,
+      })
+    ) {
       syncedLabels.push(label);
       added = true;
     }
@@ -13472,6 +13894,7 @@ function syncTelegramVisibleProofLabel(options: {
   labels: readonly string[];
   proof: Pick<TelegramVisibleProof, "status">;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextTelegramVisibleProofLabels(options.labels, options.proof);
   const hadLabel = options.labels.includes(TELEGRAM_VISIBLE_PROOF_LABEL);
@@ -13479,34 +13902,30 @@ function syncTelegramVisibleProofLabel(options: {
   const changed = hadLabel !== wantsLabel;
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
-  if (wantsLabel) ensureTelegramVisibleProofLabel();
+  if (wantsLabel) ensureTelegramVisibleProofLabel(options.onMutation);
   if (wantsLabel) {
     if (
       !tryAddOptionalLabel({
         number: options.number,
         label: TELEGRAM_VISIBLE_PROOF_LABEL,
         currentLabels: options.labels,
+        onMutation: options.onMutation,
       })
     ) {
       return { labels: [...options.labels], changed: false };
     }
   } else {
-    ghWithRetry([
-      "issue",
-      "edit",
-      String(options.number),
-      "--remove-label",
-      TELEGRAM_VISIBLE_PROOF_LABEL,
-    ]);
+    removeIssueLabel(options.number, TELEGRAM_VISIBLE_PROOF_LABEL, options.onMutation);
   }
   return { labels: nextLabels, changed };
 }
 
-function ensurePrRatingLabel(tier: PrRatingTier): void {
+function ensurePrRatingLabel(tier: PrRatingTier, onMutation?: () => void): void {
   const definition = ratingLabelForTier(tier);
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -13515,18 +13934,20 @@ function ensurePrRatingLabel(tier: PrRatingTier): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
-function ensureFeatureShowcaseLabel(): void {
+function ensureFeatureShowcaseLabel(onMutation?: () => void): void {
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${FEATURE_SHOWCASE_LABEL}`,
+      args: [
         "label",
         "create",
         FEATURE_SHOWCASE_LABEL,
@@ -13535,19 +13956,21 @@ function ensureFeatureShowcaseLabel(): void {
         "--description",
         FEATURE_SHOWCASE_LABEL_DESCRIPTION,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
-function ensurePrStatusLabel(kind: PrStatusLabelKind): void {
+function ensurePrStatusLabel(kind: PrStatusLabelKind, onMutation?: () => void): void {
   const definition = prStatusLabelForKind(kind);
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -13556,11 +13979,12 @@ function ensurePrStatusLabel(kind: PrStatusLabelKind): void {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
@@ -13574,18 +13998,20 @@ function syncFeatureShowcaseLabel(options: {
   securityReview: Pick<SecurityReview, "status">;
   overallCorrectness: OverallCorrectness;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextFeatureShowcaseLabels(options.labels, options);
   const changed =
     nextLabels.includes(FEATURE_SHOWCASE_LABEL) && !options.labels.includes(FEATURE_SHOWCASE_LABEL);
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
-  ensureFeatureShowcaseLabel();
+  ensureFeatureShowcaseLabel(options.onMutation);
   if (
     !tryAddOptionalLabel({
       number: options.number,
       label: FEATURE_SHOWCASE_LABEL,
       currentLabels: options.labels,
+      onMutation: options.onMutation,
     })
   ) {
     return { labels: [...options.labels], changed: false };
@@ -13599,6 +14025,7 @@ function syncPrRatingLabel(options: {
   rating: Pick<PrRating, "overallTier">;
   reviewFailed?: boolean;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextPrRatingLabels(options.labels, options.rating, options.reviewFailed);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13612,9 +14039,9 @@ function syncPrRatingLabel(options: {
   const changed = labelsToRemove.length > 0 || Boolean(labelToAdd);
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
-  if (labelToAdd) ensurePrRatingLabel(options.rating.overallTier);
+  if (labelToAdd) ensurePrRatingLabel(options.rating.overallTier, options.onMutation);
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   const added =
@@ -13623,6 +14050,7 @@ function syncPrRatingLabel(options: {
       number: options.number,
       label: labelToAdd,
       currentLabels: syncedLabels,
+      onMutation: options.onMutation,
     });
   if (added) syncedLabels.push(labelToAdd);
   return { labels: syncedLabels, changed: labelsToRemove.length > 0 || added };
@@ -13633,6 +14061,7 @@ function syncPrStatusLabel(options: {
   labels: readonly string[];
   statusKind: PrStatusLabelKind | null;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextPrStatusLabels(options.labels, options.statusKind);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13646,9 +14075,11 @@ function syncPrStatusLabel(options: {
   const changed = labelsToRemove.length > 0 || Boolean(labelToAdd);
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
-  if (options.statusKind && labelToAdd) ensurePrStatusLabel(options.statusKind);
+  if (options.statusKind && labelToAdd) {
+    ensurePrStatusLabel(options.statusKind, options.onMutation);
+  }
   for (const label of labelsToRemove) {
-    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+    removeIssueLabel(options.number, label, options.onMutation);
   }
   const syncedLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   const added =
@@ -13657,15 +14088,17 @@ function syncPrStatusLabel(options: {
       number: options.number,
       label: labelToAdd,
       currentLabels: syncedLabels,
+      onMutation: options.onMutation,
     });
   if (added) syncedLabels.push(labelToAdd);
   return { labels: syncedLabels, changed: labelsToRemove.length > 0 || added };
 }
 
-function ensureTelegramVisibleProofLabel(): void {
+function ensureTelegramVisibleProofLabel(onMutation?: () => void): void {
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${TELEGRAM_VISIBLE_PROOF_LABEL}`,
+      args: [
         "label",
         "create",
         TELEGRAM_VISIBLE_PROOF_LABEL,
@@ -13674,11 +14107,12 @@ function ensureTelegramVisibleProofLabel(): void {
         "--description",
         TELEGRAM_VISIBLE_PROOF_LABEL_DESCRIPTION,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/already exists/i.test(message)) throw error;
+    if (!labelAlreadyExistsError(error)) throw error;
   }
 }
 
@@ -13696,6 +14130,7 @@ function tryAddOptionalLabel(options: {
   number: number;
   label: string;
   currentLabels: readonly string[];
+  onMutation?: (() => void) | undefined;
 }): boolean {
   if (options.currentLabels.length >= 100) {
     console.warn(
@@ -13704,7 +14139,7 @@ function tryAddOptionalLabel(options: {
     return false;
   }
   try {
-    ghWithRetry(["issue", "edit", String(options.number), "--add-label", options.label]);
+    addIssueLabel(options.number, options.label, options.onMutation);
     return true;
   } catch (error) {
     if (!missingLabelError(error, options.label) && !labelCapacityError(error)) throw error;
@@ -13725,10 +14160,11 @@ export function isGitHubLabelCapacityErrorForTest(message: string): boolean {
   return labelCapacityError(new Error(message));
 }
 
-function ensureRealBehaviorProofSufficientLabel(): boolean {
+function ensureRealBehaviorProofSufficientLabel(onMutation?: () => void): boolean {
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${PROOF_SUFFICIENT_LABEL}`,
+      args: [
         "label",
         "create",
         PROOF_SUFFICIENT_LABEL,
@@ -13737,23 +14173,26 @@ function ensureRealBehaviorProofSufficientLabel(): boolean {
         "--description",
         PROOF_SUFFICIENT_LABEL_DESCRIPTION,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/already exists/i.test(message)) return true;
+    if (labelAlreadyExistsError(error)) return true;
     console.warn(`Skipping optional label sync for ${PROOF_SUFFICIENT_LABEL}: ${message}`);
     return false;
   }
 }
 
-function ensureRealBehaviorProofMediaLabel(name: string): boolean {
+function ensureRealBehaviorProofMediaLabel(name: string, onMutation?: () => void): boolean {
   const definition = PROOF_MEDIA_LABELS.find((label) => label.name === name);
   if (!definition) return false;
   try {
-    ghWithRetry(
-      [
+    ghObservedMutationCommand({
+      identity: `label_create:${definition.name}`,
+      args: [
         "label",
         "create",
         definition.name,
@@ -13762,12 +14201,14 @@ function ensureRealBehaviorProofMediaLabel(name: string): boolean {
         "--description",
         definition.description,
       ],
-      2,
-    );
+      attempts: 2,
+      onMutation,
+      knownNoMutation: labelAlreadyExistsError,
+    });
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/already exists/i.test(message)) return true;
+    if (labelAlreadyExistsError(error)) return true;
     console.warn(`Skipping optional label sync for ${definition.name}: ${message}`);
     return false;
   }
@@ -13778,6 +14219,7 @@ function syncRealBehaviorProofSufficientLabel(options: {
   labels: readonly string[];
   proof: Pick<RealBehaviorProof, "status">;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextRealBehaviorProofSufficientLabels(options.labels, options.proof);
   const hadLabel = options.labels.includes(PROOF_SUFFICIENT_LABEL);
@@ -13785,7 +14227,7 @@ function syncRealBehaviorProofSufficientLabel(options: {
   const changed = hadLabel !== wantsLabel;
   if (!changed) return { labels: nextLabels, changed };
   if (options.dryRun) return { labels: nextLabels, changed };
-  if (wantsLabel && !ensureRealBehaviorProofSufficientLabel()) {
+  if (wantsLabel && !ensureRealBehaviorProofSufficientLabel(options.onMutation)) {
     return { labels: [...options.labels], changed: false };
   }
   if (wantsLabel) {
@@ -13794,19 +14236,14 @@ function syncRealBehaviorProofSufficientLabel(options: {
         number: options.number,
         label: PROOF_SUFFICIENT_LABEL,
         currentLabels: options.labels,
+        onMutation: options.onMutation,
       })
     ) {
       return { labels: [...options.labels], changed: false };
     }
   } else {
     try {
-      ghWithRetry([
-        "issue",
-        "edit",
-        String(options.number),
-        "--remove-label",
-        PROOF_SUFFICIENT_LABEL,
-      ]);
+      removeIssueLabel(options.number, PROOF_SUFFICIENT_LABEL, options.onMutation);
     } catch (error) {
       if (!missingLabelError(error, PROOF_SUFFICIENT_LABEL)) throw error;
       console.warn(
@@ -13824,6 +14261,7 @@ function syncRealBehaviorProofMediaLabels(options: {
   labels: readonly string[];
   proof: Pick<RealBehaviorProof, "evidenceKind">;
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const nextLabels = nextRealBehaviorProofMediaLabels(options.labels, options.proof);
   const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
@@ -13840,7 +14278,7 @@ function syncRealBehaviorProofMediaLabels(options: {
   const syncedLabels = [...options.labels];
   for (const label of labelsToRemove) {
     try {
-      ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+      removeIssueLabel(options.number, label, options.onMutation);
       const index = syncedLabels.indexOf(label);
       if (index >= 0) syncedLabels.splice(index, 1);
     } catch (error) {
@@ -13853,8 +14291,15 @@ function syncRealBehaviorProofMediaLabels(options: {
     }
   }
   for (const label of labelsToAdd) {
-    if (!ensureRealBehaviorProofMediaLabel(label)) continue;
-    if (tryAddOptionalLabel({ number: options.number, label, currentLabels: syncedLabels })) {
+    if (!ensureRealBehaviorProofMediaLabel(label, options.onMutation)) continue;
+    if (
+      tryAddOptionalLabel({
+        number: options.number,
+        label,
+        currentLabels: syncedLabels,
+        onMutation: options.onMutation,
+      })
+    ) {
       syncedLabels.push(label);
     }
   }
@@ -17848,13 +18293,14 @@ function syncStalePullRequestReviewLabels(options: {
   number: number;
   labels: readonly string[];
   dryRun: boolean;
+  onMutation?: () => void;
 }): { labels: string[]; changed: boolean } {
   const labelsToRemove = options.labels.filter(isStalePullRequestReviewLabel);
   if (labelsToRemove.length === 0) return { labels: [...options.labels], changed: false };
   const nextLabels = options.labels.filter((label) => !labelsToRemove.includes(label));
   if (!options.dryRun) {
     for (const label of labelsToRemove) {
-      ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+      removeIssueLabel(options.number, label, options.onMutation);
     }
   }
   return { labels: nextLabels, changed: true };
@@ -18718,6 +19164,7 @@ function upsertReviewComment(
   number: number,
   body: string,
   existing = issueReviewComment(number, [body]),
+  mutationIdentity = `review_comment_upsert:${number}:${reviewCommentBodyDigest(body)}`,
 ): Record<string, unknown> | undefined {
   const markedBody = markedReviewCommentBody(number, body);
   const id = commentId(existing);
@@ -18742,7 +19189,12 @@ function upsertReviewComment(
       payload,
     ];
   }
-  const response = ghWithRetry(args);
+  const response = ghObservedMutationCommand({
+    identity: mutationIdentity,
+    args,
+    knownNoMutation: (error) =>
+      isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
+  });
   const written = reviewCommentFromMutationResponse(response, args);
   if (written) return written;
   const fallback = issueReviewCommentWithBody(number, markedBody);
@@ -18842,14 +19294,17 @@ function ensureCloseAppliedComment(options: {
   const body = renderCloseAppliedComment(options);
   if (options.dryRun) return "dry-run: would post close-applied comment";
   const payload = writeCommentPayload(options.number, body);
-  ghWithRetry([
-    "api",
-    `repos/${targetRepo()}/issues/${options.number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payload,
-  ]);
+  ghObservedMutationCommand({
+    identity: `close_applied_comment:${options.number}:${sha256(body)}`,
+    args: [
+      "api",
+      `repos/${targetRepo()}/issues/${options.number}/comments`,
+      "--method",
+      "POST",
+      "--input",
+      payload,
+    ],
+  });
   return "posted close-applied comment";
 }
 
@@ -18968,7 +19423,7 @@ function postReviewStartStatusComment(options: {
     nowMs: startedAtMs,
   })[0];
   if (initialLease) {
-    return { status: "held", lease: null, retryAt: initialLease.expiresAt };
+    return heldReviewStartStatusCommentResult(initialLease.expiresAt, false);
   }
   reapExpiredDedicatedReviewStartLeases(
     options.item.number,
@@ -18985,7 +19440,13 @@ function postReviewStartStatusComment(options: {
     "--input",
     payload,
   ];
-  const created = reviewCommentFromMutationResponse(ghWithRetry(createArgs), createArgs);
+  const created = reviewCommentFromMutationResponse(
+    ghObservedMutationCommand({
+      identity: `review_lease_post:${options.item.number}:${leaseOwner}`,
+      args: createArgs,
+    }),
+    createArgs,
+  );
   const createdCommentId = commentId(created);
   if (createdCommentId === null) {
     throw new Error(
@@ -19016,14 +19477,15 @@ function postReviewStartStatusComment(options: {
         `could not identify the winning review lease for #${options.item.number}; retry required`,
       );
     }
-    return { status: "held", lease: null, retryAt: winner.expiresAt };
+    return heldReviewStartStatusCommentResult(winner.expiresAt, true);
   }
-  return { status: "posted", lease: acquired };
+  return { status: "posted", lease: acquired, didMutate: true };
 }
 
 function deleteOwnedDedicatedReviewStartLease(
   itemNumber: number,
   lease: AcquiredReviewStartLease,
+  options: { throwOnError?: boolean } = {},
 ): boolean {
   try {
     const matching = issueReviewCommentState(itemNumber).dedicatedLeaseComments.find(
@@ -19033,14 +19495,18 @@ function deleteOwnedDedicatedReviewStartLease(
         (commentBody(comment) ?? "").includes(`sha=${lease.headSha}`),
     );
     if (!matching) return false;
-    ghWithRetry([
-      "api",
-      `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
-      "--method",
-      "DELETE",
-    ]);
+    ghObservedMutationCommand({
+      identity: `review_lease_delete:${itemNumber}:${lease.commentId}`,
+      args: [
+        "api",
+        `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
+        "--method",
+        "DELETE",
+      ],
+    });
     return true;
   } catch (error) {
+    if (options.throwOnError) throw error;
     console.error(
       `[review] could not delete owned review lease comment ${lease.commentId}: ${
         error instanceof Error ? error.message : String(error)
@@ -19065,12 +19531,15 @@ function reapExpiredDedicatedReviewStartLeases(
   });
   for (const lease of expired) {
     try {
-      ghWithRetry([
-        "api",
-        `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
-        "--method",
-        "DELETE",
-      ]);
+      ghObservedMutationCommand({
+        identity: `review_lease_reap:${itemNumber}:${lease.commentId}`,
+        args: [
+          "api",
+          `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
+          "--method",
+          "DELETE",
+        ],
+      });
       console.error(
         `[review] reaped expired review lease comment ${lease.commentId} for #${itemNumber} (lease expired ${lease.expiresAt})`,
       );
@@ -19093,7 +19562,10 @@ function pullRequestHeadSha(number: number): string {
 
 function closeItem(options: { number: number; kind: ItemKind; reason: CloseReason }): void {
   if (options.kind === "pull_request") {
-    ghWithRetry(["pr", "close", String(options.number)]);
+    ghObservedMutationCommand({
+      identity: `item_close:${options.number}:${options.kind}:${options.reason}`,
+      args: ["pr", "close", String(options.number)],
+    });
   } else {
     const reason = isImplementationCloseReason(options.reason) ? "completed" : "not_planned";
     const closePayloadFile = join(ROOT, ".artifacts", `close-${options.number}.json`);
@@ -19102,14 +19574,17 @@ function closeItem(options: { number: number; kind: ItemKind; reason: CloseReaso
       JSON.stringify({ state: "closed", state_reason: reason }),
       "utf8",
     );
-    ghWithRetry([
-      "api",
-      `repos/${targetRepo()}/issues/${options.number}`,
-      "--method",
-      "PATCH",
-      "--input",
-      closePayloadFile,
-    ]);
+    ghObservedMutationCommand({
+      identity: `item_close:${options.number}:${options.kind}:${options.reason}`,
+      args: [
+        "api",
+        `repos/${targetRepo()}/issues/${options.number}`,
+        "--method",
+        "PATCH",
+        "--input",
+        closePayloadFile,
+      ],
+    });
   }
 }
 
@@ -20122,6 +20597,689 @@ export function buildLocalRangeReviewForTest(
   return buildLocalRangeReview(targetDir, repo, baseRef);
 }
 
+const ACTION_LEDGER_DROPPED_FIELDS = [
+  "body",
+  "comments",
+  "diff",
+  "logs",
+  "patch",
+  "prompt",
+] as const;
+
+type ReviewLedgerItem = {
+  item: Item;
+  index: number;
+  started: boolean;
+  startedAtMs: number | null;
+  startEventId: string | null;
+  lastEventId: string | null;
+  logPublication: boolean;
+  mutationAttemptCount: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  terminal: boolean;
+};
+
+type ReviewActionLedger = {
+  operationIdentity: {
+    repository: string;
+    reviewPolicy: string;
+    shardIndex: number;
+    shardCount: number;
+    candidateSnapshots: Array<{
+      repository: string;
+      number: number;
+      kind: ItemKind;
+      updatedAt: string;
+    }>;
+  };
+  batchStartEventId: string | null;
+  items: Map<string, ReviewLedgerItem>;
+  nextPhaseSeq: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  startedAtMs: number;
+  terminal: boolean;
+};
+
+function actionLedgerItemKey(item: Pick<Item, "repo" | "number">): string {
+  return `${item.repo}#${item.number}`;
+}
+
+function actionLedgerPrivacy() {
+  return {
+    classification: "internal" as const,
+    redactionVersion: "v1",
+    fieldsDropped: ACTION_LEDGER_DROPPED_FIELDS,
+  };
+}
+
+function workflowRunEvidence(): ActionEventEvidence[] {
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "").trim();
+  const runId = String(process.env.GITHUB_RUN_ID ?? "").trim();
+  if (!/^[a-z0-9_][a-z0-9_.-]*\/[a-z0-9_][a-z0-9_.-]*$/i.test(repository) || !/^\d+$/.test(runId)) {
+    return [];
+  }
+  return [
+    {
+      kind: "workflow_run",
+      runUrl: `https://github.com/${repository}/actions/runs/${runId}`,
+    },
+  ];
+}
+
+function actionLedgerFileEvidence(kind: string, filePath: string): ActionEventEvidence | null {
+  if (!existsSync(filePath)) return null;
+  const recordPath = repoRelativePath(filePath);
+  return {
+    kind,
+    sha256: sha256(readFileSync(filePath, "utf8")),
+    ...(recordPath.startsWith("../") ? {} : { reportPath: recordPath }),
+  };
+}
+
+function actionLedgerItemSubject(
+  item: Item,
+  options: { sourceRevision?: string; recordPath?: string } = {},
+): ActionEventSubject {
+  return {
+    repository: item.repo,
+    kind: item.kind,
+    number: item.number,
+    ...(options.sourceRevision ? { sourceRevision: options.sourceRevision } : {}),
+    ...(options.recordPath && !options.recordPath.startsWith("../")
+      ? { recordPath: options.recordPath }
+      : {}),
+  };
+}
+
+function startReviewActionLedger(options: {
+  candidates: readonly Item[];
+  reviewPolicy: string;
+  shardIndex: number;
+  shardCount: number;
+  batchSize: number;
+}): ReviewActionLedger {
+  const operationIdentity = {
+    repository: targetRepo(),
+    reviewPolicy: options.reviewPolicy,
+    shardIndex: options.shardIndex,
+    shardCount: options.shardCount,
+    candidateSnapshots: options.candidates.map((item) => ({
+      repository: item.repo,
+      number: item.number,
+      kind: item.kind,
+      updatedAt: item.updatedAt,
+    })),
+  };
+  const batchStart = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewBatch,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "batch_start" },
+    operation: "review",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "batch_start" },
+    component: "review",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      candidate_count: options.candidates.length,
+      batch_size: options.batchSize,
+      shard_index: options.shardIndex,
+      shard_count: options.shardCount,
+      review_mode: "propose",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  const items = new Map<string, ReviewLedgerItem>();
+  for (const [index, item] of options.candidates.entries()) {
+    if (!Number.isSafeInteger(item.number) || item.number <= 0) continue;
+    items.set(actionLedgerItemKey(item), {
+      item,
+      index,
+      started: false,
+      startedAtMs: null,
+      startEventId: null,
+      lastEventId: null,
+      logPublication: false,
+      mutationAttemptCount: 0,
+      mutationObserved: false,
+      uncertainMutationObserved: false,
+      terminal: false,
+    });
+  }
+  return {
+    operationIdentity,
+    batchStartEventId: batchStart?.event_id ?? null,
+    items,
+    nextPhaseSeq: 2,
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+    startedAtMs: Date.now(),
+    terminal: false,
+  };
+}
+
+function nextReviewPhaseSeq(ledger: ReviewActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  if (phaseSeq >= 1_000_000) {
+    throw new Error("review action ledger exhausted per-item phase ordinals");
+  }
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function startReviewActionLedgerItem(ledger: ReviewActionLedger, item: Item): ActionEvent | null {
+  const state = ledger.items.get(actionLedgerItemKey(item));
+  if (!state || state.started) return null;
+  const phaseSeq = nextReviewPhaseSeq(ledger);
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewItem,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: {
+      slot: "item_start",
+      index: state.index,
+      repository: item.repo,
+      number: item.number,
+    },
+    operation: "review",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.batchStartEventId,
+    phaseSeq,
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "item_start",
+      index: state.index,
+      repository: item.repo,
+      number: item.number,
+    },
+    component: "review",
+    subject: actionLedgerItemSubject(item),
+    attributes: {
+      batch_index: state.index,
+      review_mode: "propose",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.started = true;
+  state.startedAtMs = Date.now();
+  state.startEventId = start?.event_id ?? null;
+  state.lastEventId = state.startEventId;
+  return start;
+}
+
+type ReviewMutationAttempt = {
+  state: ReviewLedgerItem;
+  eventId: string | null;
+  idempotencyIdentity: {
+    operation: "review";
+    slot: "coordination_mutation";
+    repository: string;
+    number: number;
+    itemUpdatedAt: string;
+    mutationIdentitySha256: string;
+  };
+  mutationIndex: number;
+  receiptIdentitySha256: string;
+};
+
+function startReviewMutationAttempt(
+  ledger: ReviewActionLedger,
+  item: Item,
+  receiptIdentity: string,
+  idempotencyIdentity: string,
+): ReviewMutationAttempt | null {
+  let state = ledger.items.get(actionLedgerItemKey(item));
+  if (!state) return null;
+  if (!state.started) {
+    startReviewActionLedgerItem(ledger, item);
+    state = ledger.items.get(actionLedgerItemKey(item));
+  }
+  if (!state) return null;
+  const mutationIndex = state.mutationAttemptCount;
+  state.mutationAttemptCount += 1;
+  const businessIdempotencyIdentity = {
+    operation: "review" as const,
+    slot: "coordination_mutation" as const,
+    repository: item.repo,
+    number: item.number,
+    itemUpdatedAt: item.updatedAt,
+    mutationIdentitySha256: sha256(idempotencyIdentity),
+  };
+  const receiptIdentitySha256 = sha256(receiptIdentity);
+  const attempt = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewItem,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: true,
+    mutation: false,
+    identity: {
+      slot: "review_coordination_mutation_attempt",
+      index: state.index,
+      mutationIndex,
+      receiptIdentitySha256,
+      repository: item.repo,
+      number: item.number,
+    },
+    operation: "review",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: state.lastEventId ?? state.startEventId,
+    phaseSeq: nextReviewPhaseSeq(ledger),
+    idempotencyIdentity: businessIdempotencyIdentity,
+    component: "review",
+    subject: actionLedgerItemSubject(item),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: state.index,
+      attempt: mutationIndex + 1,
+      action_count: 1,
+      partial: true,
+      completion_reason: "mutation_attempted",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.lastEventId = attempt?.event_id ?? state.lastEventId;
+  return {
+    state,
+    eventId: attempt?.event_id ?? null,
+    idempotencyIdentity: businessIdempotencyIdentity,
+    mutationIndex,
+    receiptIdentitySha256,
+  };
+}
+
+function finishReviewMutationAttempt(options: {
+  ledger: ReviewActionLedger;
+  item: Item;
+  attempt: ReviewMutationAttempt;
+  outcome: "accepted" | "rejected" | "unknown";
+}): string | null {
+  const mutation = options.outcome !== "rejected";
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewItem,
+    status:
+      options.outcome === "accepted"
+        ? ACTION_EVENT_STATUSES.executed
+        : options.outcome === "rejected"
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.failed,
+    reasonCode:
+      options.outcome === "accepted"
+        ? ACTION_EVENT_REASON_CODES.completed
+        : options.outcome === "rejected"
+          ? ACTION_EVENT_REASON_CODES.notApplicable
+          : ACTION_EVENT_REASON_CODES.unavailable,
+    retryable: options.outcome === "unknown",
+    mutation,
+    identity: {
+      slot: "review_coordination_mutation_outcome",
+      index: options.attempt.state.index,
+      mutationIndex: options.attempt.mutationIndex,
+      receiptIdentitySha256: options.attempt.receiptIdentitySha256,
+      outcome: options.outcome,
+      repository: options.item.repo,
+      number: options.item.number,
+    },
+    operation: "review",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.attempt.eventId,
+    phaseSeq: nextReviewPhaseSeq(options.ledger),
+    idempotencyIdentity: options.attempt.idempotencyIdentity,
+    component: "review",
+    subject: actionLedgerItemSubject(options.item),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: options.attempt.state.index,
+      attempt: options.attempt.mutationIndex + 1,
+      action_count: mutation ? 1 : 0,
+      partial: options.outcome === "unknown",
+      completion_reason:
+        options.outcome === "accepted"
+          ? "mutation_accepted"
+          : options.outcome === "rejected"
+            ? "mutation_rejected"
+            : "mutation_outcome_unknown",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.attempt.state.lastEventId = event?.event_id ?? options.attempt.state.lastEventId;
+  if (mutation) {
+    options.attempt.state.mutationObserved = true;
+    options.ledger.mutationObserved = true;
+  }
+  if (options.outcome === "unknown") {
+    options.attempt.state.uncertainMutationObserved = true;
+    options.ledger.uncertainMutationObserved = true;
+  }
+  return event?.event_id ?? null;
+}
+
+function reviewMutationRunner(ledger: ReviewActionLedger, item: Item): MutationRunner {
+  return <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    const attempt = startReviewMutationAttempt(
+      ledger,
+      item,
+      options.identity,
+      options.idempotencyIdentity,
+    );
+    if (!attempt) return options.operation();
+    try {
+      const result = options.operation();
+      finishReviewMutationAttempt({
+        ledger,
+        item,
+        attempt,
+        outcome: options.didMutate?.(result) === false ? "rejected" : "accepted",
+      });
+      return result;
+    } catch (error) {
+      finishReviewMutationAttempt({
+        ledger,
+        item,
+        attempt,
+        outcome: options.knownNoMutation?.(error) === true ? "rejected" : "unknown",
+      });
+      throw error;
+    }
+  };
+}
+
+function recordReviewLogPublication(options: {
+  ledger: ReviewActionLedger;
+  item: Item;
+  codexWorkDir?: string;
+  cached: boolean;
+  missingStatus?: ActionEventStatus;
+  missingReasonCode?: ActionEventReasonCode;
+  retryable?: boolean;
+}): ActionEvent | null {
+  const state = options.ledger.items.get(actionLedgerItemKey(options.item));
+  if (!state || !state.started || state.logPublication) return null;
+  const prefix = `${options.item.number}.`;
+  const logs =
+    options.codexWorkDir && existsSync(options.codexWorkDir)
+      ? readdirSync(options.codexWorkDir)
+          .filter(
+            (name) =>
+              name.startsWith(prefix) &&
+              (name.endsWith(".codex.stdout.log") || name.endsWith(".codex.stderr.log")),
+          )
+          .sort()
+          .slice(0, 64)
+          .map((name) => actionLedgerFileEvidence("review_log", join(options.codexWorkDir!, name)))
+          .filter((entry): entry is ActionEventEvidence => entry !== null)
+      : [];
+  const captured = logs.length > 0;
+  const phaseSeq = nextReviewPhaseSeq(options.ledger);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: captured
+      ? ACTION_EVENT_STATUSES.completed
+      : (options.missingStatus ?? ACTION_EVENT_STATUSES.skipped),
+    reasonCode: captured
+      ? ACTION_EVENT_REASON_CODES.completed
+      : (options.missingReasonCode ??
+        (options.cached
+          ? ACTION_EVENT_REASON_CODES.notApplicable
+          : ACTION_EVENT_REASON_CODES.notFound)),
+    retryable: captured ? false : (options.retryable ?? false),
+    mutation: false,
+    identity: {
+      slot: "review_logs",
+      index: state.index,
+      repository: options.item.repo,
+      number: options.item.number,
+    },
+    operation: "review",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: state.lastEventId ?? state.startEventId,
+    phaseSeq,
+    idempotencyIdentity: {
+      operationIdentity: options.ledger.operationIdentity,
+      slot: "review_logs",
+      index: state.index,
+      repository: options.item.repo,
+      number: options.item.number,
+    },
+    component: "review",
+    subject: actionLedgerItemSubject(options.item),
+    evidence: [...workflowRunEvidence(), ...logs],
+    attributes: {
+      cached: options.cached,
+      log_count: logs.length,
+      log_kind: "codex",
+      publication_kind: "local_artifact",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.logPublication = true;
+  state.lastEventId = event?.event_id ?? state.lastEventId;
+  return event;
+}
+
+function finishReviewActionLedgerItem(options: {
+  ledger: ReviewActionLedger;
+  item: Item;
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  cached: boolean;
+  startedAtMs: number;
+  sourceRevision?: string;
+  reportPath?: string;
+  findingCount?: number;
+  completionReason?: string;
+}): ActionEvent | null {
+  const state = options.ledger.items.get(actionLedgerItemKey(options.item));
+  if (!state || !state.started || state.terminal) return null;
+  if (!state.logPublication) {
+    recordReviewLogPublication({
+      ledger: options.ledger,
+      item: options.item,
+      cached: options.cached,
+      missingStatus:
+        options.status === ACTION_EVENT_STATUSES.completed ||
+        options.status === ACTION_EVENT_STATUSES.cached
+          ? ACTION_EVENT_STATUSES.skipped
+          : options.status,
+      missingReasonCode:
+        options.status === ACTION_EVENT_STATUSES.completed ||
+        options.status === ACTION_EVENT_STATUSES.cached
+          ? options.cached
+            ? ACTION_EVENT_REASON_CODES.notApplicable
+            : ACTION_EVENT_REASON_CODES.notFound
+          : options.reasonCode,
+      retryable: options.retryable,
+    });
+  }
+  const reportPath = options.reportPath ? repoRelativePath(options.reportPath) : undefined;
+  const reportEvidence = options.reportPath
+    ? actionLedgerFileEvidence("review_record", options.reportPath)
+    : null;
+  const phaseSeq = nextReviewPhaseSeq(options.ledger);
+  const terminal = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewItem,
+    status: options.status,
+    reasonCode: options.reasonCode,
+    retryable: options.retryable && !state.uncertainMutationObserved,
+    mutation: state.mutationObserved,
+    identity: {
+      slot: "item_terminal",
+      index: state.index,
+      repository: options.item.repo,
+      number: options.item.number,
+    },
+    operation: "review",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: state.lastEventId ?? state.startEventId,
+    phaseSeq,
+    idempotencyIdentity: {
+      operationIdentity: options.ledger.operationIdentity,
+      slot: "item_terminal",
+      index: state.index,
+      repository: options.item.repo,
+      number: options.item.number,
+    },
+    component: "review",
+    subject: actionLedgerItemSubject(options.item, {
+      ...(options.sourceRevision ? { sourceRevision: options.sourceRevision } : {}),
+      ...(reportPath ? { recordPath: reportPath } : {}),
+    }),
+    evidence: [...workflowRunEvidence(), ...(reportEvidence ? [reportEvidence] : [])],
+    attributes: {
+      cached: options.cached,
+      duration_ms: Math.max(0, Date.now() - options.startedAtMs),
+      review_mode: "propose",
+      ...(options.findingCount === undefined ? {} : { finding_count: options.findingCount }),
+      ...(options.completionReason ? { completion_reason: options.completionReason } : {}),
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.terminal = true;
+  state.lastEventId = terminal?.event_id ?? state.lastEventId;
+  return terminal;
+}
+
+export function actionLedgerFailureDisposition(error: unknown): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  completionReason: string;
+} {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof GitHubRuntimeBudgetError) {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      completionReason: "runtime_budget",
+    };
+  }
+  if (/timed?\s*out|timeout|etimedout|sigterm|signal 15/i.test(message)) {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.timeout,
+      completionReason: "timeout",
+    };
+  }
+  if (/cancelled|canceled|interrupted|sigint|signal 2/i.test(message)) {
+    return {
+      status: ACTION_EVENT_STATUSES.cancelled,
+      reasonCode: ACTION_EVENT_REASON_CODES.cancelled,
+      completionReason: "interrupted",
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.failed,
+    reasonCode: ACTION_EVENT_REASON_CODES.exception,
+    completionReason: "failed",
+  };
+}
+
+function finishReviewActionLedger(options: {
+  ledger: ReviewActionLedger;
+  error?: unknown;
+  activeItem?: Item | null;
+  completedCount: number;
+  cacheHits: number;
+}): void {
+  if (options.ledger.terminal) return;
+  const failure =
+    options.error === undefined ? null : actionLedgerFailureDisposition(options.error);
+  let pendingCount = 0;
+  for (const state of options.ledger.items.values()) {
+    if (state.terminal) continue;
+    pendingCount += 1;
+    if (!state.started) continue;
+    const active = options.activeItem
+      ? actionLedgerItemKey(options.activeItem) === actionLedgerItemKey(state.item)
+      : false;
+    finishReviewActionLedgerItem({
+      ledger: options.ledger,
+      item: state.item,
+      status: failure
+        ? active
+          ? failure.status
+          : ACTION_EVENT_STATUSES.cancelled
+        : ACTION_EVENT_STATUSES.blocked,
+      reasonCode: failure
+        ? active
+          ? failure.reasonCode
+          : ACTION_EVENT_REASON_CODES.workerLost
+        : ACTION_EVENT_REASON_CODES.leaseActive,
+      retryable: true,
+      cached: false,
+      startedAtMs: options.ledger.startedAtMs,
+      completionReason: failure
+        ? active
+          ? failure.completionReason
+          : "interrupted"
+        : "coordination_blocked",
+    });
+  }
+  const itemCount = options.ledger.items.size;
+  const partial = pendingCount > 0 || options.completedCount < itemCount;
+  const status = failure
+    ? failure.status
+    : partial
+      ? ACTION_EVENT_STATUSES.yielded
+      : ACTION_EVENT_STATUSES.completed;
+  const reasonCode = failure
+    ? failure.reasonCode
+    : partial
+      ? ACTION_EVENT_REASON_CODES.leaseActive
+      : ACTION_EVENT_REASON_CODES.completed;
+  recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewBatch,
+    status,
+    reasonCode,
+    retryable: (failure !== null || partial) && !options.ledger.uncertainMutationObserved,
+    mutation: options.ledger.mutationObserved,
+    identity: { slot: "batch_terminal" },
+    operation: "review",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.ledger.batchStartEventId,
+    phaseSeq: 1_000_000,
+    idempotencyIdentity: {
+      operationIdentity: options.ledger.operationIdentity,
+      slot: "batch_terminal",
+    },
+    component: "review",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      candidate_count: itemCount,
+      processed_count: options.completedCount,
+      skipped_count: pendingCount,
+      failed_count: failure ? 1 : 0,
+      duration_ms: Math.max(0, Date.now() - options.ledger.startedAtMs),
+      cached: options.cacheHits > 0,
+      partial,
+      completion_reason: failure ? failure.completionReason : partial ? "partial" : "completed",
+      review_mode: "propose",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.ledger.terminal = true;
+}
+
 function reviewCommand(args: Args): void {
   const profile = repoFromArgs(args);
   // `--local-range` is inherently a local, offline operation, so it implies `--local-only`
@@ -20254,7 +21412,10 @@ function reviewCommand(args: Args): void {
   const maintainerRequest = additionalPrompt.trim().length > 0;
   const readonlyModeSnapshots = readonlyOpenclaw ? makeTreeReadOnly(openclawDir) : [];
   const acquiredReviewLeases: Array<{ itemNumber: number; lease: AcquiredReviewStartLease }> = [];
-  let retainReviewLeasesForPublish = false;
+  let reviewLedger: ReviewActionLedger | null = null;
+  let activeReviewItem: Item | null = null;
+  let completed = 0;
+  let cacheHits = 0;
   try {
     const selectionOptions: Parameters<typeof selectCandidates>[0] = {
       batchSize,
@@ -20295,11 +21456,16 @@ function reviewCommand(args: Args): void {
       join(artifactDir, "selection.json"),
       JSON.stringify({ shardIndex, shardCount, scannedPages, candidates, reviewPolicy }, null, 2),
     );
-    let completed = 0;
+    reviewLedger = startReviewActionLedger({
+      candidates,
+      reviewPolicy,
+      shardIndex,
+      shardCount,
+      batchSize,
+    });
     let coordinationHeldRetryAt: string | null = null;
     let codexFailures = 0;
     let leaseAcquisitionFailures = 0;
-    let cacheHits = 0;
     let contentCacheHits = 0;
     let structuralCacheChecks = 0;
     let structuralCacheHits = 0;
@@ -20323,7 +21489,14 @@ function reviewCommand(args: Args): void {
     const semanticCacheRevalidationReasons = new Map<string, number>();
     const codexFailureReports: string[] = [];
     const leaseAcquisitionFailureDetails: string[] = [];
+    // oxfmt-ignore
     for (const item of candidates) {
+      activeReviewItem = item;
+      let reviewItemFailed = false;
+      const previousReviewMutationRunner = activeReviewMutationRunner;
+      try {
+      startReviewActionLedgerItem(reviewLedger, item);
+      activeReviewMutationRunner = reviewMutationRunner(reviewLedger, item);
       if (humanLocalReview) {
         console.error("");
         console.error("Collecting GitHub context");
@@ -20535,6 +21708,29 @@ function reviewCommand(args: Args): void {
               carried = replaceFrontMatterValue(carried, "review_cache_hit", "true");
               carried = updateReviewStructuralFrontMatter(carried, structuralRecord, true);
               writeFileSync(reportPath, carried, "utf8");
+              finishReviewActionLedgerItem({
+                ledger: reviewLedger,
+                item,
+                status: ACTION_EVENT_STATUSES.cached,
+                reasonCode: ACTION_EVENT_REASON_CODES.contentUnchanged,
+                retryable: false,
+                cached: true,
+                startedAtMs: reviewLedger.startedAtMs,
+                ...((
+                  item.kind === "pull_request"
+                    ? confirmedStructuralRecord.pullHeadSha
+                    : priorReview?.itemSourceRevision
+                )
+                  ? {
+                      sourceRevision: (item.kind === "pull_request"
+                        ? confirmedStructuralRecord.pullHeadSha
+                        : priorReview?.itemSourceRevision)!,
+                    }
+                  : {}),
+                reportPath,
+                findingCount: reportReviewFindings(carried).length,
+                completionReason: "structural_cache",
+              });
               completed += 1;
               cacheHits += 1;
               structuralCacheHits += 1;
@@ -20572,7 +21768,9 @@ function reviewCommand(args: Args): void {
           }
           acquiredReviewLease = startComment.lease;
           if (!acquiredReviewLease) {
-            throw new Error(`review lease acquisition returned no identity for PR #${item.number}`);
+            throw new Error(
+              `review lease acquisition returned no identity for PR #${item.number}`,
+            );
           }
           acquiredReviewLeases.push({ itemNumber: item.number, lease: acquiredReviewLease });
         } catch (error) {
@@ -21000,6 +22198,20 @@ function reviewCommand(args: Args): void {
         carried = updateReviewStructuralFrontMatter(carried, structuralRecord, false);
         carried = updateReviewSemanticFrontMatter(carried, semanticRecord, true);
         writeFileSync(reportPath, carried, "utf8");
+        finishReviewActionLedgerItem({
+          ledger: reviewLedger,
+          item,
+          status: ACTION_EVENT_STATUSES.cached,
+          reasonCode: ACTION_EVENT_REASON_CODES.contentUnchanged,
+          retryable: false,
+          cached: true,
+          startedAtMs: contextStartedAt,
+          ...(context.sourceRevision ? { sourceRevision: context.sourceRevision } : {}),
+          reportPath,
+          findingCount: reportReviewFindings(carried).length,
+          completionReason: "semantic_cache",
+        });
+        activeReviewItem = null;
         completed += 1;
         cacheHits += 1;
         semanticCacheHits += 1;
@@ -21058,6 +22270,20 @@ function reviewCommand(args: Args): void {
           : replaceFrontMatterValue(carried, "review_structural_cache_hit", "false");
         carried = updateReviewSemanticFrontMatter(carried, semanticRecord, false);
         writeFileSync(reportPath, carried, "utf8");
+        finishReviewActionLedgerItem({
+          ledger: reviewLedger,
+          item,
+          status: ACTION_EVENT_STATUSES.cached,
+          reasonCode: ACTION_EVENT_REASON_CODES.contentUnchanged,
+          retryable: false,
+          cached: true,
+          startedAtMs: contextStartedAt,
+          ...(context.sourceRevision ? { sourceRevision: context.sourceRevision } : {}),
+          reportPath,
+          findingCount: reportReviewFindings(carried).length,
+          completionReason: "content_cache",
+        });
+        activeReviewItem = null;
         completed += 1;
         cacheHits += 1;
         contentCacheHits += 1;
@@ -21092,6 +22318,9 @@ function reviewCommand(args: Args): void {
       let decision: Decision;
       let codexElapsedMs = 0;
       let codexFailed = false;
+      let codexFailureRetryable = false;
+      let codexFailureDisposition: ReturnType<typeof actionLedgerFailureDisposition> | null =
+        null;
       const codexStartedAt = Date.now();
       try {
         if (humanLocalReview) {
@@ -21128,11 +22357,19 @@ function reviewCommand(args: Args): void {
       } catch (error) {
         codexFailures += 1;
         codexFailed = true;
+        codexFailureRetryable = codexReviewFailureRetryable(error);
+        codexFailureDisposition = actionLedgerFailureDisposition(error);
         if (error instanceof CodexReviewError) {
-          decision = codexFailureDecision(error.status, error.message, error.stdout, error.stderr, {
-            errorCode: error.errorCode,
-            signal: error.signal,
-          });
+          decision = codexFailureDecision(
+            error.status,
+            error.message,
+            error.stdout,
+            error.stderr,
+            {
+              errorCode: error.errorCode,
+              signal: error.signal,
+            },
+          );
         } else {
           decision = codexFailureDecision(
             null,
@@ -21180,6 +22417,26 @@ function reviewCommand(args: Args): void {
         }),
         "utf8",
       );
+      recordReviewLogPublication({
+        ledger: reviewLedger,
+        item,
+        codexWorkDir,
+        cached: false,
+      });
+      finishReviewActionLedgerItem({
+        ledger: reviewLedger,
+        item,
+        status: codexFailureDisposition?.status ?? ACTION_EVENT_STATUSES.completed,
+        reasonCode: codexFailureDisposition?.reasonCode ?? ACTION_EVENT_REASON_CODES.completed,
+        retryable: codexFailed && codexFailureRetryable,
+        cached: false,
+        startedAtMs: contextStartedAt,
+        ...(context.sourceRevision ? { sourceRevision: context.sourceRevision } : {}),
+        reportPath,
+        findingCount: decision.reviewFindings.length,
+        completionReason: codexFailureDisposition?.completionReason ?? decision.decision,
+      });
+      activeReviewItem = null;
       completed += 1;
       if (codexFailed) codexFailureReports.push(reportPath);
       if (humanLocalReview) {
@@ -21194,6 +22451,34 @@ function reviewCommand(args: Args): void {
         console.error(
           `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} done #${item.number} (${completed}/${candidates.length}) decision=${decision.decision} confidence=${decision.confidence} action=${action.actionTaken}`,
         );
+      }
+      } catch (error) {
+        reviewItemFailed = true;
+        throw error;
+      } finally {
+        try {
+          if (
+            !reviewItemFailed &&
+            activeReviewItem &&
+            actionLedgerItemKey(activeReviewItem) === actionLedgerItemKey(item)
+          ) {
+            finishReviewActionLedgerItem({
+              ledger: reviewLedger,
+              item,
+              status: ACTION_EVENT_STATUSES.blocked,
+              reasonCode: ACTION_EVENT_REASON_CODES.leaseActive,
+              retryable: true,
+              cached: false,
+              startedAtMs:
+                reviewLedger.items.get(actionLedgerItemKey(item))?.startedAtMs ??
+                reviewLedger.startedAtMs,
+              completionReason: "coordination_deferred",
+            });
+            activeReviewItem = null;
+          }
+        } finally {
+          activeReviewMutationRunner = previousReviewMutationRunner;
+        }
       }
     }
     if (coordinationHeldRetryAt) {
@@ -21282,13 +22567,36 @@ function reviewCommand(args: Args): void {
       if (humanLocalReview) throw new UserFacingCommandError(message);
       throw new Error(message);
     }
-    retainReviewLeasesForPublish = true;
-  } finally {
-    if (!retainReviewLeasesForPublish) {
+    finishReviewActionLedger({
+      ledger: reviewLedger,
+      completedCount: completed,
+      cacheHits,
+    });
+  } catch (error) {
+    if (reviewLedger) {
       for (const acquired of acquiredReviewLeases) {
-        deleteOwnedDedicatedReviewStartLease(acquired.itemNumber, acquired.lease);
+        const state = [...reviewLedger.items.values()].find(
+          (candidate) => candidate.item.number === acquired.itemNumber,
+        );
+        if (!state) continue;
+        const previousReviewMutationRunner = activeReviewMutationRunner;
+        activeReviewMutationRunner = reviewMutationRunner(reviewLedger, state.item);
+        try {
+          deleteOwnedDedicatedReviewStartLease(acquired.itemNumber, acquired.lease);
+        } finally {
+          activeReviewMutationRunner = previousReviewMutationRunner;
+        }
       }
+      finishReviewActionLedger({
+        ledger: reviewLedger,
+        error,
+        activeItem: activeReviewItem,
+        completedCount: completed,
+        cacheHits,
+      });
     }
+    throw error;
+  } finally {
     restoreTreeModes(readonlyModeSnapshots);
   }
 }
@@ -21408,7 +22716,9 @@ function failedReviewRetrySection(options: {
       "- next step: needs human review; retry attempts for this exact revision are exhausted.",
     );
   } else if (options.status === "dispatching") {
-    lines.push("- next step: dispatch attempt checkpointed; wait for the retry cooldown.");
+    lines.push(
+      "- next step: dispatch outcome is uncertain; reconcile the workflow run before another retry.",
+    );
   } else if (options.status === "dispatch_failed") {
     lines.push("- next step: dispatch command failed; retry after the cooldown if still eligible.");
   }
@@ -21633,7 +22943,7 @@ function dispatchFailedReviewRetry(options: {
       );
     }
     const dispatchUrl = `https://github.com/${options.workflowRepo}/actions/workflows/sweep.yml`;
-    ghRawOnceWithCheckpoint(
+    const dispatch = ghRawOnceWithCheckpoint(
       [
         "api",
         "--method",
@@ -21664,10 +22974,11 @@ function dispatchFailedReviewRetry(options: {
       ],
       () => options.onBeforeDispatch?.(dispatchUrl),
     );
+    if (dispatch.outcome !== "accepted") throw new Error("GitHub dispatch was not accepted");
     return dispatchUrl;
   }
   const dispatchUrl = `https://github.com/${options.workflowRepo}/actions/workflows/sweep.yml`;
-  ghRawOnceWithCheckpoint(
+  const dispatch = ghRawOnceWithCheckpoint(
     [
       "workflow",
       "run",
@@ -21695,7 +23006,147 @@ function dispatchFailedReviewRetry(options: {
     ],
     () => options.onBeforeDispatch?.(dispatchUrl),
   );
+  if (dispatch.outcome !== "accepted") throw new Error("GitHub dispatch was not accepted");
   return dispatchUrl;
+}
+
+type ReviewRetryActionLedger = {
+  operationIdentity: {
+    repository: string;
+    requestedItemNumbers: number[];
+    reportPath: string;
+  };
+  batchStartEventId: string | null;
+  dispatchAttempts: Map<
+    string,
+    {
+      eventId: string | null;
+      phaseSeq: number;
+    }
+  >;
+  nextDispatchPhaseSeq: number;
+  startedAtMs: number;
+  terminal: boolean;
+};
+
+function startFailedReviewRetryLedger(options: {
+  requestedItemNumbers: readonly number[];
+  reportPath: string;
+}): ReviewRetryActionLedger {
+  const operationIdentity = {
+    repository: targetRepo(),
+    requestedItemNumbers: [...options.requestedItemNumbers],
+    reportPath: repoRelativePath(options.reportPath),
+  };
+  const batchStart = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewRetry,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "retry_batch_start" },
+    operation: "review_retry",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "retry_batch_start" },
+    component: "retry_failed_reviews",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      candidate_count: options.requestedItemNumbers.length,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  return {
+    operationIdentity,
+    batchStartEventId: batchStart?.event_id ?? null,
+    dispatchAttempts: new Map(),
+    nextDispatchPhaseSeq: 100_000,
+    startedAtMs: Date.now(),
+    terminal: false,
+  };
+}
+
+function reviewRetryDispatchAttemptKey(options: {
+  repository: string;
+  number: number;
+  revision: FailedReviewRetryRevision;
+}): string {
+  return `${options.repository}#${options.number}:${options.revision.kind}:${options.revision.value}`;
+}
+
+function startFailedReviewRetryDispatchAttempt(options: {
+  ledger: ReviewRetryActionLedger;
+  number: number;
+  revision: FailedReviewRetryRevision;
+  reportPath: string;
+  attempts: number;
+  dispatchUrl: string;
+}): void {
+  const repository = targetRepo();
+  const key = reviewRetryDispatchAttemptKey({
+    repository,
+    number: options.number,
+    revision: options.revision,
+  });
+  if (options.ledger.dispatchAttempts.has(key)) return;
+  const phaseSeq = options.ledger.nextDispatchPhaseSeq;
+  options.ledger.nextDispatchPhaseSeq += 10;
+  const reportMarkdown = readFileSync(options.reportPath, "utf8");
+  const kind = reportItemKind(reportMarkdown);
+  if (!kind) {
+    throw new Error(
+      `retry dispatch receipt for ${repository}#${options.number} is missing its item kind`,
+    );
+  }
+  const recordPath = repoRelativePath(options.reportPath);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewRetry,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: {
+      slot: "retry_dispatch_attempt",
+      repository,
+      number: options.number,
+    },
+    operation: "review_retry",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.ledger.batchStartEventId,
+    phaseSeq,
+    idempotencyIdentity: reviewRetryBusinessIdempotencyIdentityForTest({
+      repository,
+      number: options.number,
+      revisionKind: options.revision.kind,
+      sourceRevision: options.revision.value,
+      reviewContentDigest: frontMatterValue(reportMarkdown, "review_content_digest") ?? "unknown",
+      decisionPacketSha256: frontMatterValue(reportMarkdown, "decision_packet_sha256") ?? "none",
+      slot: "retry_dispatch",
+    }),
+    component: "retry_failed_reviews",
+    subject: {
+      repository,
+      kind,
+      number: options.number,
+      sourceRevision: options.revision.value,
+      ...(recordPath.startsWith("../") ? {} : { recordPath }),
+    },
+    evidence: [...workflowRunEvidence(), { kind: "retry_dispatch", runUrl: options.dispatchUrl }],
+    attributes: {
+      attempt: options.attempts + 1,
+      retry_count: options.attempts,
+      completion_reason: "dispatch_attempted",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.ledger.dispatchAttempts.set(key, {
+    eventId: event?.event_id ?? null,
+    phaseSeq,
+  });
 }
 
 function retryFailedReviewsCommand(args: Args): void {
@@ -21730,10 +23181,15 @@ function retryFailedReviewsCommandInner(args: Args): void {
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
   const results: FailedReviewRetryResult[] = [];
+  const retryLedger = startFailedReviewRetryLedger({
+    requestedItemNumbers,
+    reportPath,
+  });
   let attempted = 0;
   let dispatched = 0;
-  ensureDir(dirname(reportPath));
+  let commandError: unknown = null;
   try {
+    ensureDir(dirname(reportPath));
     for (const file of markdownFiles(itemsDir)) {
       ensureGitHubRuntimeAvailable("before failed-review retry item");
       const path = join(itemsDir, file);
@@ -21843,7 +23299,8 @@ function retryFailedReviewsCommandInner(args: Args): void {
         dispatched += 1;
         continue;
       }
-      const attempts = (eligibility.attempts ?? 0) + 1;
+      const attemptsBeforeDispatch = eligibility.attempts ?? 0;
+      const attempts = attemptsBeforeDispatch + 1;
       let dispatchCheckpointed = false;
       let checkpointDispatchUrl: string | undefined;
       try {
@@ -21858,14 +23315,21 @@ function retryFailedReviewsCommandInner(args: Args): void {
           maxAttempts,
           codexTimeoutMs,
           onBeforeDispatch: (nextDispatchUrl) => {
-            dispatchCheckpointed = true;
             checkpointDispatchUrl = nextDispatchUrl;
+            startFailedReviewRetryDispatchAttempt({
+              ledger: retryLedger,
+              number,
+              revision: retryRevision,
+              reportPath: path,
+              attempts: attemptsBeforeDispatch,
+              dispatchUrl: nextDispatchUrl,
+            });
             markdown = checkpointFailedReviewRetry({
               markdown,
               status: "dispatching",
               at: nowIso,
               revision: retryRevision,
-              attempts,
+              attempts: attemptsBeforeDispatch,
               maxAttempts,
               reason: retryReason,
               dispatchUrl: nextDispatchUrl,
@@ -21876,11 +23340,12 @@ function retryFailedReviewsCommandInner(args: Args): void {
               status: "dispatching",
               at: nowIso,
               revision: retryRevision,
-              attempts,
+              attempts: attemptsBeforeDispatch,
               maxAttempts,
               reason: retryReason,
               dispatchUrl: nextDispatchUrl,
             });
+            dispatchCheckpointed = true;
             attempted += 1;
           },
         });
@@ -21917,15 +23382,42 @@ function retryFailedReviewsCommandInner(args: Args): void {
         });
         dispatched += 1;
       } catch (error) {
-        if (dispatchCheckpointed) {
+        const dispatchOutcome =
+          error instanceof GitHubDispatchError
+            ? error.outcome
+            : dispatchCheckpointed
+              ? "ambiguous_transport"
+              : "definitely_not_dispatched";
+        if (dispatchCheckpointed && dispatchOutcome === "ambiguous_transport") {
+          results.push({
+            repo: targetRepo(),
+            number,
+            action: "skipped_retry_dispatch_uncertain",
+            reason: error instanceof Error ? error.message : String(error),
+            ...failedReviewRetryResultRevision(retryRevision),
+            attempts: attemptsBeforeDispatch,
+            reportPath: path,
+            ...(checkpointDispatchUrl ? { dispatchUrl: checkpointDispatchUrl } : {}),
+          });
+          if (
+            error instanceof GitHubDispatchError &&
+            error.cause instanceof GitHubRuntimeBudgetError
+          ) {
+            throw error.cause;
+          }
+          continue;
+        }
+        if (error instanceof GitHubRuntimeBudgetError) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        if (checkpointDispatchUrl) {
           markdown = markFailedReviewRetry({
             markdown,
             status: "dispatch_failed",
             at: nowIso,
             revision: retryRevision,
-            attempts,
+            attempts: attemptsBeforeDispatch,
             maxAttempts,
-            reason: error instanceof Error ? error.message : String(error),
+            reason,
             ...(checkpointDispatchUrl ? { dispatchUrl: checkpointDispatchUrl } : {}),
           });
           writeFileSync(path, markdown, "utf8");
@@ -21934,34 +23426,1407 @@ function retryFailedReviewsCommandInner(args: Args): void {
             status: "dispatch_failed",
             at: nowIso,
             revision: retryRevision,
-            attempts,
+            attempts: attemptsBeforeDispatch,
             maxAttempts,
-            reason: error instanceof Error ? error.message : String(error),
+            reason,
             ...(checkpointDispatchUrl ? { dispatchUrl: checkpointDispatchUrl } : {}),
           });
         }
-        if (error instanceof GitHubRuntimeBudgetError) throw error;
         results.push({
           repo: targetRepo(),
           number,
           action: "skipped_dispatch_failed",
-          reason: error instanceof Error ? error.message : String(error),
+          reason,
           ...failedReviewRetryResultRevision(retryRevision),
-          attempts: dispatchCheckpointed ? attempts : eligibility.attempts,
+          attempts: eligibility.attempts,
           reportPath: path,
+          ...(checkpointDispatchUrl ? { dispatchUrl: checkpointDispatchUrl } : {}),
         });
       }
     }
   } catch (error) {
-    if (!(error instanceof GitHubRuntimeBudgetError)) throw error;
-    results.push({
-      number: 0,
-      action: "skipped_runtime_budget",
-      reason: error.reason,
+    if (error instanceof GitHubRuntimeBudgetError) {
+      results.push({
+        number: 0,
+        action: "skipped_runtime_budget",
+        reason: error.reason,
+      });
+    } else {
+      commandError = error;
+    }
+  }
+  try {
+    writeFileSync(reportPath, `${JSON.stringify(results, null, 2)}\n`, "utf8");
+  } catch (error) {
+    commandError ??= error;
+  }
+  recordFailedReviewRetryEvents({
+    ledger: retryLedger,
+    results,
+    reportPath,
+    dryRun,
+    failure: commandError,
+  });
+  if (commandError) throw commandError;
+  console.log(JSON.stringify({ results, dryRun, attempted, dispatched }, null, 2));
+}
+
+export function reviewRetryActionDisposition(action: FailedReviewRetryAction): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  mutation: boolean;
+} {
+  if (action === "dispatched_failed_review_retry") {
+    return {
+      status: ACTION_EVENT_STATUSES.dispatched,
+      reasonCode: ACTION_EVENT_REASON_CODES.retryScheduled,
+      retryable: true,
+      mutation: true,
+    };
+  }
+  if (action === "planned_failed_review_retry") {
+    return {
+      status: ACTION_EVENT_STATUSES.planned,
+      reasonCode: ACTION_EVENT_REASON_CODES.dryRun,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "marked_failed_review_retry_exhausted") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.retryExhausted,
+      retryable: false,
+      mutation: true,
+    };
+  }
+  if (action === "skipped_runtime_budget") {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_dispatch_failed" || action === "skipped_live_fetch_failed") {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_retry_dispatch_uncertain") {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: false,
+      mutation: true,
+    };
+  }
+  if (action === "skipped_retry_cooldown") {
+    return {
+      status: ACTION_EVENT_STATUSES.waiting,
+      reasonCode: ACTION_EVENT_REASON_CODES.leaseActive,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_stale_head" || action === "skipped_stale_revision") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.sourceChanged,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.skipped,
+    reasonCode: ACTION_EVENT_REASON_CODES.notApplicable,
+    retryable: action !== "skipped_retry_already_exhausted",
+    mutation: false,
+  };
+}
+
+export function reviewRetryBusinessIdempotencyIdentityForTest(options: {
+  repository: string;
+  number: number;
+  revisionKind: FailedReviewRetryRevisionKind;
+  sourceRevision: string;
+  reviewContentDigest: string;
+  decisionPacketSha256: string;
+  slot: "retry_dispatch" | "retry_exhaustion" | "retry_observation";
+}) {
+  return {
+    operation: "review_retry",
+    slot: options.slot,
+    repository: options.repository,
+    number: options.number,
+    revisionKind: options.revisionKind,
+    sourceRevision: options.sourceRevision,
+    reviewContentDigest: options.reviewContentDigest,
+    decisionPacketSha256: options.decisionPacketSha256,
+  };
+}
+
+function reviewRetryIdempotencySlot(
+  action: FailedReviewRetryAction,
+): "retry_dispatch" | "retry_exhaustion" | "retry_observation" {
+  if (
+    action === "dispatched_failed_review_retry" ||
+    action === "planned_failed_review_retry" ||
+    action === "skipped_dispatch_failed" ||
+    action === "skipped_retry_dispatch_uncertain"
+  ) {
+    return "retry_dispatch";
+  }
+  return action === "marked_failed_review_retry_exhausted"
+    ? "retry_exhaustion"
+    : "retry_observation";
+}
+
+export function reviewRetryBatchEventDisposition(
+  actions: readonly FailedReviewRetryAction[],
+  failure: ReturnType<typeof actionLedgerFailureDisposition> | null = null,
+): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  completionReason: string;
+  failedCount: number;
+  partial: boolean;
+} {
+  const dispatchOutcomeUnknown = actions.includes("skipped_retry_dispatch_uncertain");
+  const yielded = actions.includes("skipped_runtime_budget");
+  const failed =
+    dispatchOutcomeUnknown ||
+    actions.some(
+      (action) => action === "skipped_dispatch_failed" || action === "skipped_live_fetch_failed",
+    );
+  if (dispatchOutcomeUnknown) {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: false,
+      completionReason: "dispatch_outcome_unknown",
+      failedCount: 1 + (failure ? 1 : 0),
+      partial: true,
+    };
+  }
+  if (failure) {
+    return {
+      status: failure.status,
+      reasonCode: failure.reasonCode,
+      retryable: true,
+      completionReason: failure.completionReason,
+      failedCount: 1 + (failed ? 1 : 0),
+      partial: actions.length > 0,
+    };
+  }
+  if (failed) {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: true,
+      completionReason: "failed",
+      failedCount: 1,
+      partial: false,
+    };
+  }
+  if (yielded) {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      retryable: true,
+      completionReason: "partial",
+      failedCount: 0,
+      partial: true,
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    retryable: false,
+    completionReason: "completed",
+    failedCount: 0,
+    partial: false,
+  };
+}
+
+function recordFailedReviewRetryEvents(options: {
+  ledger: ReviewRetryActionLedger;
+  results: readonly FailedReviewRetryResult[];
+  reportPath: string;
+  dryRun: boolean;
+  failure?: unknown;
+}): void {
+  if (options.ledger.terminal) return;
+  const operationIdentity = options.ledger.operationIdentity;
+  let dispatchOutcomeUnknownEventId: string | null = null;
+  for (const [index, result] of options.results.entries()) {
+    const disposition = reviewRetryActionDisposition(result.action);
+    const reportMarkdown =
+      result.reportPath && existsSync(result.reportPath)
+        ? readFileSync(result.reportPath, "utf8")
+        : null;
+    const kind = reportMarkdown ? reportItemKind(reportMarkdown) : undefined;
+    const sourceRevision =
+      result.revision ??
+      (reportMarkdown ? reviewLeaseRevisionFromReport(reportMarkdown) : null) ??
+      undefined;
+    const revisionKind =
+      result.revisionKind ??
+      (kind === "pull_request"
+        ? "pull_head_sha"
+        : kind === "issue"
+          ? "item_source_revision"
+          : undefined);
+    const recordPath = result.reportPath ? repoRelativePath(result.reportPath) : undefined;
+    const subject: ActionEventSubject =
+      result.number > 0 && kind
+        ? {
+            repository: result.repo ?? targetRepo(),
+            kind,
+            number: result.number,
+            ...(sourceRevision ? { sourceRevision } : {}),
+            ...(recordPath && !recordPath.startsWith("../") ? { recordPath } : {}),
+          }
+        : {
+            repository: result.repo ?? targetRepo(),
+            kind: "workflow",
+          };
+    const evidence = [
+      ...workflowRunEvidence(),
+      ...(result.reportPath
+        ? [actionLedgerFileEvidence("review_record", result.reportPath)].filter(
+            (entry): entry is ActionEventEvidence => entry !== null,
+          )
+        : []),
+      ...(result.dispatchUrl?.startsWith("https://github.com/")
+        ? [{ kind: "retry_dispatch", runUrl: result.dispatchUrl }]
+        : []),
+    ];
+    const retrySlot = reviewRetryIdempotencySlot(result.action);
+    const idempotencyIdentity =
+      result.number > 0 && revisionKind && sourceRevision
+        ? reviewRetryBusinessIdempotencyIdentityForTest({
+            repository: subject.repository,
+            number: result.number,
+            revisionKind,
+            sourceRevision,
+            reviewContentDigest:
+              (reportMarkdown
+                ? frontMatterValue(reportMarkdown, "review_content_digest")
+                : undefined) ?? "unknown",
+            decisionPacketSha256:
+              (reportMarkdown
+                ? frontMatterValue(reportMarkdown, "decision_packet_sha256")
+                : undefined) ?? "none",
+            slot: retrySlot,
+          })
+        : {
+            operation: "review_retry",
+            slot: retrySlot,
+            repository: subject.repository,
+            number: result.number,
+            action: result.action,
+          };
+    if (!options.dryRun && disposition.mutation && (!revisionKind || !sourceRevision)) {
+      throw new Error(
+        `retry mutation receipt for ${subject.repository}#${result.number} is missing its source revision`,
+      );
+    }
+    const dispatchAttempt =
+      result.number > 0 && revisionKind && sourceRevision
+        ? options.ledger.dispatchAttempts.get(
+            reviewRetryDispatchAttemptKey({
+              repository: subject.repository,
+              number: result.number,
+              revision: { kind: revisionKind, value: sourceRevision },
+            }),
+          )
+        : undefined;
+    const event = recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.reviewRetry,
+      status: disposition.status,
+      reasonCode: disposition.reasonCode,
+      retryable: disposition.retryable,
+      mutation: !options.dryRun && disposition.mutation,
+      identity: {
+        slot: "retry_result",
+        index,
+        repository: subject.repository,
+        number: result.number,
+      },
+      operation: "review_retry",
+      operationIdentity,
+      parentEventId: dispatchAttempt?.eventId ?? options.ledger.batchStartEventId,
+      phaseSeq: dispatchAttempt ? dispatchAttempt.phaseSeq + 1 : 10 + index,
+      idempotencyIdentity,
+      component: "retry_failed_reviews",
+      subject,
+      evidence,
+      attributes: {
+        batch_index: index,
+        attempt: Math.max(1, result.attempts ?? 1),
+        retry_count: result.attempts ?? 0,
+        final_attempt:
+          result.action === "marked_failed_review_retry_exhausted" ||
+          result.action === "skipped_retry_already_exhausted",
+        completion_reason:
+          result.action === "skipped_retry_dispatch_uncertain"
+            ? "dispatch_outcome_unknown"
+            : result.action,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    if (result.action === "skipped_retry_dispatch_uncertain") {
+      dispatchOutcomeUnknownEventId = event?.event_id ?? dispatchAttempt?.eventId ?? null;
+    }
+  }
+  const failure =
+    options.failure === undefined || options.failure === null
+      ? null
+      : actionLedgerFailureDisposition(options.failure);
+  const batchDisposition = reviewRetryBatchEventDisposition(
+    options.results.map((result) => result.action),
+    failure,
+  );
+  recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewRetry,
+    status: batchDisposition.status,
+    reasonCode: batchDisposition.reasonCode,
+    retryable: batchDisposition.retryable,
+    mutation:
+      !options.dryRun &&
+      options.results.some((result) => reviewRetryActionDisposition(result.action).mutation),
+    identity: { slot: "retry_batch_terminal" },
+    operation: "review_retry",
+    operationIdentity,
+    parentEventId: dispatchOutcomeUnknownEventId ?? options.ledger.batchStartEventId,
+    phaseSeq: 1_000_000,
+    idempotencyIdentity: { operationIdentity, slot: "retry_batch_terminal" },
+    component: "retry_failed_reviews",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: [
+      ...workflowRunEvidence(),
+      ...[actionLedgerFileEvidence("review_retry_report", options.reportPath)].filter(
+        (entry): entry is ActionEventEvidence => entry !== null,
+      ),
+    ],
+    attributes: {
+      result_count: options.results.length,
+      retry_count: options.results.filter(
+        (result) =>
+          result.action === "dispatched_failed_review_retry" ||
+          result.action === "planned_failed_review_retry",
+      ).length,
+      failed_count: batchDisposition.failedCount,
+      skipped_count: options.results.filter((result) => result.action.startsWith("skipped_"))
+        .length,
+      partial: batchDisposition.partial,
+      duration_ms: Math.max(0, Date.now() - options.ledger.startedAtMs),
+      completion_reason: batchDisposition.completionReason,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.ledger.terminal = true;
+}
+
+type ApplyItemBusinessIdempotencyIdentity = {
+  operation: "apply";
+  slot: "apply_item" | "apply_mutation" | "review_comment";
+  repository: string;
+  number: number;
+  sourceRevision: string;
+  reviewContentDigest: string;
+  decisionPacketSha256: string;
+};
+
+type ApplyMutationBusinessIdempotencyIdentity = ApplyItemBusinessIdempotencyIdentity & {
+  slot: "apply_mutation";
+  mutationIdentitySha256: string;
+};
+
+type ApplyLedgerItem = {
+  entry: ReportEntry;
+  index: number;
+  started: boolean;
+  startEventId: string | null;
+  lastEventId: string | null;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  mutationEventId: string | null;
+  mutationAttemptCount: number;
+  terminal: boolean;
+  businessIdentity: Omit<ApplyItemBusinessIdempotencyIdentity, "slot">;
+};
+
+type ApplyActionLedger = {
+  operationIdentity: {
+    repository: string;
+    applyKind: ApplyKind;
+    closeReasons: string[];
+    dryRun: boolean;
+    syncCommentsOnly: boolean;
+    requestedItemNumbers: number[];
+    reportPath: string;
+    checkpoint: string;
+    candidateRevisions: Array<{
+      repository: string;
+      number: number;
+      sourceRevision: string;
+      reviewContentDigest: string;
+      decisionPacketSha256: string;
+    }>;
+  };
+  batchStartEventId: string | null;
+  items: Map<string, ApplyLedgerItem>;
+  startedAtMs: number;
+  nextPhaseSeq: number;
+  terminal: boolean;
+};
+
+type ApplyPhaseCursor = {
+  nextPhaseSeq: number;
+};
+
+function nextApplyPhaseSeq(cursor: ApplyPhaseCursor): number {
+  const phaseSeq = cursor.nextPhaseSeq;
+  cursor.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+export function applyPhaseSequenceForTest(count: number): number[] {
+  const cursor: ApplyPhaseCursor = { nextPhaseSeq: 2 };
+  return Array.from({ length: Math.max(0, count) }, () => nextApplyPhaseSeq(cursor));
+}
+
+function startApplyActionLedger(options: {
+  applyKind: ApplyKind;
+  closeReasons: ReadonlySet<CloseReason> | null;
+  dryRun: boolean;
+  syncCommentsOnly: boolean;
+  requestedItemNumbers: readonly number[];
+  reportPath: string;
+  candidates: readonly ReportEntry[];
+}): ApplyActionLedger {
+  const operationIdentity = {
+    repository: targetRepo(),
+    applyKind: options.applyKind,
+    closeReasons: options.closeReasons ? [...options.closeReasons].sort() : ["all"],
+    dryRun: options.dryRun,
+    syncCommentsOnly: options.syncCommentsOnly,
+    requestedItemNumbers: [...options.requestedItemNumbers],
+    reportPath: repoRelativePath(options.reportPath),
+    checkpoint: String(process.env.CLAWSWEEPER_APPLY_CHECKPOINT ?? "0"),
+    candidateRevisions: options.candidates.map((entry) => ({
+      repository: entry.repo,
+      number: entry.number,
+      sourceRevision: reviewLeaseRevisionFromReport(entry.markdown) ?? "unknown",
+      reviewContentDigest: frontMatterValue(entry.markdown, "review_content_digest") ?? "unknown",
+      decisionPacketSha256: frontMatterValue(entry.markdown, "decision_packet_sha256") ?? "none",
+    })),
+  };
+  const batchStart = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyBatch,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "apply_batch_start" },
+    operation: "apply",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "apply_batch_start" },
+    component: "apply_decisions",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      candidate_count: options.candidates.length,
+      review_mode: options.syncCommentsOnly ? "comment_sync" : "apply",
+      work_kind: options.dryRun ? "proof" : "mutation",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  const items = new Map<string, ApplyLedgerItem>();
+  for (const [index, entry] of options.candidates.entries()) {
+    const key = actionLedgerItemKey(entry);
+    if (items.has(key)) continue;
+    items.set(key, {
+      entry,
+      index,
+      started: false,
+      startEventId: null,
+      lastEventId: null,
+      mutationObserved: false,
+      uncertainMutationObserved: false,
+      mutationEventId: null,
+      mutationAttemptCount: 0,
+      terminal: false,
+      businessIdentity: {
+        operation: "apply",
+        repository: entry.repo,
+        number: entry.number,
+        sourceRevision: reviewLeaseRevisionFromReport(entry.markdown) ?? "unknown",
+        reviewContentDigest: frontMatterValue(entry.markdown, "review_content_digest") ?? "unknown",
+        decisionPacketSha256: frontMatterValue(entry.markdown, "decision_packet_sha256") ?? "none",
+      },
     });
   }
-  writeFileSync(reportPath, `${JSON.stringify(results, null, 2)}\n`, "utf8");
-  console.log(JSON.stringify({ results, dryRun, attempted, dispatched }, null, 2));
+  return {
+    operationIdentity,
+    batchStartEventId: batchStart?.event_id ?? null,
+    items,
+    startedAtMs: Date.now(),
+    nextPhaseSeq: 2,
+    terminal: false,
+  };
+}
+
+export function applyItemBusinessIdempotencyIdentityForTest(options: {
+  slot: "apply_item" | "apply_mutation" | "review_comment";
+  repository: string;
+  number: number;
+  sourceRevision: string;
+  reviewContentDigest: string;
+  decisionPacketSha256: string;
+}): ApplyItemBusinessIdempotencyIdentity {
+  return {
+    operation: "apply",
+    slot: options.slot,
+    repository: options.repository,
+    number: options.number,
+    sourceRevision: options.sourceRevision,
+    reviewContentDigest: options.reviewContentDigest,
+    decisionPacketSha256: options.decisionPacketSha256,
+  };
+}
+
+function applyItemIdempotencyIdentity(
+  state: ApplyLedgerItem,
+  slot: "apply_item" | "apply_mutation" | "review_comment",
+): ApplyItemBusinessIdempotencyIdentity {
+  return applyItemBusinessIdempotencyIdentityForTest({
+    ...state.businessIdentity,
+    slot,
+  });
+}
+
+export function applyMutationBusinessIdempotencyIdentityForTest(options: {
+  repository: string;
+  number: number;
+  sourceRevision: string;
+  reviewContentDigest: string;
+  decisionPacketSha256: string;
+  mutationIdentity: string;
+}): ApplyMutationBusinessIdempotencyIdentity {
+  return {
+    ...applyItemBusinessIdempotencyIdentityForTest({
+      ...options,
+      slot: "apply_mutation",
+    }),
+    slot: "apply_mutation",
+    mutationIdentitySha256: sha256(options.mutationIdentity),
+  };
+}
+
+function applyLedgerItemSubject(
+  state: ApplyLedgerItem,
+  entry: ReportEntry = state.entry,
+): ActionEventSubject {
+  const kind = reportItemKind(entry.markdown);
+  if (!kind) {
+    throw new Error(
+      `apply ledger item ${state.businessIdentity.repository}#${state.businessIdentity.number} has no report item kind`,
+    );
+  }
+  const recordPath = repoRelativePath(entry.path);
+  return {
+    repository: state.businessIdentity.repository,
+    kind,
+    number: state.businessIdentity.number,
+    ...(state.businessIdentity.sourceRevision === "unknown"
+      ? {}
+      : { sourceRevision: state.businessIdentity.sourceRevision }),
+    ...(recordPath.startsWith("../") ? {} : { recordPath }),
+  };
+}
+
+function startApplyActionLedgerItem(
+  ledger: ApplyActionLedger,
+  entry: ReportEntry,
+): ApplyLedgerItem | null {
+  const state = ledger.items.get(actionLedgerItemKey(entry));
+  if (!state) return null;
+  if (state.started) return state;
+  const phaseSeq = nextApplyPhaseSeq(ledger);
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyAction,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: {
+      slot: "apply_item_start",
+      index: state.index,
+      repository: entry.repo,
+      number: entry.number,
+    },
+    operation: "apply",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.batchStartEventId,
+    phaseSeq,
+    idempotencyIdentity: applyItemIdempotencyIdentity(state, "apply_item"),
+    component: "apply_decisions",
+    subject: applyLedgerItemSubject(state),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: state.index,
+      item_count: 1,
+      completion_reason: "started",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.started = true;
+  state.startEventId = start?.event_id ?? null;
+  state.lastEventId = state.startEventId;
+  return state;
+}
+
+type ApplyMutationAttempt = {
+  state: ApplyLedgerItem;
+  eventId: string | null;
+  idempotencyIdentity: ApplyMutationBusinessIdempotencyIdentity;
+  mutationIndex: number;
+  receiptIdentitySha256: string;
+};
+
+function startApplyMutationAttempt(
+  ledger: ApplyActionLedger,
+  entry: ReportEntry,
+  receiptIdentity: string,
+  idempotencyIdentity: string,
+): ApplyMutationAttempt | null {
+  const state = startApplyActionLedgerItem(ledger, entry);
+  if (!state) return null;
+  const mutationIndex = state.mutationAttemptCount;
+  state.mutationAttemptCount += 1;
+  const businessIdempotencyIdentity = applyMutationBusinessIdempotencyIdentityForTest({
+    ...state.businessIdentity,
+    mutationIdentity: idempotencyIdentity,
+  });
+  const receiptIdentitySha256 = sha256(receiptIdentity);
+  const phaseSeq = nextApplyPhaseSeq(ledger);
+  const attempt = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyAction,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: true,
+    mutation: false,
+    identity: {
+      slot: "apply_mutation_attempt",
+      index: state.index,
+      mutationIndex,
+      receiptIdentitySha256,
+      repository: entry.repo,
+      number: entry.number,
+    },
+    operation: "apply",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: state.lastEventId ?? state.startEventId,
+    phaseSeq,
+    idempotencyIdentity: businessIdempotencyIdentity,
+    component: "apply_decisions",
+    subject: applyLedgerItemSubject(state),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: state.index,
+      attempt: mutationIndex + 1,
+      action_count: 1,
+      partial: true,
+      completion_reason: "mutation_attempted",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.lastEventId = attempt?.event_id ?? state.lastEventId;
+  return {
+    state,
+    eventId: attempt?.event_id ?? null,
+    idempotencyIdentity: businessIdempotencyIdentity,
+    mutationIndex,
+    receiptIdentitySha256,
+  };
+}
+
+function finishApplyMutationAttempt(options: {
+  ledger: ApplyActionLedger;
+  entry: ReportEntry;
+  attempt: ApplyMutationAttempt;
+  outcome: "accepted" | "rejected" | "unknown";
+}): string | null {
+  const mutation = options.outcome !== "rejected";
+  const phaseSeq = nextApplyPhaseSeq(options.ledger);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyAction,
+    status:
+      options.outcome === "accepted"
+        ? ACTION_EVENT_STATUSES.executed
+        : options.outcome === "rejected"
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.failed,
+    reasonCode:
+      options.outcome === "accepted"
+        ? ACTION_EVENT_REASON_CODES.completed
+        : options.outcome === "rejected"
+          ? ACTION_EVENT_REASON_CODES.notApplicable
+          : ACTION_EVENT_REASON_CODES.unavailable,
+    retryable: options.outcome === "unknown",
+    mutation,
+    identity: {
+      slot: "apply_mutation_outcome",
+      index: options.attempt.state.index,
+      mutationIndex: options.attempt.mutationIndex,
+      receiptIdentitySha256: options.attempt.receiptIdentitySha256,
+      outcome: options.outcome,
+      repository: options.entry.repo,
+      number: options.entry.number,
+    },
+    operation: "apply",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.attempt.eventId,
+    phaseSeq,
+    idempotencyIdentity: options.attempt.idempotencyIdentity,
+    component: "apply_decisions",
+    subject: applyLedgerItemSubject(options.attempt.state),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: options.attempt.state.index,
+      attempt: options.attempt.mutationIndex + 1,
+      action_count: mutation ? 1 : 0,
+      partial: options.outcome === "unknown",
+      completion_reason:
+        options.outcome === "accepted"
+          ? "mutation_accepted"
+          : options.outcome === "rejected"
+            ? "mutation_rejected"
+            : "mutation_outcome_unknown",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.attempt.state.lastEventId = event?.event_id ?? options.attempt.state.lastEventId;
+  if (mutation) {
+    options.attempt.state.mutationEventId = event?.event_id ?? options.attempt.eventId;
+  }
+  if (options.outcome === "unknown") {
+    options.attempt.state.uncertainMutationObserved = true;
+  }
+  return event?.event_id ?? null;
+}
+
+function recordApplyMutationBoundary(
+  ledger: ApplyActionLedger,
+  entry: ReportEntry,
+  parentEventId?: string | null,
+): void {
+  const state = startApplyActionLedgerItem(ledger, entry);
+  if (!state || state.mutationObserved) return;
+  const phaseSeq = nextApplyPhaseSeq(ledger);
+  const mutation = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyAction,
+    status: ACTION_EVENT_STATUSES.executed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    retryable: true,
+    mutation: true,
+    identity: {
+      slot: "apply_mutation_observed",
+      index: state.index,
+      repository: entry.repo,
+      number: entry.number,
+    },
+    operation: "apply",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: parentEventId ?? state.lastEventId ?? state.startEventId,
+    phaseSeq,
+    idempotencyIdentity: applyItemIdempotencyIdentity(state, "apply_item"),
+    component: "apply_decisions",
+    subject: applyLedgerItemSubject(state),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      batch_index: state.index,
+      action_count: 1,
+      partial: true,
+      completion_reason: "mutation_observed",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  state.mutationObserved = true;
+  state.lastEventId = mutation?.event_id ?? state.lastEventId;
+  state.mutationEventId = mutation?.event_id ?? state.mutationEventId;
+}
+
+export function applyActionEventDisposition(
+  action: ActionTaken,
+  mutationOccurred: boolean,
+  dryRun: boolean,
+  commentMutationOccurred = mutationOccurred,
+): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  mutation: boolean;
+  completionReason: string;
+} {
+  if (action === "skipped_runtime_budget") {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      retryable: true,
+      mutation: mutationOccurred,
+      completionReason: "runtime_budget",
+    };
+  }
+  if (dryRun && (action === "closed" || action === "review_comment_synced")) {
+    return {
+      status: ACTION_EVENT_STATUSES.planned,
+      reasonCode: ACTION_EVENT_REASON_CODES.dryRun,
+      retryable: false,
+      mutation: false,
+      completionReason: "dry_run",
+    };
+  }
+  if (action === "closed") {
+    return {
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: mutationOccurred,
+      completionReason: "closed",
+    };
+  }
+  if (action === "review_comment_synced" || action === "corrected_stale_canonical_comment") {
+    if (!commentMutationOccurred) {
+      return {
+        status: ACTION_EVENT_STATUSES.unchanged,
+        reasonCode: ACTION_EVENT_REASON_CODES.contentUnchanged,
+        retryable: false,
+        mutation: mutationOccurred,
+        completionReason: "comment_unchanged",
+      };
+    }
+    return {
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: mutationOccurred,
+      completionReason: "comment_published",
+    };
+  }
+  if (action.startsWith("retry_")) {
+    return {
+      status: ACTION_EVENT_STATUSES.waiting,
+      reasonCode: ACTION_EVENT_REASON_CODES.dependencyPending,
+      retryable: true,
+      mutation: mutationOccurred,
+      completionReason: "retry_pending",
+    };
+  }
+  if (action === "skipped_changed_since_review") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.sourceChanged,
+      retryable: true,
+      mutation: mutationOccurred,
+      completionReason: "source_changed",
+    };
+  }
+  if (action === "skipped_comment_auth") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.authorizationFailed,
+      retryable: true,
+      mutation: mutationOccurred,
+      completionReason: "authorization_failed",
+    };
+  }
+  if (action === "skipped_locked_conversation") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.policyBlocked,
+      retryable: false,
+      mutation: mutationOccurred,
+      completionReason: "locked_conversation",
+    };
+  }
+  if (action === "kept_open" || action.startsWith("skipped_")) {
+    return {
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.notApplicable,
+      retryable: false,
+      mutation: mutationOccurred,
+      completionReason: action,
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    retryable: false,
+    mutation: mutationOccurred,
+    completionReason: "completed",
+  };
+}
+
+function applyRuntimeBudgetYieldResults(number: number, reason: string): ApplyResult[] {
+  return [
+    {
+      number,
+      action: "skipped_runtime_budget",
+      reason,
+    },
+    {
+      number: 0,
+      action: "skipped_runtime_budget",
+      reason,
+    },
+  ];
+}
+
+export function applyRuntimeBudgetYieldResultsForTest(
+  number: number,
+  reason: string,
+): ApplyResult[] {
+  return applyRuntimeBudgetYieldResults(number, reason);
+}
+
+export function reviewCommentPublicationEventDisposition(
+  action: ActionTaken,
+  commentMutationOccurred: boolean,
+  dryRun: boolean,
+): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  mutation: boolean;
+  completionReason: string;
+} | null {
+  if (action === "review_comment_synced" || action === "corrected_stale_canonical_comment") {
+    if (!dryRun && !commentMutationOccurred) {
+      return {
+        status: ACTION_EVENT_STATUSES.unchanged,
+        reasonCode: ACTION_EVENT_REASON_CODES.contentUnchanged,
+        retryable: false,
+        mutation: false,
+        completionReason: "comment_unchanged",
+      };
+    }
+    return {
+      status: dryRun ? ACTION_EVENT_STATUSES.planned : ACTION_EVENT_STATUSES.published,
+      reasonCode: dryRun ? ACTION_EVENT_REASON_CODES.dryRun : ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: !dryRun && commentMutationOccurred,
+      completionReason: dryRun ? "dry_run" : "comment_published",
+    };
+  }
+  if (action === "skipped_comment_auth") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.authorizationFailed,
+      retryable: true,
+      mutation: false,
+      completionReason: "authorization_failed",
+    };
+  }
+  if (action === "skipped_locked_conversation") {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.policyBlocked,
+      retryable: false,
+      mutation: false,
+      completionReason: "locked_conversation",
+    };
+  }
+  if (action === "retry_stale_canonical_comment_sync") {
+    return {
+      status: ACTION_EVENT_STATUSES.waiting,
+      reasonCode: ACTION_EVENT_REASON_CODES.dependencyPending,
+      retryable: true,
+      mutation: false,
+      completionReason: "retry_pending",
+    };
+  }
+  if (action === "skipped_stale_review_comment_sync") {
+    return {
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.sourceChanged,
+      retryable: true,
+      mutation: false,
+      completionReason: "source_changed",
+    };
+  }
+  return null;
+}
+
+function recordApplyActionLedgerItemResults(options: {
+  ledger: ApplyActionLedger;
+  state: ApplyLedgerItem;
+  results: readonly ApplyResult[];
+  entry: ReportEntry;
+  mutationOccurred: boolean;
+  dryRun: boolean;
+}): void {
+  if (options.state.terminal) return;
+  const results =
+    options.results.length > 0
+      ? options.results
+      : [
+          {
+            repo: options.state.businessIdentity.repository,
+            number: options.state.businessIdentity.number,
+            action: "kept_open" as const,
+            reason: options.mutationOccurred
+              ? "apply item completed after a durable mutation"
+              : "apply item required no action",
+          },
+        ];
+  for (const [resultIndex, result] of results.entries()) {
+    const commentMutationOccurred = result.commentMutationOccurred === true;
+    const disposition = applyActionEventDisposition(
+      result.action,
+      options.mutationOccurred,
+      options.dryRun,
+      commentMutationOccurred,
+    );
+    const commentDisposition = reviewCommentPublicationEventDisposition(
+      result.action,
+      commentMutationOccurred,
+      options.dryRun,
+    );
+    const actionPhaseSeq = nextApplyPhaseSeq(options.ledger);
+    const actionEvent = recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: disposition.status,
+      reasonCode: disposition.reasonCode,
+      retryable: disposition.retryable,
+      mutation: disposition.mutation,
+      identity: {
+        slot: "apply_result",
+        index: options.state.index,
+        resultIndex,
+        repository: options.state.businessIdentity.repository,
+        number: options.state.businessIdentity.number,
+      },
+      operation: "apply",
+      operationIdentity: options.ledger.operationIdentity,
+      parentEventId: options.state.lastEventId ?? options.state.startEventId,
+      phaseSeq: actionPhaseSeq,
+      idempotencyIdentity: applyItemIdempotencyIdentity(options.state, "apply_item"),
+      component: "apply_decisions",
+      subject: applyLedgerItemSubject(options.state, options.entry),
+      evidence: [
+        ...workflowRunEvidence(),
+        ...[actionLedgerFileEvidence("review_record", options.entry.path)].filter(
+          (entry): entry is ActionEventEvidence => entry !== null,
+        ),
+      ],
+      attributes: {
+        batch_index: options.state.index,
+        item_count: 1,
+        closed_count: result.action === "closed" ? 1 : 0,
+        skipped_count:
+          result.action === "kept_open" ||
+          result.action.startsWith("skipped_") ||
+          result.action.startsWith("retry_")
+            ? 1
+            : 0,
+        completion_reason: disposition.completionReason,
+        partial: disposition.status === ACTION_EVENT_STATUSES.yielded,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    options.state.lastEventId = actionEvent?.event_id ?? options.state.lastEventId;
+    if (commentDisposition) {
+      const commentPhaseSeq = nextApplyPhaseSeq(options.ledger);
+      const commentEvent = recordWorkflowPhaseEvent(ROOT, {
+        phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+        status: commentDisposition.status,
+        reasonCode: commentDisposition.reasonCode,
+        retryable: commentDisposition.retryable,
+        mutation: commentDisposition.mutation,
+        identity: {
+          slot: "review_comment_publication",
+          index: options.state.index,
+          resultIndex,
+          repository: options.state.businessIdentity.repository,
+          number: options.state.businessIdentity.number,
+        },
+        operation: "apply",
+        operationIdentity: options.ledger.operationIdentity,
+        parentEventId: options.state.lastEventId ?? options.state.startEventId,
+        phaseSeq: commentPhaseSeq,
+        idempotencyIdentity: applyItemIdempotencyIdentity(options.state, "review_comment"),
+        component: "apply_decisions",
+        subject: applyLedgerItemSubject(options.state, options.entry),
+        evidence: workflowRunEvidence(),
+        attributes: {
+          publication_kind: "review_comment",
+          comment_count: commentDisposition.mutation ? 1 : 0,
+          completion_reason: commentDisposition.completionReason,
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      options.state.lastEventId = commentEvent?.event_id ?? options.state.lastEventId;
+    }
+  }
+  options.state.terminal = true;
+}
+
+function recordApplyActionLedgerItemFailure(options: {
+  ledger: ApplyActionLedger;
+  state: ApplyLedgerItem;
+  entry: ReportEntry;
+  failure: unknown;
+  mutationOccurred: boolean;
+}): void {
+  if (options.state.terminal) return;
+  const disposition = actionLedgerFailureDisposition(options.failure);
+  const phaseSeq = nextApplyPhaseSeq(options.ledger);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyAction,
+    status: disposition.status,
+    reasonCode: disposition.reasonCode,
+    retryable: true,
+    mutation: options.mutationOccurred,
+    identity: {
+      slot: "apply_in_flight_failure",
+      index: options.state.index,
+      repository: options.state.businessIdentity.repository,
+      number: options.state.businessIdentity.number,
+    },
+    operation: "apply",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.state.lastEventId ?? options.state.startEventId,
+    phaseSeq,
+    idempotencyIdentity: applyItemIdempotencyIdentity(options.state, "apply_item"),
+    component: "apply_decisions",
+    subject: applyLedgerItemSubject(options.state, options.entry),
+    evidence: workflowRunEvidence(),
+    attributes: {
+      failed_count: 1,
+      partial: options.mutationOccurred,
+      completion_reason: disposition.completionReason,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.state.lastEventId = event?.event_id ?? options.state.lastEventId;
+  options.state.terminal = true;
+}
+
+function recordApplyActionEvents(options: {
+  ledger: ApplyActionLedger;
+  results: readonly ApplyResult[];
+  entries: ReadonlyMap<number, ReportEntry>;
+  mutationByItem: ReadonlyMap<string, boolean>;
+  dryRun: boolean;
+  reportPath: string;
+  failed?: boolean;
+  failure?: unknown;
+  inFlightItem?: { repo: string; number: number; mutationOccurred: boolean };
+}): void {
+  if (options.ledger.terminal) return;
+  const inFlightKey = options.inFlightItem ? actionLedgerItemKey(options.inFlightItem) : null;
+  if (options.failed && options.inFlightItem && inFlightKey) {
+    const state = options.ledger.items.get(inFlightKey);
+    if (state?.started && !state.terminal) {
+      const entry = options.entries.get(options.inFlightItem.number) ?? state.entry;
+      recordApplyActionLedgerItemFailure({
+        ledger: options.ledger,
+        state,
+        entry,
+        failure: options.failure,
+        mutationOccurred:
+          options.inFlightItem.mutationOccurred ||
+          state.mutationObserved ||
+          state.uncertainMutationObserved,
+      });
+    }
+  }
+  for (const state of options.ledger.items.values()) {
+    if (!state.started || state.terminal) continue;
+    const repository = state.businessIdentity.repository;
+    const number = state.businessIdentity.number;
+    const itemResults = options.results.filter(
+      (result) => (result.repo ?? targetRepo()) === repository && result.number === number,
+    );
+    const entry = options.entries.get(number) ?? state.entry;
+    recordApplyActionLedgerItemResults({
+      ledger: options.ledger,
+      state,
+      results: itemResults,
+      entry,
+      mutationOccurred:
+        state.mutationObserved ||
+        state.uncertainMutationObserved ||
+        options.mutationByItem.get(`${repository}#${number}`) === true,
+      dryRun: options.dryRun,
+    });
+  }
+  for (const [index, result] of options.results.entries()) {
+    if (result.number > 0) continue;
+    const disposition = applyActionEventDisposition(result.action, false, options.dryRun);
+    const phaseSeq = nextApplyPhaseSeq(options.ledger);
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: disposition.status,
+      reasonCode: disposition.reasonCode,
+      retryable: disposition.retryable,
+      mutation: false,
+      identity: {
+        slot: "apply_result",
+        index,
+        repository: result.repo ?? targetRepo(),
+        number: result.number,
+      },
+      operation: "apply",
+      operationIdentity: options.ledger.operationIdentity,
+      parentEventId: options.ledger.batchStartEventId,
+      phaseSeq,
+      idempotencyIdentity: {
+        operationIdentity: options.ledger.operationIdentity,
+        slot: "apply_workflow_result",
+        action: result.action,
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: result.repo ?? targetRepo(),
+        kind: "workflow",
+      },
+      evidence: workflowRunEvidence(),
+      attributes: {
+        item_count: 0,
+        completion_reason: disposition.completionReason,
+        partial: disposition.status === ACTION_EVENT_STATUSES.yielded,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+  }
+  const mutationCount = [...options.mutationByItem.values()].filter(Boolean).length;
+  const closedCount = options.results.filter((result) => result.action === "closed").length;
+  const skippedCount = options.results.filter(
+    (result) =>
+      result.action === "kept_open" ||
+      result.action.startsWith("skipped_") ||
+      result.action.startsWith("retry_"),
+  ).length;
+  const yielded = options.results.some((result) => result.action === "skipped_runtime_budget");
+  const failure = options.failed ? actionLedgerFailureDisposition(options.failure) : null;
+  const partial =
+    yielded ||
+    (options.failed === true &&
+      (options.results.length > 0 || options.inFlightItem?.mutationOccurred === true));
+  const batchStatus = failure
+    ? failure.status
+    : yielded
+      ? ACTION_EVENT_STATUSES.yielded
+      : options.dryRun
+        ? ACTION_EVENT_STATUSES.planned
+        : options.results.length === 0
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.completed;
+  const batchReason = failure
+    ? failure.reasonCode
+    : yielded
+      ? ACTION_EVENT_REASON_CODES.runtimeBudget
+      : options.dryRun
+        ? ACTION_EVENT_REASON_CODES.dryRun
+        : options.results.length === 0
+          ? ACTION_EVENT_REASON_CODES.noChanges
+          : ACTION_EVENT_REASON_CODES.completed;
+  const batchTerminalPhaseSeq = nextApplyPhaseSeq(options.ledger);
+  const batchTerminal = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyBatch,
+    status: batchStatus,
+    reasonCode: batchReason,
+    retryable: Boolean(failure) || yielded,
+    mutation: !options.dryRun && mutationCount > 0,
+    identity: { slot: "apply_batch_terminal" },
+    operation: "apply",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: options.ledger.batchStartEventId,
+    phaseSeq: batchTerminalPhaseSeq,
+    idempotencyIdentity: {
+      operationIdentity: options.ledger.operationIdentity,
+      slot: "apply_batch_terminal",
+    },
+    component: "apply_decisions",
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      result_count: options.results.length,
+      processed_count: options.results.filter((result) => result.number > 0).length,
+      closed_count: closedCount,
+      skipped_count: skippedCount,
+      failed_count: failure ? 1 : 0,
+      action_count: mutationCount,
+      duration_ms: Math.max(0, Date.now() - options.ledger.startedAtMs),
+      partial,
+      completion_reason: failure
+        ? failure.completionReason
+        : yielded
+          ? "partial"
+          : options.dryRun
+            ? "dry_run"
+            : options.results.length === 0
+              ? "no_changes"
+              : "completed",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  const reportEvidence = actionLedgerFileEvidence("apply_report", options.reportPath);
+  const reportPublicationPhaseSeq = nextApplyPhaseSeq(options.ledger);
+  recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.applyPublish,
+    status: reportEvidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
+    reasonCode: reportEvidence
+      ? ACTION_EVENT_REASON_CODES.completed
+      : ACTION_EVENT_REASON_CODES.notFound,
+    retryable: !reportEvidence,
+    mutation: false,
+    identity: { slot: "apply_report_publication" },
+    operation: "apply",
+    operationIdentity: options.ledger.operationIdentity,
+    parentEventId: batchTerminal?.event_id ?? options.ledger.batchStartEventId,
+    phaseSeq: reportPublicationPhaseSeq,
+    idempotencyIdentity: {
+      operationIdentity: options.ledger.operationIdentity,
+      slot: "apply_report_publication",
+    },
+    component: "apply_decisions",
+    subject: {
+      repository: targetRepo(),
+      kind: "publication",
+      ...(repoRelativePath(options.reportPath).startsWith("../")
+        ? {}
+        : { recordPath: repoRelativePath(options.reportPath) }),
+    },
+    evidence: [...workflowRunEvidence(), ...(reportEvidence ? [reportEvidence] : [])],
+    attributes: {
+      publication_kind: "local_report",
+      result_count: options.results.length,
+      partial,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  options.ledger.terminal = true;
 }
 
 function applyDecisionsCommand(args: Args): void {
@@ -21973,8 +24838,12 @@ function applyDecisionsCommand(args: Args): void {
     try {
       applyDecisionsCommandInner(args, runtimeBudget);
     } catch (error) {
-      if (!(error instanceof GitHubRuntimeBudgetError) || !runtimeBudget.onYield) throw error;
-      runtimeBudget.onYield(error.reason);
+      if (error instanceof GitHubRuntimeBudgetError && runtimeBudget.onYield) {
+        runtimeBudget.onYield(error.reason);
+        return;
+      }
+      runtimeBudget.onFailure?.(error);
+      throw error;
     }
   });
 }
@@ -22115,6 +24984,18 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
   const allOpenFileEntries = applyReportEntriesForDir(itemsDir, "items", false);
   const openFileEntryByNumber = new Map(allOpenFileEntries.map((entry) => [entry.number, entry]));
   const closedThisRun = new Set<string>();
+  const applyLedger = startApplyActionLedger({
+    applyKind,
+    closeReasons: applyCloseReasons,
+    dryRun,
+    syncCommentsOnly,
+    requestedItemNumbers,
+    reportPath,
+    candidates: fileEntries,
+  });
+  const mutationByItem = new Map<string, boolean>();
+  let activeApplyItem: { repo: string; number: number; mutationOccurred: boolean } | null = null;
+  let applyEventsFinalized = false;
   const writeCursorTrace = (): void => {
     if (!cursorTracePath) return;
     ensureDir(dirname(cursorTracePath));
@@ -22128,12 +25009,45 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       "utf8",
     );
   };
-  const finishApply = (): void => {
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    writeCursorTrace();
-    logProgress("finished apply");
-    console.log(JSON.stringify(results, null, 2));
+  const finishApply = (failed = false, failure?: unknown): void => {
+    if (applyEventsFinalized) return;
+    const publicResults = results.map(
+      ({
+        mutationOccurred: _mutationOccurred,
+        commentMutationOccurred: _commentMutationOccurred,
+        ...result
+      }) => result,
+    );
+    let publicationError: unknown = null;
+    try {
+      ensureDir(dirname(reportPath));
+      writeFileSync(reportPath, JSON.stringify(publicResults, null, 2), "utf8");
+      writeCursorTrace();
+    } catch (error) {
+      publicationError = error;
+    }
+    const finalEntries = new Map<number, ReportEntry>();
+    for (const finalEntry of [
+      ...reportEntriesForDir(itemsDir),
+      ...reportEntriesForDir(closedDir),
+    ].filter((candidate) => candidate.repo === targetRepo())) {
+      finalEntries.set(finalEntry.number, finalEntry);
+    }
+    recordApplyActionEvents({
+      ledger: applyLedger,
+      results,
+      entries: finalEntries,
+      mutationByItem,
+      dryRun,
+      reportPath,
+      failed: failed || publicationError !== null,
+      failure: failure ?? publicationError,
+      ...(activeApplyItem ? { inFlightItem: activeApplyItem } : {}),
+    });
+    applyEventsFinalized = true;
+    if (publicationError) throw publicationError;
+    logProgress(failed ? "failed apply" : "finished apply");
+    console.log(JSON.stringify(publicResults, null, 2));
   };
   let activeApplyMutationLease: {
     itemNumber: number;
@@ -22142,28 +25056,53 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
   const releaseActiveApplyMutationLease = (): void => {
     const active = activeApplyMutationLease;
     activeApplyMutationLease = null;
-    if (active) deleteOwnedDedicatedReviewStartLease(active.itemNumber, active.lease);
+    if (!active) return;
+    try {
+      deleteOwnedDedicatedReviewStartLease(active.itemNumber, active.lease, {
+        throwOnError: true,
+      });
+    } catch (error) {
+      console.error(
+        `[apply] could not delete owned review lease comment ${active.lease.commentId}: ${mutationErrorMessage(error)}`,
+      );
+    }
+  };
+  runtimeBudget.onFailure = (error: unknown): void => {
+    releaseActiveApplyMutationLease();
+    if (applyEventsFinalized) return;
+    try {
+      finishApply(true, error);
+    } catch (finalizationError) {
+      console.error(
+        `[action-ledger] failed to finalize partial apply events: ${
+          finalizationError instanceof Error ? finalizationError.message : String(finalizationError)
+        }`,
+      );
+    }
   };
   runtimeBudget.onYield = (reason: string, resumeCurrent = true): void => {
     releaseActiveApplyMutationLease();
+    const interruptedItem = resumeCurrent && activeApplyItem !== null;
     const currentNumber = examinedItemNumbers.at(-1);
     if (resumeCurrent && currentNumber !== undefined) {
       removeCurrentCursorTraceItem(examinedItemNumbers, currentNumber);
     }
     results.push({ number: 0, action: "skipped_runtime_budget", reason });
     logProgress(`stopping apply: ${reason}`);
-    finishApply();
+    finishApply(
+      interruptedItem,
+      interruptedItem ? new GitHubRuntimeBudgetError(reason) : undefined,
+    );
   };
   if (fileEntries.length === 0 && !existsSync(itemsDir)) {
     console.log("No items directory.");
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    writeCursorTrace();
+    finishApply();
     return;
   }
   logProgress(
     `starting apply: files=${files.length} dry_run=${dryRun} apply_kind=${applyKind} min_age=${minAgeDescription} apply_close_reasons=${closeReasonFilterText(applyCloseReasons)} stale_min_age_days=${staleMinAgeDays} close_delay_ms=${closeDelayMs} sync_comments_only=${syncCommentsOnly} comment_sync_min_age_days=${commentSyncMinAgeDays} max_runtime_ms=${maxRuntimeMs} item_numbers=${requestedItemNumbers.join(",") || "all"}`,
   );
+  // oxfmt-ignore
   for (const entry of fileEntries) {
     releaseActiveApplyMutationLease();
     const file = entry.name;
@@ -22180,6 +25119,59 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     let markdown = entry.markdown;
     const repo = entry.repo;
     const number = entry.number;
+    activeApplyItem = { repo, number, mutationOccurred: false };
+    startApplyActionLedgerItem(applyLedger, entry);
+    const applyItemResultStart = results.length;
+    let applyItemFailed = false;
+    const previousApplyMutationRunner = activeApplyMutationRunner;
+    try {
+    const markMutationObserved = (): void => {
+      if (dryRun) return;
+      activeApplyItem = { repo, number, mutationOccurred: true };
+      mutationByItem.set(`${repo}#${number}`, true);
+    };
+    const recordMutation = (parentEventId?: string | null): void => {
+      markMutationObserved();
+      recordApplyMutationBoundary(applyLedger, entry, parentEventId);
+    };
+    activeApplyMutationRunner = <T>(options: {
+      identity: string;
+      idempotencyIdentity: string;
+      operation: () => T;
+      didMutate?: ((result: T) => boolean) | undefined;
+      knownNoMutation?: ((error: unknown) => boolean) | undefined;
+    }): T => {
+      if (dryRun) return options.operation();
+      const attempt = startApplyMutationAttempt(
+        applyLedger,
+        entry,
+        options.identity,
+        options.idempotencyIdentity,
+      );
+      if (!attempt) return options.operation();
+      try {
+        const result = options.operation();
+        const mutated = options.didMutate?.(result) ?? true;
+        const outcomeEventId = finishApplyMutationAttempt({
+          ledger: applyLedger,
+          entry,
+          attempt,
+          outcome: mutated ? "accepted" : "rejected",
+        });
+        if (mutated) recordMutation(outcomeEventId);
+        return result;
+      } catch (error) {
+        const rejected = options.knownNoMutation?.(error) === true;
+        finishApplyMutationAttempt({
+          ledger: applyLedger,
+          entry,
+          attempt,
+          outcome: rejected ? "rejected" : "unknown",
+        });
+        if (!rejected) markMutationObserved();
+        throw error;
+      }
+    };
     examinedItemNumbers.push(number);
     const decision = frontMatterValue(markdown, "decision");
     let closeReason = frontMatterValue(markdown, "close_reason") as CloseReason | undefined;
@@ -22291,6 +25283,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       !storedHash ||
       (action !== "proposed_close" &&
         action !== "kept_open" &&
+        action !== "skipped_low_signal_live_guard" &&
         action !== "skipped_pr_close_coverage_proof" &&
         action !== "retry_pr_close_coverage_proof" &&
         !shouldProbeClosedState)
@@ -22474,7 +25467,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         };
       }
     };
-    const ownedApplyMutationLeaseBlockReason = (lease: AcquiredReviewStartLease): string | null => {
+    const ownedApplyMutationLeaseBlockReason = (
+      lease: AcquiredReviewStartLease,
+    ): string | null => {
       try {
         const revisionBefore = fetchLiveReviewHeadSha();
         const refreshed = issueReviewCommentState(number);
@@ -22768,11 +25763,15 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     };
     const recordRuntimeBudgetYield = (reason: string): void => {
       if (clawSweeperLabelsChanged && !dryRun) {
-        markdown = replaceFrontMatterValue(markdown, "labels_synced_at", new Date().toISOString());
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "labels_synced_at",
+          new Date().toISOString(),
+        );
         writeReportMarkdown(path, markdown);
       }
       removeCurrentCursorTraceItem(examinedItemNumbers, number);
-      results.push({ number: 0, action: "skipped_runtime_budget", reason });
+      results.push(...applyRuntimeBudgetYieldResults(number, reason));
       logProgress(`stopping apply: ${reason}`);
     };
     const sameAuthorPairStartCloseable = new Map<string, boolean>();
@@ -22883,7 +25882,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             hasAutoCloseAllowedMetadata(counterpartMarkdown) &&
             hasVerifiedLocalCheckoutAccess(counterpartMarkdown)
           ) {
-            const { item: counterpartItem, state: counterpartState } = fetchItem(counterpartNumber);
+            const { item: counterpartItem, state: counterpartState } =
+              fetchItem(counterpartNumber);
             const counterpartReviewedAuthorAssociation = normalizeAuthorAssociation(
               frontMatterValue(counterpartMarkdown, "author_association"),
             );
@@ -23190,7 +26190,10 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     ) {
       if (!unconfirmedProductDirectionCloseEnabled()) {
         if (
-          recordApplySkipped("kept_open", "unconfirmed product-direction apply policy is disabled")
+          recordApplySkipped(
+            "kept_open",
+            "unconfirmed product-direction apply policy is disabled",
+          )
         ) {
           break;
         }
@@ -23232,7 +26235,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         staleMinAgeDays,
       );
       if (lowSignalBlockReason) {
-        if (markApplySkipped("kept_open", lowSignalBlockReason)) break;
+        if (markApplySkipped("skipped_low_signal_live_guard", lowSignalBlockReason, true)) break;
         continue;
       }
     }
@@ -23390,6 +26393,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           number,
           labels: item.labels,
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = staleLabelSyncResult.labels;
         clawSweeperLabelsChanged ||= staleLabelSyncResult.changed;
@@ -23405,6 +26409,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           proof: realBehaviorProof,
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = proofSufficientSyncResult.labels;
         clawSweeperLabelsChanged ||= proofSufficientSyncResult.changed;
@@ -23413,6 +26418,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           proof: realBehaviorProof,
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = proofMediaSyncResult.labels;
         clawSweeperLabelsChanged ||= proofMediaSyncResult.changed;
@@ -23422,6 +26428,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           rating: reportPrRating(markdown),
           reviewFailed: frontMatterValue(markdown, "review_status") === "failed",
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = prRatingSyncResult.labels;
         clawSweeperLabelsChanged ||= prRatingSyncResult.changed;
@@ -23435,6 +26442,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           securityReview: reportSecurityReview(markdown),
           overallCorrectness: reportOverallCorrectness(markdown),
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = featureShowcaseSyncResult.labels;
         clawSweeperLabelsChanged ||= featureShowcaseSyncResult.changed;
@@ -23448,6 +26456,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           statusKind: currentPrStatusKind,
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = prStatusSyncResult.labels;
         clawSweeperLabelsChanged ||= prStatusSyncResult.changed;
@@ -23456,6 +26465,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           proof: reportTelegramVisibleProof(markdown),
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = telegramVisibleProofSyncResult.labels;
         clawSweeperLabelsChanged ||= telegramVisibleProofSyncResult.changed;
@@ -23525,7 +26535,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       currentUpdatedAt?: string | undefined;
       currentSnapshotHash?: string | undefined;
     }): boolean => {
-      markdown = replaceFrontMatterValue(markdown, "action_taken", "skipped_changed_since_review");
+      markdown = replaceFrontMatterValue(
+        markdown,
+        "action_taken",
+        "skipped_changed_since_review",
+      );
       if (options.currentUpdatedAt) {
         markdown = replaceFrontMatterValue(
           markdown,
@@ -23576,7 +26590,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       let refreshedContext: ItemContext | null = null;
       const selfMutationMaskedNonAutomationActivity = (): boolean => {
         if (prCloseCoverageProofStartedAtMs === null) return true;
-        refreshedContext ??= collectItemContext(refreshed.item, { fullTimelineForRelations: true });
+        refreshedContext ??= collectItemContext(refreshed.item, {
+          fullTimelineForRelations: true,
+        });
         return contextHasNonAutomationActivityAfter(
           refreshedContext,
           prCloseCoverageProofStartedAtMs,
@@ -23659,7 +26675,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           "applied_at",
           commentUpdatedAt(existingReviewComment) ?? new Date().toISOString(),
         );
-        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "apply_checked_at",
+          new Date().toISOString(),
+        );
         archiveClosed(markdown);
         closedCount += 1;
         processedCount += 1;
@@ -23700,7 +26720,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       continue;
     }
     if (isCloseProposal && updatedSinceReview && !automationOnlyUpdate) {
-      markdown = replaceFrontMatterValue(markdown, "action_taken", "skipped_changed_since_review");
+      markdown = replaceFrontMatterValue(
+        markdown,
+        "action_taken",
+        "skipped_changed_since_review",
+      );
       markdown = replaceFrontMatterValue(markdown, "current_item_updated_at", item.updatedAt);
       markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
       if (!dryRun) writeReportMarkdown(path, markdown);
@@ -23724,7 +26748,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           "skipped_changed_since_review",
         );
         markdown = replaceFrontMatterValue(markdown, "current_item_snapshot_hash", currentHash);
-        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "apply_checked_at",
+          new Date().toISOString(),
+        );
         if (!dryRun) writeReportMarkdown(path, markdown);
         results.push({
           number,
@@ -23754,6 +26782,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           triagePriority: triagePriorityFromReport(markdown),
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = syncResult.labels;
         clawSweeperLabelsChanged ||= syncResult.changed;
@@ -23763,6 +26792,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           impactLabels: item.kind === "pull_request" ? [] : impactLabelsFromReport(markdown),
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = impactSyncResult.labels;
         clawSweeperLabelsChanged ||= impactSyncResult.changed;
@@ -23772,6 +26802,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           maturityLabels: item.kind === "pull_request" ? [] : maturityLabelsFromReport(markdown),
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = maturitySyncResult.labels;
         clawSweeperLabelsChanged ||= maturitySyncResult.changed;
@@ -23783,6 +26814,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             labels: item.labels,
             mergeRiskLabels: mergeRiskLabelsFromReport(markdown),
             dryRun,
+            onMutation: recordMutation,
           });
           item.labels = mergeRiskSyncResult.labels;
           mergeRiskLabelsChanged = mergeRiskSyncResult.changed;
@@ -23803,7 +26835,12 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         continue;
       }
     }
-    if (state === "open" && item.kind === "issue" && !isCloseProposal && isCurrentCompleteReport) {
+    if (
+      state === "open" &&
+      item.kind === "issue" &&
+      !isCloseProposal &&
+      isCurrentCompleteReport
+    ) {
       const mutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
       if (mutationLeaseBlockReason) {
         if (recordReviewLeaseSkip(mutationLeaseBlockReason, false)) break;
@@ -23835,12 +26872,15 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           labels: item.labels,
           state: advisoryState,
           dryRun,
+          onMutation: recordMutation,
         });
         item.labels = syncResult.labels;
         issueAdvisoryLabelsChanged = syncResult.changed;
         clawSweeperLabelsChanged ||= syncResult.changed;
         markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
-        if (syncResult.changed) rememberSelfMutationUpdatedAt();
+        if (syncResult.changed) {
+          rememberSelfMutationUpdatedAt();
+        }
       } catch (error) {
         if (!isGitHubRequiresAuthenticationError(error)) throw error;
         if (markLabelSyncAuthSkipped("advisory issue")) break;
@@ -23856,7 +26896,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         (pullNumber, pullRepo) => canClosePairCounterpartInThisRun(pullNumber, pullRepo),
       );
       if (openClosingPullRequestReason) {
-        if (markApplySkipped("skipped_open_closing_pr", openClosingPullRequestReason, true)) break;
+        if (markApplySkipped("skipped_open_closing_pr", openClosingPullRequestReason, true))
+          break;
         continue;
       }
     }
@@ -23991,7 +27032,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           canStartSameAuthorPairCloseInThisRun(counterpartNumber, counterpartKind),
       );
       if (sameAuthorCounterpartReason) {
-        if (markApplySkipped("skipped_same_author_pair", sameAuthorCounterpartReason, true)) break;
+        if (markApplySkipped("skipped_same_author_pair", sameAuthorCounterpartReason, true))
+          break;
         continue;
       }
     }
@@ -24008,7 +27050,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     const labelSyncProgressMessage = issueAdvisoryLabelsChanged
       ? `synced advisory issue labels #${number}`
       : `synced ClawSweeper labels #${number}`;
-    if (needsReviewCommentSync && needsReviewCommentBodySync && shouldCheckCanonicalCommentSync()) {
+    if (
+      needsReviewCommentSync &&
+      needsReviewCommentBodySync &&
+      shouldCheckCanonicalCommentSync()
+    ) {
       const wasStaleCanonicalCommentSyncPending = staleCanonicalCommentSyncPending;
       const mutationBoundaryGuard = applyCanonicalCommentSyncGuard(true);
       if (mutationBoundaryGuard.stopApply) break;
@@ -24046,7 +27092,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     if (needsReviewCommentSync) {
       const staleSyncReason = needsReviewCommentBodySync ? staleReviewCommentReason : null;
       if (staleSyncReason) {
-        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "apply_checked_at",
+          new Date().toISOString(),
+        );
         if (!dryRun) writeReportMarkdown(path, markdown);
         results.push({
           number,
@@ -24058,7 +27108,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (processedCount >= processedLimit) break;
         continue;
       }
-      const lockedReason = needsReviewCommentBodySync ? lockedConversationApplyReason(item) : null;
+      const lockedReason = needsReviewCommentBodySync
+        ? lockedConversationApplyReason(item)
+        : null;
       if (lockedReason) {
         const actionTaken: ActionTaken = staleCanonicalCommentSyncPending
           ? "retry_stale_canonical_comment_sync"
@@ -24131,11 +27183,22 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
               ? lowSignalUnmergeablePrApplyBlockReasonSafe(number, staleMinAgeDays)
               : null;
           if (lowSignalCommentSyncBlockReason) {
-            if (markApplySkipped("kept_open", lowSignalCommentSyncBlockReason)) break;
+            if (
+              markApplySkipped(
+                "skipped_low_signal_live_guard",
+                lowSignalCommentSyncBlockReason,
+                true,
+              )
+            )
+              break;
             continue;
           }
           try {
-            syncedComment = upsertReviewComment(number, markedReviewComment, existingReviewComment);
+            syncedComment = upsertReviewComment(
+              number,
+              markedReviewComment,
+              existingReviewComment,
+            );
             const syncedCommentUpdatedAt = commentUpdatedAt(syncedComment);
             if (syncedCommentUpdatedAt) {
               allowedSelfMutationUpdatedAts.add(syncedCommentUpdatedAt);
@@ -24178,6 +27241,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         reason: closeBlockedForCommentSync
           ? [closeBlockedForCommentSync.reason, ...syncReasons].join("; ")
           : syncReasons.join("; "),
+        commentMutationOccurred: !dryRun && needsReviewCommentBodySync,
         ...(emitEventApplyProof ? { durableReviewSynced: true } : {}),
       });
       processedCount += 1;
@@ -24189,7 +27253,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (staleCanonicalCommentSyncPending) {
           markdown = completeStaleCanonicalCommentSyncReport(markdown);
         }
-        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "apply_checked_at",
+          new Date().toISOString(),
+        );
         if (!dryRun) writeReportMarkdown(path, markdown);
         results.push({
           number,
@@ -24334,7 +27402,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         ? lowSignalUnmergeablePrApplyBlockReasonSafe(number, staleMinAgeDays)
         : null;
     if (lowSignalBlockReason) {
-      if (markApplySkipped("kept_open", lowSignalBlockReason)) break;
+      if (markApplySkipped("skipped_low_signal_live_guard", lowSignalBlockReason, true)) break;
       continue;
     }
     const inactivityCloseBlockReason =
@@ -24404,7 +27472,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       continue;
     }
     ensureRuntimeDelayFits(closeDelayMs, "before close");
-    closeItem({ number, kind: item.kind, reason: closeReason });
+    const appliedCloseReason = closeReason;
+    closeItem({ number, kind: item.kind, reason: appliedCloseReason });
     let postCloseRuntimeYieldReason: string | null = null;
     try {
       ensureRuntimeDelayFits(closeDelayMs, "before close delay");
@@ -24424,7 +27493,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     results.push({
       number,
       action: "closed",
-      reason: [closeReasonText(closeReason), closeAppliedCommentReason].filter(Boolean).join("; "),
+      reason: [closeReasonText(closeReason), closeAppliedCommentReason]
+        .filter(Boolean)
+        .join("; "),
       ...(emitEventApplyProof ? { terminalStateVerified: true } : {}),
     });
     logProgress(`closed #${number}`);
@@ -24434,8 +27505,47 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       return;
     }
     if (processedCount >= processedLimit) break;
+    } catch (error) {
+      applyItemFailed = true;
+      throw error;
+    } finally {
+      releaseActiveApplyMutationLease();
+      activeApplyMutationRunner = previousApplyMutationRunner;
+      if (!applyItemFailed) {
+        const state = applyLedger.items.get(actionLedgerItemKey(entry));
+        if (!applyLedger.terminal && state?.started && !state.terminal) {
+          const closedEntryPath = join(closedDir, file);
+          const currentEntryPath = existsSync(path)
+            ? path
+            : existsSync(closedEntryPath)
+              ? closedEntryPath
+              : entry.path;
+          const currentEntry = existsSync(currentEntryPath)
+            ? {
+                ...entry,
+                path: currentEntryPath,
+                markdown: readFileSync(currentEntryPath, "utf8"),
+              }
+            : entry;
+          recordApplyActionLedgerItemResults({
+            ledger: applyLedger,
+            state,
+            results: results
+              .slice(applyItemResultStart)
+              .filter(
+                (result) => (result.repo ?? targetRepo()) === repo && result.number === number,
+              ),
+            entry: currentEntry,
+            mutationOccurred: mutationByItem.get(`${repo}#${number}`) === true,
+            dryRun,
+          });
+        }
+        activeApplyItem = null;
+      }
+    }
   }
   releaseActiveApplyMutationLease();
+  activeApplyItem = null;
   if (runtimeBudget.yieldReason) {
     runtimeBudget.onYield?.(runtimeBudget.yieldReason);
     return;
@@ -25123,61 +28233,259 @@ function applyArtifactsCommand(args: Args): void {
   const skipReconcile = boolArg(args.skip_reconcile);
   const replayClosedArtifacts = boolArg(args.replay_closed_artifacts);
   const maxPages = numberArg(args.max_pages, 250);
-  const openNumbers = skipReconcile ? null : fetchOpenItemNumbers(maxPages).numbers;
   let appliedArtifacts = 0;
   let skippedClosedArtifacts = 0;
-  ensureDir(itemsDir);
-  ensureDir(closedDir);
-  if (existsSync(artifactDir)) {
-    for (const entry of readdirSync(artifactDir, { recursive: true })) {
-      const name = String(entry);
-      if (!name.endsWith(".md")) continue;
-      const source = join(artifactDir, name);
-      if (!parseReportFileName(basename(source))) continue;
-      const number = numberForMarkdownFile(basename(source));
-      let markdown = readFileSync(source, "utf8");
-      if (!isMarkdownForActiveRepo(markdown, basename(source))) continue;
-      const destinationFile = reportFileName(
-        markdownRepository(markdown, basename(source)),
-        number,
-      );
-      const action = frontMatterValue(markdown, "action_taken") ?? "unknown";
-      const destination = reviewArtifactDestination(
-        action,
-        replayClosedArtifacts || artifactTargetIsOpen(number, openNumbers),
-      );
-      if (destination === "skip_closed") {
-        skippedClosedArtifacts += 1;
-        continue;
+  const operationIdentity = {
+    repository: targetRepo(),
+    artifactDir: repoRelativePath(artifactDir),
+    itemsDir: repoRelativePath(itemsDir),
+    closedDir: repoRelativePath(closedDir),
+  };
+  const publicationStart = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "review_publication_start" },
+    operation: "review_publication",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "review_publication_start" },
+    component: "apply_artifacts",
+    subject: {
+      repository: targetRepo(),
+      kind: "publication",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      publication_kind: "review_record",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  let publicationIndex = 0;
+  let publicationTerminal = false;
+  let activePublication: {
+    markdown: string;
+    reportPath: string;
+    number: number;
+    destination: string;
+    mutation: boolean;
+  } | null = null;
+  const recordPublication = (options: {
+    markdown: string;
+    reportPath: string;
+    number: number;
+    status: ActionEventStatus;
+    reasonCode: ActionEventReasonCode;
+    mutation: boolean;
+    destination: string;
+  }): void => {
+    const kind = reportItemKind(options.markdown);
+    if (!kind) return;
+    const sourceRevision = reviewLeaseRevisionFromReport(options.markdown);
+    const recordPath = repoRelativePath(options.reportPath);
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      status: options.status,
+      reasonCode: options.reasonCode,
+      retryable:
+        options.status === ACTION_EVENT_STATUSES.failed ||
+        options.status === ACTION_EVENT_STATUSES.yielded ||
+        options.status === ACTION_EVENT_STATUSES.cancelled,
+      mutation: options.mutation,
+      identity: {
+        slot: "review_publication",
+        index: publicationIndex,
+        number: options.number,
+      },
+      operation: "review_publication",
+      operationIdentity,
+      parentEventId: publicationStart?.event_id ?? null,
+      phaseSeq: 10 + publicationIndex,
+      idempotencyIdentity: {
+        operationIdentity,
+        slot: "review_publication",
+        index: publicationIndex,
+        number: options.number,
+      },
+      component: "apply_artifacts",
+      subject: {
+        repository: targetRepo(),
+        kind,
+        number: options.number,
+        ...(sourceRevision ? { sourceRevision } : {}),
+        ...(recordPath.startsWith("../") ? {} : { recordPath }),
+      },
+      evidence: [
+        ...workflowRunEvidence(),
+        {
+          kind: "review_record",
+          sha256: sha256(options.markdown),
+          ...(recordPath.startsWith("../") ? {} : { reportPath: recordPath }),
+        },
+      ],
+      attributes: {
+        publication_kind: "review_record",
+        log_kind: "review",
+        log_count: 1,
+        state: options.destination,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    publicationIndex += 1;
+  };
+  const finishPublication = (error?: unknown, interruptedMutation = false): void => {
+    if (publicationTerminal) return;
+    const failure = error === undefined ? null : actionLedgerFailureDisposition(error);
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      status: failure
+        ? failure.status
+        : appliedArtifacts === 0 && skippedClosedArtifacts > 0
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.completed,
+      reasonCode: failure
+        ? failure.reasonCode
+        : appliedArtifacts === 0
+          ? ACTION_EVENT_REASON_CODES.noChanges
+          : ACTION_EVENT_REASON_CODES.completed,
+      retryable: failure !== null,
+      mutation: appliedArtifacts > 0 || interruptedMutation,
+      identity: { slot: "review_publication_terminal" },
+      operation: "review_publication",
+      operationIdentity,
+      parentEventId: publicationStart?.event_id ?? null,
+      phaseSeq: 1_000_000,
+      idempotencyIdentity: { operationIdentity, slot: "review_publication_terminal" },
+      component: "apply_artifacts",
+      subject: {
+        repository: targetRepo(),
+        kind: "publication",
+      },
+      evidence: workflowRunEvidence(),
+      attributes: {
+        action_count: appliedArtifacts,
+        skipped_count: skippedClosedArtifacts,
+        failed_count: failure ? 1 : 0,
+        publication_kind: "state_worktree",
+        partial:
+          failure !== null
+            ? appliedArtifacts > 0 || interruptedMutation
+            : skippedClosedArtifacts > 0 && appliedArtifacts > 0,
+        completion_reason: failure
+          ? failure.completionReason
+          : appliedArtifacts === 0
+            ? "no_changes"
+            : "completed",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    publicationTerminal = true;
+  };
+  try {
+    ensureDir(itemsDir);
+    ensureDir(closedDir);
+    const openNumbers = skipReconcile ? null : fetchOpenItemNumbers(maxPages).numbers;
+    if (existsSync(artifactDir)) {
+      for (const entry of readdirSync(artifactDir, { recursive: true })) {
+        const name = String(entry);
+        if (!name.endsWith(".md")) continue;
+        const source = join(artifactDir, name);
+        if (!parseReportFileName(basename(source))) continue;
+        const number = numberForMarkdownFile(basename(source));
+        let markdown = readFileSync(source, "utf8");
+        if (!isMarkdownForActiveRepo(markdown, basename(source))) continue;
+        const destinationFile = reportFileName(
+          markdownRepository(markdown, basename(source)),
+          number,
+        );
+        const action = frontMatterValue(markdown, "action_taken") ?? "unknown";
+        const destination = reviewArtifactDestination(
+          action,
+          replayClosedArtifacts || artifactTargetIsOpen(number, openNumbers),
+        );
+        if (destination === "skip_closed") {
+          recordPublication({
+            markdown,
+            reportPath: source,
+            number,
+            status: ACTION_EVENT_STATUSES.skipped,
+            reasonCode: ACTION_EVENT_REASON_CODES.stateChanged,
+            mutation: false,
+            destination,
+          });
+          skippedClosedArtifacts += 1;
+          continue;
+        }
+        const destinationDir = destination === "closed" ? closedDir : itemsDir;
+        const reportPath = join(destinationDir, destinationFile);
+        activePublication = {
+          markdown,
+          reportPath,
+          number,
+          destination,
+          mutation: false,
+        };
+        const stalePath = join(destinationDir === itemsDir ? closedDir : itemsDir, destinationFile);
+        if (existsSync(stalePath)) {
+          unlinkSync(stalePath);
+          activePublication.mutation = true;
+        }
+        if (existsSync(reportPath)) {
+          markdown = preserveFailedReviewRetryMetadata(readFileSync(reportPath, "utf8"), markdown);
+        }
+        activePublication.mutation = true;
+        const syncedMarkdown = syncDecisionPacketRecord({
+          markdown,
+          reportPath,
+          packetsDir: decisionPacketsDir,
+          repoRoot: ROOT,
+          subjectState: destination === "closed" ? "closed" : "open",
+        }).markdown;
+        activePublication.markdown = syncedMarkdown;
+        writeFileSync(reportPath, syncedMarkdown, "utf8");
+        if (destination === "closed") {
+          const planPath = workPlanPathForReport(reportPath, plansDir);
+          if (existsSync(planPath)) unlinkSync(planPath);
+        } else {
+          syncWorkPlanFromReport({ markdown: syncedMarkdown, reportPath, plansDir });
+        }
+        recordPublication({
+          markdown: syncedMarkdown,
+          reportPath,
+          number,
+          status: ACTION_EVENT_STATUSES.completed,
+          reasonCode: ACTION_EVENT_REASON_CODES.completed,
+          mutation: true,
+          destination,
+        });
+        activePublication = null;
+        appliedArtifacts += 1;
       }
-      const destinationDir = destination === "closed" ? closedDir : itemsDir;
-      const stalePath = join(destinationDir === itemsDir ? closedDir : itemsDir, destinationFile);
-      if (existsSync(stalePath)) unlinkSync(stalePath);
-      const reportPath = join(destinationDir, destinationFile);
-      if (existsSync(reportPath)) {
-        markdown = preserveFailedReviewRetryMetadata(readFileSync(reportPath, "utf8"), markdown);
-      }
-      const syncedMarkdown = syncDecisionPacketRecord({
-        markdown,
-        reportPath,
-        packetsDir: decisionPacketsDir,
-        repoRoot: ROOT,
-        subjectState: destination === "closed" ? "closed" : "open",
-      }).markdown;
-      writeFileSync(reportPath, syncedMarkdown, "utf8");
-      if (destination === "closed") {
-        const planPath = workPlanPathForReport(reportPath, plansDir);
-        if (existsSync(planPath)) unlinkSync(planPath);
-      } else {
-        syncWorkPlanFromReport({ markdown: syncedMarkdown, reportPath, plansDir });
-      }
-      appliedArtifacts += 1;
     }
+    console.error(
+      `[apply-artifacts] applied=${appliedArtifacts} skipped_closed=${skippedClosedArtifacts}`,
+    );
+    if (!skipReconcile) reconcileFolders({ itemsDir, closedDir, plansDir, decisionPacketsDir });
+    finishPublication();
+  } catch (error) {
+    const interruptedMutation = activePublication?.mutation ?? false;
+    if (activePublication) {
+      recordPublication({
+        markdown: activePublication.markdown,
+        reportPath: activePublication.reportPath,
+        number: activePublication.number,
+        status: actionLedgerFailureDisposition(error).status,
+        reasonCode: actionLedgerFailureDisposition(error).reasonCode,
+        mutation: interruptedMutation,
+        destination: activePublication.destination,
+      });
+      activePublication = null;
+    }
+    finishPublication(error, interruptedMutation);
+    throw error;
   }
-  console.error(
-    `[apply-artifacts] applied=${appliedArtifacts} skipped_closed=${skippedClosedArtifacts}`,
-  );
-  if (!skipReconcile) reconcileFolders({ itemsDir, closedDir, plansDir, decisionPacketsDir });
 }
 
 function artifactTargetIsOpen(number: number, openNumbers: Set<number> | null): boolean {
@@ -26938,34 +30246,199 @@ function checkCommand(): void {
   console.log("ok");
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<void> {
+function publishActionEventsCommand(args: Args): void {
+  const sourceRoot = resolve(
+    stringArg(args.source_root, join(ROOT, ".clawsweeper-repair", "action-ledger-download")),
+  );
+  const stateRoot = resolve(stringArg(args.state_root, ROOT));
+  const expectedProducerJob = stringArg(args.expected_producer_job, "");
+  if (!expectedProducerJob) {
+    throw new UserFacingCommandError("--expected-producer-job is required");
+  }
+  const currentProducer = workflowActionProducer("action_event_publisher");
+  const result = importActionEventShards(sourceRoot, stateRoot, {
+    expectedProducer: {
+      repository: currentProducer.repository,
+      sha: currentProducer.sha,
+      workflow: currentProducer.workflow,
+      job: expectedProducerJob,
+      runId: currentProducer.runId,
+      runAttempt: currentProducer.runAttempt,
+    },
+  });
+  console.log(JSON.stringify(result, null, 2));
+}
+
+const ACTION_EVENT_PUBLISH_PATH_PATTERN =
+  /^ledger\/v1\/(?:events\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.jsonl|import-bindings\/(?:producer-runs|events|shard-sets|completed-shard-sets)\/[a-f0-9]{64}\.json)$/;
+const ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES = ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS * 512;
+
+export function actionEventPublishPathsForTest(content: string): string[] {
+  if (Buffer.byteLength(content, "utf8") > ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES) {
+    throw new Error(
+      `action event publish path manifest exceeds ${ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES} bytes`,
+    );
+  }
+  const paths = content.split("\n").filter(Boolean);
+  if (paths.length === 0) throw new Error("action event publish path manifest is empty");
+  if (paths.length > ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS) {
+    throw new Error(
+      `action event publish path manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS} paths`,
+    );
+  }
+  let previous = "";
+  for (const path of paths) {
+    if (!ACTION_EVENT_PUBLISH_PATH_PATTERN.test(path)) {
+      throw new Error(`invalid action event publish path: ${path}`);
+    }
+    if (previous && path <= previous) {
+      throw new Error("action event publish paths must be sorted and unique");
+    }
+    previous = path;
+  }
+  return paths;
+}
+
+function publishActionEventPathsCommand(args: Args): void {
+  const pathsFile = resolve(stringArg(args.paths_file, ""));
+  const message = stringArg(args.message, "");
+  if (!pathsFile || pathsFile === ROOT) {
+    throw new UserFacingCommandError("--paths-file is required");
+  }
+  if (!message) throw new UserFacingCommandError("--message is required");
+  const stat = statSync(pathsFile);
+  if (!stat.isFile())
+    throw new Error(`action event publish path manifest is not a file: ${pathsFile}`);
+  if (stat.size > ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES) {
+    throw new Error(
+      `action event publish path manifest exceeds ${ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES} bytes`,
+    );
+  }
+  const paths = actionEventPublishPathsForTest(readFileSync(pathsFile, "utf8"));
+  for (const path of paths) {
+    const source = resolve(ROOT, path);
+    const rootRelativeSource = relative(ROOT, source);
+    if (
+      rootRelativeSource.startsWith("..") ||
+      resolve(ROOT, rootRelativeSource) !== source ||
+      !statSync(source).isFile()
+    ) {
+      throw new Error(`action event publish path is not a regular file: ${path}`);
+    }
+  }
+  const result = publishMainCommit({
+    message,
+    paths,
+    rebaseStrategy: "normal",
+  });
+  console.log(JSON.stringify({ result, path_count: paths.length }));
+}
+
+function isExplicitActionLedgerCommand(command: string): boolean {
+  return (
+    command === "finalize-action-events" ||
+    command === "publish-action-events" ||
+    command === "publish-action-event-paths"
+  );
+}
+
+export async function main(
+  argv = process.argv.slice(2),
+  dependencies: {
+    flushWorkflowActionEvents?: typeof flushWorkflowActionEvents;
+  } = {},
+): Promise<void> {
   const args = parseArgs(argv);
   const command = args._[0] ?? "review";
-  if (command === "plan") planCommand(args);
-  else if (command === "review") reviewCommand(args);
-  else if (command === "retry-failed-reviews") retryFailedReviewsCommand(args);
-  else if (command === "apply-artifacts") applyArtifactsCommand(args);
-  else if (command === "apply-decisions") applyDecisionsCommand(args);
-  else if (command === "proof-nudges") proofNudgesCommand(args);
-  else if (command === "bot-proof") botProofCommand(args);
-  else if (command === "audit") auditCommand(args);
-  else if (command === "reconcile") reconcileCommand(args);
-  else if (command === "dashboard") {
-    repoFromArgs(args);
-    updateDashboard(
-      resolve(stringArg(args.items_dir, defaultItemsDir())),
-      resolve(stringArg(args.closed_dir, defaultClosedDir())),
+  const flushActionEvents = dependencies.flushWorkflowActionEvents ?? flushWorkflowActionEvents;
+  if (!process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION) {
+    process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION = sha256(stableJson({ command, args })).slice(
+      0,
+      16,
     );
-  } else if (command === "status") statusCommand(args);
-  else if (command === "assist-target") assistResolveTargetCommand(args);
-  else if (command === "assist" || command === "assist-generate") assistGenerateCommand(args);
-  else if (command === "assist-validate") assistValidateArtifactCommand(args);
-  else if (command === "assist-publish") assistPublishCommand(args);
-  else if (command === "check") checkCommand();
-  else {
-    console.error(`Unknown command: ${command}`);
-    process.exit(1);
   }
+  let commandFailed = false;
+  let commandError: unknown;
+  try {
+    if (command === "plan") planCommand(args);
+    else if (command === "review") reviewCommand(args);
+    else if (command === "retry-failed-reviews") retryFailedReviewsCommand(args);
+    else if (command === "apply-artifacts") applyArtifactsCommand(args);
+    else if (command === "apply-decisions") applyDecisionsCommand(args);
+    else if (command === "publish-action-events") publishActionEventsCommand(args);
+    else if (command === "publish-action-event-paths") publishActionEventPathsCommand(args);
+    else if (command === "proof-nudges") proofNudgesCommand(args);
+    else if (command === "bot-proof") botProofCommand(args);
+    else if (command === "audit") auditCommand(args);
+    else if (command === "reconcile") reconcileCommand(args);
+    else if (command === "dashboard") {
+      repoFromArgs(args);
+      updateDashboard(
+        resolve(stringArg(args.items_dir, defaultItemsDir())),
+        resolve(stringArg(args.closed_dir, defaultClosedDir())),
+      );
+    } else if (command === "status") statusCommand(args);
+    else if (command === "assist-target") assistResolveTargetCommand(args);
+    else if (command === "assist" || command === "assist-generate") assistGenerateCommand(args);
+    else if (command === "assist-validate") assistValidateArtifactCommand(args);
+    else if (command === "assist-publish") assistPublishCommand(args);
+    else if (command === "check") checkCommand();
+    else if (command === "finalize-action-events") {
+      if (boolArg(args.interrupt_open_attempts)) {
+        const reason = stringArg(args.reason, ACTION_EVENT_REASON_CODES.timeout);
+        if (
+          reason !== ACTION_EVENT_REASON_CODES.timeout &&
+          reason !== ACTION_EVENT_REASON_CODES.cancelled &&
+          reason !== ACTION_EVENT_REASON_CODES.workflowFailed
+        ) {
+          throw new UserFacingCommandError(
+            `Unsupported --reason for interrupted action events: ${reason}`,
+          );
+        }
+        const interrupted = interruptOpenWorkflowActionEvents(ROOT, {
+          reasonCode: reason,
+        });
+        if (interrupted > 0) {
+          console.error(
+            `[action-ledger] recorded ${interrupted} ${reason} terminal event${
+              interrupted === 1 ? "" : "s"
+            }`,
+          );
+        }
+      }
+    } else throw new UserFacingCommandError(`Unknown command: ${command}`);
+  } catch (error) {
+    commandFailed = true;
+    commandError = error;
+  }
+  try {
+    const shardPaths = await flushActionEvents(ROOT);
+    if (shardPaths.length > 0) {
+      console.error(
+        `[action-ledger] finalized ${shardPaths.length} immutable workflow shard${
+          shardPaths.length === 1 ? "" : "s"
+        }`,
+      );
+    }
+  } catch (error) {
+    if (commandFailed) {
+      console.error(
+        `[action-ledger] best-effort finalization failed after command failure: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } else if (isExplicitActionLedgerCommand(command)) {
+      commandFailed = true;
+      commandError = error;
+    } else {
+      console.error(
+        `[action-ledger] best-effort finalization failed after successful ${command}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  if (commandFailed) throw commandError;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

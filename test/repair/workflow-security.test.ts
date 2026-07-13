@@ -36,6 +36,21 @@ test("repair worker passes the job input to shell scripts through the environmen
   assert.match(workflow, /--source-job-path "\$JOB_PATH"/);
 });
 
+test("comment router passes replay attempt identities through the environment", () => {
+  const workflow = fs.readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
+  const directAttemptLines = workflow
+    .split("\n")
+    .filter(
+      (line) => line.includes("inputs.attempt_id") || line.includes("client_payload.attempt_id"),
+    );
+
+  assert.equal(directAttemptLines.length, 2);
+  for (const line of directAttemptLines) {
+    assert.match(line, /^\s*ROUTER_ATTEMPT_ID:/, line);
+  }
+  assert.equal(workflow.match(/attempt_id="\$ROUTER_ATTEMPT_ID"/g)?.length, 2);
+});
+
 test("repair job restoration rejects shell metacharacters and path traversal", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-restore-job-"));
   const restore = path.resolve("scripts/restore-repair-job.sh");

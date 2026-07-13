@@ -28,6 +28,7 @@ import {
   actionAttemptId,
   actionEventId,
   actionEventKey,
+  actionEventShardImportBindingRelativePaths,
   actionEventShardRelativePath,
   actionEventSpoolRelativePath,
   actionIdempotencyKey,
@@ -1790,7 +1791,7 @@ test("durable shard writers split deterministically within importer event and by
     ["unchanged", "unchanged"],
   );
   assert.equal(imported.created, 2);
-  assert.deepEqual(imported.paths, first.map((result) => result.relativePath).sort());
+  assert.deepEqual(imported.eventPaths, first.map((result) => result.relativePath).sort());
   for (const result of first) {
     assert.ok(fs.statSync(result.path).size <= ACTION_EVENT_SHARD_FILE_LIMITS.maxBytes);
     assert.ok(result.eventCount <= ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents);
@@ -2072,6 +2073,32 @@ test("shard paths use the stable run partition instead of event ordering", () =>
     actionEventShardRelativePath(identity, [completed]),
     actionEventShardRelativePath(identity, [earlier, completed]),
   );
+});
+
+test("serialized shard and import-binding paths are portable POSIX paths", () => {
+  const identity = {
+    repository: producer.repository,
+    sha: producer.sha,
+    producer: producer.component,
+    workflow: producer.workflow,
+    job: producer.job,
+    runId: producer.runId,
+    runAttempt: producer.runAttempt,
+    partitionDate: "2026-07-12",
+  };
+  const event = createActionEvent(reviewInput());
+  const bindings = actionEventShardImportBindingRelativePaths(identity);
+  const relativePaths = [
+    actionEventShardRelativePath(identity, [event], 1, 1),
+    bindings.reservation,
+    bindings.completion,
+  ];
+
+  for (const relativePath of relativePaths) {
+    assert.equal(relativePath.includes("\\"), false);
+    assert.equal(relativePath, path.posix.normalize(relativePath));
+    assert.match(relativePath, /^ledger\/v1\//);
+  }
 });
 
 test("shard path components stay below portable filesystem name limits", () => {

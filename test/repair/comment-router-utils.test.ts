@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs, { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -14,12 +17,16 @@ import {
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
   normalizeGitHubActor,
+  readLedger,
+  routerDispatchReceiptKey,
   selectCommentsForRouting,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
   supersededReReviewCommentVersions,
   summarizeChecks,
+  writeLedger,
 } from "../../dist/repair/comment-router-utils.js";
+import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
 test("exact terminal comment versions short-circuit duplicate created deliveries", () => {
   const body = "@clawsweeper re-review";
@@ -251,6 +258,48 @@ test("synthetic dispatch receipt material is stable within an attempt and change
   );
 });
 
+test("production forced replay parsing scopes claims and dispatch keys by durable attempt", () => {
+  const baseArgs = {
+    repo: "openclaw/openclaw",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+  };
+  const baseCommand = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-12T20:00:00Z:automerge",
+    comment_id: "991122",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+  };
+  const forcedCommand = (attemptId: string) => ({
+    ...baseCommand,
+    ...forcedReplayCommandFields(
+      readCommentRouterConfig({
+        ...baseArgs,
+        "force-reprocess": true,
+        "attempt-id": attemptId,
+      }),
+    ),
+  });
+
+  const first = forcedCommand("forced-replay-41001");
+  const firstRetry = forcedCommand("forced-replay-41001");
+  const second = forcedCommand("forced-replay-41002");
+  assert.deepEqual(dispatchClaimLookupKeys(first), dispatchClaimLookupKeys(firstRetry));
+  assert.equal(routerDispatchReceiptKey(first, null), routerDispatchReceiptKey(firstRetry, null));
+  assert.deepEqual(
+    dispatchClaimLookupKeys(first).filter((key) => dispatchClaimLookupKeys(second).includes(key)),
+    [],
+  );
+  assert.notEqual(routerDispatchReceiptKey(first, null), routerDispatchReceiptKey(second, null));
+
+  const normalReplay = { ...baseCommand, processed_at: "2026-07-12T20:05:00Z" };
+  assert.deepEqual(dispatchClaimLookupKeys(baseCommand), dispatchClaimLookupKeys(normalReplay));
+  assert.equal(
+    routerDispatchReceiptKey(baseCommand, null),
+    routerDispatchReceiptKey(normalReplay, null),
+  );
+});
+
 test("synthetic dispatch attempt replaces its durable claim in the ledger", () => {
   const ledger = { updated_at: null, commands: [] };
   const base = {
@@ -436,6 +485,386 @@ test("appendLedger records claimed dispatch commands as recoverable idempotency 
       job_path: null,
     },
   ]);
+});
+
+test("forced replay claims preserve the ordinary terminal command state", () => {
+  const ledger = { updated_at: null, commands: [] };
+  const terminal = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-12T20:00:00Z:automerge",
+    comment_id: "991122",
+    comment_version_key: "991122:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "executed",
+    processed_at: "2026-07-12T20:01:00Z",
+    intent: "automerge",
+    actions: [{ action: "dispatch_clawsweeper", status: "completed" }],
+  };
+  const forcedClaim = {
+    ...terminal,
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+
+  assert.equal(appendLedger(ledger, [terminal]), true);
+  assert.equal(appendLedger(ledger, [forcedClaim]), true);
+  assert.equal(ledger.commands.length, 2);
+  assert.deepEqual(
+    ledger.commands.map((entry) => [entry.attempt_id ?? "ordinary", entry.status]),
+    [
+      ["ordinary", "executed"],
+      ["forced-replay-41001", "claimed"],
+    ],
+  );
+
+  assert.equal(
+    appendLedger(ledger, [
+      { ...forcedClaim, status: "executed", processed_at: terminal.processed_at },
+    ]),
+    true,
+  );
+  assert.equal(ledger.commands.length, 2);
+  assert.equal(ledger.commands.find((entry) => !entry.forced_replay)?.status, "executed");
+  assert.equal(
+    ledger.commands.find((entry) => entry.attempt_id === forcedClaim.attempt_id)?.status,
+    "executed",
+  );
+});
+
+test("forced replay claims survive ledger interruption without cross-attempt aliases", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const processedAt = "2026-07-12T20:05:00Z";
+  const base = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-12T20:00:00Z:automerge",
+    comment_id: "991122",
+    comment_version_key: "991122:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "claimed",
+    processed_at: processedAt,
+    intent: "automerge",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const firstAttempt = {
+    ...base,
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+  };
+  const ledger = { updated_at: null, commands: [] };
+  assert.equal(appendLedger(ledger, [firstAttempt]), true);
+  writeLedger(ledgerPath, ledger);
+
+  const restored = readLedger(ledgerPath);
+  assert.equal(restored.commands.length, 1);
+  assert.equal(restored.commands[0]?.forced_replay, true);
+  assert.equal(restored.commands[0]?.attempt_id, firstAttempt.attempt_id);
+
+  const priorClaims = new Map<string, unknown>();
+  for (const claim of restored.commands) {
+    for (const key of dispatchClaimLookupKeys(claim)) priorClaims.set(key, claim);
+  }
+  const claimFor = (command: typeof firstAttempt) =>
+    dispatchClaimLookupKeys(command)
+      .map((key) => priorClaims.get(key))
+      .find(Boolean) ?? null;
+
+  const recoveredClaim = claimFor(firstAttempt);
+  assert.equal(recoveredClaim, restored.commands[0]);
+  assert.equal(claimFor({ ...base, forced_replay: false, attempt_id: undefined }), null);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: recoveredClaim,
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74499 [${routerDispatchReceiptKey(
+        firstAttempt,
+        recoveredClaim,
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+
+  assert.equal(
+    appendLedger(restored, [{ ...firstAttempt, attempt_id: "forced-replay-41002" }]),
+    true,
+  );
+  assert.equal(restored.commands.length, 2);
+  assert.deepEqual(
+    restored.commands.map((entry) => entry.attempt_id),
+    ["forced-replay-41001", "forced-replay-41002"],
+  );
+  const refreshedClaims = new Map<string, unknown>();
+  for (const claim of restored.commands) {
+    for (const key of dispatchClaimLookupKeys(claim)) refreshedClaims.set(key, claim);
+  }
+  const claimForAttempt = (attemptId: string) =>
+    dispatchClaimLookupKeys({ ...firstAttempt, attempt_id: attemptId })
+      .map((key) => refreshedClaims.get(key))
+      .find(Boolean) ?? null;
+  assert.equal(claimForAttempt("forced-replay-41001"), restored.commands[0]);
+  assert.equal(claimForAttempt("forced-replay-41002"), restored.commands[1]);
+});
+
+test("refreshed forced replay claims survive bounded ledger trimming and restart", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const commentUpdatedAt = "2026-07-12T20:00:00Z";
+  const commands = Array.from({ length: 1000 }, (_, index) => ({
+    idempotency_key: `command-${index}`,
+    comment_id: String(index),
+    comment_version_key: `${index}:${commentUpdatedAt}`,
+    comment_updated_at: commentUpdatedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 74000 + index,
+    status: "executed",
+    processed_at: "2026-07-12T20:01:00Z",
+  }));
+  const forcedClaim = {
+    ...commands[0],
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const freshClaim = {
+    idempotency_key: "command-1000",
+    comment_id: "1000",
+    comment_version_key: `1000:${commentUpdatedAt}`,
+    comment_updated_at: commentUpdatedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 75000,
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const ledger = { updated_at: null, commands };
+
+  assert.equal(appendLedger(ledger, [forcedClaim, freshClaim]), true);
+  assert.equal(ledger.commands.length, 1000);
+  assert.equal(
+    ledger.commands.some((entry) => entry.comment_id === "1"),
+    false,
+  );
+  assert.deepEqual(
+    ledger.commands.slice(-2).map((entry) => entry.comment_id),
+    ["0", "1000"],
+  );
+  writeLedger(ledgerPath, ledger);
+
+  const restored = readLedger(ledgerPath);
+  const forcedKeys = new Set(dispatchClaimLookupKeys(forcedClaim));
+  const recoveredClaim =
+    restored.commands.find((entry) =>
+      dispatchClaimLookupKeys(entry).some((key) => forcedKeys.has(key)),
+    ) ?? null;
+  assert.equal(recoveredClaim?.attempt_id, forcedClaim.attempt_id);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: recoveredClaim,
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74000 [${routerDispatchReceiptKey(
+        forcedClaim,
+        recoveredClaim,
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+});
+
+test("atomic ledger writes preserve the previous forced claim across interruption", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const forcedClaim = {
+    idempotency_key: "claim-before-dispatch",
+    comment_id: "125",
+    comment_version_key: "125:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  writeLedger(ledgerPath, { updated_at: forcedClaim.processed_at, commands: [forcedClaim] });
+
+  const originalFsyncSync = fs.fsyncSync;
+  fs.fsyncSync = (() => {
+    throw new Error("simulated interrupted ledger write");
+  }) as typeof fs.fsyncSync;
+  try {
+    assert.throws(
+      () => writeLedger(ledgerPath, { updated_at: null, commands: [] }),
+      /simulated interrupted ledger write/,
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+  fs.writeFileSync(
+    path.join(directory, ".comment-router.json.interrupted.tmp"),
+    '{"updated_at":null,"commands":[',
+  );
+
+  const restored = readLedger(ledgerPath);
+  assert.equal(restored.commands.length, 1);
+  assert.equal(restored.commands[0]?.attempt_id, forcedClaim.attempt_id);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: restored.commands[0],
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74499 [${routerDispatchReceiptKey(
+        forcedClaim,
+        restored.commands[0],
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+});
+
+test("readLedger initializes only missing files and fails closed on torn state", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  assert.deepEqual(readLedger(ledgerPath), { updated_at: null, commands: [] });
+
+  fs.writeFileSync(ledgerPath, '{"updated_at":null,"commands":[');
+  assert.throws(() => readLedger(ledgerPath), /failed to parse comment router ledger/);
+
+  fs.writeFileSync(ledgerPath, "[]");
+  assert.throws(() => readLedger(ledgerPath), /ledger must be an object/);
+
+  fs.writeFileSync(ledgerPath, '{"updated_at":null}');
+  assert.throws(() => readLedger(ledgerPath), /ledger commands must be an array/);
+});
+
+test("readLedger rejects malformed forced replay identity", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const base = {
+    idempotency_key: "claim-before-dispatch",
+    comment_id: "125",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+  };
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, forced_replay: true }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /attempt_id must be a non-empty token/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, attempt_id: "forced-replay-41001" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, forced_replay: "true", attempt_id: "forced-replay-41001" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+});
+
+test("readLedger fails closed on malformed claimed state before restart dispatch", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeLedger(ledgerPath, {
+    updated_at: "2026-07-12T20:05:00Z",
+    commands: [
+      {
+        status: "claimed",
+        processed_at: "2026-07-12T20:05:00Z",
+        forced_replay: true,
+        attempt_id: "forced-replay-41001",
+        actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+      },
+    ],
+  });
+
+  let dispatchReached = false;
+  assert.throws(() => {
+    const restored = readLedger(ledgerPath);
+    dispatchReached = true;
+    dispatchClaimDecision({
+      claim: restored.commands[0] ?? null,
+      runs: [],
+      expectedTitle: "Review event item openclaw/openclaw#74499 [router-abc]",
+    });
+  }, /requires a durable lookup identity/);
+  assert.equal(dispatchReached, false);
+});
+
+test("readLedger validates compact command entry structure", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const base = {
+    idempotency_key: "claim-before-dispatch",
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+  };
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, status: "ready" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /command status is invalid/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, processed_at: "not-a-timestamp" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /processed_at must be a valid timestamp/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, actions: {} }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /actions must be an array of objects/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, target: [] }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /target must be an object or null/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [
+      base,
+      {
+        comment_id: "125",
+        comment_updated_at: "2026-07-12T20:00:00Z",
+        status: "claimed",
+        processed_at: "2026-07-12T20:05:00Z",
+      },
+    ],
+  });
+  assert.equal(readLedger(ledgerPath).commands.length, 2);
 });
 
 test("fresh dispatch claims wait for the Actions receipt visibility window", () => {

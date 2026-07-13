@@ -9,6 +9,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Added
 
+- Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
 - Added versioned staged repair proof plans with deterministic cheap-to-expensive validation, behavioral profile-command staging, concrete-argv environment resolution and revalidation, structured package-manager option parsing, checkout immutability checks, retention of every allowlisted required command, exact-command deduplication, explicit-only non-live subsumption with digest provenance, fail-closed canonical-gate stalls and runtime budgets, topology-stable retry traces, and bounded machine-readable proof bound to the exact validated head/base after final or fallback history compaction. Thanks @vincentkoc.
 - Required every repair merge owner to verify a non-bypass GitHub App credential and server-enforced strict base-branch status checks from repository rulesets or classic protection before merging, using a fresh trusted finalizer with exact-repository mutation and administration verifier tokens while keeping Codex credentials administration-free.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
@@ -59,6 +60,31 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Accepted package-manager argument separators in the action-ledger CLI and
+  allowed proven zero-command router runs to finish without empty publication.
+- Made action-ledger publication include every transactional import binding,
+  added pre-dispatch apply and retry receipts with conservative unknown-outcome
+  recovery, failed active apply items on runtime yield, preserved skipped apply
+  outcomes independently from incidental mutations, separated durable comment
+  writes from metadata reconciliation, propagated ambiguous retry dispatches
+  and final Codex retryability exactly, and ordered every apply mutation attempt
+  and outcome with monotonic causal phases.
+- Dual-write review batches, items, retries, Codex log publications, durable
+  review comments, apply actions, apply batches, and apply reports into the
+  immutable action ledger, including partial, interrupted, timeout, and failed
+  executions.
+- Dual-write comment-router command receipt, classification, durable claim,
+  claim refresh, receipt-aware command-side GitHub mutation attempts and
+  outcomes, dispatch, wait, recovery, completion, skip, and failure transition,
+  status-comment progress, and report-only repair requeues into immutable
+  per-attempt action chains. Each retried request receives its own causal
+  receipt pair while retaining stable business idempotency; forced replays use
+  production-wired durable attempt identities through dispatch claims and worker
+  receipt keys; and bounded requeues dispatch the same original source path
+  bound to their digest and depth before fail-closed immutable publication from
+  the setup-provided action-ledger output root to the state repository. Each
+  command lane binds publication to a canonical, run-scoped finalized-shard
+  manifest and rejects any missing producer path before state import.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.
@@ -78,13 +104,44 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
+- Restored exact-review intake by deriving cancellation from `job.status`, avoiding an unsupported status-check function in step environment expressions that made GitHub reject the sweep workflow, and added checksum-pinned workflow-semantic linting to CI.
+- Made comment-router ledger updates retain refreshed claims at the bounded
+  history limit, publish through fsynced atomic replacement, and fail closed on
+  malformed existing state so interrupted forced replays cannot dispatch twice.
+- Completed exact-review events when a fresh low-signal close guard keeps the
+  item open, instead of retrying the same safely rejected close forever.
+- Coalesced self-continuing hot and normal review runs per target so scheduled
+  backstops cannot create permanent parallel continuation chains that overwhelm
+  serialized review publication, while exact-item, apply, and comment-sync
+  lanes remain independent.
+- Gated review artifact application, record publication, exact-review queue
+  completion, apply dispatch, and review/apply continuations on explicit
+  primary success markers so action-ledger setup, import, finalization, upload,
+  or publication failures remain visible but fail open, while real review,
+  sync, proof, and apply failures still block dependent mutations.
+- Bound apply receipts to each actual GitHub request attempt while preserving
+  stable business idempotency across transient retries, recorded review lease
+  creation and cleanup independently, bound retry dispatches to review and
+  decision digests, aggregated every exact-attempt mutation outcome, and made
+  pre-spawn budget exhaustion a definite no-mutation yield. Interruption
+  recovery now terminalizes exact open mutation receipts before their enclosing
+  item and batch summaries with causal, collision-free phases; immutable ledger
+  finalization and publisher failures remain visible without suppressing valid
+  isolated apply dispatch or proof-backed apply work; selected-comment and
+  failed-review retry lanes finalize interrupted receipts before publication;
+  scheduled retry failures remain failed after cleanup; active coverage-proof
+  yields cannot become kept-open terminals; and review mutation, retryability,
+  and cancellation status survive finalization.
 - Recovered exact-review intake from Cloudflare SQLite value-size exhaustion by normalizing delivery receipts and queue items into independently bounded rows, committing dedupe and admission atomically, restoring the seven-day idempotency window, and migrating live queue state through a transaction-coupled, generation-aware, size-bounded rollback bridge that retains the complete active dedupe set and safely reimports rollback-era changes. Thanks @brokemac79.
 - Hardened action-ledger privacy, import identity and causal validation,
   multi-shard capacity, crash-safe completion publication, portable paths,
   bounded shard, marker, and spool reads, producer-lock and finalization races,
   direct shard collection invariants, calendar timestamp parity, single-label
   email and common service-credential rejection, root-scoped projection drains,
-  and bounded optional CrabFleet delivery.
+  bounded optional CrabFleet delivery, eager apply mutation receipts, exact
+  active-item timeout recovery, and item/revision-stable apply and retry
+  idempotency across checkpoint and batch reordering.
 - Bounded every repair git helper subprocess while retaining the shorter configurable network timeout, ordinary nonzero and signal status semantics, platform-aware command launching, and explicit spawn-error reporting. Thanks @hex-AI12.
 - Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.
 - Separated review publication from apply/comment-sync concurrency so long

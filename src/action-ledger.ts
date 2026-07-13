@@ -57,6 +57,7 @@ export const ACTION_EVENT_TYPES = {
   commandClassified: "command.classified",
   commandClaimRefreshed: "command.claim_refreshed",
   commandProgress: "command.progress",
+  commandMutation: "command.mutation",
   commandWait: "command.wait",
   commandRequeue: "command.requeue",
   commandRecover: "command.recover",
@@ -118,6 +119,7 @@ export const ACTION_EVENT_FAMILIES = {
     ACTION_EVENT_TYPES.commandClassified,
     ACTION_EVENT_TYPES.commandClaimRefreshed,
     ACTION_EVENT_TYPES.commandProgress,
+    ACTION_EVENT_TYPES.commandMutation,
     ACTION_EVENT_TYPES.commandWait,
     ACTION_EVENT_TYPES.commandRequeue,
     ACTION_EVENT_TYPES.commandRecover,
@@ -194,6 +196,7 @@ export const ACTION_EVENT_PHASE_TYPES = {
   commandClassified: ACTION_EVENT_TYPES.commandClassified,
   commandClaimRefreshed: ACTION_EVENT_TYPES.commandClaimRefreshed,
   commandProgress: ACTION_EVENT_TYPES.commandProgress,
+  commandMutation: ACTION_EVENT_TYPES.commandMutation,
   commandWait: ACTION_EVENT_TYPES.commandWait,
   commandRequeue: ACTION_EVENT_TYPES.commandRequeue,
   commandRecover: ACTION_EVENT_TYPES.commandRecover,
@@ -835,7 +838,7 @@ export function actionEventShardRelativePath(
       : `${filenameBase}-part-${String(normalizedShardIndex).padStart(6, "0")}-of-${String(
           normalizedShardCount,
         ).padStart(6, "0")}`;
-  return path.join(
+  return path.posix.join(
     "ledger",
     "v1",
     "events",
@@ -854,8 +857,8 @@ export function actionEventShardImportBindingRelativePaths(identity: ActionEvent
 } {
   const digest = sha256(actionLedgerJson(normalizeShardIdentity(identity)));
   return {
-    reservation: path.join("ledger", "v1", "import-bindings", "shard-sets", `${digest}.json`),
-    completion: path.join(
+    reservation: path.posix.join("ledger", "v1", "import-bindings", "shard-sets", `${digest}.json`),
+    completion: path.posix.join(
       "ledger",
       "v1",
       "import-bindings",

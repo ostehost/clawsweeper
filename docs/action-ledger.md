@@ -88,8 +88,44 @@ confidential-identifier checks as every other durable machine-text field.
 - Reusing a key for different semantic content is a hard conflict.
 - Retrying an operation creates a new `attempt_id` and new event records while
   preserving `operation_id` and mutation idempotency keys.
+- Receipt-aware command-side GitHub writes record a mutation-attempt receipt
+  immediately before each actual request and an accepted, rejected-before-write,
+  or unknown outcome immediately after it. Retried requests reuse the business
+  idempotency identity but receive separate causal receipt pairs; best-effort
+  metadata writes remain one-shot. A later command failure inherits accepted or
+  uncertain mutation state instead of being finalized as `mutation: false`.
+- Explicit command replays require a durable command `attempt_id` derived from
+  or forwarded through the production workflow. It scopes command operation,
+  attempt, mutation idempotency, dispatch claims, and worker receipt keys to that
+  replay while remaining stable across retries of the same workflow run.
+- Repair requeue identity binds the source run, source job path, source job
+  authorization digest, and incremented requeue depth. The dispatched job path
+  is the same original source path bound into the receipt, including when the
+  locally verified job is sealed elsewhere. Depth is propagated to the next
+  workflow run and bounded before another dispatch.
 - Mutation events require an explicit business `idempotencyIdentity`; outcome
   status and failure reason never define side-effect identity.
+- Review operation identity binds each selected item's repository, kind, number,
+  and observed `updated_at`, while item starts are written only when processing
+  actually begins. Apply operation identity may retain checkpoint and batch
+  context, but apply and retry-dispatch business idempotency bind only the item,
+  immutable source revision, review content digest, and decision packet digest.
+  Candidate order, checkpoint composition, and list indexes never define those
+  side effects.
+- Apply writes an item start at loop entry and a child mutation-attempt receipt
+  before every GitHub write. Accepted, rejected-before-write, and unknown
+  outcomes close that receipt explicitly. Recovery treats an open attempt as a
+  possible mutation, so a crash after GitHub accepted a write can never be
+  finalized as `mutation: false`. Per-item terminals are written as each item
+  finishes, and runtime-budget yield fails the genuinely active item rather than
+  synthesizing a normal kept-open result.
+- Failed-review dispatch writes the same pre-dispatch boundary, keeps the
+  durable retry count unchanged until `gh` returns success, and leaves an
+  ambiguous dispatch fail-closed for that exact source revision. Its business
+  identity also binds the durable review-content and decision-packet digests,
+  so a changed failed-review record cannot reuse an earlier dispatch receipt.
+  Operators must reconcile the workflow run before another launch; automatic
+  retry never duplicates an outcome-unknown dispatch.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix
@@ -200,6 +236,11 @@ confidential-identifier checks as every other durable machine-text field.
   first numbered part cannot expose a partial run. Sequential imports therefore
   cannot move a run, replace a reserved numbered set with a different part
   count, or advertise completion before payload publication finishes.
+- The importer returns one sorted publication manifest containing every event
+  shard plus its producer-run, event, shard-set, and completion binding. Workflow
+  publishers stage and commit that complete bounded manifest, so a fresh state
+  clone retains the same cross-import conflict and causal protections instead
+  of receiving payload files alone.
 
 ## Privacy Boundary
 
@@ -248,8 +289,8 @@ dropped. The checked-in JSON schema is
 The shared taxonomy defines six families:
 
 1. **Review**: batch, item, retry, log publication, and comment publication.
-2. **Command**: receive, classify, claim refresh, progress, wait, requeue, and
-   recovery.
+2. **Command**: receive, classify, claim refresh, mutation attempt/outcome,
+   progress, wait, requeue, and recovery.
 3. **Repair**: intake, dispatch, plan, execute, validate, review, publish,
    post-flight, requeue, recovery, and queue phases. Blocked and failed summary
    types remain available for coarse emitters.
@@ -269,6 +310,12 @@ New writers should prefer phase-oriented types from
 reasons from `ACTION_EVENT_REASON_CODES`. The event type identifies what phase
 ran; `action.status` identifies its transition or outcome. Free-form detail
 belongs in neither field.
+
+`published` is reserved for evidence durably visible at its declared external
+destination, such as a synced GitHub comment or an imported immutable ledger
+shard. A log, review record, or apply report that only exists in the current
+workspace is `completed` and identifies its local or worktree destination via
+`publication_kind`; a later publication lane records the durable transition.
 
 ```ts
 recordWorkflowPhaseEvent(root, {

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -14,24 +14,62 @@ const DEFAULT_IGNORED_CHECKS = [
   "Stale",
 ];
 const TRANSIENT_CANCELLED_CHECKS = new Set(["real behavior proof"]);
+const LEDGER_COMMAND_STATUSES = new Set(["claimed", "executed", "skipped", "waiting"]);
+const LEDGER_COMMAND_STRING_FIELDS = [
+  "idempotency_key",
+  "comment_id",
+  "comment_version_key",
+  "comment_created_at",
+  "comment_updated_at",
+  "repo",
+  "processed_at",
+] as const;
 
 export function dispatchClaimLookupKeys(entry: LooseRecord) {
   const keys: string[] = [];
+  const attemptId = forcedReplayAttemptId(entry);
   const commentId = String(entry.comment_id ?? "").trim();
   const commentUpdatedAt = String(entry.comment_updated_at ?? "").trim();
-  if (commentId && commentUpdatedAt) keys.push(`comment:${commentId}:${commentUpdatedAt}`);
+  if (commentId && commentUpdatedAt) {
+    keys.push(scopedDispatchLookupKey(`comment:${commentId}:${commentUpdatedAt}`, attemptId));
+  }
   const idempotencyKey = String(entry.idempotency_key ?? "").trim();
-  if (idempotencyKey) keys.push(`idempotency:${idempotencyKey}`);
+  if (idempotencyKey) {
+    keys.push(scopedDispatchLookupKey(`idempotency:${idempotencyKey}`, attemptId));
+  }
   return keys;
 }
 
 export function dispatchReceiptKeyMaterial(entry: LooseRecord, claim: LooseRecord | null) {
   const idempotencyKey = String(entry.idempotency_key ?? entry.comment_version_key ?? "unknown");
+  const attemptId = forcedReplayAttemptId(entry);
+  if (attemptId) {
+    return JSON.stringify({
+      idempotency_key: idempotencyKey,
+      forced_replay_attempt_id: attemptId,
+    });
+  }
   if (entry.automation_source !== "repair_loop_label_sweep") return idempotencyKey;
   const attempt = String(
     claim?.processed_at ?? entry.processed_at ?? entry.comment_updated_at ?? "unknown-attempt",
   );
   return `${idempotencyKey}:${attempt}`;
+}
+
+export function routerDispatchReceiptKey(entry: LooseRecord, claim: LooseRecord | null) {
+  return `router-${createHash("sha256")
+    .update(dispatchReceiptKeyMaterial(entry, claim))
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
+function forcedReplayAttemptId(entry: LooseRecord): string | null {
+  const identity = forcedReplayIdentityFields(entry);
+  return identity.attempt_id ? String(identity.attempt_id) : null;
+}
+
+function scopedDispatchLookupKey(key: string, attemptId: string | null): string {
+  return attemptId ? `forced-replay:${JSON.stringify([key, attemptId])}` : key;
 }
 
 export function hasSuccessfulDispatchExecutionJob(jobs: LooseRecord[], requiredJobName: string) {
@@ -428,16 +466,31 @@ function ignoredCheckNames() {
 }
 
 export function readLedger(file: JsonValue) {
-  if (!fs.existsSync(file)) return { updated_at: null, commands: [] };
+  let contents: string;
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    return {
-      updated_at: data.updated_at ?? null,
-      commands: Array.isArray(data.commands) ? data.commands : [],
-    };
-  } catch {
-    return { updated_at: null, commands: [] };
+    contents = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { updated_at: null, commands: [] };
+    }
+    throw error;
   }
+  let data: LooseRecord;
+  try {
+    data = JSON.parse(contents);
+  } catch (error) {
+    throw new Error(`failed to parse comment router ledger: ${String(file)}`, { cause: error });
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("comment router ledger must be an object");
+  }
+  if (!Array.isArray(data.commands)) {
+    throw new Error("comment router ledger commands must be an array");
+  }
+  return {
+    updated_at: data.updated_at ?? null,
+    commands: data.commands.map((entry: JsonValue) => validatedLedgerCommand(entry)),
+  };
 }
 
 export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
@@ -469,6 +522,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         trusted_bot_author: entry.trusted_bot_author ?? null,
         automation_source: entry.automation_source ?? null,
         repair_reason: entry.repair_reason ?? null,
+        ...forcedReplayIdentityFields(entry),
         expected_head_sha: entry.expected_head_sha ?? null,
         finding_id: entry.finding_id ?? null,
         status: entry.status,
@@ -494,6 +548,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     const key = ledgerEntryKey(entry);
     const previous = byCommentVersion.get(key);
     if (previous && stableLedgerEntry(previous) === stableLedgerEntry(entry)) continue;
+    if (previous) byCommentVersion.delete(key);
     byCommentVersion.set(key, entry);
     changed = true;
   }
@@ -501,6 +556,74 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
   current.updated_at = new Date().toISOString();
   current.commands = [...byCommentVersion.values()].slice(-1000);
   return true;
+}
+
+function validatedLedgerCommand(entry: JsonValue): LooseRecord {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("comment router ledger commands must be objects");
+  }
+  const command = { ...entry, ...forcedReplayIdentityFields(entry) };
+  for (const field of LEDGER_COMMAND_STRING_FIELDS) {
+    const value = command[field];
+    if (value !== undefined && value !== null && (typeof value !== "string" || !value.trim())) {
+      throw new Error(`comment router ledger command ${field} must be a non-empty string or null`);
+    }
+  }
+  if (!LEDGER_COMMAND_STATUSES.has(command.status)) {
+    throw new Error("comment router ledger command status is invalid");
+  }
+  if (
+    typeof command.processed_at !== "string" ||
+    !Number.isFinite(Date.parse(command.processed_at))
+  ) {
+    throw new Error("comment router ledger command processed_at must be a valid timestamp");
+  }
+  if (
+    command.actions !== undefined &&
+    (!Array.isArray(command.actions) ||
+      command.actions.some(
+        (action: JsonValue) => !action || typeof action !== "object" || Array.isArray(action),
+      ))
+  ) {
+    throw new Error("comment router ledger command actions must be an array of objects");
+  }
+  if (
+    command.target !== undefined &&
+    command.target !== null &&
+    (typeof command.target !== "object" || Array.isArray(command.target))
+  ) {
+    throw new Error("comment router ledger command target must be an object or null");
+  }
+  if (command.status === "claimed" && dispatchClaimLookupKeys(command).length === 0) {
+    throw new Error("claimed comment router ledger command requires a durable lookup identity");
+  }
+  return command;
+}
+
+function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
+  const forcedReplay = entry.forced_replay;
+  const hasAttemptId = entry.attempt_id !== undefined && entry.attempt_id !== null;
+  const attemptId = String(entry.attempt_id ?? "").trim();
+  if (
+    (forcedReplay === undefined || forcedReplay === null || forcedReplay === false) &&
+    !hasAttemptId
+  ) {
+    return {};
+  }
+  if (forcedReplay !== true) {
+    throw new Error("forced replay dispatch identity requires forced_replay=true");
+  }
+  if (
+    !attemptId ||
+    attemptId.length > 128 ||
+    /\s/.test(attemptId) ||
+    attemptId.includes(String.fromCharCode(0))
+  ) {
+    throw new Error(
+      "forced replay dispatch attempt_id must be a non-empty token of at most 128 characters",
+    );
+  }
+  return { forced_replay: true, attempt_id: attemptId };
 }
 
 function isNoopSkip(entry: LooseRecord) {
@@ -521,6 +644,12 @@ function stableLedgerEntry(entry: LooseRecord) {
 }
 
 function ledgerEntryKey(entry: LooseRecord) {
+  const ordinaryKey = ordinaryLedgerEntryKey(entry);
+  const attemptId = forcedReplayAttemptId(entry);
+  return attemptId ? `forced-replay:${JSON.stringify([ordinaryKey, attemptId])}` : ordinaryKey;
+}
+
+function ordinaryLedgerEntryKey(entry: LooseRecord) {
   if (
     !entry.comment_version_key &&
     entry.automation_source === "repair_loop_label_sweep" &&
@@ -547,8 +676,44 @@ function compactLedgerActions(actions: JsonValue) {
 }
 
 export function writeLedger(file: JsonValue, current: LooseRecord) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`);
+  const ledgerPath = String(file);
+  const directory = path.dirname(ledgerPath);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(ledgerPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  const contents = `${JSON.stringify(current, null, 2)}\n`;
+  fs.mkdirSync(directory, { recursive: true });
+  try {
+    const descriptor = fs.openSync(
+      temporaryPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    try {
+      fs.writeFileSync(descriptor, contents, "utf8");
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    fs.renameSync(temporaryPath, ledgerPath);
+    fsyncDirectory(directory);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
+}
+
+function fsyncDirectory(directory: string) {
+  if (process.platform === "win32") return;
+  const descriptor = fs.openSync(
+    directory,
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0),
+  );
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 export function writeReportFile(root: string, data: LooseRecord) {

@@ -15,6 +15,11 @@ on:
         required: true
         default: false
         type: boolean
+      attempt_id:
+        description: "Optional durable identity for one forced replay across workflow retries"
+        required: false
+        default: ""
+        type: string
       target_repo:
         description: "Repository to scan for ClawSweeper commands"
         required: true
@@ -107,6 +112,9 @@ jobs:
             src/github-json.ts
             src/github-retry.ts
             src/pr-close-coverage-proof.ts
+            src/action-ledger-files.ts
+            src/action-ledger-runtime.ts
+            src/action-ledger.ts
             src/repair
             src/repository-profiles.ts
             package.json
@@ -168,7 +176,10 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -209,6 +220,7 @@ jobs:
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
 
       - name: Route ClawSweeper comments
+        id: route-comments
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation-app.outputs.app_id }}
@@ -221,6 +233,8 @@ jobs:
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION: initial
+          ROUTER_ATTEMPT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || github.event.client_payload.attempt_id || '' }}
         run: |
           set -euo pipefail
           target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
@@ -233,6 +247,7 @@ jobs:
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
+          attempt_id="$ROUTER_ATTEMPT_ID"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
@@ -257,6 +272,13 @@ jobs:
             comment_event_auth=""
             comment_updated_at=""
             comment_body_sha256=""
+          fi
+          if [ "$force_reprocess" = "true" ] && [ -z "$attempt_id" ]; then
+            attempt_id="forced-replay-${GITHUB_RUN_ID}"
+          fi
+          if [ "$force_reprocess" != "true" ] && [ -n "$attempt_id" ]; then
+            echo "attempt_id requires force_reprocess=true" >&2
+            exit 1
           fi
 
           args=(
@@ -303,6 +325,7 @@ jobs:
           fi
           if [ "$force_reprocess" = "true" ]; then
             args+=(--force-reprocess)
+            args+=(--attempt-id "$attempt_id")
           fi
           if { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.execute }}" = "true" ]; } ||
              { [ "${{ github.event_name }}" = "repository_dispatch" ]; } ||
@@ -350,6 +373,8 @@ jobs:
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION: retry
+          ROUTER_ATTEMPT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || github.event.client_payload.attempt_id || '' }}
         run: |
           set -euo pipefail
           target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
@@ -362,6 +387,7 @@ jobs:
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
+          attempt_id="$ROUTER_ATTEMPT_ID"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
@@ -386,6 +412,13 @@ jobs:
             comment_event_auth=""
             comment_updated_at=""
             comment_body_sha256=""
+          fi
+          if [ "$force_reprocess" = "true" ] && [ -z "$attempt_id" ]; then
+            attempt_id="forced-replay-${GITHUB_RUN_ID}"
+          fi
+          if [ "$force_reprocess" != "true" ] && [ -n "$attempt_id" ]; then
+            echo "attempt_id requires force_reprocess=true" >&2
+            exit 1
           fi
 
           args=(
@@ -432,6 +465,7 @@ jobs:
           fi
           if [ "$force_reprocess" = "true" ]; then
             args+=(--force-reprocess)
+            args+=(--attempt-id "$attempt_id")
           fi
           args+=(--execute)
 
@@ -447,3 +481,67 @@ jobs:
             --path results/comment-router-latest.json \
             --path jobs \
             --rebase-strategy theirs
+
+      - name: Finalize command action ledger
+        id: finalize-command-action-ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          # Empty is valid only when this run's report proves no command lifecycle started.
+          if [ "${{ steps.route-comments.outcome }}" = "success" ] &&
+             jq -e '.commands_seen == 0' results/comment-router-latest.json >/dev/null 2>&1; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          manifest_file=".artifacts/comment-router-command-action-ledger-manifest.json"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --lane comment-router \
+            "${allow_empty_args[@]}" \
+            > "$manifest_file"
+          if [ -s "$manifest_file" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish immutable command action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.finalize-command-action-ledger.outputs.publish == 'true' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/comment-router-command-action-ledger-manifest.json"
+          test -s "$manifest_file"
+          event_paths_file=".artifacts/command-action-ledger-paths.txt"
+          import_result_file=".artifacts/command-action-ledger-import.json"
+          pnpm run --silent repair:action-ledger -- publish \
+            --lane comment-router \
+            --manifest "$manifest_file" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          if ! jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null; then
+            echo "Imported command action event paths do not match the finalized manifest." >&2
+            exit 1
+          fi
+          jq -r '.paths[]?' "$import_result_file" |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Command action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append command action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

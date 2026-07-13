@@ -8,11 +8,13 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS,
   ACTION_EVENT_SHARD_IMPORT_LIMITS,
   CRABFLEET_PROJECTION_LIMITS,
   flushPendingCrabFleetPosts,
   flushWorkflowActionEvents,
   importActionEventShards,
+  interruptOpenWorkflowActionEvents,
   postActionEventToCrabFleet,
   recordWorkflowActionEvent,
   recordWorkflowPhaseEvent,
@@ -28,6 +30,7 @@ import {
   actionEventShardRelativePath,
   actionLedgerJson,
   createActionEvent,
+  readAllSpooledActionEvents,
   readActionEventShard,
   readActionEventShardAt,
   writeActionEventShard,
@@ -58,6 +61,57 @@ async function waitForPath(filePath: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(filePath)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${filePath}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error
+    ? (error as NodeJS.ErrnoException).code
+    : undefined;
+}
+
+async function waitForPositivePidFile(filePath: string, timeoutMs = 2_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const value = fs.readFileSync(filePath, "utf8").trim();
+      if (/^[1-9]\d*$/.test(value)) {
+        const pid = Number(value);
+        if (Number.isSafeInteger(pid)) return pid;
+      }
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") throw error;
+    }
+    if (Date.now() >= deadline)
+      throw new Error(`timed out waiting for positive PID in ${filePath}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function waitForLinuxProcessState(
+  pid: number,
+  expectedState: string,
+  timeoutMs = 2_000,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new Error(`invalid Linux process PID: ${pid}`);
+  const statPath = `/proc/${pid}/stat`;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const stat = fs.readFileSync(statPath, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      if (commandEnd >= 0) {
+        const state = stat
+          .slice(commandEnd + 1)
+          .trim()
+          .split(/\s+/)[0];
+        if (state === expectedState) return true;
+      }
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") throw error;
+    }
+    if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
@@ -332,30 +386,32 @@ function recreateActionEvent(
 }
 
 test("workflow event telemetry is disabled outside an explicit workflow context", () => {
-  assert.equal(
-    recordWorkflowActionEvent(
-      tempRoot(),
-      {
-        scope: "review.completed",
-        identity: { number: 42 },
-        type: ACTION_EVENT_TYPES.reviewCompleted,
-        component: "review",
-        subject: {
-          repository: "openclaw/openclaw",
-          kind: "pull_request",
-          number: 42,
+  for (const env of [{}, { GITHUB_ACTIONS: "true" }]) {
+    assert.equal(
+      recordWorkflowActionEvent(
+        tempRoot(),
+        {
+          scope: "review.completed",
+          identity: { number: 42 },
+          type: ACTION_EVENT_TYPES.reviewCompleted,
+          component: "review",
+          subject: {
+            repository: "openclaw/openclaw",
+            kind: "pull_request",
+            number: 42,
+          },
+          action: {
+            name: "review",
+            status: "completed",
+            retryable: false,
+            mutation: false,
+          },
         },
-        action: {
-          name: "review",
-          status: "completed",
-          retryable: false,
-          mutation: false,
-        },
-      },
-      { env: {} },
-    ),
-    null,
-  );
+        { env },
+      ),
+      null,
+    );
+  }
 });
 
 test("phase event helpers derive canonical types, action names, and replay identities", () => {
@@ -422,6 +478,1244 @@ test("phase event helpers derive canonical types, action names, and replay ident
   assert.equal(first.parent_event_id, null);
   assert.equal(first.phase_seq, 3);
   assert.match(first.idempotency_key_sha256, /^[a-f0-9]{64}$/);
+});
+
+test("timeout recovery closes only start-only review attempts before finalization", () => {
+  const root = tempRoot();
+  const env = workflowEnv();
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    candidateSnapshots: [
+      {
+        repository: "openclaw/openclaw",
+        number: 42,
+        kind: "pull_request",
+        updatedAt: "2026-07-12T09:00:00Z",
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 43,
+        kind: "issue",
+        updatedAt: "2026-07-12T09:01:00Z",
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 44,
+        kind: "pull_request",
+        updatedAt: "2026-07-12T09:02:00Z",
+      },
+    ],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "batch_start" },
+      operation: "review",
+      operationIdentity,
+      phaseSeq: 1,
+      component: "review",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const openItem = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "item_start", number: 42 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 10,
+      component: "review",
+      subject: { repository: "openclaw/openclaw", kind: "pull_request", number: 42 },
+    },
+    { env },
+  );
+  assert.ok(openItem);
+  const completedItem = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "item_start", number: 43 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 20,
+      component: "review",
+      subject: { repository: "openclaw/openclaw", kind: "issue", number: 43 },
+    },
+    { env },
+  );
+  assert.ok(completedItem);
+  recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "item_terminal", number: 43 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: completedItem.event_id,
+      phaseSeq: 22,
+      component: "review",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "issue",
+        number: 43,
+        sourceRevision: "revision-43",
+      },
+    },
+    { env },
+  );
+
+  assert.equal(
+    interruptOpenWorkflowActionEvents(root, {
+      env,
+      now: () => new Date("2026-07-12T10:05:00Z"),
+    }),
+    2,
+  );
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+
+  const events = readAllSpooledActionEvents(root);
+  const interrupted = events.filter(
+    (event) =>
+      event.action.status === ACTION_EVENT_STATUSES.failed &&
+      event.action.reason_code === ACTION_EVENT_REASON_CODES.timeout,
+  );
+  assert.equal(interrupted.length, 2);
+  assert.deepEqual(
+    interrupted
+      .map((event) => [event.event_type, event.subject.number ?? null] as const)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+    [
+      [ACTION_EVENT_TYPES.reviewBatch, null],
+      [ACTION_EVENT_TYPES.reviewItem, 42],
+    ],
+  );
+  assert.ok(
+    interrupted.every(
+      (event) =>
+        event.operation_id === batch.operation_id &&
+        event.attempt_id === batch.attempt_id &&
+        event.action.retryable &&
+        !event.action.mutation,
+    ),
+  );
+  assert.equal(
+    events.filter(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.reviewItem &&
+        (event.subject.number === 43 || event.subject.number === 44) &&
+        event.action.status === ACTION_EVENT_STATUSES.failed,
+    ).length,
+    0,
+  );
+  assert.equal(events.filter((event) => event.subject.number === 44).length, 0);
+});
+
+test("timeout recovery preserves hard-killed apply mutation truth and ignores untouched items", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-0",
+    GITHUB_ACTION: "__apply",
+    GITHUB_JOB: "apply-existing",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    checkpoint: "2",
+    candidateRevisions: [
+      { number: 41, sourceRevision: "revision-41" },
+      { number: 42, sourceRevision: "revision-42" },
+      { number: 43, sourceRevision: "revision-43" },
+    ],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_batch_start" },
+      operation: "apply",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "apply_batch_start" },
+      component: "apply_decisions",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const completedStart = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 41 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 10,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 41,
+        sourceRevision: "revision-41",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 41,
+        sourceRevision: "revision-41",
+      },
+    },
+    { env },
+  );
+  assert.ok(completedStart);
+  recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_result", number: 41 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: completedStart.event_id,
+      phaseSeq: 12,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 41,
+        sourceRevision: "revision-41",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 41,
+        sourceRevision: "revision-41",
+      },
+    },
+    { env },
+  );
+  const activeStart = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 42 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 30,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+    },
+    { env },
+  );
+  assert.ok(activeStart);
+  const mutation = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.executed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: true,
+      mutation: true,
+      identity: { slot: "apply_mutation_observed", number: 42 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: activeStart.event_id,
+      phaseSeq: 31,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+    },
+    { env },
+  );
+  assert.ok(mutation);
+
+  assert.equal(
+    interruptOpenWorkflowActionEvents(root, {
+      env,
+      now: () => new Date("2026-07-12T10:05:00Z"),
+    }),
+    2,
+  );
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+
+  const events = readAllSpooledActionEvents(root);
+  const interrupted = events.filter(
+    (event) =>
+      event.action.status === ACTION_EVENT_STATUSES.failed &&
+      event.action.reason_code === ACTION_EVENT_REASON_CODES.timeout,
+  );
+  assert.equal(interrupted.length, 2);
+  assert.ok(interrupted.every((event) => event.action.mutation));
+  const interruptedItem = interrupted.find(
+    (event) => event.event_type === ACTION_EVENT_TYPES.applyAction && event.subject.number === 42,
+  );
+  assert.ok(interruptedItem);
+  assert.equal(interruptedItem.parent_event_id, mutation.event_id);
+  assert.equal(interruptedItem.idempotency_key_sha256, activeStart.idempotency_key_sha256);
+  assert.equal(
+    interrupted.filter(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.applyAction &&
+        (event.subject.number === 41 || event.subject.number === 43),
+    ).length,
+    0,
+  );
+  assert.equal(events.filter((event) => event.subject.number === 43).length, 0);
+});
+
+test("timeout recovery terminalizes the latest open mutation before its item summary", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-uncertain",
+    GITHUB_ACTION: "__apply",
+    GITHUB_JOB: "apply-existing",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    candidateRevisions: [{ number: 52, sourceRevision: "revision-52" }],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_batch_start" },
+      operation: "apply",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "apply_batch_start" },
+      component: "apply_decisions",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const item = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 52 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 10,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 52,
+        sourceRevision: "revision-52",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 52,
+        sourceRevision: "revision-52",
+      },
+    },
+    { env },
+  );
+  assert.ok(item);
+  const acceptedAttempt = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_mutation_attempt", mutationIdentitySha256: "a".repeat(64) },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: item.event_id,
+      phaseSeq: 11,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_mutation",
+        repository: "openclaw/openclaw",
+        number: 52,
+        sourceRevision: "revision-52",
+        mutationIdentitySha256: "a".repeat(64),
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 52,
+        sourceRevision: "revision-52",
+      },
+      attributes: { completion_reason: "mutation_attempted" },
+    },
+    { env },
+  );
+  assert.ok(acceptedAttempt);
+  const acceptedOutcome = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.executed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: true,
+      identity: { slot: "apply_mutation_outcome", outcome: "accepted" },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: acceptedAttempt.event_id,
+      phaseSeq: 12,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_mutation",
+        repository: "openclaw/openclaw",
+        number: 52,
+        sourceRevision: "revision-52",
+        mutationIdentitySha256: "a".repeat(64),
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 52,
+        sourceRevision: "revision-52",
+      },
+      attributes: { completion_reason: "mutation_accepted" },
+    },
+    { env },
+  );
+  assert.ok(acceptedOutcome);
+  const attempt = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_mutation_attempt", mutationIdentitySha256: "c".repeat(64) },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: acceptedOutcome.event_id,
+      phaseSeq: 13,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_mutation",
+        repository: "openclaw/openclaw",
+        number: 52,
+        sourceRevision: "revision-52",
+        mutationIdentitySha256: "c".repeat(64),
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 52,
+        sourceRevision: "revision-52",
+      },
+      attributes: { completion_reason: "mutation_attempted" },
+    },
+    { env },
+  );
+  assert.ok(attempt);
+  const rejectedItem = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 53 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 30,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+    },
+    { env },
+  );
+  assert.ok(rejectedItem);
+  const rejectedAttempt = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_mutation_attempt", mutationIdentitySha256: "b".repeat(64) },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: rejectedItem.event_id,
+      phaseSeq: 31,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_mutation",
+        repository: "openclaw/openclaw",
+        number: 53,
+        sourceRevision: "revision-53",
+        mutationIdentitySha256: "b".repeat(64),
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+      attributes: { completion_reason: "mutation_attempted" },
+    },
+    { env },
+  );
+  assert.ok(rejectedAttempt);
+  const rejectedOutcome = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.notApplicable,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_mutation_outcome", outcome: "rejected" },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: rejectedAttempt.event_id,
+      phaseSeq: 32,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_mutation",
+        repository: "openclaw/openclaw",
+        number: 53,
+        sourceRevision: "revision-53",
+        mutationIdentitySha256: "b".repeat(64),
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+      attributes: { completion_reason: "mutation_rejected" },
+    },
+    { env },
+  );
+  assert.ok(rejectedOutcome);
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 4);
+  const events = readAllSpooledActionEvents(root);
+  const recovered = events.filter(
+    (event) =>
+      event.action.status === ACTION_EVENT_STATUSES.failed &&
+      event.attributes?.completion_reason === "mutation_outcome_unknown",
+  );
+  assert.equal(recovered.length, 3);
+  assert.ok(recovered.every((event) => event.action.mutation));
+  const recoveredAttempt = recovered.find(
+    (event) => event.idempotency_key_sha256 === attempt.idempotency_key_sha256,
+  );
+  assert.ok(recoveredAttempt);
+  assert.equal(recoveredAttempt.parent_event_id, attempt.event_id);
+  assert.notEqual(recoveredAttempt.parent_event_id, acceptedOutcome.event_id);
+  assert.ok(acceptedOutcome.phase_seq < attempt.phase_seq);
+  assert.ok(attempt.phase_seq < recoveredAttempt.phase_seq);
+  const recoveredItem = recovered.find(
+    (event) =>
+      event.subject.number === 52 && event.idempotency_key_sha256 === item.idempotency_key_sha256,
+  );
+  assert.ok(recoveredItem);
+  assert.equal(recoveredItem.parent_event_id, recoveredAttempt.event_id);
+  assert.ok(recoveredAttempt.phase_seq < recoveredItem.phase_seq);
+  const rejectedRecovery = events.find(
+    (event) =>
+      event.subject.number === 53 &&
+      event.action.status === ACTION_EVENT_STATUSES.failed &&
+      event.attributes?.completion_reason === "timeout",
+  );
+  assert.ok(rejectedRecovery);
+  assert.equal(rejectedRecovery.action.mutation, false);
+  assert.equal(rejectedRecovery.parent_event_id, rejectedOutcome.event_id);
+  const recoveredTerminals = events.filter(
+    (event) =>
+      event.action.status === ACTION_EVENT_STATUSES.failed && event.attributes?.partial === true,
+  );
+  assert.equal(recoveredTerminals.length, 4);
+  const eventsById = new Map(events.map((event) => [event.event_id, event]));
+  for (const terminal of recoveredTerminals) {
+    const parent = terminal.parent_event_id ? eventsById.get(terminal.parent_event_id) : null;
+    assert.ok(parent);
+    assert.ok(terminal.phase_seq > parent.phase_seq);
+  }
+  const phaseSeqs = events.map((event) => event.phase_seq);
+  assert.equal(new Set(phaseSeqs).size, phaseSeqs.length);
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+});
+
+test("interruption recovery follows the latest accepted mutation ordinal", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-ordered-mutations",
+    GITHUB_ACTION: "__apply",
+    GITHUB_JOB: "apply-existing",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    candidateRevisions: [{ number: 53, sourceRevision: "revision-53" }],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_batch_start" },
+      operation: "apply",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "apply_batch_start" },
+      component: "apply_decisions",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const item = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 53 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 53,
+        sourceRevision: "revision-53",
+      },
+    },
+    { env },
+  );
+  assert.ok(item);
+
+  let parentEventId = item.event_id;
+  let latestOutcome: ActionEvent | null = null;
+  for (const [index, mutationIdentitySha256] of ["f".repeat(64), "0".repeat(64)].entries()) {
+    const idempotencyIdentity = {
+      operation: "apply",
+      slot: "apply_mutation",
+      repository: "openclaw/openclaw",
+      number: 53,
+      sourceRevision: "revision-53",
+      mutationIdentitySha256,
+    };
+    const attempt = recordWorkflowPhaseEvent(
+      root,
+      {
+        phase: ACTION_EVENT_TYPES.applyAction,
+        status: ACTION_EVENT_STATUSES.started,
+        reasonCode: ACTION_EVENT_REASON_CODES.selected,
+        retryable: true,
+        mutation: false,
+        identity: { slot: "apply_mutation_attempt", mutationIdentitySha256 },
+        operation: "apply",
+        operationIdentity,
+        parentEventId,
+        phaseSeq: 3 + index * 2,
+        idempotencyIdentity,
+        component: "apply_decisions",
+        subject: {
+          repository: "openclaw/openclaw",
+          kind: "pull_request",
+          number: 53,
+          sourceRevision: "revision-53",
+        },
+        attributes: { completion_reason: "mutation_attempted" },
+      },
+      { env },
+    );
+    assert.ok(attempt);
+    const outcome = recordWorkflowPhaseEvent(
+      root,
+      {
+        phase: ACTION_EVENT_TYPES.applyAction,
+        status: ACTION_EVENT_STATUSES.executed,
+        reasonCode: ACTION_EVENT_REASON_CODES.completed,
+        retryable: false,
+        mutation: true,
+        identity: { slot: "apply_mutation_outcome", mutationIdentitySha256, outcome: "accepted" },
+        operation: "apply",
+        operationIdentity,
+        parentEventId: attempt.event_id,
+        phaseSeq: 4 + index * 2,
+        idempotencyIdentity,
+        component: "apply_decisions",
+        subject: {
+          repository: "openclaw/openclaw",
+          kind: "pull_request",
+          number: 53,
+          sourceRevision: "revision-53",
+        },
+        attributes: { completion_reason: "mutation_accepted" },
+      },
+      { env },
+    );
+    assert.ok(outcome);
+    parentEventId = outcome.event_id;
+    latestOutcome = outcome;
+  }
+
+  assert.ok(latestOutcome);
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
+  const recoveredItem = readAllSpooledActionEvents(root).find(
+    (event) =>
+      event.subject.number === 53 &&
+      event.attributes?.completion_reason === "timeout" &&
+      event.attributes.partial === true,
+  );
+  assert.ok(recoveredItem);
+  assert.equal(recoveredItem.parent_event_id, latestOutcome.event_id);
+  assert.ok(recoveredItem.phase_seq > latestOutcome.phase_seq);
+  const attemptPhases = readAllSpooledActionEvents(root)
+    .filter(
+      (event) =>
+        event.operation_id === recoveredItem.operation_id &&
+        event.attempt_id === recoveredItem.attempt_id,
+    )
+    .map((event) => event.phase_seq);
+  assert.equal(new Set(attemptPhases).size, attemptPhases.length);
+  assert.equal(recoveredItem.action.mutation, true);
+  assert.equal(recoveredItem.action.retryable, true);
+});
+
+test("review interruption recovery aggregates coordination comment mutations", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "review-coordination-mutation",
+    GITHUB_ACTION: "__review",
+    GITHUB_JOB: "review",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    candidateSnapshots: [
+      {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        updatedAt: "2026-07-12T12:00:00Z",
+      },
+    ],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "review_batch_start" },
+      operation: "review",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "review_batch_start" },
+      component: "review",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const item = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "review_item_start", number: 54 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operation: "review",
+        slot: "review_item",
+        repository: "openclaw/openclaw",
+        number: 54,
+      },
+      component: "review",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        sourceRevision: "a".repeat(40),
+      },
+    },
+    { env },
+  );
+  assert.ok(item);
+  const mutationIdentity = {
+    operation: "review",
+    slot: "coordination_mutation",
+    repository: "openclaw/openclaw",
+    number: 54,
+    mutationIdentitySha256: "b".repeat(64),
+  };
+  const attempt = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: true,
+      mutation: false,
+      identity: { slot: "review_coordination_mutation_attempt", number: 54 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: item.event_id,
+      phaseSeq: 3,
+      idempotencyIdentity: mutationIdentity,
+      component: "review",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        sourceRevision: "a".repeat(40),
+      },
+      attributes: { completion_reason: "mutation_attempted" },
+    },
+    { env },
+  );
+  assert.ok(attempt);
+  const outcome = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.executed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: true,
+      identity: { slot: "review_coordination_mutation_outcome", number: 54 },
+      operation: "review",
+      operationIdentity,
+      parentEventId: attempt.event_id,
+      phaseSeq: 4,
+      idempotencyIdentity: mutationIdentity,
+      component: "review",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        sourceRevision: "a".repeat(40),
+      },
+      attributes: { completion_reason: "mutation_accepted" },
+    },
+    { env },
+  );
+  assert.ok(outcome);
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
+  const recovered = readAllSpooledActionEvents(root).filter(
+    (event) =>
+      event.attributes?.completion_reason === "timeout" && event.action.status === "failed",
+  );
+  const recoveredItem = recovered.find((event) => event.subject.number === 54);
+  const recoveredBatch = recovered.find((event) => event.subject.kind === "workflow");
+  assert.ok(recoveredItem);
+  assert.ok(recoveredBatch);
+  assert.equal(recoveredItem.parent_event_id, outcome.event_id);
+  assert.ok(recoveredItem.phase_seq > outcome.phase_seq);
+  assert.equal(recoveredItem.action.mutation, true);
+  assert.equal(recoveredBatch.action.mutation, true);
+});
+
+test("interruption recovery preserves any earlier unknown mutation outcome", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-unknown-then-accepted",
+    GITHUB_ACTION: "__apply",
+    GITHUB_JOB: "apply-existing",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    candidateRevisions: [{ number: 54, sourceRevision: "revision-54" }],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_batch_start" },
+      operation: "apply",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "apply_batch_start" },
+      component: "apply_decisions",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const item = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.applyAction,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "apply_item_start", number: 54 },
+      operation: "apply",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 10,
+      idempotencyIdentity: {
+        operation: "apply",
+        slot: "apply_item",
+        repository: "openclaw/openclaw",
+        number: 54,
+        sourceRevision: "revision-54",
+      },
+      component: "apply_decisions",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 54,
+        sourceRevision: "revision-54",
+      },
+    },
+    { env },
+  );
+  assert.ok(item);
+
+  const recordAttempt = (
+    mutationIdentitySha256: string,
+    outcome: "unknown" | "accepted",
+    phaseSeq: number,
+  ): ActionEvent => {
+    const idempotencyIdentity = {
+      operation: "apply",
+      slot: "apply_mutation",
+      repository: "openclaw/openclaw",
+      number: 54,
+      sourceRevision: "revision-54",
+      mutationIdentitySha256,
+    };
+    const attempt = recordWorkflowPhaseEvent(
+      root,
+      {
+        phase: ACTION_EVENT_TYPES.applyAction,
+        status: ACTION_EVENT_STATUSES.started,
+        reasonCode: ACTION_EVENT_REASON_CODES.selected,
+        retryable: true,
+        mutation: false,
+        identity: { slot: "apply_mutation_attempt", mutationIdentitySha256 },
+        operation: "apply",
+        operationIdentity,
+        parentEventId: item.event_id,
+        phaseSeq,
+        idempotencyIdentity,
+        component: "apply_decisions",
+        subject: {
+          repository: "openclaw/openclaw",
+          kind: "pull_request",
+          number: 54,
+          sourceRevision: "revision-54",
+        },
+        attributes: { completion_reason: "mutation_attempted" },
+      },
+      { env },
+    );
+    assert.ok(attempt);
+    const terminal = recordWorkflowPhaseEvent(
+      root,
+      {
+        phase: ACTION_EVENT_TYPES.applyAction,
+        status:
+          outcome === "accepted" ? ACTION_EVENT_STATUSES.executed : ACTION_EVENT_STATUSES.failed,
+        reasonCode:
+          outcome === "accepted"
+            ? ACTION_EVENT_REASON_CODES.completed
+            : ACTION_EVENT_REASON_CODES.unavailable,
+        retryable: outcome === "unknown",
+        mutation: true,
+        identity: { slot: "apply_mutation_outcome", mutationIdentitySha256, outcome },
+        operation: "apply",
+        operationIdentity,
+        parentEventId: attempt.event_id,
+        phaseSeq: phaseSeq + 1,
+        idempotencyIdentity,
+        component: "apply_decisions",
+        subject: {
+          repository: "openclaw/openclaw",
+          kind: "pull_request",
+          number: 54,
+          sourceRevision: "revision-54",
+        },
+        attributes: {
+          completion_reason:
+            outcome === "accepted" ? "mutation_accepted" : "mutation_outcome_unknown",
+        },
+      },
+      { env },
+    );
+    assert.ok(terminal);
+    return terminal;
+  };
+
+  const unknown = recordAttempt("a".repeat(64), "unknown", 11);
+  recordAttempt("b".repeat(64), "accepted", 21);
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
+  const allEvents = readAllSpooledActionEvents(root);
+  const recovered = allEvents.filter(
+    (event) =>
+      event.attributes?.completion_reason === "mutation_outcome_unknown" &&
+      event.attributes.partial === true,
+  );
+  assert.equal(recovered.length, 2);
+  assert.ok(recovered.every((event) => event.action.mutation));
+  assert.ok(recovered.every((event) => event.action.retryable === false));
+  const itemTerminal = recovered.find((event) => event.subject.number === 54);
+  assert.ok(itemTerminal);
+  assert.equal(itemTerminal?.parent_event_id, unknown.event_id);
+  assert.ok(unknown.phase_seq < itemTerminal.phase_seq);
+  const batchTerminal = recovered.find((event) => event.subject.kind === "workflow");
+  assert.ok(batchTerminal);
+  assert.equal(batchTerminal.parent_event_id, itemTerminal.event_id);
+  assert.ok(itemTerminal.phase_seq < batchTerminal.phase_seq);
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+});
+
+test("interruption recovery closes the exact retry dispatch and aggregates it into the batch", () => {
+  const root = tempRoot();
+  const env = workflowEnv({
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "retry-0",
+    GITHUB_ACTION: "__retry",
+    GITHUB_JOB: "retry-failed-reviews",
+  });
+  const operationIdentity = {
+    repository: "openclaw/openclaw",
+    requestedItemNumbers: [42],
+  };
+  const batch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewRetry,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "retry_batch_start" },
+      operation: "review_retry",
+      operationIdentity,
+      phaseSeq: 1,
+      idempotencyIdentity: { operationIdentity, slot: "retry_batch_start" },
+      component: "retry_failed_reviews",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+  assert.ok(batch);
+  const dispatch = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewRetry,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "retry_dispatch_attempt", number: 42 },
+      operation: "review_retry",
+      operationIdentity,
+      parentEventId: batch.event_id,
+      phaseSeq: 100_000,
+      idempotencyIdentity: {
+        operation: "review_retry",
+        slot: "retry_dispatch",
+        repository: "openclaw/openclaw",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+      component: "retry_failed_reviews",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "issue",
+        number: 42,
+        sourceRevision: "revision-42",
+      },
+      attributes: { completion_reason: "dispatch_attempted" },
+    },
+    { env },
+  );
+  assert.ok(dispatch);
+
+  assert.equal(
+    interruptOpenWorkflowActionEvents(root, {
+      env,
+      reasonCode: ACTION_EVENT_REASON_CODES.workflowFailed,
+    }),
+    2,
+  );
+  const events = readAllSpooledActionEvents(root);
+  const dispatchTerminal = events.find(
+    (event) =>
+      event.parent_event_id === dispatch.event_id &&
+      event.subject.number === 42 &&
+      event.attributes?.completion_reason === "dispatch_outcome_unknown",
+  );
+  assert.ok(dispatchTerminal);
+  assert.equal(dispatchTerminal.idempotency_key_sha256, dispatch.idempotency_key_sha256);
+  assert.equal(dispatchTerminal.action.retryable, false);
+  assert.equal(dispatchTerminal.action.mutation, true);
+
+  const batchTerminal = events.find(
+    (event) =>
+      event.subject.kind === "workflow" &&
+      event.action.status === ACTION_EVENT_STATUSES.failed &&
+      event.phase_seq === 1_000_000,
+  );
+  assert.ok(batchTerminal);
+  assert.equal(batchTerminal.parent_event_id, dispatchTerminal.event_id);
+  assert.ok(dispatchTerminal.phase_seq < batchTerminal.phase_seq);
+  assert.equal(batchTerminal.action.mutation, true);
+  assert.equal(batchTerminal.action.retryable, false);
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+});
+
+test("interruption recovery preserves cancellation instead of rewriting it as timeout", () => {
+  const root = tempRoot();
+  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "cancelled-review" });
+  recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.reviewBatch,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "review_batch_start" },
+      operation: "review",
+      operationIdentity: { repository: "openclaw/openclaw" },
+      phaseSeq: 1,
+      component: "review",
+      subject: { repository: "openclaw/openclaw", kind: "workflow" },
+    },
+    { env },
+  );
+
+  assert.equal(
+    interruptOpenWorkflowActionEvents(root, {
+      env,
+      reasonCode: ACTION_EVENT_REASON_CODES.cancelled,
+    }),
+    1,
+  );
+  const terminal = readAllSpooledActionEvents(root).find(
+    (event) => event.action.status === ACTION_EVENT_STATUSES.cancelled,
+  );
+  assert.equal(terminal?.action.reason_code, ACTION_EVENT_REASON_CODES.cancelled);
+  assert.equal(terminal?.attributes?.completion_reason, "cancelled");
 });
 
 test("workflow retries preserve operation and idempotency identity but change attempts", () => {
@@ -1230,6 +2524,10 @@ test(
   },
 );
 
+test("Linux zombie-lock polling rejects PID 0 before probing procfs", async () => {
+  await assert.rejects(waitForLinuxProcessState(0, "Z"), /invalid Linux process PID: 0/);
+});
+
 test(
   "Linux producer locks reclaim zombie owners",
   { skip: process.platform === "linux" ? false : "requires Linux procfs zombie state" },
@@ -1260,19 +2558,10 @@ test(
     );
     const keeperDone = childResult(keeper);
     try {
-      await waitForPath(pidPath);
-      const zombiePid = Number(fs.readFileSync(pidPath, "utf8"));
-      const deadline = Date.now() + 2_000;
-      for (;;) {
-        const stat = fs.readFileSync(`/proc/${zombiePid}/stat`, "utf8");
-        const commandEnd = stat.lastIndexOf(")");
-        const state = stat
-          .slice(commandEnd + 1)
-          .trim()
-          .split(/\s+/)[0];
-        if (state === "Z") break;
-        if (Date.now() >= deadline) throw new Error("child did not enter zombie state");
-        await new Promise((resolve) => setTimeout(resolve, 5));
+      const zombiePid = await waitForPositivePidFile(pidPath);
+      if (!(await waitForLinuxProcessState(zombiePid, "Z"))) {
+        t.skip("zombie child disappeared before its state could be observed");
+        return;
       }
 
       const target = prepareSafeWriteTarget(
@@ -1469,7 +2758,11 @@ test("full producer identity prevents cross-repository shard collisions", async 
 
   const imported = importActionEventShards(outputRoot, destination);
   assert.equal(imported.created, 2);
-  assert.deepEqual(imported.paths, paths);
+  assert.deepEqual(imported.eventPaths, paths);
+  for (const relativePath of imported.paths) {
+    assert.equal(relativePath.includes("\\"), false);
+    assert.equal(relativePath, path.posix.normalize(relativePath));
+  }
 });
 
 test("CrabFleet projection sends the validated ledger event and bearer token", async () => {
@@ -2538,7 +3831,7 @@ test("state shard imports are validated, create-only, and conflict detecting", a
   });
 
   const created = importActionEventShards(source, destination);
-  const destinationDirectory = path.dirname(path.join(destination, created.paths[0]!));
+  const destinationDirectory = path.dirname(path.join(destination, created.eventPaths[0]!));
   const replayed = importActionEventShards(source, destination);
   assert.equal(created.created, 1);
   assert.equal(replayed.unchanged, 1);
@@ -2547,11 +3840,91 @@ test("state shard imports are validated, create-only, and conflict detecting", a
     [],
   );
 
-  const shard = path.join(source, created.paths[0]!);
+  const shard = path.join(source, created.eventPaths[0]!);
   fs.appendFileSync(shard, "\n", "utf8");
   assert.throws(
     () => importActionEventShards(source, destination),
     /action event shard content is not canonical/,
+  );
+});
+
+test("manifest-bound imports reject a missing producer group before state publication", async () => {
+  const root = tempRoot();
+  const source = trustedChildRoot(root, "source");
+  const destination = trustedChildRoot(root, "destination");
+  recordReviewNumber(root, 42, workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "initial" }));
+  const initialPaths = await flushWorkflowActionEvents(root, {
+    env: workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "initial" }),
+    outputRoot: source,
+  });
+  recordReviewNumber(root, 43, workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "retry" }));
+  const manifestPaths = await flushWorkflowActionEvents(root, {
+    env: workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "retry" }),
+    outputRoot: source,
+  });
+  assert.equal(initialPaths.length, 1);
+  assert.equal(manifestPaths.length, 2);
+
+  fs.rmSync(path.join(source, initialPaths[0]!));
+  assert.throws(
+    () =>
+      importActionEventShards(source, destination, {
+        expectedEventPaths: manifestPaths,
+      }),
+    /action event shard manifest path is missing/,
+  );
+  assert.deepEqual(fs.readdirSync(destination), []);
+
+  await flushWorkflowActionEvents(root, {
+    env: workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "retry" }),
+    outputRoot: source,
+  });
+  const imported = importActionEventShards(source, destination, {
+    expectedEventPaths: manifestPaths,
+  });
+  assert.equal(imported.created, 2);
+  assert.deepEqual(imported.eventPaths, manifestPaths);
+});
+
+test("state shard imports reject producer provenance outside the authenticated workflow job", async () => {
+  const root = tempRoot();
+  const source = trustedChildRoot(root, "source");
+  const destination = trustedChildRoot(root, "destination");
+  const event = recordReview(root);
+  assert.ok(event);
+  await flushWorkflowActionEvents(root, {
+    env: workflowEnv(),
+    outputRoot: source,
+  });
+
+  assert.throws(
+    () =>
+      importActionEventShards(source, destination, {
+        expectedProducer: {
+          repository: event.producer.repository,
+          sha: event.producer.sha,
+          workflow: event.producer.workflow,
+          job: "publish",
+          runId: event.producer.run_id,
+          runAttempt: event.producer.run_attempt,
+        },
+      }),
+    /producer provenance mismatch for job/,
+  );
+  assert.deepEqual(fs.readdirSync(destination), []);
+
+  assert.equal(
+    importActionEventShards(source, destination, {
+      expectedProducer: {
+        repository: event.producer.repository,
+        sha: event.producer.sha,
+        workflow: event.producer.workflow,
+        job: event.producer.job,
+        runId: event.producer.run_id,
+        runAttempt: event.producer.run_attempt,
+      },
+    }).created,
+    1,
   );
 });
 
@@ -2982,7 +4355,7 @@ test("state shard imports accept a complete 4097-event producer run", () => {
   const imported = importActionEventShards(source, destination);
   assert.equal(imported.created, shards.length);
   assert.equal(
-    imported.paths.reduce(
+    imported.eventPaths.reduce(
       (count, relativePath) =>
         count +
         fs.readFileSync(path.join(destination, relativePath), "utf8").trim().split("\n").length,
@@ -3036,7 +4409,7 @@ test("state shard imports preserve chronological ordering across timestamp offse
   const imported = importActionEventShards(source, destination);
   assert.equal(imported.created, 1);
   const eventTypes = fs
-    .readFileSync(path.join(destination, imported.paths[0]!), "utf8")
+    .readFileSync(path.join(destination, imported.eventPaths[0]!), "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line).event_type);
@@ -3110,7 +4483,7 @@ test("state shard imports accept exact sub-millisecond canonical ordering", asyn
   const imported = importActionEventShards(source, destination);
   assert.equal(imported.created, 1);
   const occurredAt = fs
-    .readFileSync(path.join(destination, imported.paths[0]!), "utf8")
+    .readFileSync(path.join(destination, imported.eventPaths[0]!), "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line).occurred_at);
@@ -3199,6 +4572,9 @@ test("state shard imports ignore unrelated entries and reject links in the ledge
   assert.deepEqual(importActionEventShards(source, emptyDestination), {
     created: 0,
     unchanged: 0,
+    eventPaths: [],
+    reservationPaths: [],
+    completionPaths: [],
     paths: [],
   });
   createDirectoryLink(linked, path.join(source, "ledger"));
@@ -3339,7 +4715,24 @@ importActionEventShards(process.argv[1], process.argv[2]);`;
     const replay = importActionEventShards(source, destination);
     assert.equal(replay.created, 1);
     assert.equal(replay.unchanged, 1);
-    assert.deepEqual(replay.paths, sourceShards.map((shard) => shard.relativePath).sort());
+    assert.deepEqual(replay.eventPaths, sourceShards.map((shard) => shard.relativePath).sort());
+    assert.ok(replay.reservationPaths.length > 0);
+    assert.ok(replay.completionPaths.length > 0);
+    assert.deepEqual(
+      replay.paths,
+      [...replay.eventPaths, ...replay.reservationPaths, ...replay.completionPaths].sort(),
+    );
+    assert.ok(replay.paths.length <= ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS);
+    const freshState = trustedChildRoot(root, "fresh-state");
+    for (const relativePath of replay.paths) {
+      const target = path.join(freshState, relativePath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(path.join(destination, relativePath), target);
+    }
+    assert.throws(
+      () => importActionEventShards(replacementSource, freshState),
+      /producer shard-set binding conflict/,
+    );
     for (const shard of sourceShards) {
       assert.equal(
         fs.readFileSync(path.join(destination, shard.relativePath), "utf8"),
