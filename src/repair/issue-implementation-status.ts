@@ -22,6 +22,7 @@ import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
+  repairHttpMutationOutcome,
   repairSourceRevision,
   runRepairMutation,
   runRepairMutationAsync,
@@ -477,7 +478,7 @@ export async function postDashboardStatus(options: StatusOptions, fetchImpl: typ
         },
         body: JSON.stringify(requestBody),
       }),
-    outcome: (result) => (result.ok ? "accepted" : "rejected"),
+    outcome: repairHttpMutationOutcome,
   });
   if (!response.ok) {
     throw new Error(`dashboard ingest returned ${response.status}: ${await response.text()}`);

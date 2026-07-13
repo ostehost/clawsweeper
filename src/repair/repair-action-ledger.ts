@@ -89,6 +89,19 @@ export type RepairMutationOptions<T> = {
   knownNoMutation?: (error: unknown) => boolean;
 };
 
+const DEFINITE_HTTP_MUTATION_REJECTIONS = new Set([
+  400, 401, 403, 404, 405, 406, 407, 410, 411, 413, 414, 415, 416, 417, 421, 422, 426, 428, 431,
+  451,
+]);
+
+export function repairHttpMutationOutcome(response: {
+  ok: boolean;
+  status: number;
+}): RepairMutationOutcome {
+  if (response.ok) return "accepted";
+  return DEFINITE_HTTP_MUTATION_REJECTIONS.has(response.status) ? "rejected" : "unknown";
+}
+
 export function recordRepairLifecycleEvent(
   input: RepairLifecycleInput,
   event: RepairLifecycleEvent,

@@ -196,6 +196,63 @@ test("dashboard response loss records one unknown POST outcome", async () => {
   }
 });
 
+test("dashboard HTTP outcomes preserve ambiguous server failures", async () => {
+  for (const [status, expected] of [
+    [503, ["failed", "mutation_outcome_unknown", true]],
+    [422, ["skipped", "mutation_rejected", false]],
+  ] as const) {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `dashboard-${status}-`)));
+    const outputRoot = path.join(root, "output");
+    fs.mkdirSync(outputRoot);
+    const previous = { ...process.env };
+    Object.assign(process.env, {
+      CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+      CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+      CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+      CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: `dashboard-${status}`,
+      CLAWSWEEPER_STATUS_INGEST_TOKEN: "dashboard-secret",
+      CLAWSWEEPER_STATUS_INGEST_URL: "https://dashboard.example/events",
+      GITHUB_ACTION: "publish_dashboard",
+      GITHUB_JOB: "mutate",
+      GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_RUN_ID: "4242",
+      GITHUB_SHA: "a".repeat(40),
+      GITHUB_WORKFLOW: "repair cluster worker",
+      GITHUB_WORKFLOW_REF:
+        "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+    });
+    try {
+      await assert.rejects(
+        postDashboardStatus(
+          { ...options, sourceRevision: "b".repeat(40) },
+          async () => new Response("remote failure", { status }),
+        ),
+        new RegExp(`dashboard ingest returned ${status}`),
+      );
+      await flushRepairActionEvents();
+      const mutations = readEvents(outputRoot).filter(
+        (event) => event.event_type === "repair.mutation",
+      );
+      assert.deepEqual(
+        mutations.map((event) => [
+          event.action.status,
+          event.attributes.completion_reason,
+          event.action.retryable,
+        ]),
+        [["started", "mutation_attempted", true], expected],
+      );
+    } finally {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key];
+      }
+      Object.assign(process.env, previous);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 function readEvents(root: string): Array<Record<string, unknown>> {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const target = path.join(root, entry.name);

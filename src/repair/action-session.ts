@@ -13,6 +13,7 @@ import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
+  repairHttpMutationOutcome,
   repairSourceRevision,
   runRepairMutationAsync,
   type RepairLifecycleInput,
@@ -206,7 +207,7 @@ export async function registerActionSession(
               },
               body: JSON.stringify(requestBody),
             }),
-          outcome: (result) => (result.ok ? "accepted" : "rejected"),
+          outcome: repairHttpMutationOutcome,
         });
         const responseText = await response.text();
         let body: LooseRecord;
@@ -327,7 +328,7 @@ export async function updateActionSession(
               },
               body: JSON.stringify(requestBody),
             }),
-          outcome: (result) => (result.ok ? "accepted" : "rejected"),
+          outcome: repairHttpMutationOutcome,
         });
         if (!response.ok) {
           const text = await response.text();

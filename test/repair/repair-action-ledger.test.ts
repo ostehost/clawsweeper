@@ -15,6 +15,7 @@ import {
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
   recordRepairWorkflowEvent,
+  repairHttpMutationOutcome,
   repairSourceRevision,
   repairWorkflowTerminalPhase,
   runRepairMutation,
@@ -498,6 +499,16 @@ test("repair source revision selects the sealed repaired source", () => {
   assert.equal(repairSourceRevision({ expected_head_sha: "b".repeat(40) }), "b".repeat(40));
   assert.equal(repairSourceRevision({ commit_sha: "c".repeat(40) }), "c".repeat(40));
   assert.equal(repairSourceRevision({}), null);
+});
+
+test("HTTP mutation outcomes reject only definite no-mutation responses", () => {
+  assert.equal(repairHttpMutationOutcome({ ok: true, status: 200 }), "accepted");
+  for (const status of [400, 401, 403, 404, 405, 415, 422]) {
+    assert.equal(repairHttpMutationOutcome({ ok: false, status }), "rejected", String(status));
+  }
+  for (const status of [302, 408, 409, 425, 429, 500, 502, 503, 504]) {
+    assert.equal(repairHttpMutationOutcome({ ok: false, status }), "unknown", String(status));
+  }
 });
 
 test("repair workflow reports map to matching terminal lifecycle phases", async () => {

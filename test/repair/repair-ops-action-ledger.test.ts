@@ -15,6 +15,8 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(session, /recordRepairLifecycleFailureSafely/);
   assert.match(session, /repairSourceRevision\(job\.frontmatter\)/);
   assert.match(session, /metadata\.remoteEnabled === true/);
+  assert.equal([...session.matchAll(/outcome: repairHttpMutationOutcome/g)].length, 2);
+  assert.match(status, /outcome: repairHttpMutationOutcome/);
   const registration = session.slice(
     session.indexOf("async function registerActionSession"),
     session.indexOf("async function updateActionSession"),

@@ -237,6 +237,38 @@ test("CrabFleet registration response loss records one unknown request outcome",
   }
 });
 
+test("CrabFleet registration keeps ambiguous HTTP failures unknown", async () => {
+  const fixture = remoteSessionFixture("register-503");
+  try {
+    await assert.rejects(
+      registerActionSession(fixture.jobPath, {
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ error: "upstream unavailable" }), { status: 503 }),
+      }),
+      /registration failed \(503\)/,
+    );
+    assertUnknownMutation(fixture.outputRoot);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("CrabFleet registration records definite request rejection", async () => {
+  const fixture = remoteSessionFixture("register-422");
+  try {
+    await assert.rejects(
+      registerActionSession(fixture.jobPath, {
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ error: "invalid request" }), { status: 422 }),
+      }),
+      /registration failed \(422\)/,
+    );
+    assertRejectedMutation(fixture.outputRoot);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("CrabFleet update response loss records one unknown request outcome", async () => {
   const fixture = remoteSessionFixture("update");
   fs.writeFileSync(
@@ -346,6 +378,23 @@ function remoteSessionFixture(name: string) {
 }
 
 function assertUnknownMutation(outputRoot: string): void {
+  assertMutationOutcome(outputRoot, [
+    ["started", "mutation_attempted", true],
+    ["failed", "mutation_outcome_unknown", true],
+  ]);
+}
+
+function assertRejectedMutation(outputRoot: string): void {
+  assertMutationOutcome(outputRoot, [
+    ["started", "mutation_attempted", true],
+    ["skipped", "mutation_rejected", false],
+  ]);
+}
+
+function assertMutationOutcome(
+  outputRoot: string,
+  expected: Array<[string, string, boolean]>,
+): void {
   const mutations = walk(outputRoot)
     .filter((file) => file.endsWith(".jsonl"))
     .flatMap((file) =>
@@ -363,9 +412,6 @@ function assertUnknownMutation(outputRoot: string): void {
       event.attributes.completion_reason,
       event.action.retryable,
     ]),
-    [
-      ["started", "mutation_attempted", true],
-      ["failed", "mutation_outcome_unknown", true],
-    ],
+    expected,
   );
 }
