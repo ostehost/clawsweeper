@@ -202,12 +202,51 @@ test("redactSecrets masks common token shapes", () => {
       "OPENAI_API_KEY=[REDACTED]",
       '"GITHUB_TOKEN":"[REDACTED]"',
       "token [REDACTED_GITHUB_TOKEN]",
-      "Authorization: Bearer [REDACTED]",
+      "Authorization: [REDACTED]",
       "jwt [REDACTED_JWT]",
       '"token":"[REDACTED]"',
       "privateKey: [REDACTED]",
     ].join("\n"),
   );
+});
+
+test("redactSecrets masks authorization and cookie headers at every encoding depth", () => {
+  const headers = [
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+    "Proxy-Authorization: Digest username=test,response=secret",
+    "Cookie: session=secret; csrf=hidden",
+    "Set-Cookie: session=secret; HttpOnly",
+  ];
+  const input = headers.join("\n");
+
+  assert.equal(containsSensitiveValue(input, []), true);
+  const redacted = redactSecrets(input);
+  assert.equal(
+    redacted,
+    [
+      "Authorization: [REDACTED]",
+      "Proxy-Authorization: [REDACTED]",
+      "Cookie: [REDACTED]",
+      "Set-Cookie: [REDACTED]",
+    ].join("\n"),
+  );
+  assert.equal(containsSensitiveValue(redacted, []), false);
+
+  const structured = JSON.stringify({
+    Authorization: "Basic dXNlcjpwYXNzd29yZA==",
+    Cookie: "session=secret",
+    visible: "safe",
+  });
+  for (let depth = 0; depth <= 3; depth += 1) {
+    const encoded = encodeJsonDepth(structured, depth);
+    assert.equal(containsSensitiveValue(encoded, []), true);
+    const retained = JSON.parse(decodeJsonDepth(redactSecrets(encoded), depth));
+    assert.deepEqual(retained, {
+      Authorization: "[REDACTED]",
+      Cookie: "[REDACTED]",
+      visible: "safe",
+    });
+  }
 });
 
 test("redactSecrets masks named credentials across JSON escape depths", () => {
@@ -431,7 +470,7 @@ test("collectCodexDebug redacts file-sourced credentials absent from the current
     const artifact = fs.readFileSync(path.join(outDir, "sessions", "historical.jsonl"), "utf8");
     assert.doesNotMatch(artifact, /eyJhbGci|older-bearer|older-file-token/);
     assert.match(artifact, /"actions_token":"\[REDACTED\]"/);
-    assert.match(artifact, /Bearer \[REDACTED\]/);
+    assert.match(artifact, /Authorization: \[REDACTED\]/);
     assert.match(artifact, /"token":"\[REDACTED\]"/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

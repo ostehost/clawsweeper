@@ -62,7 +62,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 - Stripped GitHub Actions artifact and OIDC credentials plus ambient secrets
   from repair Codex subprocesses, and redacted streamed logs, structured
-  last-message output, and collected debug artifacts before publication.
+  last-message output, and collected debug artifacts before publication,
+  including scheme-independent authorization and cookie headers.
 - Checkpointed accepted OpenClaw event hooks before status-dashboard delivery
   so reruns retry only the unfinished destination instead of replaying Discord.
 - Accepted package-manager argument separators in the action-ledger CLI and

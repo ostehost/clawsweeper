@@ -34,6 +34,8 @@ type SkippedEntry = {
 const DEFAULT_SINCE_MINUTES = 240;
 const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
 const SENSITIVE_FIELD_NAME = String.raw`(?=[A-Za-z_])[A-Za-z0-9_.-]*(?:token|api[_-]?key|secret|password|credential|private[_-]?key)[A-Za-z0-9_.-]*`;
+const SENSITIVE_HEADER_NAME = String.raw`(?:authorization|proxy-authorization|cookie|set-cookie)`;
+const SENSITIVE_HEADER_LINE_SOURCE = `^(\\s*${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)$`;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
@@ -41,7 +43,10 @@ const PRIVATE_KEY_PEM_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
 const JSON_NUMBER_PATTERN = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 const REDACTED_VALUE = "[REDACTED]";
-const SENSITIVE_FIELD_NAME_PATTERN = new RegExp(`^${SENSITIVE_FIELD_NAME}$`, "i");
+const SENSITIVE_FIELD_NAME_PATTERN = new RegExp(
+  `^(?:${SENSITIVE_FIELD_NAME}|${SENSITIVE_HEADER_NAME})$`,
+  "i",
+);
 
 type EncodedJsonStringToken = {
   depth: number;
@@ -153,6 +158,7 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(JWT_PATTERN, "[REDACTED_JWT]")
     .replace(BEARER_PATTERN, "Bearer [REDACTED]")
+    .replace(new RegExp(SENSITIVE_HEADER_LINE_SOURCE, "gim"), `$1${REDACTED_VALUE}`)
     .replace(PRIVATE_KEY_PEM_PATTERN, "[REDACTED_PRIVATE_KEY]")
     .replace(
       new RegExp(
@@ -189,6 +195,14 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
     new RegExp(JWT_PATTERN.source).test(text) ||
     new RegExp(BEARER_PATTERN.source, "i").test(text) ||
     new RegExp(PRIVATE_KEY_BEGIN_PATTERN.source).test(text)
+  ) {
+    return true;
+  }
+  if (
+    [...text.matchAll(new RegExp(SENSITIVE_HEADER_LINE_SOURCE, "gim"))].some((match) => {
+      const value = String(match[2] ?? "").trim();
+      return value !== "" && !isRedactedValue(value);
+    })
   ) {
     return true;
   }
