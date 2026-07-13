@@ -4032,6 +4032,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   let dispatchedClaimMutationId = mergeClaim.lastClaimMutationId;
   let dispatchedClaimMutationAt = mergeClaim.lastClaimMutationAt;
   let squashCommitProof: SquashMergeCommitProof | undefined;
+  const dispatchBoundaryState: {
+    reviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
+  } = { reviewActivityBlock: null };
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4053,6 +4056,11 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       {},
       {
         beforeDispatch: () => {
+          dispatchBoundaryState.reviewActivityBlock =
+            trustedAutomergeReviewActivityBlockReason(command);
+          if (dispatchBoundaryState.reviewActivityBlock) {
+            throw new Error(dispatchBoundaryState.reviewActivityBlock.reason);
+          }
           const dispatchBoundary = markAutomergeMergeClaimDispatched(
             command,
             mergeClaim.claimId,
@@ -4100,10 +4108,17 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     );
   } catch (error) {
     if (!mergeRequestStarted) {
+      const dispatchReviewActivityBlock = dispatchBoundaryState.reviewActivityBlock;
       return releaseBeforeDispatch({
         action: "merge",
-        status: "waiting",
-        reason: `merge ledger failed before dispatch: ${compactGhError(error)}`,
+        status: dispatchReviewActivityBlock
+          ? dispatchReviewActivityBlock.retryable
+            ? "waiting"
+            : "blocked"
+          : "waiting",
+        reason:
+          dispatchReviewActivityBlock?.reason ??
+          `merge ledger failed before dispatch: ${compactGhError(error)}`,
         merge_method: "squash",
         transient_wait_ms: waitedMs,
         transient_observations: transientObservations,

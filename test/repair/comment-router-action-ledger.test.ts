@@ -252,6 +252,47 @@ test("trusted verdict automerge rechecks reviewed PR activity around the merge c
   assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
 });
 
+test("trusted verdict activity arriving after claim preflight retires the claim before merge dispatch", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const dispatchBoundary = executeAutomerge.slice(
+    executeAutomerge.indexOf("beforeDispatch: () => {"),
+    executeAutomerge.indexOf("onDispatchStart: () => {"),
+  );
+  const mergeAttempt = executeAutomerge.indexOf("const dispatchBoundaryState");
+  const preDispatchCatch = executeAutomerge.indexOf("} catch (error) {", mergeAttempt);
+  const preDispatchFailure = executeAutomerge.slice(
+    preDispatchCatch,
+    executeAutomerge.indexOf("return reconcileClaimedAutomergeRequest(", preDispatchCatch),
+  );
+  const activityCheck = dispatchBoundary.indexOf(
+    "trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const activityFailure = dispatchBoundary.indexOf(
+    "throw new Error(dispatchBoundaryState.reviewActivityBlock.reason)",
+  );
+  const claimDispatch = dispatchBoundary.indexOf("markAutomergeMergeClaimDispatched(");
+
+  assert.ok(activityCheck >= 0);
+  assert.ok(activityFailure > activityCheck);
+  assert.ok(claimDispatch > activityFailure);
+  assert.match(
+    executeAutomerge,
+    /const dispatchBoundaryState: \{[\s\S]*reviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;[\s\S]*\} = \{ reviewActivityBlock: null \};/,
+  );
+  assert.match(
+    preDispatchFailure,
+    /const dispatchReviewActivityBlock = dispatchBoundaryState\.reviewActivityBlock;[\s\S]*releaseBeforeDispatch\([\s\S]*status: dispatchReviewActivityBlock[\s\S]*dispatchReviewActivityBlock\.retryable[\s\S]*reason:[\s\S]*dispatchReviewActivityBlock\?\.reason/,
+  );
+  assert.match(
+    source,
+    /function trustedAutomergeReviewActivityBlockReason[\s\S]*command\.intent !== "clawsweeper_auto_merge"\) return null;/,
+  );
+});
+
 test("all exact-head merge owners release unused claims and require squash auto-merge", () => {
   const apply = readText("src/repair/apply-result.ts");
   const router = readText("src/repair/comment-router.ts");
