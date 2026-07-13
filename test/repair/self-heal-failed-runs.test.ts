@@ -123,6 +123,87 @@ test("failed-run self-heal exposes exact immutable generation provenance", () =>
   }
 });
 
+test("failed-run self-heal restricts unsealed legacy records to plan mode", () => {
+  const fixture = createFixture("legacy-unsealed");
+  try {
+    writeRunRecord(fixture, "910001", {
+      source_job: fixture.jobPath,
+      source_state_revision: undefined,
+      source_job_sha256: undefined,
+      workflow_conclusion: "failure",
+      workflow_updated_at: new Date().toISOString(),
+      mode: "autonomous",
+    });
+
+    const result = runSelfHeal(fixture, { args: ["--mode", "autonomous"] });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual(summary.candidates, [
+      {
+        source_run_id: "910001",
+        source_job: fixture.jobPath,
+        source_state_revision: fixture.stateRevision,
+        source_job_sha256: fixture.jobSha256,
+        legacy_unsealed: true,
+        mode: "plan",
+      },
+    ]);
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("failed-run self-heal recovers live sealed provenance from the inputs artifact", () => {
+  const fixture = createFixture("live-artifact");
+  const now = new Date().toISOString();
+  try {
+    fs.writeFileSync(
+      fixture.recoveryInputsFile,
+      `${JSON.stringify({
+        schema_version: 1,
+        source_job: fixture.jobPath,
+        state_revision: fixture.stateRevision,
+        job_sha256: fixture.jobSha256,
+        requested_mode: "autonomous",
+        effective_mode: "autonomous",
+      })}\n`,
+    );
+    writeRunPages(fixture, {
+      1: [
+        {
+          id: 910_003,
+          display_title: `repair cluster ${fixture.jobPath} (${fixture.jobSha256})`,
+          status: "completed",
+          conclusion: "failure",
+          created_at: now,
+          updated_at: now,
+          html_url: "https://github.test/actions/runs/910003",
+        },
+      ],
+    });
+
+    const result = runSelfHeal(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual(summary.candidates, [
+      {
+        source_run_id: "910003",
+        source_job: fixture.jobPath,
+        source_state_revision: fixture.stateRevision,
+        source_job_sha256: fixture.jobSha256,
+        mode: "plan",
+        run_url: "https://github.test/actions/runs/910003",
+      },
+    ]);
+    assert.match(
+      fs.readFileSync(fixture.commandLog, "utf8"),
+      /run download 910003 .*--pattern clawsweeper-repair-inputs-910003-\*/,
+    );
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
 test("failed-run self-heal uses paginated history and receipts real mutations", () => {
   const source = fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8");
 
@@ -149,6 +230,7 @@ function createFixture(label: string) {
   const pagesFile = path.join(root, "run-pages.json");
   const commandLog = path.join(root, "gh-commands.log");
   const variablesFile = path.join(root, "variables.json");
+  const recoveryInputsFile = path.join(root, "workflow-inputs.json");
   const stateRoot = path.join(root, "state");
   const jobPath = `jobs/test/inbox/self-heal-${process.pid}-${path.basename(root)}.md`;
   const jobBytes = `---
@@ -194,6 +276,7 @@ candidates:
     pagesFile,
     commandLog,
     variablesFile,
+    recoveryInputsFile,
     stateRoot,
     stateRevision,
     jobPath,
@@ -243,6 +326,7 @@ function runSelfHeal(fixture: Fixture, options: { args?: string[]; env?: NodeJS.
         GH_COMMAND_LOG: fixture.commandLog,
         GH_RUN_PAGES_FIXTURE: fixture.pagesFile,
         GH_VARIABLES_FIXTURE: fixture.variablesFile,
+        GH_RECOVERY_INPUTS_FIXTURE: fixture.recoveryInputsFile,
         ...options.env,
       },
     },
@@ -258,6 +342,24 @@ set -eu
 printf '%s\\n' "$*" >> "$GH_COMMAND_LOG"
 if [ "$1" = "variable" ] && [ "$2" = "list" ]; then
   cat "$GH_VARIABLES_FIXTURE"
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "download" ]; then
+  if [ ! -f "$GH_RECOVERY_INPUTS_FIXTURE" ]; then
+    echo "no artifacts found" >&2
+    exit 1
+  fi
+  output_dir=""
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "--dir" ]; then
+      output_dir="$argument"
+      break
+    fi
+    previous="$argument"
+  done
+  mkdir -p "$output_dir/recovery-inputs"
+  cp "$GH_RECOVERY_INPUTS_FIXTURE" "$output_dir/recovery-inputs/workflow-inputs.json"
   exit 0
 fi
 if [ "$1" = "api" ]; then

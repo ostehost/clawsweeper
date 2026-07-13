@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -19,6 +20,7 @@ import {
   immutableJobDispatchArgs,
   immutableJobIdentityKey,
   isMissingImmutableJobError,
+  resolveCurrentStateJobIdentity,
   resolveStateJobIdentity,
 } from "./immutable-job-handoff.js";
 import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
@@ -38,6 +40,7 @@ const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
 const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
+const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
 
 type GateState = {
@@ -217,10 +220,7 @@ function selectCandidates() {
     if (!generation) continue;
     const sourceRunId = String(attempt.source_run_id ?? "");
     if (sourceRunId) attemptedRunGenerations.add(`${sourceRunId}:${generation}`);
-    attemptCountsByGeneration.set(
-      generation,
-      (attemptCountsByGeneration.get(generation) ?? 0) + 1,
-    );
+    attemptCountsByGeneration.set(generation, (attemptCountsByGeneration.get(generation) ?? 0) + 1);
   }
   const latestByGeneration = new Map<string, LooseRecord>();
 
@@ -262,7 +262,10 @@ function selectCandidates() {
           source_state_revision: immutableJob.stateRevision,
           source_job_sha256: immutableJob.jobSha256,
           immutable_job_key: immutableJob.identityKey,
-          mode: requestedMode ?? record.mode ?? immutableJob.job.frontmatter.mode,
+          ...(immutableJob.legacyUnsealed ? { legacy_unsealed: true } : {}),
+          mode: immutableJob.legacyUnsealed
+            ? "plan"
+            : (requestedMode ?? record.mode ?? immutableJob.job.frontmatter.mode),
         };
       } catch (error) {
         skippedCandidates.push({
@@ -320,13 +323,106 @@ function runRecordGenerationKey(record: LooseRecord, sourceJob: string): string 
 }
 
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
-  const stateRevision = record.source_state_revision;
-  const jobSha256 = record.source_job_sha256;
-  return resolveStateJobIdentity({
-    jobPath: sourceJob,
-    stateRevision,
-    jobSha256,
-  });
+  const stateRevision = String(record.source_state_revision ?? "").trim();
+  const jobSha256 = String(record.source_job_sha256 ?? "").trim();
+  if (stateRevision) {
+    if (!STATE_REVISION.test(stateRevision)) throw new Error("state revision is malformed");
+    return {
+      ...resolveStateJobIdentity({
+        jobPath: sourceJob,
+        stateRevision,
+        jobSha256,
+      }),
+      legacyUnsealed: false,
+    };
+  }
+  if (jobSha256) {
+    if (!JOB_SHA256.test(jobSha256)) throw new Error("job SHA-256 is malformed");
+    const recovered = resolveRunRecoveryInputs(record.run_id, sourceJob, jobSha256);
+    return {
+      ...resolveStateJobIdentity({
+        jobPath: sourceJob,
+        stateRevision: recovered.stateRevision,
+        jobSha256: recovered.jobSha256,
+      }),
+      legacyUnsealed: false,
+    };
+  }
+  return {
+    ...resolveCurrentStateJobIdentity(sourceJob),
+    legacyUnsealed: true,
+  };
+}
+
+function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobSha256: string) {
+  const runId = String(runIdValue ?? "").trim();
+  if (!/^[1-9][0-9]*$/.test(runId)) {
+    throw new Error("run id is malformed for immutable recovery input lookup");
+  }
+  const artifactDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), `clawsweeper-self-heal-inputs-${runId}-`),
+  );
+  try {
+    const downloaded = spawnSync(
+      "gh",
+      [
+        "run",
+        "download",
+        runId,
+        "--repo",
+        repo,
+        "--pattern",
+        `clawsweeper-repair-inputs-${runId}-*`,
+        "--dir",
+        artifactDir,
+      ],
+      { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    );
+    if (downloaded.status !== 0) {
+      throw new Error(
+        `cannot download immutable recovery inputs for run ${runId}: ${
+          downloaded.stderr || downloaded.stdout
+        }`,
+      );
+    }
+    const inputs = fs
+      .globSync(path.join(artifactDir, "**", "workflow-inputs.json"))
+      .filter((file) => fs.lstatSync(file).isFile())
+      .map((file) => {
+        const bytes = fs.readFileSync(file);
+        if (bytes.length > 64 * 1024) {
+          throw new Error(`immutable recovery input artifact is oversized for run ${runId}`);
+        }
+        return JSON.parse(bytes.toString("utf8")) as LooseRecord;
+      })
+      .filter(
+        (input) =>
+          input.schema_version === 1 &&
+          input.source_job === sourceJob &&
+          input.job_sha256 === jobSha256 &&
+          STATE_REVISION.test(String(input.state_revision ?? "")),
+      );
+    if (inputs.length === 0) {
+      throw new Error(`immutable recovery inputs are unavailable for run ${runId}`);
+    }
+    const identities = new Set(
+      inputs.map((input) =>
+        JSON.stringify({
+          stateRevision: input.state_revision,
+          jobSha256: input.job_sha256,
+        }),
+      ),
+    );
+    if (identities.size !== 1) {
+      throw new Error(`immutable recovery inputs are ambiguous for run ${runId}`);
+    }
+    return {
+      stateRevision: String(inputs[0]!.state_revision),
+      jobSha256: String(inputs[0]!.job_sha256),
+    };
+  } finally {
+    fs.rmSync(artifactDir, { recursive: true, force: true });
+  }
 }
 
 function activeRepairJobGenerations() {
@@ -676,6 +772,7 @@ function summarizeCandidate(candidate: LooseRecord) {
     source_job: candidate.source_job,
     source_state_revision: candidate.source_state_revision,
     source_job_sha256: candidate.source_job_sha256,
+    ...(candidate.legacy_unsealed === true ? { legacy_unsealed: true } : {}),
     mode: candidate.mode,
     result_status: candidate.result_status,
     run_url: candidate.run_url,
