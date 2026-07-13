@@ -155,10 +155,12 @@ test("repair event notifications publish durable claims before delivery and rece
   assert.ok(claimIndex < notifyIndex);
   assert.ok(notifyIndex < receiptIndex);
   assert.ok(receiptIndex < resultIndex);
+  assert.match(prepare, /GH_TOKEN: \$\{\{ steps\.app_token\.outputs\.token \}\}/);
   assert.match(prepare, /--prepare-only/);
   assert.match(claim, /--path notifications/);
   assert.match(claim, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-claims/);
   assert.match(claim, /--best-effort-refresh/);
+  assert.match(notify, /GH_TOKEN: \$\{\{ steps\.app_token\.outputs\.token \}\}/);
   assert.match(notify, /CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1"/);
   assert.match(receipt, /--path notifications/);
   assert.match(receipt, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-receipts/);

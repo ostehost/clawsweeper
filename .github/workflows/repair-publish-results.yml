@@ -526,6 +526,7 @@ jobs:
       - name: Prepare durable notification claims
         if: ${{ steps.download.outputs.has_artifacts == '1' }}
         env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           CLAWSWEEPER_OPENCLAW_HOOK_URL: ${{ secrets.CLAWSWEEPER_OPENCLAW_HOOK_URL }}
           CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: ${{ secrets.CLAWSWEEPER_OPENCLAW_HOOK_TOKEN }}
@@ -570,6 +571,7 @@ jobs:
       - name: Notify OpenClaw about ClawSweeper events
         if: ${{ steps.download.outputs.has_artifacts == '1' }}
         env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1"
           CLAWSWEEPER_OPENCLAW_HOOK_URL: ${{ secrets.CLAWSWEEPER_OPENCLAW_HOOK_URL }}
