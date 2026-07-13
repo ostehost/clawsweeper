@@ -382,14 +382,23 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       const dispatchBoundary = owner.slice(dispatchStart, dispatchEnd);
       const marker = dispatchBoundary.indexOf("markDispatched: () =>");
       const activity = dispatchBoundary.indexOf("reviewActivityBlock: () =>");
-      const strictBase = dispatchBoundary.indexOf("strictBaseBindingBlock: () => {");
-      const policyRead = dispatchBoundary.indexOf("policyReadJson: rulesetPolicyReader()");
+      const strictBase = dispatchBoundary.indexOf(
+        "strictBaseBindingBlock: () => liveDispatchStateBlock(true)",
+      );
+      const finalState = dispatchBoundary.indexOf(
+        "finalStateBlock: () => liveDispatchStateBlock(false)",
+      );
+      const liveStateStart = owner.indexOf("const liveDispatchStateBlock =");
+      const liveStateEnd = owner.indexOf("let result;", liveStateStart);
+      const liveState = owner.slice(liveStateStart, liveStateEnd);
 
       assert.ok(dispatchStart >= 0, `${file} lacks a pre-dispatch boundary`);
       assert.ok(marker >= 0, `${file} lacks durable dispatch marking`);
       assert.ok(activity > marker, `${file} must refresh review activity after dispatch marking`);
       assert.ok(strictBase > activity, `${file} must refresh strict-base policy after activity`);
-      assert.ok(policyRead > strictBase, `${file} final strict-base check lacks the policy reader`);
+      assert.ok(finalState > strictBase, `${file} must refresh target state after policy reads`);
+      assert.match(liveState, /policyReadJson: rulesetPolicyReader\(\)/);
+      assert.match(liveState, /fetchPullRequestView\(command\.issue_number\)/);
       assert.match(owner, /knownNoMutation: \(\) => !mergeRequestStarted/);
       continue;
     }

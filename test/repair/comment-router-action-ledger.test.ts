@@ -263,6 +263,13 @@ test("activity and strict-base policy are checked after durable dispatch marking
     executeAutomerge.indexOf("beforeDispatch: () => {"),
     executeAutomerge.indexOf("onDispatchStart: () => {"),
   );
+  const liveDispatchState = executeAutomerge.slice(
+    executeAutomerge.indexOf("const liveDispatchStateBlock ="),
+    executeAutomerge.indexOf(
+      "let result;",
+      executeAutomerge.indexOf("const liveDispatchStateBlock ="),
+    ),
+  );
   const mergeAttempt = executeAutomerge.indexOf("const dispatchBoundaryState");
   const preDispatchCatch = executeAutomerge.indexOf("} catch (error) {", mergeAttempt);
   const preDispatchFailure = executeAutomerge.slice(
@@ -277,8 +284,12 @@ test("activity and strict-base policy are checked after durable dispatch marking
   const postMarkerActivityCheck = dispatchBoundary.indexOf(
     "reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command)",
   );
-  const postMarkerStrictBaseCheck = dispatchBoundary.indexOf("strictBaseBindingBlock: () => {");
-  const policyRead = dispatchBoundary.indexOf("policyReadJson: rulesetPolicyReader()");
+  const postMarkerStrictBaseCheck = dispatchBoundary.indexOf(
+    "strictBaseBindingBlock: () => liveDispatchStateBlock(true)",
+  );
+  const finalStateCheck = dispatchBoundary.indexOf(
+    "finalStateBlock: () => liveDispatchStateBlock(false)",
+  );
   const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
 
   assert.ok(preMarkerActivityCheck >= 0);
@@ -286,8 +297,12 @@ test("activity and strict-base policy are checked after durable dispatch marking
   assert.ok(claimDispatch > guard);
   assert.ok(postMarkerActivityCheck > claimDispatch);
   assert.ok(postMarkerStrictBaseCheck > postMarkerActivityCheck);
-  assert.ok(policyRead > postMarkerStrictBaseCheck);
-  assert.ok(reject > policyRead);
+  assert.ok(finalStateCheck > postMarkerStrictBaseCheck);
+  assert.ok(reject > finalStateCheck);
+  assert.match(
+    liveDispatchState,
+    /fetchPullRequestView\(command\.issue_number\)[\s\S]*latestAutomergeTarget\([\s\S]*validateAutomergeHardReadiness\([\s\S]*validateAutomergeReadiness\([\s\S]*runtimeStrictBaseBindingBlock\([\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+  );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
     executeAutomerge,

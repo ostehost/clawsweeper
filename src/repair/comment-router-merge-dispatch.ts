@@ -26,6 +26,7 @@ export function guardAutomergeMergeDispatch(options: {
   markDispatched: () => ExactHeadMergeClaimDispatchResult;
   reviewActivityBlock: () => AutomergeReviewActivityBlock | null;
   strictBaseBindingBlock: () => AutomergeDispatchBlock | null;
+  finalStateBlock: () => AutomergeDispatchBlock | null;
   rejectDispatched: () => ExactHeadMergeClaimRejectionResult;
 }): AutomergeMergeDispatchGuardResult {
   const dispatch = options.markDispatched();
@@ -41,6 +42,16 @@ export function guardAutomergeMergeDispatch(options: {
   const strictBaseBindingBlock = options.strictBaseBindingBlock();
   if (strictBaseBindingBlock) {
     return rejectDispatchedClaim(dispatch, strictBaseBindingBlock, options.rejectDispatched);
+  }
+
+  const finalStateBlock = options.finalStateBlock();
+  if (finalStateBlock) {
+    return rejectDispatchedClaim(dispatch, finalStateBlock, options.rejectDispatched);
+  }
+
+  const finalActivityBlock = options.reviewActivityBlock();
+  if (finalActivityBlock) {
+    return rejectDispatchedClaim(dispatch, finalActivityBlock, options.rejectDispatched);
   }
 
   return { status: "ready", dispatch };

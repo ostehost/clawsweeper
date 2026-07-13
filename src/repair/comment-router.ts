@@ -4039,6 +4039,53 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     preMarkerReviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
     dispatchedAbortAction: LooseRecord | null;
   } = { preMarkerReviewActivityBlock: null, dispatchedAbortAction: null };
+  const liveDispatchStateBlock = (
+    verifyStrictBase: boolean,
+  ): { reason: string; retryable: boolean } | null => {
+    let dispatchView;
+    let dispatchTarget;
+    try {
+      dispatchView = fetchPullRequestView(command.issue_number);
+      dispatchTarget = latestAutomergeTarget(command, dispatchView);
+    } catch (error) {
+      return {
+        reason: `pre-dispatch automerge state could not be refreshed: ${compactGhError(error)}`,
+        retryable: true,
+      };
+    }
+    const hardBlock = validateAutomergeHardReadiness({
+      command,
+      view: dispatchView,
+      target: dispatchTarget,
+    });
+    if (hardBlock) return { reason: hardBlock, retryable: false };
+    const pendingReason = exactHeadAutomergePendingReason(command, dispatchView);
+    if (pendingReason) return { reason: pendingReason, retryable: true };
+    const readinessBlock = validateAutomergeReadiness({
+      command,
+      view: dispatchView,
+      target: dispatchTarget,
+    });
+    if (readinessBlock) {
+      return { reason: readinessBlock, retryable: isTransientAutomergeBlock(readinessBlock) };
+    }
+    if (!verifyStrictBase) return null;
+    try {
+      const strictBaseBlock = runtimeStrictBaseBindingBlock({
+        repo: command.repo,
+        baseBranch: String(
+          dispatchView.baseRefName ?? dispatchTarget.base_ref ?? targetBranch ?? "main",
+        ),
+        policyReadJson: rulesetPolicyReader(),
+      });
+      return strictBaseBlock ? { reason: strictBaseBlock, retryable: false } : null;
+    } catch (error) {
+      return {
+        reason: `pre-dispatch strict-base policy could not be refreshed: ${compactGhError(error)}`,
+        retryable: true,
+      };
+    }
+  };
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4073,23 +4120,8 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
                 expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
               ),
             reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
-            strictBaseBindingBlock: () => {
-              try {
-                const block = runtimeStrictBaseBindingBlock({
-                  repo: command.repo,
-                  baseBranch: String(
-                    claimedView.baseRefName ?? claimedTarget.base_ref ?? targetBranch ?? "main",
-                  ),
-                  policyReadJson: rulesetPolicyReader(),
-                });
-                return block ? { reason: block, retryable: false } : null;
-              } catch (error) {
-                return {
-                  reason: `pre-dispatch strict-base policy could not be refreshed: ${compactGhError(error)}`,
-                  retryable: true,
-                };
-              }
-            },
+            strictBaseBindingBlock: () => liveDispatchStateBlock(true),
+            finalStateBlock: () => liveDispatchStateBlock(false),
             rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
           });
           if (dispatchGuard.status === "marker_failed") {
