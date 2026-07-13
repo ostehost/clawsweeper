@@ -614,6 +614,7 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
       FAKE_GH_PULL_FILE: fixture.pullPath,
       FAKE_GH_MERGED_FILE: fixture.mergedPath,
       FAKE_GH_MERGE_COUNT_FILE: fixture.mergeCountPath,
+      FAKE_GH_MERGE_CLAIM_FILE: fixture.mergeClaimPath,
       FAKE_GH_COMMENTS_COUNT_FILE: fixture.commentsCountPath,
       FAKE_GH_DELAYED_MERGE_FILE: fixture.delayedMergePath,
       FAKE_GH_CONFIRMATION_COUNT_FILE: fixture.confirmationCountPath,
@@ -676,6 +677,26 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
       /^merge attempt was transient and GitHub did not confirm an exact-head merge effect:/,
     );
     assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    fs.rmSync(fixture.reportPath, { force: true });
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-transient-reconcile",
+        GITHUB_RUN_ATTEMPT: "2",
+        FAKE_GH_MERGE_MODE: "transient",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "exact-head merge request is durably claimed; reconciliation only",
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 0);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
 
     fixture.reset();
@@ -1355,6 +1376,7 @@ function createVerifiedMergeFixture() {
   const pullPath = path.join(root, "pull.json");
   const mergedPath = path.join(root, "merged.txt");
   const mergeCountPath = path.join(root, "merge-count.txt");
+  const mergeClaimPath = path.join(root, "merge-claim.txt");
   const commentsCountPath = path.join(root, "comments-count.txt");
   const delayedMergePath = path.join(root, "delayed-merge.txt");
   const confirmationCountPath = path.join(root, "confirmation-count.txt");
@@ -1621,6 +1643,12 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123') { process.stdout.write(JSON.stringify({ labels: pull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/122') { process.stdout.write(JSON.stringify({ labels: sourcePull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/122/comments?per_page=100')) { if (args.includes('--slurp')) process.stdout.write('[[]]'); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments' && args.includes('-f')) {",
+      "  const body = String(args.find((arg) => arg.startsWith('body=')) || '').slice(5);",
+      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, body);",
+      "  process.stdout.write(JSON.stringify({ id: 1001, body, performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } }));",
+      "  process.exit(0);",
+      "}",
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/123/comments?per_page=100')) {",
       "  const count = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0;",
       "  fs.writeFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, String(count + 1));",
@@ -1628,6 +1656,7 @@ function createVerifiedMergeFixture() {
       "  const securityOnFinalGate = process.env.FAKE_GH_SECURITY_ON_FINAL_GATE === '1' && count >= 3;",
       "  const security = securityAfterFailure || securityOnFinalGate;",
       "  const comments = [];",
+      "  if (fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE)) comments.push({ id: 1001, body: fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8'), performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } });",
       "  if (security) comments.push({ body: '<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->', user: { login: 'maintainer-user' } });",
       "  if (args.includes('--slurp')) process.stdout.write(JSON.stringify([comments]));",
       "  else process.stdout.write(comments.map((comment) => comment.body).join('\\n'));",
@@ -1682,6 +1711,7 @@ function createVerifiedMergeFixture() {
     pullPath,
     mergedPath,
     mergeCountPath,
+    mergeClaimPath,
     commentsCountPath,
     delayedMergePath,
     confirmationCountPath,
@@ -1691,6 +1721,7 @@ function createVerifiedMergeFixture() {
     reset() {
       fs.rmSync(mergedPath, { force: true });
       fs.rmSync(mergeCountPath, { force: true });
+      fs.rmSync(mergeClaimPath, { force: true });
       fs.rmSync(commentsCountPath, { force: true });
       fs.rmSync(delayedMergePath, { force: true });
       fs.rmSync(confirmationCountPath, { force: true });

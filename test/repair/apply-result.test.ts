@@ -1130,7 +1130,7 @@ test("repair apply confirms an exact merge after an ambiguous command response",
     assert.equal(report.actions[0].reason, "merge confirmed after ambiguous response");
     assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
     const mergeCall = ghCalls(fixture.ghLogPath).find(
       (call) => call.args[0] === "pr" && call.args[1] === "merge",
     );
@@ -1157,7 +1157,7 @@ test("repair apply rejects a merged REST snapshot for a different head", () => {
     );
     assert.equal(report.actions[0].merged_at, undefined);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
   } finally {
     fixture.cleanup();
   }
@@ -1181,14 +1181,14 @@ for (const pendingKind of ["queue", "auto_merge"] as const) {
           : "auto-merge is pending for the authorized pull request head",
       );
       assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 3);
+      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 4);
 
       runMergeApplyResult(fixture);
       report = readApplyReport(fixture.reportPath);
       assert.equal(report.actions[0].status, "blocked");
       assert.equal(report.actions[0].requeue_required, true);
       assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 4);
+      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 5);
     } finally {
       fixture.cleanup();
     }
@@ -1231,7 +1231,7 @@ test("repair apply reports a post-command terminal check failure before queue st
     assert.equal(report.actions[0].reason, "checks are not clean: test: FAILURE");
     assert.equal(report.actions[0].requeue_required, undefined);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 3);
+    assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 4);
   } finally {
     fixture.cleanup();
   }
@@ -1293,7 +1293,30 @@ test("repair apply does not transport-retry an ambiguous merge mutation", () => 
     assert.equal(report.actions[0].requeue_required, true);
     assert.match(report.actions[0].reason, /merge command failed.*HTTP 502/i);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply fresh attempts reconcile an unknown claimed merge without reissuing it", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
+  try {
+    runMergeApplyResult(fixture, { runAttempt: 1 });
+    let report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+
+    runMergeApplyResult(fixture, { runAttempt: 2 });
+    report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "exact-head merge request is durably claimed; reconciliation only",
+    );
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
   } finally {
     fixture.cleanup();
   }
@@ -1754,6 +1777,7 @@ type MergeFixture = {
   reportPath: string;
   ghLogPath: string;
   mergeCountPath: string;
+  mergeClaimPath: string;
   headSha: string;
   cleanup(): void;
 };
@@ -1784,6 +1808,7 @@ function writeMergeApplyFixture(
   const reportPath = path.join(runDir, "apply-report.json");
   const ghLogPath = path.join(root, "gh.log");
   const mergeCountPath = path.join(root, "merge-count");
+  const mergeClaimPath = path.join(root, "merge-claim");
   const issueCountPath = path.join(root, "issue-count");
   const headSha = "a".repeat(40);
   fs.mkdirSync(binDir, { recursive: true });
@@ -1853,6 +1878,7 @@ function writeMergeApplyFixture(
   const fakeData = {
     ghLogPath,
     mergeCountPath,
+    mergeClaimPath,
     headSha,
     wrongHeadSha: "b".repeat(40),
     mergeMode: options.mergeMode ?? "success_exact",
@@ -1892,8 +1918,30 @@ function issueCount() {
 
 if (args[0] === "api") {
   const apiPath = args[1] || "";
+  if (apiPath === "repos/openclaw/openclaw/issues/101/comments" && args.includes("-f")) {
+    const body = String(args.find((arg) => arg.startsWith("body=")) || "").slice(5);
+    fs.writeFileSync(data.mergeClaimPath, body);
+    write({
+      id: 1001,
+      body,
+      performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+      user: { login: "openclaw-clawsweeper[bot]" },
+    });
+    process.exit(0);
+  }
   if (apiPath.includes("/issues/101/comments")) {
-    write(args.includes("--slurp") ? [[]] : []);
+    const body = fs.existsSync(data.mergeClaimPath)
+      ? fs.readFileSync(data.mergeClaimPath, "utf8")
+      : "";
+    const comments = body
+      ? [{
+          id: 1001,
+          body,
+          performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+          user: { login: "openclaw-clawsweeper[bot]" },
+        }]
+      : [];
+    write(args.includes("--slurp") ? [comments] : comments);
     process.exit(0);
   }
   if (apiPath === "repos/openclaw/openclaw/issues/101") {
@@ -1904,7 +1952,9 @@ if (args[0] === "api") {
       title: "Exact merge candidate",
       html_url: "https://github.com/openclaw/openclaw/pull/101",
       state: "open",
-      updated_at: "2026-07-13T07:00:00Z",
+      updated_at: fs.existsSync(data.mergeClaimPath)
+        ? "2026-07-13T07:01:00Z"
+        : "2026-07-13T07:00:00Z",
       author_association: "CONTRIBUTOR",
       user: { login: "contributor" },
       labels: data.securityOnFinalIssueFetch && count > 1 ? [{ name: "security" }] : [],
@@ -2024,6 +2074,7 @@ process.exit(1);
     reportPath,
     ghLogPath,
     mergeCountPath,
+    mergeClaimPath,
     headSha,
     cleanup() {
       fs.rmSync(root, { recursive: true, force: true });
@@ -2031,7 +2082,10 @@ process.exit(1);
   };
 }
 
-function runMergeApplyResult(fixture: MergeFixture, options: { retryAttempts?: number } = {}) {
+function runMergeApplyResult(
+  fixture: MergeFixture,
+  options: { retryAttempts?: number; runAttempt?: number } = {},
+) {
   execFileSync(
     process.execPath,
     ["dist/repair/apply-result.js", fixture.jobPath, fixture.resultPath],
@@ -2051,6 +2105,8 @@ function runMergeApplyResult(fixture: MergeFixture, options: { retryAttempts?: n
         CLAWSWEEPER_RULESET_GH_TOKEN: "ruleset-token",
         CLAWSWEEPER_RULESET_INSTALLATION_ID: "7001",
         CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
+        GITHUB_RUN_ATTEMPT: String(options.runAttempt ?? 1),
+        GITHUB_RUN_ID: "9001",
         GH_TOKEN: "write-token",
         ...mockGhBinEnv(path.join(fixture.binDir, "gh.js")),
       },

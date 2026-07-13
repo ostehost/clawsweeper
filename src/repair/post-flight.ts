@@ -15,6 +15,7 @@ import { externalMessageProvenance, postMergeCloseoutComment } from "./external-
 import {
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghPagedWithRetry as ghPaged,
   ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
@@ -48,6 +49,14 @@ import {
   type RepairLifecycleInput,
   type RepairWorkflowPhase,
 } from "./repair-action-ledger.js";
+import {
+  ensureExactHeadMergeClaim,
+  exactHeadMergeClaimIdentity,
+  exactHeadMergeClaimant,
+  isTrustedExactHeadMergeClaimComment,
+  type ExactHeadMergeClaimRequest,
+  type ExactHeadMergeClaimResult,
+} from "./exact-head-merge-claim.js";
 import {
   issueImplementationPublishedHeadBlock,
   postFlightOutcomeExitCode,
@@ -340,11 +349,13 @@ function finalizeFixPr(action: LooseRecord) {
   for (;;) {
     let mergeAttempt: {
       policyBlock: string;
+      claim: ExactHeadMergeClaimResult | null;
       pull: LooseRecord;
       view: LooseRecord;
       confirmation: ReturnType<typeof reconcileMergeState> | null;
       confirmationError: string;
       ambiguous: boolean;
+      reconciliationOnly: boolean;
     };
     try {
       mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
@@ -359,11 +370,72 @@ function finalizeFixPr(action: LooseRecord) {
         if (policyBlock) {
           return {
             policyBlock,
+            claim: null,
             pull: finalPull,
             view: finalView,
             confirmation: null,
             confirmationError: "",
             ambiguous: false,
+            reconciliationOnly: false,
+          };
+        }
+        const claim = claimPostFlightMergeRequest(parsed.number, action.commit);
+        if (claim.status === "blocked" || claim.status === "unknown") {
+          return {
+            policyBlock: "",
+            claim,
+            pull: finalPull,
+            view: finalView,
+            confirmation: null,
+            confirmationError: "",
+            ambiguous: false,
+            reconciliationOnly: true,
+          };
+        }
+        if (claim.status === "existing") {
+          try {
+            const confirmation = reconcileMergeState(parsed.number, action.commit);
+            return {
+              policyBlock: "",
+              claim,
+              pull: confirmation.pull,
+              view: confirmation.view,
+              confirmation,
+              confirmationError: "",
+              ambiguous: false,
+              reconciliationOnly: true,
+            };
+          } catch (error) {
+            return {
+              policyBlock: "",
+              claim,
+              pull: finalPull,
+              view: finalView,
+              confirmation: null,
+              confirmationError: ghErrorText(error),
+              ambiguous: false,
+              reconciliationOnly: true,
+            };
+          }
+        }
+        const claimedPull = fetchPullRequest(result.repo, parsed.number);
+        const claimedView = fetchPullRequestView(result.repo, parsed.number);
+        const claimedPolicyBlock = postFlightMergeRetryBlock({
+          action,
+          number: parsed.number,
+          pull: claimedPull,
+          view: claimedView,
+        });
+        if (claimedPolicyBlock) {
+          return {
+            policyBlock: claimedPolicyBlock,
+            claim,
+            pull: claimedPull,
+            view: claimedView,
+            confirmation: null,
+            confirmationError: "",
+            ambiguous: false,
+            reconciliationOnly: false,
           };
         }
         mergeAttempts += 1;
@@ -403,11 +475,13 @@ function finalizeFixPr(action: LooseRecord) {
         });
         return {
           policyBlock: "",
+          claim,
           pull: mutation.confirmation?.pull ?? finalPull,
           view: mutation.confirmation?.view ?? finalView,
           confirmation: mutation.confirmation,
           confirmationError: mutation.confirmationError,
           ambiguous: mutation.ambiguous,
+          reconciliationOnly: false,
         };
       });
     } catch (error) {
@@ -534,6 +608,17 @@ function finalizeFixPr(action: LooseRecord) {
         waited_ms: waitedMs,
       };
     }
+    if (mergeAttempt.claim?.status === "blocked" || mergeAttempt.claim?.status === "unknown") {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: mergeAttempt.claim.reason,
+        merge_method: "squash",
+        ...(mergeAttempt.claim.status === "unknown" ? { retry_recommended: true } : {}),
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
 
     const confirmation = mergeAttempt.confirmation;
     if (!confirmation) {
@@ -561,6 +646,9 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
     if (confirmation.pendingReason) {
+      if (mergeAttempt.reconciliationOnly) {
+        recordPostFlightMergeObserved(parsed.number, action.commit);
+      }
       return {
         ...prBase,
         status: "blocked",
@@ -575,7 +663,10 @@ function finalizeFixPr(action: LooseRecord) {
       return {
         ...prBase,
         status: "blocked",
-        reason: "merge command completed but GitHub has not confirmed the pull request as merged",
+        reason:
+          mergeAttempt.reconciliationOnly && mergeAttempt.claim?.status === "existing"
+            ? mergeAttempt.claim.reason
+            : "merge command completed but GitHub has not confirmed the pull request as merged",
         mergeable: view.mergeable ?? null,
         merge_state_status: view.mergeStateStatus ?? null,
         review_decision: view.reviewDecision ?? null,
@@ -585,12 +676,17 @@ function finalizeFixPr(action: LooseRecord) {
         waited_ms: waitedMs,
       };
     }
+    if (mergeAttempt.reconciliationOnly) {
+      recordPostFlightMergeObserved(parsed.number, action.commit);
+    }
     return {
       ...prBase,
       status: "executed",
       reason: mergeAttempt.ambiguous
         ? "merge confirmed after ambiguous response"
-        : "merged by ClawSweeper Repair post-flight",
+        : mergeAttempt.reconciliationOnly
+          ? "merge confirmed for durably claimed exact head"
+          : "merged by ClawSweeper Repair post-flight",
       merged_at: confirmation.mergedAt,
       merge_commit_sha: pull.merge_commit_sha ?? null,
       merge_method: "squash",
@@ -635,6 +731,54 @@ function postFlightMergeMutationIdentity(number: number, headSha: JsonValue) {
     headSha: headSha ?? null,
     method: "squash",
   };
+}
+
+function claimPostFlightMergeRequest(
+  number: number,
+  headSha: JsonValue,
+): ExactHeadMergeClaimResult {
+  try {
+    const request: ExactHeadMergeClaimRequest = {
+      repository: result.repo,
+      number,
+      headSha: String(headSha ?? ""),
+      method: "squash",
+      owner: "post_flight",
+      claimant: exactHeadMergeClaimant("post_flight"),
+      appId: Number(process.env.CLAWSWEEPER_AUTHENTICATED_APP_ID),
+      appSlug: String(process.env.CLAWSWEEPER_AUTHENTICATED_APP_SLUG ?? ""),
+    };
+    return ensureExactHeadMergeClaim(request, {
+      listComments: () =>
+        ghPaged<LooseRecord>(
+          `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+        ),
+      createComment: (body) =>
+        runRepairMutation(postFlightLifecycle(null), {
+          kind: "post_flight_merge_claim",
+          identity: exactHeadMergeClaimIdentity(request),
+          component: "merge_claim",
+          operation: () =>
+            ghJson(
+              [
+                "api",
+                `repos/${request.repository}/issues/${request.number}/comments`,
+                "-f",
+                `body=${body}`,
+              ],
+              { attempts: 1 },
+            ),
+          outcome: (comment) =>
+            isTrustedExactHeadMergeClaimComment(comment, request) ? "accepted" : "unknown",
+        }),
+    });
+  } catch (error) {
+    return {
+      status: "unknown",
+      reason: `exact-head merge claim could not be prepared: ${compactText(ghErrorText(error), 500)}`,
+      claimId: null,
+    };
+  }
 }
 
 function exactHeadPendingMergeReason(view: LooseRecord, expectedHeadSha: JsonValue) {

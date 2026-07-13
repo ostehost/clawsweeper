@@ -6,6 +6,10 @@ import {
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
 } from "../../dist/repair/automerge-effect.js";
+import {
+  ensureExactHeadMergeClaim,
+  exactHeadMergeClaimBody,
+} from "../../dist/repair/exact-head-merge-claim.js";
 
 const headSha = "a".repeat(40);
 
@@ -114,4 +118,81 @@ test("definitive unconfirmed merge rejection closes the mutation receipt", () =>
   };
   assert.equal(automergeUnconfirmedFailureDisposition(attempt), "blocked");
   assert.equal(automergeAttemptReceiptOutcome(attempt), "rejected");
+});
+
+test("fresh comment-router attempts reconcile a durable claim after an unknown merge response", () => {
+  const comments: Record<string, any>[] = [];
+  let claimCreates = 0;
+  let mergeRequests = 0;
+  const request = (runAttempt: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "comment_router",
+    claimant: `comment_router:9001:${runAttempt}`,
+    appId: 3306130,
+    appSlug: "openclaw-clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      claimCreates += 1;
+      const comment = {
+        id: 1000 + claimCreates,
+        body,
+        performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+        user: { login: "openclaw-clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  const first = ensureExactHeadMergeClaim(request(1), io);
+  if (first.status === "acquired") mergeRequests += 1;
+  assert.equal(first.status, "acquired");
+
+  const freshAttempt = ensureExactHeadMergeClaim(request(2), io);
+  if (freshAttempt.status === "acquired") mergeRequests += 1;
+  assert.equal(freshAttempt.status, "existing");
+  assert.equal(claimCreates, 1);
+  assert.equal(mergeRequests, 1);
+});
+
+test("exact-head merge claims fail closed on a trusted conflicting head", () => {
+  const conflicting = {
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha: "b".repeat(40),
+    method: "squash" as const,
+    owner: "post_flight",
+    claimant: "post_flight:8001:1",
+    appId: 3306130,
+    appSlug: "openclaw-clawsweeper",
+  };
+  const comments = [
+    {
+      id: 1001,
+      body: exactHeadMergeClaimBody(conflicting),
+      performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
+      user: { login: "openclaw-clawsweeper[bot]" },
+    },
+  ];
+  const result = ensureExactHeadMergeClaim(
+    {
+      ...conflicting,
+      headSha,
+      owner: "apply_result",
+      claimant: "apply_result:8002:1",
+    },
+    {
+      listComments: () => comments,
+      createComment: () => {
+        throw new Error("must not create a claim after conflicting durable state");
+      },
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.match(result.reason, /conflicting durable merge claim/);
 });

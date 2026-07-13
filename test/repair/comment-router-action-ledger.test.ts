@@ -163,6 +163,29 @@ test("automerge observes exact-head queue state before issuing another merge", (
   assert.equal(source.match(/"autoMergeRequest"/g)?.length, 3);
 });
 
+test("automerge fresh attempts reconcile a durable exact-head claim before merge", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const claim = executeAutomerge.indexOf("claimAutomergeMergeRequest(command)");
+  const reconciliation = executeAutomerge.indexOf("reconcileClaimedAutomergeRequest(");
+  const merge = executeAutomerge.indexOf("const result = runGitHubSpawnMutation(");
+
+  assert.ok(claim >= 0);
+  assert.ok(reconciliation > claim);
+  assert.ok(merge > reconciliation);
+  assert.match(
+    source,
+    /function claimAutomergeMergeRequest[\s\S]*ensureExactHeadMergeClaim[\s\S]*"pull_request_merge_claim"/,
+  );
+  assert.match(
+    source,
+    /function reconcileClaimedAutomergeRequest[\s\S]*fetchAutomergeEffectSnapshot[\s\S]*status: "waiting"/,
+  );
+});
+
 test("automerge execution never invents a merge timestamp", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(

@@ -113,9 +113,11 @@ checkpoint, and status-only commits are intentionally omitted.
   pair per actual one-shot request, including unknown response-loss outcomes.
   Merge owners now use one-shot exact-head compare-and-swap requests, reconcile
   ambiguous responses against exact REST snapshots, and observe queue or
-  auto-merge state without issuing a second successful merge transition. Hard
-  proof or policy drift remains terminal despite transient readiness or an
-  earlier unknown mutation outcome.
+  auto-merge state without issuing a second successful merge transition. A
+  trusted write-ahead claim binds the repository, pull request, and head across
+  workflow attempts; once present, every merge owner is reconciliation-only.
+  Hard proof or policy drift remains terminal despite transient readiness or
+  an earlier unknown mutation outcome.
   Added digest-bound repair planning, structured-result repair, execution, and
   commit-review Codex log/report lifecycles, request-bound commit-check and
   notification delivery receipts, generic workflow attempt/finalization
