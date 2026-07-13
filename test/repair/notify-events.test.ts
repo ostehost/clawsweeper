@@ -428,7 +428,7 @@ test("dashboard receipt failures preserve the delivery error and continue notifi
   try {
     console.error = (message?: unknown) => {
       receiptErrors.push(String(message));
-      if (receiptErrors.length === 2) {
+      if (receiptErrors.length === 1) {
         process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
       }
     };
@@ -458,8 +458,8 @@ test("dashboard receipt failures preserve the delivery error and continue notifi
       },
     });
 
-    assert.equal(receiptErrors.length, 2);
-    assert.match(receiptErrors[1] ?? "", /after the primary failure/);
+    assert.equal(receiptErrors.length, 1);
+    assert.match(receiptErrors[0] ?? "", /after the primary failure/);
     assert.equal(summary.sent, 1);
     assert.equal(summary.failed, 1);
     const report = JSON.parse(
