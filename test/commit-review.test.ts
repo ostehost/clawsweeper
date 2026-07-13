@@ -8,19 +8,20 @@ import { fileURLToPath } from "node:url";
 
 const CLI = fileURLToPath(new URL("../dist/commit-sweeper.js", import.meta.url));
 
-test("commit review finalization tolerates a missing artifact directory", () => {
+test("commit review ledger attestation runs outside the Codex review job", () => {
   const workflow = fs.readFileSync(".github/workflows/commit-review.yml", "utf8");
-  const finalizer = workflow.slice(
-    workflow.indexOf("- name: Finish commit review lifecycle"),
-    workflow.indexOf("- name: Finalize commit review action ledger"),
+  const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  attest:"));
+  const attestor = workflow.slice(
+    workflow.indexOf("\n  attest:"),
+    workflow.indexOf("\n  publish:"),
   );
 
-  assert.match(finalizer, /set -euo pipefail/);
-  assert.match(
-    finalizer,
-    /report_path=""\n\s+if \[ -d \.\.\/commit-artifacts \]; then\n\s+report_path="\$\(find \.\.\/commit-artifacts [^\n]+\)"\n\s+fi/,
-  );
-  assert.match(finalizer, /finish-review[\s\S]*--report-path "\$report_path"/);
+  assert.doesNotMatch(review, /setup-action-ledger|CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/);
+  assert.doesNotMatch(review, /permission-checks: write|publish-check|finish-review/);
+  assert.match(attestor, /setup-action-ledger/);
+  assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
+  assert.match(attestor, /--report-path "\$report_path"/);
+  assert.match(attestor, /Finalize commit review action ledger/);
 });
 
 test("commit review captures the complete structured Codex stream", () => {

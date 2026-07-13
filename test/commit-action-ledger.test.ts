@@ -621,6 +621,58 @@ test("commit review matrix invocations publish distinct importable shard paths",
   }
 });
 
+test("trusted commit review attestation binds the immutable report before publication", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-attestor-")));
+  const outputRoot = path.join(root, "output");
+  const sha = "b".repeat(40);
+  const reportPath = path.join(root, `${sha}.md`);
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    reportPath,
+    `---\nresult: nothing_found\nsha: ${sha}\nrepository: openclaw/openclaw\n---\n\nNo findings.\n`,
+  );
+  const previous = { ...process.env };
+  const env = { ...process.env, ...workflowEnv(root, outputRoot), GITHUB_JOB: "attest" };
+  Object.assign(process.env, env);
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist/commit-sweeper.js"),
+        "attest-review",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--commit-sha",
+        sha,
+        "--report-path",
+        reportPath,
+      ],
+      { env, stdio: "pipe" },
+    );
+    await flushWorkflowActionEvents(root);
+
+    const events = readEvents(outputRoot).sort((left, right) => left.phase_seq - right.phase_seq);
+    assert.equal(
+      events.filter(
+        (event) =>
+          event.attributes?.publication_kind === "commit_review_report" &&
+          event.attributes?.state === "prepared",
+      ).length,
+      1,
+    );
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+        .map((event) => event.attributes?.state),
+      ["started", "completed", "finalized"],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("commit review check publication completes before the workflow is finalized", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-lifecycle-order-")));
   const outputRoot = path.join(root, "output");
@@ -654,19 +706,27 @@ test("commit review check publication completes before the workflow is finalized
   }
 });
 
-test("commit check publisher skips accepted shard writes and installs verified causality", () => {
+test("commit check publisher owns every privileged check write and installs attested causality", () => {
   const workflow = readText(".github/workflows/commit-review.yml");
+  const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  attest:"));
+  const attestor = workflow.slice(
+    workflow.indexOf("\n  attest:"),
+    workflow.indexOf("\n  publish:"),
+  );
   const publisher = workflow.slice(workflow.indexOf("\n  publish:"));
 
+  assert.doesNotMatch(review, /setup-action-ledger|permission-checks: write|publish-check/);
+  assert.match(attestor, /attest-review/);
   assert.match(publisher, /commit-review-action-ledger-causality\.json/);
   assert.match(publisher, /CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=/);
-  assert.match(
+  assert.match(publisher, /--expected-job attest/);
+  assert.doesNotMatch(
     publisher,
-    /publication_kind == "commit_check_publication"[\s\S]*completion_reason == "mutation_accepted"/,
+    /accepted-commit-review-check-shas|skipping duplicate write|completion_reason == "mutation_accepted"/,
   );
   assert.match(
     publisher,
-    /grep -Fqx "\$sha" "\$accepted_checks_file"[\s\S]*skipping duplicate write[\s\S]*continue/,
+    /find commit-artifacts[\s\S]*node dist\/commit-sweeper\.js publish-check/,
   );
   assert.ok(
     publisher.indexOf("repair:action-ledger -- verify") <

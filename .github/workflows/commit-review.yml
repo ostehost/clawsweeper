@@ -406,8 +406,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-    env:
-      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-${{ matrix.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -433,13 +431,7 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
 
-      - uses: ./clawsweeper/.github/actions/setup-action-ledger
-        id: review-action-ledger
-        with:
-          worktree-path: clawsweeper
-
       - uses: ./clawsweeper/.github/actions/setup-pnpm
-        id: review-setup-pnpm
         with:
           working-directory: clawsweeper
           build-script: build
@@ -495,82 +487,6 @@ jobs:
             --codex-timeout-ms 1800000 \
             --defer-workflow-completion
 
-      - name: Create target checks token
-        id: target-checks-token
-        if: ${{ needs.plan.outputs.create_checks == 'true' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ needs.plan.outputs.target_repo_owner }}
-          repositories: ${{ needs.plan.outputs.target_repo_name }}
-          permission-checks: write
-
-      - name: Publish commit check
-        id: publish-commit-check
-        if: ${{ needs.plan.outputs.create_checks == 'true' }}
-        working-directory: clawsweeper
-        env:
-          GH_TOKEN: ${{ steps.target-checks-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN"
-          report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
-          if [ -z "$report_path" ]; then
-            echo "Missing report artifact for ${{ matrix.sha }}" >&2
-            exit 1
-          fi
-          relative_path="records/${report_path#../commit-artifacts/}"
-          node dist/commit-sweeper.js publish-check \
-            --target-repo "${{ needs.plan.outputs.target_repo }}" \
-            --commit-sha "${{ matrix.sha }}" \
-            --report-path "$report_path" \
-            --report-relative-path "$relative_path" \
-            --report-repo "${{ github.repository }}" \
-            --continue-workflow
-
-      - name: Finish commit review lifecycle
-        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
-        working-directory: clawsweeper
-        env:
-          REVIEW_OUTCOME: ${{ steps.review-commit.outcome }}
-          CHECK_OUTCOME: ${{ steps.publish-commit-check.outcome }}
-          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
-        run: |
-          set -euo pipefail
-          report_path=""
-          if [ -d ../commit-artifacts ]; then
-            report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
-          fi
-          node dist/commit-sweeper.js finish-review \
-            --target-repo "${{ needs.plan.outputs.target_repo }}" \
-            --commit-sha "${{ matrix.sha }}" \
-            --report-path "$report_path" \
-            --review-outcome "$REVIEW_OUTCOME" \
-            --check-outcome "$CHECK_OUTCOME" \
-            --checks-requested "$CHECKS_REQUESTED" \
-            --error-kind "review=$REVIEW_OUTCOME,report=${report_path:-missing},checks_requested=$CHECKS_REQUESTED,check=$CHECK_OUTCOME"
-
-      - name: Finalize commit review action ledger
-        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
-        working-directory: clawsweeper
-        run: |
-          set -euo pipefail
-          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          pnpm run --silent repair:action-ledger -- finalize \
-            --repair-lane "commit-review-${{ matrix.sha }}" \
-            > "$output_root/repair-action-ledger-manifest.json"
-
-      - name: Upload commit review action ledger
-        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.review-action-ledger.outputs.output-root }}/**
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 90
-
       - name: Upload commit review Codex logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -587,9 +503,76 @@ jobs:
           path: commit-artifacts
           if-no-files-found: ignore
 
+  attest:
+    name: Attest commit review ${{ matrix.sha }}
+    needs: [plan, review]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.planned_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-${{ matrix.sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: review-action-ledger
+
+      - uses: ./.github/actions/setup-pnpm
+        id: attest-setup-pnpm
+        with:
+          build-script: build
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: commit-artifacts
+
+      - name: Attest immutable commit review report
+        run: |
+          set -euo pipefail
+          report_path="$(find commit-artifacts -type f -name '${{ matrix.sha }}.md' -print -quit)"
+          if [ -z "$report_path" ]; then
+            echo "Missing report artifact for ${{ matrix.sha }}" >&2
+            exit 1
+          fi
+          node dist/commit-sweeper.js attest-review \
+            --target-repo "${{ needs.plan.outputs.target_repo }}" \
+            --commit-sha "${{ matrix.sha }}" \
+            --report-path "$report_path"
+
+      - name: Finalize commit review action ledger
+        if: ${{ always() && steps.attest-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane "commit-review-${{ matrix.sha }}" \
+            > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Upload commit review action ledger
+        if: ${{ always() && steps.attest-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.review-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
   publish:
     name: Commit reports
-    needs: [plan, review]
+    needs: [plan, review, attest]
     if: ${{ always() && needs.plan.result == 'success' && (needs.plan.outputs.planned_count != '0' || needs.plan.outputs.skipped_count != '0') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -673,11 +656,9 @@ jobs:
           cohort_file=".artifacts/commit-review-artifact-cohort.json"
           expected_shas_file=".artifacts/expected-commit-review-shas.txt"
           actual_shas_file=".artifacts/actual-commit-review-shas.txt"
-          accepted_checks_file=".artifacts/accepted-commit-review-check-shas.txt"
           causality_file=".artifacts/commit-review-action-ledger-causality.json"
           test -s "$cohort_file"
           : > "$actual_shas_file"
-          : > "$accepted_checks_file"
           printf '[]\n' > "$causality_file"
           if [ "$PLANNED_COUNT" = "1" ]; then
             IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id \
@@ -718,7 +699,7 @@ jobs:
             pnpm run --silent repair:action-ledger -- verify \
               --repair-lane "commit-review-$commit_sha" \
               --manifest "$review_root/repair-action-ledger-manifest.json" \
-              --expected-job review \
+              --expected-job attest \
               --expected-run-attempt "$artifact_attempt" \
               --commit-report "${report_files[0]}" \
               --expected-commit-repository "$EXPECTED_TARGET_REPO" \
@@ -751,23 +732,6 @@ jobs:
             jq --argjson entry "$context_entry" '. + [$entry]' "$causality_file" \
               > "${causality_file}.tmp"
             mv "${causality_file}.tmp" "$causality_file"
-            mapfile -t event_paths \
-              < <(jq -r '.event_paths[]' "$review_root/repair-action-ledger-manifest.json")
-            event_files=()
-            for event_path in "${event_paths[@]}"; do
-              event_files+=("$review_root/$event_path")
-            done
-            if jq -s -e \
-              --arg repository "$EXPECTED_TARGET_REPO" \
-              --arg sha "$commit_sha" \
-              'any(.[]; .subject.repository == $repository and
-                        .subject.kind == "commit" and
-                        .subject.source_revision == $sha and
-                        .attributes.publication_kind == "commit_check_publication" and
-                        .attributes.completion_reason == "mutation_accepted")' \
-              "${event_files[@]}" >/dev/null; then
-              echo "$commit_sha" >> "$accepted_checks_file"
-            fi
             cp -R "$report_root"/. commit-artifacts/
             echo "$commit_sha" >> "$actual_shas_file"
           done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
@@ -777,7 +741,6 @@ jobs:
             diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
             exit 1
           fi
-          sort -u -o "$accepted_checks_file" "$accepted_checks_file"
           echo "CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=$(pwd -P)/$causality_file" \
             >> "$GITHUB_ENV"
 
@@ -852,13 +815,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          accepted_checks_file=".artifacts/accepted-commit-review-check-shas.txt"
           find commit-artifacts -name '*.md' -print0 | while IFS= read -r -d '' report_path; do
             sha="$(basename "$report_path" .md)"
-            if [ -s "$accepted_checks_file" ] && grep -Fqx "$sha" "$accepted_checks_file"; then
-              echo "Commit check already accepted by review shard for $sha; skipping duplicate write."
-              continue
-            fi
             relative_path="records/${report_path#commit-artifacts/}"
             node dist/commit-sweeper.js publish-check \
               --target-repo "${{ needs.plan.outputs.target_repo }}" \
@@ -958,7 +916,7 @@ jobs:
             review_root=".clawsweeper-repair/action-ledger-download/$ledger_name"
             verify_lane \
               "commit-review-$commit_sha" \
-              review \
+              attest \
               "$artifact_attempt" \
               "$review_root" \
               "$review_root/repair-action-ledger-manifest.json"
@@ -977,7 +935,7 @@ jobs:
             pnpm run --silent repair:action-ledger -- publish \
               --repair-lane "commit-review-$commit_sha" \
               --manifest "$manifest_file" \
-              --expected-job review \
+              --expected-job attest \
               --expected-run-attempt "$artifact_attempt" \
               --source-root "$review_root" \
               --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"

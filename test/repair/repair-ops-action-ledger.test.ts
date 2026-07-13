@@ -359,7 +359,8 @@ test("commit review and notification workflows publish their operation receipts"
   const commit = readText(".github/workflows/commit-review.yml");
   const activity = readText(".github/workflows/github-activity.yml");
   const maintainer = readText(".github/workflows/maintainer-report-discord.yml");
-  const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  publish:"));
+  const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  attest:"));
+  const attestor = commit.slice(commit.indexOf("\n  attest:"), commit.indexOf("\n  publish:"));
   const publisher = commit.slice(commit.indexOf("\n  publish:"));
 
   assert.match(commit, /run-name:.*continuation_key/);
@@ -373,30 +374,20 @@ test("commit review and notification workflows publish their operation receipts"
     commit,
     /plan:\n\s+name: Plan commits\n\s+needs: receipt\n\s+if:.*needs\.receipt\.outputs\.proceed == 'true'/,
   );
-  assert.match(review, /setup-action-ledger/);
-  assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
+  assert.doesNotMatch(review, /setup-action-ledger|CLAWSWEEPER_ACTION_LEDGER/);
   assert.match(review, /--defer-workflow-completion/);
-  assert.match(review, /--continue-workflow/);
-  assert.match(review, /node dist\/commit-sweeper\.js finish-review/);
-  assert.match(review, /--review-outcome "\$REVIEW_OUTCOME"/);
-  assert.match(review, /report_path=.*matrix\.sha[\s\S]*--report-path "\$report_path"/);
-  assert.match(review, /--check-outcome "\$CHECK_OUTCOME"/);
-  assert.match(review, /--checks-requested "\$CHECKS_REQUESTED"/);
-  assert.doesNotMatch(review, /CHECK_OUTCOME" = "skipped"/);
+  assert.doesNotMatch(review, /publish-check|permission-checks: write|finish-review/);
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
+  assert.match(attestor, /setup-action-ledger/);
+  assert.match(attestor, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
+  assert.match(attestor, /node dist\/commit-sweeper\.js attest-review/);
+  assert.match(attestor, /--report-path "\$report_path"/);
   assert.ok(
-    review.indexOf("- name: Review commit") < review.indexOf("- name: Create target checks token"),
-  );
-  assert.ok(
-    review.indexOf("- name: Publish commit check") <
-      review.indexOf("- name: Finish commit review lifecycle"),
-  );
-  assert.ok(
-    review.indexOf("- name: Finish commit review lifecycle") <
-      review.indexOf("- name: Finalize commit review action ledger"),
+    attestor.indexOf("- name: Attest immutable commit review report") <
+      attestor.indexOf("- name: Finalize commit review action ledger"),
   );
   assert.match(
-    review,
+    attestor,
     /action-ledger-commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
   assert.match(
@@ -410,6 +401,8 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(publisher, /create-state-token/);
   assert.match(publisher, /setup-state/);
+  assert.match(publisher, /--expected-job attest/);
+  assert.doesNotMatch(publisher, /accepted-commit-review-check-shas|skipping duplicate write/);
   assert.match(publisher, /Resolve commit review artifact cohort/);
   assert.match(publisher, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"/);
   assert.match(publisher, /pnpm run --silent repair:resolve-run-artifact/);

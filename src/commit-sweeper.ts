@@ -65,6 +65,12 @@ const DEFAULT_CODEX_MODEL = PUBLIC_CODEX_MODEL;
 const DEFAULT_REASONING_EFFORT = "high";
 const DEFAULT_SERVICE_TIER = "";
 const COMMIT_REVIEW_CHECK_NAME = "ClawSweeper Commit Review";
+const COMMIT_REVIEW_SUCCESS_RESULTS = new Set([
+  "nothing_found",
+  "findings",
+  "inconclusive",
+  "skipped_non_code",
+]);
 
 function run(command: string, commandArgs: string[], options: { cwd?: string } = {}): string {
   return runText(command, commandArgs, { cwd: options.cwd });
@@ -756,6 +762,63 @@ function finishReviewCommand(args: Args): void {
   recordCommitWorkflowEvent(lifecycle, "finalized");
 }
 
+function attestReviewCommand(args: Args): void {
+  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
+  const sha = assertSha(argString(args, "commit_sha", ""));
+  const reportPath = resolve(argString(args, "report_path", ""));
+  const lifecycle = commitLifecycle(targetRepo, sha);
+  recordCommitWorkflowEvent(lifecycle, "started");
+  try {
+    if (!existsSync(reportPath)) throw new Error("commit review report is missing");
+    const markdown = readFileSync(reportPath, "utf8");
+    const { frontMatter } = splitFrontMatter(markdown);
+    if (assertSha(String(frontMatter.sha ?? "")) !== sha) {
+      throw new Error("commit review report SHA does not match the attested commit");
+    }
+    if (
+      String(frontMatter.repository ?? "")
+        .trim()
+        .toLowerCase() !== targetRepo.toLowerCase()
+    ) {
+      throw new Error("commit review report repository does not match the attested target");
+    }
+    const reportResult = commitReviewReportResult(reportPath);
+    if (!COMMIT_REVIEW_SUCCESS_RESULTS.has(reportResult)) {
+      throw new Error(`commit review report result is not publishable: ${reportResult}`);
+    }
+    recordCommitArtifactPrepared(lifecycle, {
+      path: reportPath,
+      kind: "commit_review_report",
+    });
+    recordCommitLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.reviewCompleted,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "commit_review_attestor",
+      state: "attested",
+      reviewMode: "commit_review",
+      eventIdentity: { sha, reportResult },
+    });
+    recordCommitWorkflowEvent(lifecycle, "completed");
+  } catch (error) {
+    recordCommitLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.reviewFailed,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.validationFailed,
+      mutation: false,
+      component: "commit_review_attestor",
+      state: "attestation_failed",
+      reviewMode: "commit_review",
+      eventIdentity: { sha },
+    });
+    recordCommitWorkflowEvent(lifecycle, "failed", error);
+    throw error;
+  } finally {
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+  }
+}
+
 function commitReviewReportResult(reportPath: string): string {
   if (!reportPath || !existsSync(reportPath)) return "missing";
   try {
@@ -1236,6 +1299,7 @@ export function main(argv = process.argv.slice(2)): void {
   else if (command === "classify") classifyCommand(args);
   else if (command === "publish-check") publishCheckCommand(args);
   else if (command === "finish-review") finishReviewCommand(args);
+  else if (command === "attest-review") attestReviewCommand(args);
   else if (command === "reports") reportsCommand(args);
   else if (command === "copy-artifacts") copyArtifactsCommand(args);
   else if (command === "dispatch-findings") dispatchFindingsCommand(args);
