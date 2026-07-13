@@ -345,11 +345,10 @@ test("exact event publish and routing require a successful fresh review artifact
     "- name: Confirm terminal item remains closed",
   );
   const completeStart = eventReviewJob.indexOf("- name: Mark re-review complete", routeStart);
+  const finalizeLedgerStart = eventReviewJob.indexOf("- name: Finalize exact event action ledger");
+  const exactLedgerStart = eventReviewJob.indexOf("- name: Publish exact event action ledger");
   const failStart = eventReviewJob.indexOf("- name: Fail unsuccessful exact review");
-  const leaseCompleteStart = eventReviewJob.indexOf(
-    "- name: Complete exact-review queue lease",
-    failStart,
-  );
+  const leaseCompleteStart = eventReviewJob.indexOf("- name: Complete exact-review queue lease");
   const liveItemStep = eventReviewJob.slice(liveItemStart, buildRuntimeStart);
   const setupCodexStep = eventReviewJob.slice(setupCodexStart, exactReviewStart);
   const exactReviewStep = eventReviewJob.slice(exactReviewStart, publishStart);
@@ -360,7 +359,10 @@ test("exact event publish and routing require a successful fresh review artifact
   const reactStep = eventReviewJob.slice(reactStart, primaryResultStart);
   const releaseLeaseStep = eventReviewJob.slice(releaseLeaseStart, confirmTerminalStart);
   const confirmTerminalStep = eventReviewJob.slice(confirmTerminalStart, completeStart);
-  const failStep = eventReviewJob.slice(failStart, leaseCompleteStart);
+  const failStep = eventReviewJob.slice(
+    failStart,
+    eventReviewJob.indexOf("\n      - ", failStart + 1),
+  );
   const publisherCompleteStart = publisher.indexOf("const complete =");
   const authoritativeReset = publisher.indexOf("hardResetToRemoteMain();", publisherCompleteStart);
   const authoritativeRefresh = publisher.indexOf(
@@ -378,6 +380,10 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.ok(deferredRouteStart > routeStart);
   assert.ok(releaseLeaseStart > routeStart);
   assert.ok(confirmTerminalStart > releaseLeaseStart);
+  assert.ok(finalizeLedgerStart > primaryResultStart);
+  assert.ok(exactLedgerStart > finalizeLedgerStart);
+  assert.ok(leaseCompleteStart > exactLedgerStart);
+  assert.ok(failStart > leaseCompleteStart);
   assert.match(liveItemStep, /id: live-item/);
   assert.match(liveItemStep, /repos\/\$TARGET_REPO\/issues\/\$ITEM_NUMBER/);
   assert.match(liveItemStep, /echo "proceed=false" >> "\$GITHUB_OUTPUT"/);

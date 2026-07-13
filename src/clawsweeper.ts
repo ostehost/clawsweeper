@@ -23613,6 +23613,10 @@ function reviewRetryIdempotencySlot(
     : "retry_observation";
 }
 
+export function reviewRetryActionNeedsItemEventForTest(action: FailedReviewRetryAction): boolean {
+  return action !== "skipped_not_failed_review";
+}
+
 export function reviewRetryBatchEventDisposition(
   actions: readonly FailedReviewRetryAction[],
   failure: ReturnType<typeof actionLedgerFailureDisposition> | null = null,
@@ -23692,6 +23696,9 @@ function recordFailedReviewRetryEvents(options: {
   const operationIdentity = options.ledger.operationIdentity;
   let dispatchOutcomeUnknownEventId: string | null = null;
   for (const [index, result] of options.results.entries()) {
+    // Healthy records dominate the hourly scan. Keep their count in the batch
+    // terminal event instead of creating thousands of immutable no-op receipts.
+    if (!reviewRetryActionNeedsItemEventForTest(result.action)) continue;
     const disposition = reviewRetryActionDisposition(result.action);
     const reportMarkdown =
       result.reportPath && existsSync(result.reportPath)
