@@ -35,6 +35,7 @@ import {
   hydrateClosureRows,
   sortNewestClosureRowFirst,
 } from "./publish-tracked-rows.js";
+import { reviewedResultRevision } from "./publish-result-source.js";
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
@@ -116,6 +117,7 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
+  const reviewedTargetRevision = reviewedResultRevision(result, clusterPlan);
   const runId = String(args["run-id"] ?? inferRunId(resultPath) ?? "");
   const metadata = runId ? metadataByRunId.get(runId) : undefined;
   const previousRecord = runId ? readExistingRunRecord(root, runId) : null;
@@ -207,7 +209,7 @@ function publishResult(resultPath: string) {
       repository: repo,
       workKey: `${repo}:${clusterId}`,
       clusterId,
-      sourceRevision: headSha,
+      sourceRevision: reviewedTargetRevision,
       recordPath: path.posix.join("results", owner, `${slug(clusterId)}.md`),
     },
     {

@@ -12,6 +12,8 @@ import {
   actionSourceUrl,
   actionWorkKey,
   actionWorkKind,
+  registerActionSession,
+  updateActionSession,
   withActionSessionReceiptFinalization,
 } from "../../dist/repair/action-session.js";
 
@@ -215,9 +217,155 @@ test("normal repair sessions emit queue and plan receipts without CrabFleet cred
   }
 });
 
+test("CrabFleet registration response loss records one unknown request outcome", async () => {
+  const fixture = remoteSessionFixture("register");
+  let requests = 0;
+  try {
+    await assert.rejects(
+      registerActionSession(fixture.jobPath, {
+        fetchImpl: async () => {
+          requests += 1;
+          throw new Error("connection reset after request submission");
+        },
+      }),
+      /connection reset/,
+    );
+    assert.equal(requests, 1);
+    assertUnknownMutation(fixture.outputRoot);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("CrabFleet update response loss records one unknown request outcome", async () => {
+  const fixture = remoteSessionFixture("update");
+  fs.writeFileSync(
+    fixture.metadataPath,
+    `${JSON.stringify({
+      remoteEnabled: true,
+      repository: "openclaw/openclaw",
+      workKey: "openclaw/openclaw:repair-pr-42",
+      workKind: "pr_repair",
+      clusterId: "repair-pr-42",
+      sourceRevision: "b".repeat(40),
+      sessionId: "session-42",
+    })}\n`,
+  );
+  let requests = 0;
+  try {
+    await assert.rejects(
+      updateActionSession(
+        {
+          state: "running",
+          phase: "review",
+          summary: "Reviewing",
+          completionReason: "",
+        },
+        {
+          fetchImpl: async () => {
+            requests += 1;
+            throw new Error("socket closed after request submission");
+          },
+        },
+      ),
+      /socket closed/,
+    );
+    assert.equal(requests, 1);
+    assertUnknownMutation(fixture.outputRoot);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 function walk(root: string): string[] {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const target = path.join(root, entry.name);
     return entry.isDirectory() ? walk(target) : [target];
   });
+}
+
+function remoteSessionFixture(name: string) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `action-session-${name}-`)));
+  const outputRoot = path.join(root, "output");
+  const metadataPath = path.join(root, "action-session.json");
+  const githubEnvPath = path.join(root, "github.env");
+  const jobPath = path.join(root, "job.md");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    jobPath,
+    [
+      "---",
+      "repo: openclaw/openclaw",
+      "cluster_id: repair-pr-42",
+      "mode: execute",
+      "job_intent: pr_repair",
+      `expected_head_sha: ${"b".repeat(40)}`,
+      "allowed_actions: [fix]",
+      "candidates: [#42]",
+      "---",
+      "Repair pull request 42.",
+      "",
+    ].join("\n"),
+  );
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: name,
+    CLAWSWEEPER_ACTION_SESSION_METADATA: metadataPath,
+    CLAWSWEEPER_ACTION_SESSION_REMOTE: "1",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "agent-secret",
+    CLAWSWEEPER_CRABFLEET_OWNER: "@maintainer",
+    CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: "service-secret",
+    CLAWSWEEPER_CRABFLEET_WORK_STATE_URL: "https://crabfleet.example/work-state",
+    GITHUB_ACTION: `session_${name}`,
+    GITHUB_ENV: githubEnvPath,
+    GITHUB_JOB: "cluster",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "4242",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_WORKFLOW: "repair cluster worker",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+  });
+  return {
+    outputRoot,
+    metadataPath,
+    jobPath,
+    cleanup() {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key];
+      }
+      Object.assign(process.env, previous);
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function assertUnknownMutation(outputRoot: string): void {
+  const mutations = walk(outputRoot)
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) =>
+      fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+    )
+    .filter((event) => event.event_type === "repair.mutation");
+  assert.deepEqual(
+    mutations.map((event) => [
+      event.action.status,
+      event.attributes.completion_reason,
+      event.action.retryable,
+    ]),
+    [
+      ["started", "mutation_attempted", true],
+      ["failed", "mutation_outcome_unknown", true],
+    ],
+  );
 }

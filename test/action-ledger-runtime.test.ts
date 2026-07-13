@@ -1718,6 +1718,91 @@ test("interruption recovery preserves cancellation instead of rewriting it as ti
   assert.equal(terminal?.attributes?.completion_reason, "cancelled");
 });
 
+test("interruption recovery terminalizes generic repair and commit review starts", () => {
+  const root = tempRoot();
+  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "generic-review" });
+  for (const [component, subject] of [
+    [
+      "execute_fix_codex",
+      {
+        repository: "openclaw/openclaw",
+        kind: "pull_request" as const,
+        number: 42,
+        sourceRevision: "b".repeat(40),
+      },
+    ],
+    [
+      "commit_review",
+      {
+        repository: "openclaw/openclaw",
+        kind: "commit" as const,
+        subjectId: `commit-${"c".repeat(40)}`,
+        sourceRevision: "c".repeat(40),
+      },
+    ],
+  ] as const) {
+    const started = recordWorkflowActionEvent(
+      root,
+      {
+        scope: ACTION_EVENT_TYPES.reviewStarted,
+        identity: { component, phase: "started" },
+        operation: component,
+        operationIdentity: { component, sourceRevision: subject.sourceRevision },
+        type: ACTION_EVENT_TYPES.reviewStarted,
+        component,
+        subject,
+        action: {
+          name: ACTION_EVENT_TYPES.reviewStarted,
+          status: ACTION_EVENT_STATUSES.started,
+          retryable: false,
+          mutation: false,
+        },
+      },
+      { env: { ...env, GITHUB_ACTION: component } },
+    );
+    assert.ok(started);
+    recordWorkflowActionEvent(
+      root,
+      {
+        scope: ACTION_EVENT_TYPES.reviewLogPublication,
+        identity: { component, phase: "log" },
+        operation: component,
+        operationIdentity: { component, sourceRevision: subject.sourceRevision },
+        type: ACTION_EVENT_TYPES.reviewLogPublication,
+        component,
+        subject,
+        action: {
+          name: ACTION_EVENT_TYPES.reviewLogPublication,
+          status: ACTION_EVENT_STATUSES.published,
+          retryable: false,
+          mutation: false,
+        },
+        parentEventId: started.event_id,
+        phaseSeq: 2,
+      },
+      { env: { ...env, GITHUB_ACTION: component } },
+    );
+  }
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
+  const terminals = readAllSpooledActionEvents(root).filter(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.reviewStarted &&
+      event.action.status === ACTION_EVENT_STATUSES.failed,
+  );
+  assert.equal(terminals.length, 2);
+  assert.ok(
+    terminals.every(
+      (event) =>
+        event.attributes?.completion_reason === "timeout" &&
+        event.attributes.partial === true &&
+        event.action.retryable &&
+        !event.action.mutation,
+    ),
+  );
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+});
+
 test("workflow retries preserve operation and idempotency identity but change attempts", () => {
   const root = tempRoot();
   const input = {

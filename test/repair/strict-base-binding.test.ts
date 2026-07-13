@@ -328,7 +328,7 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       "function executeAutomerge(",
       "const result = runGitHubSpawnMutation(",
     ],
-    ["src/repair/post-flight.ts", "function finalizeFixPr(", "ghWithRetry(mergeArgs)"],
+    ["src/repair/post-flight.ts", "function finalizeFixPr(", "ghText(mergeArgs)"],
   ] as const) {
     const source = fs.readFileSync(file, "utf8");
     const start = source.indexOf(functionName);

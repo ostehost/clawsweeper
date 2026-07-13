@@ -434,7 +434,8 @@ export async function flushWorkflowActionEvents(
 function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
   return (
     workflowActionEventIsUncertainMutationStart(event) ||
-    ((event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+    ((event.event_type === ACTION_EVENT_TYPES.reviewStarted ||
+      event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
       event.event_type === ACTION_EVENT_TYPES.reviewItem ||
       event.event_type === ACTION_EVENT_TYPES.reviewRetry ||
       event.event_type === ACTION_EVENT_TYPES.applyBatch ||
@@ -478,6 +479,14 @@ function workflowActionEventClosesLifecycle(start: ActionEvent, event: ActionEve
     return (
       event.parent_event_id === start.event_id &&
       event.idempotency_key_sha256 === start.idempotency_key_sha256
+    );
+  }
+  if (start.event_type === ACTION_EVENT_TYPES.reviewStarted) {
+    return (
+      event.event_type === ACTION_EVENT_TYPES.reviewCompleted ||
+      event.event_type === ACTION_EVENT_TYPES.reviewFailed ||
+      (event.event_type === ACTION_EVENT_TYPES.reviewStarted &&
+        event.action.status !== ACTION_EVENT_STATUSES.started)
     );
   }
   if (
@@ -573,10 +582,9 @@ export function interruptOpenWorkflowActionEvents(
         );
       let written = 0;
       for (const start of starts) {
-        const lifecycleKey = workflowActionLifecycleKey(start);
         const lifecycleEvents = current.filter(
           (event) =>
-            event.event_id !== start.event_id && workflowActionLifecycleKey(event) === lifecycleKey,
+            event.event_id !== start.event_id && workflowActionEventSharesLifecycle(start, event),
         );
         if (lifecycleEvents.some((event) => workflowActionEventClosesLifecycle(start, event))) {
           continue;
@@ -753,6 +761,18 @@ function workflowActionLifecycleKey(event: ActionEvent): string {
     eventType: event.event_type,
     subject: workflowActionSubjectIdentity(event),
   });
+}
+
+function workflowActionEventSharesLifecycle(start: ActionEvent, event: ActionEvent): boolean {
+  if (start.event_type !== ACTION_EVENT_TYPES.reviewStarted) {
+    return workflowActionLifecycleKey(event) === workflowActionLifecycleKey(start);
+  }
+  return (
+    event.operation_id === start.operation_id &&
+    event.attempt_id === start.attempt_id &&
+    actionLedgerJson(workflowActionSubjectIdentity(event)) ===
+      actionLedgerJson(workflowActionSubjectIdentity(start))
+  );
 }
 
 function workflowActionSubjectIdentity(event: ActionEvent) {

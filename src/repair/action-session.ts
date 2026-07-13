@@ -14,6 +14,7 @@ import {
   recordRepairLifecycleEvent,
   recordRepairLifecycleFailureSafely,
   repairSourceRevision,
+  runRepairMutationAsync,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -127,9 +128,9 @@ async function main(): Promise<void> {
   );
 }
 
-async function registerActionSession(
+export async function registerActionSession(
   jobPath: string,
-  options: { skipRepairReceipt?: boolean } = {},
+  options: { skipRepairReceipt?: boolean; fetchImpl?: typeof fetch } = {},
 ): Promise<void> {
   if (!jobPath) throw new Error("action-session register requires a job path");
   const job = parseJob(jobPath);
@@ -164,34 +165,58 @@ async function registerActionSession(
       }
 
       if (remoteEnabled) {
+        const fetchImpl = options.fetchImpl ?? fetch;
         const serviceToken = requiredEnv("CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN");
         const baseUrl = String(
           process.env.CLAWSWEEPER_CRABFLEET_URL ?? "https://crabfleet.openclaw.ai",
         ).replace(/\/+$/, "");
-        const response = await fetch(`${baseUrl}/api/openclaw/action-sessions`, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${serviceToken}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
+        const url = `${baseUrl}/api/openclaw/action-sessions`;
+        const requestBody = {
+          workKey: actionWorkKey(job.frontmatter),
+          workKind: actionWorkKind(job.frontmatter),
+          owner: actionSessionOwner(),
+          repo: String(job.frontmatter.repo ?? ""),
+          branch: String(job.frontmatter.target_branch ?? process.env.GITHUB_REF_NAME ?? ""),
+          sourceUrl,
+          runUrl: actionRunUrl(),
+          purpose:
+            actionWorkKind(job.frontmatter) === "issue_to_pr"
+              ? "Convert issue to pull request"
+              : actionWorkKind(job.frontmatter) === "pr_repair"
+                ? "Repair pull request"
+                : "Review and repair related GitHub items",
+          summary: `GitHub Actions work for ${String(job.frontmatter.cluster_id ?? job.relativePath)}`,
+        };
+        const response = await runRepairMutationAsync(lifecycle, {
+          kind: "crabfleet_session_register",
+          identity: {
+            url,
             workKey: actionWorkKey(job.frontmatter),
             workKind: actionWorkKind(job.frontmatter),
-            owner: actionSessionOwner(),
             repo: String(job.frontmatter.repo ?? ""),
-            branch: String(job.frontmatter.target_branch ?? process.env.GITHUB_REF_NAME ?? ""),
-            sourceUrl,
-            runUrl: actionRunUrl(),
-            purpose:
-              actionWorkKind(job.frontmatter) === "issue_to_pr"
-                ? "Convert issue to pull request"
-                : actionWorkKind(job.frontmatter) === "pr_repair"
-                  ? "Repair pull request"
-                  : "Review and repair related GitHub items",
-            summary: `GitHub Actions work for ${String(job.frontmatter.cluster_id ?? job.relativePath)}`,
-          }),
+          },
+          component: "action_session",
+          operationName: "session",
+          operation: () =>
+            fetchImpl(url, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${serviceToken}`,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify(requestBody),
+            }),
+          outcome: (result) => (result.ok ? "accepted" : "rejected"),
         });
-        const body = (await response.json()) as LooseRecord;
+        const responseText = await response.text();
+        let body: LooseRecord;
+        try {
+          body = JSON.parse(responseText) as LooseRecord;
+        } catch {
+          throw new Error(
+            `CrabFleet action session registration returned invalid JSON (${response.status})`,
+          );
+        }
         if (!response.ok) {
           throw new Error(
             `CrabFleet action session registration failed (${response.status}): ${String(body.error ?? "unknown error")}`,
@@ -246,17 +271,20 @@ async function registerActionSession(
   });
 }
 
-async function updateActionSession({
-  state,
-  phase,
-  summary,
-  completionReason,
-}: {
-  state: string;
-  phase: string;
-  summary: string;
-  completionReason: string;
-}): Promise<void> {
+export async function updateActionSession(
+  {
+    state,
+    phase,
+    summary,
+    completionReason,
+  }: {
+    state: string;
+    phase: string;
+    summary: string;
+    completionReason: string;
+  },
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<void> {
   const metadata = readActionSessionMetadata();
   const lifecycle = actionSessionLifecycleFromMetadata(metadata);
   await withActionSessionReceiptFinalization(async () => {
@@ -274,18 +302,32 @@ async function updateActionSession({
       if (metadata.remoteEnabled === true) {
         const url = requiredEnv("CLAWSWEEPER_CRABFLEET_WORK_STATE_URL");
         const token = requiredEnv("CLAWSWEEPER_CRABFLEET_AGENT_TOKEN");
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
+        const requestBody = {
+          state,
+          phase,
+          summary,
+          ...(completionReason ? { completionReason } : {}),
+        };
+        const response = await runRepairMutationAsync(lifecycle, {
+          kind: "crabfleet_session_update",
+          identity: {
+            url,
+            sessionId: String(metadata.sessionId ?? ""),
             state,
             phase,
-            summary,
-            ...(completionReason ? { completionReason } : {}),
-          }),
+          },
+          component: "action_session",
+          operationName: "session",
+          operation: () =>
+            (options.fetchImpl ?? fetch)(url, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${token}`,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify(requestBody),
+            }),
+          outcome: (result) => (result.ok ? "accepted" : "rejected"),
         });
         if (!response.ok) {
           const text = await response.text();

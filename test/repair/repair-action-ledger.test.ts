@@ -149,6 +149,40 @@ test("repair mutation uncertainty survives later workflow failure", async () => 
   }
 });
 
+test("repair failure mutation truth is scoped to the supplied operation", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-operation-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+
+  try {
+    runRepairMutation(lifecycle, {
+      kind: "issue_status_comment_update",
+      identity: { repo: "openclaw/openclaw", number: 42 },
+      operationName: "status",
+      operation: () => "accepted",
+    });
+    recordRepairLifecycleFailureSafely(lifecycle, {
+      component: "issue_implementation_status",
+      operation: "dashboard",
+      error: new Error("dashboard failed before request"),
+    });
+    await flushRepairActionEvents();
+
+    const failure = readEvents(outputRoot).find(
+      (event) => event.event_type === ACTION_EVENT_TYPES.repairFailed,
+    );
+    assert.equal(failure?.action.mutation, false);
+    assert.equal(failure?.action.retryable, false);
+    assert.equal(failure?.attributes?.completion_reason, "failed");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("repair finalization turns interrupted request boundaries into unknown outcomes", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "repair-interrupted-ledger-")),

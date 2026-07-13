@@ -514,7 +514,7 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*ghWithRetry\(mergeArgs\)/,
+    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*ghText\(mergeArgs\)/,
   );
   assert.match(
     finalizeFixPr,

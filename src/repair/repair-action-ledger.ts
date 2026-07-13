@@ -44,6 +44,7 @@ export type RepairLifecycleEvent = {
   reasonCode: ActionEventReasonCode;
   mutation: boolean;
   component: string;
+  parentEventId?: string | null;
   operation?: string;
   state?: string;
   phase?: string;
@@ -127,7 +128,10 @@ export function recordRepairLifecycleEvent(
     operation,
     operationIdentity,
     attemptIdentity,
-    parentEventId: replay?.parent_event_id ?? previous?.event_id ?? null,
+    parentEventId:
+      event.parentEventId !== undefined
+        ? event.parentEventId
+        : (replay?.parent_event_id ?? previous?.event_id ?? null),
     phaseSeq,
     ...(event.idempotencyIdentity !== undefined
       ? { idempotencyIdentity: event.idempotencyIdentity }
@@ -184,7 +188,7 @@ export function runRepairMutation<T>(
     mutation: kind,
     requestSha256,
   };
-  recordRepairLifecycleEvent(input, {
+  const attemptEvent = recordRepairLifecycleEvent(input, {
     type: ACTION_EVENT_TYPES.repairMutation,
     status: ACTION_EVENT_STATUSES.started,
     reasonCode: ACTION_EVENT_REASON_CODES.selected,
@@ -214,6 +218,7 @@ export function runRepairMutation<T>(
       requestAttempt,
       idempotencyIdentity,
       operation,
+      parentEventId: attemptEvent?.event_id ?? null,
       ...(options.component ? { component: options.component } : {}),
       outcome,
     });
@@ -230,6 +235,7 @@ export function runRepairMutation<T>(
       requestAttempt,
       idempotencyIdentity,
       operation,
+      parentEventId: attemptEvent?.event_id ?? null,
       ...(options.component ? { component: options.component } : {}),
       outcome: "unknown",
     });
@@ -241,6 +247,7 @@ export function runRepairMutation<T>(
     requestAttempt,
     idempotencyIdentity,
     operation,
+    parentEventId: attemptEvent?.event_id ?? null,
     ...(options.component ? { component: options.component } : {}),
     outcome,
   });
@@ -263,7 +270,7 @@ export async function runRepairMutationAsync<T>(
     mutation: kind,
     requestSha256,
   };
-  recordRepairLifecycleEvent(input, {
+  const attemptEvent = recordRepairLifecycleEvent(input, {
     type: ACTION_EVENT_TYPES.repairMutation,
     status: ACTION_EVENT_STATUSES.started,
     reasonCode: ACTION_EVENT_REASON_CODES.selected,
@@ -285,6 +292,7 @@ export async function runRepairMutationAsync<T>(
       requestAttempt,
       idempotencyIdentity,
       operation,
+      parentEventId: attemptEvent?.event_id ?? null,
       ...(options.component ? { component: options.component } : {}),
       outcome,
     });
@@ -302,6 +310,7 @@ export async function runRepairMutationAsync<T>(
       requestAttempt,
       idempotencyIdentity,
       operation,
+      parentEventId: attemptEvent?.event_id ?? null,
       ...(options.component ? { component: options.component } : {}),
       outcome,
     });
@@ -384,7 +393,8 @@ export function recordRepairLifecycleFailure(
   input: RepairLifecycleInput,
   options: RepairLifecycleFailureOptions,
 ): void {
-  const mutationState = repairMutationState(input);
+  const operation = options.operation ?? "repair";
+  const mutationState = repairMutationState(input, operation);
   recordRepairLifecycleEvent(input, {
     type: "repair.failed",
     status: ACTION_EVENT_STATUSES.failed,
@@ -393,8 +403,8 @@ export function recordRepairLifecycleFailure(
     component: options.component,
     state: "failed",
     retryable: mutationState.uncertainMutationObserved,
-    completionReason: repairCompletionReason(input),
-    ...(options.operation ? { operation: options.operation } : {}),
+    completionReason: repairCompletionReason(input, operation),
+    operation,
     ...(options.phase ? { phase: options.phase } : {}),
     ...(options.workKind ? { workKind: options.workKind } : {}),
     eventIdentity: {
@@ -574,13 +584,16 @@ function nextRepairRequestAttempt(
   );
 }
 
-function repairMutationState(input: RepairLifecycleInput): {
+function repairMutationState(
+  input: RepairLifecycleInput,
+  operation: string = "repair",
+): {
   mutationObserved: boolean;
   uncertainMutationObserved: boolean;
 } {
   let mutationObserved = false;
   let uncertainMutationObserved = false;
-  for (const event of repairAttemptEvents(input)) {
+  for (const event of repairAttemptEvents(input, operation)) {
     if (event.event_type !== ACTION_EVENT_TYPES.repairMutation) continue;
     const completionReason = String(event.attributes?.completion_reason ?? "");
     if (
@@ -594,8 +607,8 @@ function repairMutationState(input: RepairLifecycleInput): {
   return { mutationObserved, uncertainMutationObserved };
 }
 
-function repairCompletionReason(input: RepairLifecycleInput): string {
-  const state = repairMutationState(input);
+function repairCompletionReason(input: RepairLifecycleInput, operation: string = "repair"): string {
+  const state = repairMutationState(input, operation);
   return state.uncertainMutationObserved
     ? "mutation_outcome_unknown"
     : state.mutationObserved
@@ -611,6 +624,7 @@ function recordRepairMutationOutcome(
     requestAttempt: number;
     idempotencyIdentity: unknown;
     operation: string;
+    parentEventId?: string | null;
     component?: string;
     outcome: RepairMutationOutcome;
   },
@@ -632,6 +646,7 @@ function recordRepairMutationOutcome(
     mutation: options.outcome !== "rejected",
     retryable: options.outcome === "unknown",
     component: options.component ?? "repair_mutation",
+    ...(options.parentEventId !== undefined ? { parentEventId: options.parentEventId } : {}),
     operation: options.operation,
     eventIdentity: {
       kind: options.kind,

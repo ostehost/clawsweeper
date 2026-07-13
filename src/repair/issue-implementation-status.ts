@@ -15,7 +15,7 @@ import {
   runVerifiedPublishedPullMutation,
   runVerifiedSealedSourceMutation,
 } from "./execution-handoff.js";
-import { ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
+import { ghJson, ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { parseArgs, parseJob, repoRoot } from "./lib.js";
 import {
@@ -24,6 +24,7 @@ import {
   recordRepairLifecycleFailureSafely,
   repairSourceRevision,
   runRepairMutation,
+  runRepairMutationAsync,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
 
@@ -161,7 +162,7 @@ async function main() {
       ]);
       return;
     }
-    const created = ghJsonWithRetry<LooseRecord>([
+    const created = ghJson<LooseRecord>([
       "api",
       `repos/${repo}/issues/${itemNumber}/comments`,
       "--method",
@@ -432,37 +433,51 @@ export function renderIssueImplementationStatusComment(
   return `${existing}\n\n${progress}`;
 }
 
-async function postDashboardStatus(options: StatusOptions) {
+export async function postDashboardStatus(options: StatusOptions, fetchImpl: typeof fetch = fetch) {
   const token = String(process.env.CLAWSWEEPER_STATUS_INGEST_TOKEN ?? "").trim();
   if (!token) return "skipped";
   const url =
     String(process.env.CLAWSWEEPER_STATUS_INGEST_URL ?? "").trim() ||
     "https://clawsweeper.openclaw.ai/api/events";
   const state = options.state.trim().toLowerCase();
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      event_type: eventTypeForState(state),
-      mode: "automatic-issue-to-pr",
-      stage: state.replace(/\s+/g, "_"),
-      status: eventStatusForState(state),
+  const requestBody = {
+    event_type: eventTypeForState(state),
+    mode: "automatic-issue-to-pr",
+    stage: state.replace(/\s+/g, "_"),
+    status: eventStatusForState(state),
+    repository: options.repo,
+    item_number: options.itemNumber,
+    source_item_number: options.itemNumber,
+    item_url: `https://github.com/${options.repo}/issues/${options.itemNumber}`,
+    source_item_url: `https://github.com/${options.repo}/issues/${options.itemNumber}`,
+    run_url: options.runUrl || null,
+    pr_url: options.prUrl || null,
+    title: options.title,
+    note: options.detail,
+    work_kind: "issue_to_pr",
+    automatic: true,
+    cluster_id: `issue-${repoSlug(options.repo)}-${options.itemNumber}`,
+  };
+  const response = await runRepairMutationAsync(issueStatusLifecycle(options), {
+    kind: "issue_status_dashboard_post",
+    identity: {
+      url,
       repository: options.repo,
-      item_number: options.itemNumber,
-      source_item_number: options.itemNumber,
-      item_url: `https://github.com/${options.repo}/issues/${options.itemNumber}`,
-      source_item_url: `https://github.com/${options.repo}/issues/${options.itemNumber}`,
-      run_url: options.runUrl || null,
-      pr_url: options.prUrl || null,
-      title: options.title,
-      note: options.detail,
-      work_kind: "issue_to_pr",
-      automatic: true,
-      cluster_id: `issue-${repoSlug(options.repo)}-${options.itemNumber}`,
-    }),
+      itemNumber: options.itemNumber,
+      state,
+    },
+    component: "issue_implementation_status",
+    operationName: "dashboard",
+    operation: () =>
+      fetchImpl(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+      }),
+    outcome: (result) => (result.ok ? "accepted" : "rejected"),
   });
   if (!response.ok) {
     throw new Error(`dashboard ingest returned ${response.status}: ${await response.text()}`);

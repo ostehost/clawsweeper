@@ -13,9 +13,9 @@ import {
 import { stripAnsi } from "./comment-router-utils.js";
 import { externalMessageProvenance, postMergeCloseoutComment } from "./external-messages.js";
 import {
-  ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
@@ -368,7 +368,7 @@ function finalizeFixPr(action: LooseRecord) {
           headSha: pull.head?.sha ?? null,
           method: "squash",
         },
-        () => ghWithRetry(mergeArgs),
+        () => ghText(mergeArgs),
       );
       return { policyBlock: "" };
     });
@@ -631,22 +631,25 @@ function finalizePostMergeCloseout({
   if (beforeLabelSecurityBlock) {
     return { ...base, status: "blocked", reason: beforeLabelSecurityBlock };
   }
-  runRepairMutation(postFlightLifecycle(target), {
-    kind: "closeout_label",
-    identity: { repo: result.repo, number: target, label: "clawsweeper" },
-    component: "post_flight",
-    operation: () =>
-      ghBestEffort([
-        "issue",
-        "edit",
-        String(target),
-        "--repo",
-        result.repo,
-        "--add-label",
-        "clawsweeper",
-      ]),
-    outcome: () => "unknown",
-  });
+  try {
+    runRepairMutation(postFlightLifecycle(target), {
+      kind: "closeout_label",
+      identity: { repo: result.repo, number: target, label: "clawsweeper" },
+      component: "post_flight",
+      operation: () =>
+        ghText([
+          "issue",
+          "edit",
+          String(target),
+          "--repo",
+          result.repo,
+          "--add-label",
+          "clawsweeper",
+        ]),
+    });
+  } catch {
+    // Helpful metadata must not block the verified closeout path.
+  }
   const beforeCommentSecurityBlock = freshLiveSecurityBlockReason(target);
   if (beforeCommentSecurityBlock) {
     return { ...base, status: "blocked", reason: beforeCommentSecurityBlock };
@@ -660,7 +663,7 @@ function finalizePostMergeCloseout({
       mergeCommitSha: finalized.merge_commit_sha ?? null,
     },
     () =>
-      ghWithRetry([
+      ghText([
         "issue",
         "comment",
         String(target),
@@ -685,22 +688,14 @@ function finalizePostMergeCloseout({
     runPostFlightMutation(
       "source_pull_request_closeout",
       { repo: result.repo, number: target, fixUrl },
-      () => ghWithRetry(["pr", "close", String(target), "--repo", result.repo]),
+      () => ghText(["pr", "close", String(target), "--repo", result.repo]),
     );
   } else {
     runPostFlightMutation(
       "source_issue_closeout",
       { repo: result.repo, number: target, fixUrl, reason: "completed" },
       () =>
-        ghWithRetry([
-          "issue",
-          "close",
-          String(target),
-          "--repo",
-          result.repo,
-          "--reason",
-          "completed",
-        ]),
+        ghText(["issue", "close", String(target), "--repo", result.repo, "--reason", "completed"]),
     );
   }
   const after = fetchIssue(result.repo, target);
@@ -744,22 +739,17 @@ function hasLabel(labels: LooseRecord[], wanted: string) {
 
 function labelForClawSweeperReview(repo: string, number: JsonValue) {
   ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
-  runRepairMutation(postFlightLifecycle(Number(number)), {
-    kind: "pull_request_label",
-    identity: { repo, number: Number(number), label: CLAWSWEEPER_LABEL },
-    component: "post_flight",
-    operation: () =>
-      ghBestEffort([
-        "issue",
-        "edit",
-        String(number),
-        "--repo",
-        repo,
-        "--add-label",
-        CLAWSWEEPER_LABEL,
-      ]),
-    outcome: () => "unknown",
-  });
+  try {
+    runRepairMutation(postFlightLifecycle(Number(number)), {
+      kind: "pull_request_label",
+      identity: { repo, number: Number(number), label: CLAWSWEEPER_LABEL },
+      component: "post_flight",
+      operation: () =>
+        ghText(["issue", "edit", String(number), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]),
+    });
+  } catch {
+    // Helpful metadata must not block the verified repair path.
+  }
 }
 
 function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
@@ -769,10 +759,17 @@ function ensureLabel(repo: string, name: string, color: JsonValue, description: 
       identity: { repo, name, color, description },
       component: "post_flight",
       operation: () =>
-        ghWithRetry(
-          ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
-          2,
-        ),
+        ghText([
+          "label",
+          "create",
+          name,
+          "--repo",
+          repo,
+          "--color",
+          color,
+          "--description",
+          description,
+        ]),
       knownNoMutation: (error) => /already exists/i.test(ghErrorText(error)),
     });
   } catch (error) {
