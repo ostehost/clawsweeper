@@ -520,7 +520,7 @@ jobs:
       # from worker runs are downloaded as data and handled by repair publishers.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
-      - name: Notify OpenClaw about ClawSweeper events
+      - name: Prepare durable notification claims
         if: ${{ steps.download.outputs.has_artifacts == '1' }}
         env:
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -535,22 +535,66 @@ jobs:
           pnpm run repair:notify-events -- \
             --run-id "$RUN_ID" \
             --run-record "results/runs/$RUN_ID.json" \
+            --prepare-only \
             --write-report
 
       # This workflow_run job executes trusted main-branch code only; notification
-      # checkpoints are generated locally from already verified result artifacts.
+      # claims are generated locally from already verified result artifacts and
+      # must be durable before any external delivery can begin.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
-      - name: Commit notification checkpoint
+      - name: Commit notification claims
         if: ${{ steps.download.outputs.has_artifacts == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
           set -euo pipefail
           if [ -d notifications ]; then
-            CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-state \
+            CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-claims \
               pnpm run repair:publish-main -- \
-              --message "chore: checkpoint event notifications" \
+              --message "chore: claim event notifications" \
+              --path notifications \
+              --receipt-kind repair_notification_state \
+              --max-attempts 12 \
+              --push-attempts 4
+          fi
+
+      # This workflow_run job executes trusted main-branch code only; delivery is
+      # permitted only for claims durably published by this exact run attempt.
+      # codeql[actions/untrusted-checkout/critical]
+      # lgtm[actions/untrusted-checkout/critical]
+      - name: Notify OpenClaw about ClawSweeper events
+        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1"
+          CLAWSWEEPER_OPENCLAW_HOOK_URL: ${{ secrets.CLAWSWEEPER_OPENCLAW_HOOK_URL }}
+          CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: ${{ secrets.CLAWSWEEPER_OPENCLAW_HOOK_TOKEN }}
+          CLAWSWEEPER_OPENCLAW_AGENT_ID: ${{ vars.CLAWSWEEPER_OPENCLAW_AGENT_ID || 'clawsweeper' }}
+          CLAWSWEEPER_DISCORD_TARGET: ${{ vars.CLAWSWEEPER_DISCORD_TARGET }}
+          CLAWSWEEPER_STATUS_INGEST_URL: https://clawsweeper.openclaw.ai/api/events
+          CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:notify-events -- \
+            --run-id "$RUN_ID" \
+            --run-record "results/runs/$RUN_ID.json" \
+            --write-report
+
+      # This workflow_run job executes trusted main-branch code only; accepted
+      # hook and dashboard receipts advance the already durable claim.
+      # codeql[actions/untrusted-checkout/critical]
+      # lgtm[actions/untrusted-checkout/critical]
+      - name: Commit notification receipts
+        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -d notifications ]; then
+            CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-receipts \
+              pnpm run repair:publish-main -- \
+              --message "chore: checkpoint event notification receipts" \
               --path notifications \
               --receipt-kind repair_notification_state \
               --max-attempts 12 \

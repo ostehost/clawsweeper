@@ -215,6 +215,110 @@ test("runClawSweeperEventNotifier posts hook payloads and records ledger", async
   assert.equal(ledger.notifications[0].discordTarget, "channel:123");
 });
 
+test("durable claims gate hook delivery by publication workflow attempt", async () => {
+  const makeRoot = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-claim-"));
+    fs.writeFileSync(
+      path.join(root, "repair-apply-report.json"),
+      `${JSON.stringify([
+        {
+          repo: "openclaw/openclaw",
+          target: "#123",
+          action: "close_duplicate",
+          status: "executed",
+          run_id: "987",
+          published_at: "2026-05-02T10:00:00Z",
+        },
+      ])}\n`,
+    );
+    return root;
+  };
+  const baseEnv = {
+    CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+    CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+    CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+    GITHUB_RUN_ID: "5252",
+    GITHUB_RUN_ATTEMPT: "1",
+  };
+  const ownedRoot = makeRoot();
+  const staleRoot = makeRoot();
+
+  try {
+    const prepared = await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root: ownedRoot,
+      env: baseEnv,
+      fetch: async () => {
+        throw new Error("prepare-only must not send");
+      },
+      now: () => new Date("2026-05-02T11:00:00Z"),
+      log: () => undefined,
+    });
+    assert.equal(prepared.pending, 1);
+    assert.equal(prepared.sent, 0);
+    const claim = JSON.parse(
+      fs.readFileSync(path.join(ownedRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(claim.deliveryStatus, "hook_claimed");
+    assert.equal(claim.claimRunId, "5252");
+    assert.equal(claim.claimRunAttempt, "1");
+
+    let ownedHookCalls = 0;
+    const delivered = await runClawSweeperEventNotifier(["--run-id", "987"], {
+      root: ownedRoot,
+      env: {
+        ...baseEnv,
+        CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1",
+      },
+      fetch: async () => {
+        ownedHookCalls += 1;
+        return Response.json({ runId: "hook-owned" });
+      },
+      now: () => new Date("2026-05-02T11:01:00Z"),
+      log: () => undefined,
+    });
+    assert.equal(delivered.sent, 1);
+    assert.equal(ownedHookCalls, 1);
+    const sent = JSON.parse(
+      fs.readFileSync(path.join(ownedRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(sent.deliveryStatus, "sent");
+    assert.equal(sent.claimRunId, "5252");
+    assert.equal(sent.claimRunAttempt, "1");
+
+    await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root: staleRoot,
+      env: baseEnv,
+      now: () => new Date("2026-05-02T11:00:00Z"),
+      log: () => undefined,
+    });
+    let staleHookCalls = 0;
+    const staleAttempt = await runClawSweeperEventNotifier(["--run-id", "987"], {
+      root: staleRoot,
+      env: {
+        ...baseEnv,
+        GITHUB_RUN_ATTEMPT: "2",
+        CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1",
+      },
+      fetch: async () => {
+        staleHookCalls += 1;
+        return Response.json({ runId: "must-not-send" });
+      },
+      log: () => undefined,
+    });
+    assert.equal(staleAttempt.sent, 0);
+    assert.equal(staleAttempt.skipped, 1);
+    assert.equal(staleHookCalls, 0);
+    const retainedClaim = JSON.parse(
+      fs.readFileSync(path.join(staleRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(retainedClaim.deliveryStatus, "hook_claimed");
+    assert.equal(retainedClaim.claimRunAttempt, "1");
+  } finally {
+    fs.rmSync(ownedRoot, { recursive: true, force: true });
+    fs.rmSync(staleRoot, { recursive: true, force: true });
+  }
+});
+
 test("permanent hook rejection records a terminal no-mutation notification", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-hook-rejected-")),

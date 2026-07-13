@@ -23,7 +23,7 @@ import {
 
 type EventSeverity = "info" | "warning" | "error";
 type EventStatus = "sent" | "planned" | "failed" | "skipped";
-type EventDeliveryStatus = "hook_accepted" | "sent";
+type EventDeliveryStatus = "hook_claimed" | "hook_accepted" | "sent";
 type DashboardIngestConfig = {
   url: string;
   token: string;
@@ -53,6 +53,8 @@ export type ClawSweeperEventLedgerEntry = ClawSweeperEvent & {
   hookRunId: string | null;
   discordTarget: string | null;
   deliveryStatus: EventDeliveryStatus;
+  claimRunId: string | null;
+  claimRunAttempt: string | null;
   dashboardNotifiedAt: string | null;
 };
 
@@ -285,16 +287,21 @@ export function addEventLedgerEntry(
     hookRunId: string | null;
     discordTarget: string | null;
     deliveryStatus?: EventDeliveryStatus;
+    claimRunId?: string | null;
+    claimRunAttempt?: string | null;
     dashboardNotifiedAt?: string | null;
   },
 ): ClawSweeperEventLedger {
   const existing = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
+  const previous = existing.get(event.key);
   existing.set(event.key, {
     ...event,
     notifiedAt: result.notifiedAt,
     hookRunId: result.hookRunId,
     discordTarget: result.discordTarget,
     deliveryStatus: result.deliveryStatus ?? "sent",
+    claimRunId: result.claimRunId ?? previous?.claimRunId ?? null,
+    claimRunAttempt: result.claimRunAttempt ?? previous?.claimRunAttempt ?? null,
     dashboardNotifiedAt: result.dashboardNotifiedAt ?? null,
   });
   return {
@@ -341,13 +348,16 @@ export async function runClawSweeperEventNotifier(
   const now = runtime.now ?? (() => new Date());
   const inputPath = path.resolve(root, stringArg(args.input) ?? DEFAULT_INPUT_PATH);
   const ledgerPath = path.resolve(root, stringArg(args.ledger) ?? DEFAULT_LEDGER_PATH);
-  const reportPath = path.resolve(root, stringArg(args.report) ?? DEFAULT_REPORT_PATH);
   const runRecordArg = stringArg(args["run-record"]);
   const runRecordPath = runRecordArg ? path.resolve(root, runRecordArg) : null;
   const runId = stringArg(args["run-id"]) ?? env.RUN_ID ?? env.GITHUB_RUN_ID;
   const dryRun = Boolean(args["dry-run"] || env.CLAWSWEEPER_EVENT_NOTIFY_DRY_RUN === "1");
+  const prepareOnly = Boolean(args["prepare-only"]);
+  const requireDurableClaim = env.CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM === "1";
   const strict = Boolean(args.strict || env.CLAWSWEEPER_EVENT_NOTIFY_STRICT === "1");
   const dashboardConfig = resolveDashboardIngestConfig(env);
+  const claimOwner =
+    prepareOnly || requireDurableClaim ? requiredClaimOwner(env) : optionalClaimOwner(env);
 
   if (!fs.existsSync(inputPath) && (!runRecordPath || !fs.existsSync(runRecordPath))) {
     const summary = summaryRow("skipped", 0, 0, 0, 0, 0, "event sources missing");
@@ -378,6 +388,77 @@ export async function runClawSweeperEventNotifier(
     return summary;
   }
 
+  if (prepareOnly) {
+    const reportActions: JsonObject[] = [...collected.skipped];
+    let nextLedger = ledger;
+    let prepared = 0;
+    const existingNotifications = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
+    for (const event of collected.events) {
+      const ledgerInput = eventNotificationLedgerInput(event);
+      const existing = existingNotifications.get(event.key);
+      if (existing) {
+        recordNotificationPhaseSafely(ledgerInput, "skipped", "durable_claim_exists");
+        reportActions.push(
+          reportRow(
+            event,
+            "skipped",
+            existing.deliveryStatus === "hook_claimed"
+              ? "notification already durably claimed"
+              : `notification already checkpointed as ${existing.deliveryStatus}`,
+            existing.hookRunId,
+          ),
+        );
+        continue;
+      }
+      if (dryRun) {
+        recordNotificationPhase(ledgerInput, "planned", "dry_run");
+        reportActions.push(reportRow(event, "planned", "dry run"));
+        continue;
+      }
+      recordNotificationPhase(ledgerInput, "planned", "durable_claim");
+      const claimedAt = now().toISOString();
+      nextLedger = addEventLedgerEntry(nextLedger, event, {
+        notifiedAt: claimedAt,
+        hookRunId: null,
+        discordTarget: config.discordTarget,
+        deliveryStatus: "hook_claimed",
+        claimRunId: claimOwner?.runId ?? null,
+        claimRunAttempt: claimOwner?.runAttempt ?? null,
+      });
+      existingNotifications.set(
+        event.key,
+        nextLedger.notifications.find((entry) => entry.key === event.key)!,
+      );
+      reportActions.push(reportRow(event, "planned", "durable hook claim prepared"));
+      prepared += 1;
+    }
+    if (prepared > 0) writeJsonFile(ledgerPath, nextLedger);
+    writeEventReportIfRequested({
+      args,
+      now,
+      root,
+      inputPath,
+      runRecordPath,
+      ledgerPath,
+      runId,
+      dryRun,
+      considered: collected.considered,
+      pending: collected.events.length,
+      actions: reportActions,
+    });
+    const summary = summaryRow(
+      "ok",
+      collected.considered,
+      collected.events.length,
+      0,
+      0,
+      reportActions.filter((action) => action.status === "skipped").length,
+      null,
+    );
+    log(JSON.stringify({ ...summary, prepared }, null, 2));
+    return summary;
+  }
+
   const reportActions: JsonObject[] = [...collected.skipped];
   let nextLedger = ledger;
   const existingNotifications = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
@@ -397,6 +478,32 @@ export async function runClawSweeperEventNotifier(
       const existing = existingNotifications.get(event.key);
       let hookRunId = existing?.deliveryStatus === "hook_accepted" ? existing.hookRunId : null;
       const reusedHookCheckpoint = existing?.deliveryStatus === "hook_accepted";
+      const ownsDurableClaim =
+        existing?.deliveryStatus === "hook_claimed" &&
+        existing.claimRunId === claimOwner?.runId &&
+        existing.claimRunAttempt === claimOwner?.runAttempt;
+      if (existing?.deliveryStatus === "hook_claimed" && (!claimOwner || !ownsDurableClaim)) {
+        recordNotificationPhaseSafely(
+          ledgerInput,
+          "skipped",
+          "durable_claim_owned_by_prior_attempt",
+        );
+        reportActions.push(
+          reportRow(
+            event,
+            "skipped",
+            "durable hook claim belongs to another workflow attempt; delivery outcome unknown",
+          ),
+        );
+        continue;
+      }
+      if (requireDurableClaim && !reusedHookCheckpoint && !ownsDurableClaim) {
+        recordNotificationPhaseSafely(ledgerInput, "skipped", "durable_claim_required");
+        reportActions.push(
+          reportRow(event, "skipped", "durable hook claim is required before delivery"),
+        );
+        continue;
+      }
       if (!reusedHookCheckpoint) {
         const result = await postOpenClawAgentHook({
           config,
@@ -474,24 +581,19 @@ export async function runClawSweeperEventNotifier(
     }
   }
 
-  if (reportActions.length > 0 || Boolean(args["write-report"])) {
-    writeJsonFile(reportPath, {
-      version: 1,
-      generated_at: now().toISOString(),
-      input: fs.existsSync(inputPath) ? path.relative(root, inputPath) : null,
-      run_record:
-        runRecordPath && fs.existsSync(runRecordPath) ? path.relative(root, runRecordPath) : null,
-      ledger: path.relative(root, ledgerPath),
-      dry_run: dryRun,
-      run_id: runId ?? null,
-      considered: collected.considered,
-      pending: collected.events.length,
-      sent: reportActions.filter((action) => action.status === "sent").length,
-      failed: reportActions.filter((action) => action.status === "failed").length,
-      skipped: reportActions.filter((action) => action.status === "skipped").length,
-      actions: reportActions,
-    });
-  }
+  writeEventReportIfRequested({
+    args,
+    now,
+    root,
+    inputPath,
+    runRecordPath,
+    ledgerPath,
+    runId,
+    dryRun,
+    considered: collected.considered,
+    pending: collected.events.length,
+    actions: reportActions,
+  });
 
   const failed = reportActions.filter((action) => action.status === "failed").length;
   const summary = {
@@ -526,6 +628,20 @@ function resolveDashboardIngestConfig(env: NodeJS.ProcessEnv): DashboardIngestCo
     stringOrNull(env.CLAWSWEEPER_STATUS_INGEST_URL) ??
     `${trimTrailingSlash(stringOrNull(env.CLAWSWEEPER_STATUS_URL) ?? "https://clawsweeper.openclaw.ai")}/api/events`;
   return { url, token };
+}
+
+function optionalClaimOwner(env: NodeJS.ProcessEnv): { runId: string; runAttempt: string } | null {
+  const runId = stringOrNull(env.GITHUB_RUN_ID);
+  const runAttempt = stringOrNull(env.GITHUB_RUN_ATTEMPT);
+  return runId && runAttempt ? { runId, runAttempt } : null;
+}
+
+function requiredClaimOwner(env: NodeJS.ProcessEnv): { runId: string; runAttempt: string } {
+  const owner = optionalClaimOwner(env);
+  if (!owner) {
+    throw new Error("durable notification claims require GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT");
+  }
+  return owner;
 }
 
 async function postStatusDashboardEvent({
@@ -701,13 +817,15 @@ function normalizeLedgerEntry(row: JsonObject): ClawSweeperEventLedgerEntry | nu
     deliveryStatus: normalizeDeliveryStatus(
       stringOrNull(row.deliveryStatus) ?? stringOrNull(row.delivery_status),
     ),
+    claimRunId: stringOrNull(row.claimRunId) ?? stringOrNull(row.claim_run_id),
+    claimRunAttempt: stringOrNull(row.claimRunAttempt) ?? stringOrNull(row.claim_run_attempt),
     dashboardNotifiedAt:
       stringOrNull(row.dashboardNotifiedAt) ?? stringOrNull(row.dashboard_notified_at),
   };
 }
 
 function normalizeDeliveryStatus(value: string | null): EventDeliveryStatus {
-  return value === "hook_accepted" ? value : "sent";
+  return value === "hook_claimed" || value === "hook_accepted" ? value : "sent";
 }
 
 function normalizeSeverity(value: JsonValue): EventSeverity {
@@ -758,6 +876,51 @@ function summaryRow(
   reason: string | null,
 ): ClawSweeperEventNotifierSummary {
   return { status, considered, pending, sent, failed, skipped, exitCode: 0, reason };
+}
+
+function writeEventReportIfRequested({
+  args,
+  now,
+  root,
+  inputPath,
+  runRecordPath,
+  ledgerPath,
+  runId,
+  dryRun,
+  considered,
+  pending,
+  actions,
+}: {
+  args: Record<string, JsonValue>;
+  now: () => Date;
+  root: string;
+  inputPath: string;
+  runRecordPath: string | null;
+  ledgerPath: string;
+  runId: string | undefined;
+  dryRun: boolean;
+  considered: number;
+  pending: number;
+  actions: JsonObject[];
+}): void {
+  if (actions.length === 0 && !Boolean(args["write-report"])) return;
+  const reportPath = path.resolve(root, stringArg(args.report) ?? DEFAULT_REPORT_PATH);
+  writeJsonFile(reportPath, {
+    version: 1,
+    generated_at: now().toISOString(),
+    input: fs.existsSync(inputPath) ? path.relative(root, inputPath) : null,
+    run_record:
+      runRecordPath && fs.existsSync(runRecordPath) ? path.relative(root, runRecordPath) : null,
+    ledger: path.relative(root, ledgerPath),
+    dry_run: dryRun,
+    run_id: runId ?? null,
+    considered,
+    pending,
+    sent: actions.filter((action) => action.status === "sent").length,
+    failed: actions.filter((action) => action.status === "failed").length,
+    skipped: actions.filter((action) => action.status === "skipped").length,
+    actions,
+  });
 }
 
 function writeJsonFile(filePath: string, value: JsonValue) {

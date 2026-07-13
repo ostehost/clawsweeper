@@ -122,22 +122,33 @@ test("repair result publication rejects untrusted worker heads before minting wr
   assert.match(classification, /! git merge-base --is-ancestor "\$WORKER_HEAD_SHA"[\s\S]*exit 1/);
 });
 
-test("repair event notifications publish their checkpoint before result state", () => {
+test("repair event notifications publish durable claims before delivery and receipts", () => {
   const workflow = readText(".github/workflows/repair-publish-results.yml");
+  const prepareIndex = workflow.indexOf("- name: Prepare durable notification claims");
+  const claimIndex = workflow.indexOf("- name: Commit notification claims");
   const notifyIndex = workflow.indexOf("- name: Notify OpenClaw about ClawSweeper events");
-  const checkpointIndex = workflow.indexOf("- name: Commit notification checkpoint");
+  const receiptIndex = workflow.indexOf("- name: Commit notification receipts");
   const resultIndex = workflow.indexOf("- name: Commit result ledger");
-  const checkpoint = workflow.slice(checkpointIndex, resultIndex);
+  const prepare = workflow.slice(prepareIndex, claimIndex);
+  const claim = workflow.slice(claimIndex, notifyIndex);
+  const notify = workflow.slice(notifyIndex, receiptIndex);
+  const receipt = workflow.slice(receiptIndex, resultIndex);
   const result = workflow.slice(
     resultIndex,
     workflow.indexOf("- name: Finalize repair publication"),
   );
 
-  assert.ok(notifyIndex >= 0);
-  assert.ok(notifyIndex < checkpointIndex);
-  assert.ok(checkpointIndex < resultIndex);
-  assert.match(checkpoint, /--path notifications/);
-  assert.match(checkpoint, /--receipt-kind repair_notification_state/);
+  assert.ok(prepareIndex >= 0);
+  assert.ok(prepareIndex < claimIndex);
+  assert.ok(claimIndex < notifyIndex);
+  assert.ok(notifyIndex < receiptIndex);
+  assert.ok(receiptIndex < resultIndex);
+  assert.match(prepare, /--prepare-only/);
+  assert.match(claim, /--path notifications/);
+  assert.match(claim, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-claims/);
+  assert.match(notify, /CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1"/);
+  assert.match(receipt, /--path notifications/);
+  assert.match(receipt, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-receipts/);
   assert.doesNotMatch(result, /--path notifications/);
 });
 
