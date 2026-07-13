@@ -140,6 +140,7 @@ import {
   writePayload,
   writeReportFile,
 } from "./comment-router-utils.js";
+import { guardAutomergeMergeDispatch } from "./comment-router-merge-dispatch.js";
 import {
   DEFAULT_TRUSTED_BOTS,
   forcedReplayCommandFields,
@@ -4033,8 +4034,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   let dispatchedClaimMutationAt = mergeClaim.lastClaimMutationAt;
   let squashCommitProof: SquashMergeCommitProof | undefined;
   const dispatchBoundaryState: {
-    reviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
-  } = { reviewActivityBlock: null };
+    preMarkerReviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
+    dispatchedAbortAction: LooseRecord | null;
+  } = { preMarkerReviewActivityBlock: null, dispatchedAbortAction: null };
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4056,21 +4058,36 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       {},
       {
         beforeDispatch: () => {
-          dispatchBoundaryState.reviewActivityBlock =
+          dispatchBoundaryState.preMarkerReviewActivityBlock =
             trustedAutomergeReviewActivityBlockReason(command);
-          if (dispatchBoundaryState.reviewActivityBlock) {
-            throw new Error(dispatchBoundaryState.reviewActivityBlock.reason);
+          if (dispatchBoundaryState.preMarkerReviewActivityBlock) {
+            throw new Error(dispatchBoundaryState.preMarkerReviewActivityBlock.reason);
           }
-          const dispatchBoundary = markAutomergeMergeClaimDispatched(
-            command,
-            mergeClaim.claimId,
-            expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
-          );
-          if (dispatchBoundary.status !== "dispatched") {
-            throw new Error(dispatchBoundary.reason);
+          const dispatchGuard = guardAutomergeMergeDispatch({
+            markDispatched: () =>
+              markAutomergeMergeClaimDispatched(
+                command,
+                mergeClaim.claimId,
+                expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
+              ),
+            reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
+            rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
+          });
+          if (dispatchGuard.status === "marker_failed") {
+            throw new Error(dispatchGuard.reason);
           }
-          dispatchedClaimMutationId = dispatchBoundary.lastClaimMutationId;
-          dispatchedClaimMutationAt = dispatchBoundary.lastClaimMutationAt;
+          dispatchedClaimMutationId = dispatchGuard.dispatch.lastClaimMutationId;
+          dispatchedClaimMutationAt = dispatchGuard.dispatch.lastClaimMutationAt;
+          if (dispatchGuard.status === "aborted") {
+            dispatchBoundaryState.dispatchedAbortAction = {
+              action: "merge",
+              ...dispatchGuard.action,
+              merge_method: "squash",
+              transient_wait_ms: waitedMs,
+              transient_observations: transientObservations,
+            };
+            throw new Error(dispatchGuard.action.reason);
+          }
         },
         onDispatchStart: () => {
           mergeRequestStarted = true;
@@ -4108,7 +4125,10 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     );
   } catch (error) {
     if (!mergeRequestStarted) {
-      const dispatchReviewActivityBlock = dispatchBoundaryState.reviewActivityBlock;
+      if (dispatchBoundaryState.dispatchedAbortAction) {
+        return dispatchBoundaryState.dispatchedAbortAction;
+      }
+      const dispatchReviewActivityBlock = dispatchBoundaryState.preMarkerReviewActivityBlock;
       return releaseBeforeDispatch({
         action: "merge",
         status: dispatchReviewActivityBlock

@@ -252,7 +252,7 @@ test("trusted verdict automerge rechecks reviewed PR activity around the merge c
   assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
 });
 
-test("trusted verdict activity arriving after claim preflight retires the claim before merge dispatch", () => {
+test("trusted verdict activity is checked on both sides of durable dispatch marking", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(
     source.indexOf("function executeAutomerge("),
@@ -268,24 +268,28 @@ test("trusted verdict activity arriving after claim preflight retires the claim 
     preDispatchCatch,
     executeAutomerge.indexOf("return reconcileClaimedAutomergeRequest(", preDispatchCatch),
   );
-  const activityCheck = dispatchBoundary.indexOf(
+  const preMarkerActivityCheck = dispatchBoundary.indexOf(
     "trustedAutomergeReviewActivityBlockReason(command)",
   );
-  const activityFailure = dispatchBoundary.indexOf(
-    "throw new Error(dispatchBoundaryState.reviewActivityBlock.reason)",
+  const guard = dispatchBoundary.indexOf("guardAutomergeMergeDispatch({");
+  const claimDispatch = dispatchBoundary.indexOf("markDispatched: () =>");
+  const postMarkerActivityCheck = dispatchBoundary.indexOf(
+    "reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command)",
   );
-  const claimDispatch = dispatchBoundary.indexOf("markAutomergeMergeClaimDispatched(");
+  const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
 
-  assert.ok(activityCheck >= 0);
-  assert.ok(activityFailure > activityCheck);
-  assert.ok(claimDispatch > activityFailure);
+  assert.ok(preMarkerActivityCheck >= 0);
+  assert.ok(guard > preMarkerActivityCheck);
+  assert.ok(claimDispatch > guard);
+  assert.ok(postMarkerActivityCheck > claimDispatch);
+  assert.ok(reject > postMarkerActivityCheck);
   assert.match(
     executeAutomerge,
-    /const dispatchBoundaryState: \{[\s\S]*reviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;[\s\S]*\} = \{ reviewActivityBlock: null \};/,
+    /const dispatchBoundaryState: \{[\s\S]*preMarkerReviewActivityBlock:[\s\S]*dispatchedAbortAction: LooseRecord \| null;[\s\S]*\}/,
   );
   assert.match(
     preDispatchFailure,
-    /const dispatchReviewActivityBlock = dispatchBoundaryState\.reviewActivityBlock;[\s\S]*releaseBeforeDispatch\([\s\S]*status: dispatchReviewActivityBlock[\s\S]*dispatchReviewActivityBlock\.retryable[\s\S]*reason:[\s\S]*dispatchReviewActivityBlock\?\.reason/,
+    /if \(dispatchBoundaryState\.dispatchedAbortAction\) \{[\s\S]*return dispatchBoundaryState\.dispatchedAbortAction;[\s\S]*const dispatchReviewActivityBlock = dispatchBoundaryState\.preMarkerReviewActivityBlock;[\s\S]*releaseBeforeDispatch/,
   );
   assert.match(
     source,
