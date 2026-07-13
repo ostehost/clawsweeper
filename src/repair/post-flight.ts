@@ -13,9 +13,9 @@ import {
 import { stripAnsi } from "./comment-router-utils.js";
 import { externalMessageProvenance, postMergeCloseoutComment } from "./external-messages.js";
 import {
-  ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
@@ -31,6 +31,15 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import {
+  recordRepairMutationObservedSafely,
+  recordRepairWorkflowEvent,
+  repairSourceRevision,
+  repairWorkflowTerminalPhase,
+  runRepairMutation,
+  type RepairLifecycleInput,
+  type RepairWorkflowPhase,
+} from "./repair-action-ledger.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -91,6 +100,13 @@ if (result.cluster_id !== job.frontmatter.cluster_id) {
 if (!["execute", "autonomous"].includes(result.mode)) {
   throw new Error(`refusing post-flight: result mode is ${result.mode}`);
 }
+recordPostFlightWorkflowEventSafely("started");
+process.on("uncaughtExceptionMonitor", (error) => {
+  recordPostFlightWorkflowEventSafely("failed", error);
+});
+process.on("exit", () => {
+  recordPostFlightWorkflowEventSafely("finalized");
+});
 
 const fixReport = readSiblingJson(resultPath, "fix-execution-report.json");
 const report: LooseRecord = {
@@ -171,6 +187,7 @@ function finalizeFixPr(action: LooseRecord) {
 
     const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
     if (mergedAt) {
+      recordPostFlightMergeObserved(parsed.number, pull.head?.sha);
       return {
         ...prBase,
         status: "executed",
@@ -241,8 +258,22 @@ function finalizeFixPr(action: LooseRecord) {
     bodyFile,
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
+  let merged;
   try {
-    ghWithRetry(mergeArgs);
+    const mergeAttempt = runRepairMutation(postFlightLifecycle(parsed.number, "pull_request"), {
+      kind: "post_flight_merge",
+      identity: postFlightMergeMutationIdentity(parsed.number, pull.head?.sha),
+      component: "post_flight",
+      operation: () => {
+        const output = ghText(mergeArgs);
+        return {
+          output,
+          pull: fetchPullRequest(result.repo, parsed.number),
+        };
+      },
+      outcome: (attempt) => (attempt.pull.merged_at ? "accepted" : "unknown"),
+    });
+    merged = mergeAttempt.pull;
   } catch (error) {
     const detail = ghErrorText(error);
     if (isRecoverableMergeRace(detail)) {
@@ -260,7 +291,6 @@ function finalizeFixPr(action: LooseRecord) {
     }
     throw error;
   }
-  const merged = fetchPullRequest(result.repo, parsed.number);
   return {
     ...prBase,
     status: "executed",
@@ -396,35 +426,72 @@ function finalizePostMergeCloseout({
     };
   }
 
-  ghBestEffort([
-    "issue",
-    "edit",
-    String(target),
-    "--repo",
-    result.repo,
-    "--add-label",
-    "clawsweeper",
-  ]);
-  ghWithRetry([
-    "issue",
-    "comment",
-    String(target),
-    "--repo",
-    result.repo,
-    "--body",
-    postMergeCloseoutComment({
-      actionName,
+  const targetKind = live.pull_request ? "pull_request" : "issue";
+  try {
+    runPostFlightMutation(
+      "closeout_label",
+      { repo: result.repo, number: target, label: CLAWSWEEPER_LABEL },
+      () =>
+        ghText([
+          "issue",
+          "edit",
+          String(target),
+          "--repo",
+          result.repo,
+          "--add-label",
+          CLAWSWEEPER_LABEL,
+        ]),
+      target,
+      targetKind,
+    );
+  } catch {
+    // Helpful metadata must not block the closeout path.
+  }
+  runPostFlightMutation(
+    "closeout_comment",
+    {
+      repo: result.repo,
+      number: target,
       fixUrl,
-      provenance: externalMessageProvenance({
-        reviewedSha:
-          finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
-      }),
-    }),
-  ]);
+      mergeCommitSha: finalized.merge_commit_sha ?? null,
+    },
+    () =>
+      ghText([
+        "issue",
+        "comment",
+        String(target),
+        "--repo",
+        result.repo,
+        "--body",
+        postMergeCloseoutComment({
+          actionName,
+          fixUrl,
+          provenance: externalMessageProvenance({
+            reviewedSha:
+              finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
+          }),
+        }),
+      ]),
+    target,
+    targetKind,
+  );
   if (live.pull_request) {
-    ghWithRetry(["pr", "close", String(target), "--repo", result.repo]);
+    runPostFlightMutation(
+      "source_pull_request_closeout",
+      postFlightSourceCloseIdentity({ target, fixUrl, pullRequest: true }),
+      () => ghText(["pr", "close", String(target), "--repo", result.repo]),
+      target,
+      "pull_request",
+    );
   } else {
-    ghWithRetry(["issue", "close", String(target), "--repo", result.repo, "--reason", "completed"]);
+    runPostFlightMutation(
+      "source_issue_closeout",
+      postFlightSourceCloseIdentity({ target, fixUrl, pullRequest: false }),
+      () =>
+        ghText(["issue", "close", String(target), "--repo", result.repo, "--reason", "completed"]),
+      target,
+      "issue",
+    );
   }
   const after = fetchIssue(result.repo, target);
   return {
@@ -435,6 +502,91 @@ function finalizePostMergeCloseout({
     live_state: after.state,
     merge_commit_sha: finalized.merge_commit_sha ?? null,
   };
+}
+
+function postFlightMergeMutationIdentity(number: number, headSha: JsonValue) {
+  return {
+    repo: result.repo,
+    number,
+    headSha: String(headSha ?? "") || null,
+    method: "squash",
+  };
+}
+
+function recordPostFlightMergeObserved(number: number, headSha: JsonValue) {
+  recordRepairMutationObservedSafely(postFlightLifecycle(number, "pull_request"), {
+    kind: "post_flight_merge",
+    identity: postFlightMergeMutationIdentity(number, headSha),
+    component: "post_flight",
+  });
+}
+
+function postFlightSourceCloseIdentity({
+  target,
+  fixUrl,
+  pullRequest,
+}: {
+  target: number;
+  fixUrl: string;
+  pullRequest: boolean;
+}) {
+  return {
+    repo: result.repo,
+    number: target,
+    fixUrl,
+    ...(pullRequest ? {} : { reason: "completed" }),
+  };
+}
+
+function postFlightLifecycle(
+  number: number | null,
+  subjectKind: "pull_request" | "issue" | "workflow" = number ? "issue" : "workflow",
+): RepairLifecycleInput {
+  return {
+    repository: result.repo,
+    workKey: `post-flight:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
+    clusterId: result.cluster_id ?? null,
+    ...(number && number > 0 ? { number } : {}),
+    sourceRevision:
+      repairSourceRevision(job.frontmatter) ??
+      repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
+    subjectKind,
+    subjectId:
+      number && number > 0
+        ? `${subjectKind.replace("_", "-")}-${number}`
+        : `post-flight-${result.cluster_id ?? "unknown"}`,
+  };
+}
+
+function recordPostFlightWorkflowEventSafely(phase: RepairWorkflowPhase, error?: unknown) {
+  try {
+    recordRepairWorkflowEvent(postFlightLifecycle(null), {
+      component: "post_flight",
+      phase,
+      ...(error === undefined ? {} : { error }),
+    });
+  } catch (receiptError) {
+    console.error(
+      `[action-ledger] failed to record post-flight workflow ${phase}: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
+}
+
+function runPostFlightMutation<T>(
+  kind: string,
+  identity: unknown,
+  operation: () => T,
+  number: number | null = null,
+  subjectKind: "pull_request" | "issue" | "workflow" = number ? "issue" : "workflow",
+): T {
+  return runRepairMutation(postFlightLifecycle(number, subjectKind), {
+    kind,
+    identity,
+    component: "post_flight",
+    operation,
+  });
 }
 
 function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
@@ -467,15 +619,39 @@ function hasLabel(labels: LooseRecord[], wanted: string) {
 
 function labelForClawSweeperReview(repo: string, number: JsonValue) {
   ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
-  ghBestEffort(["issue", "edit", String(number), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]);
+  try {
+    runRepairMutation(postFlightLifecycle(Number(number), "pull_request"), {
+      kind: "pull_request_label",
+      identity: { repo, number: Number(number), label: CLAWSWEEPER_LABEL },
+      component: "post_flight",
+      operation: () =>
+        ghText(["issue", "edit", String(number), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]),
+    });
+  } catch {
+    // Helpful metadata must not block the repair path.
+  }
 }
 
 function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
   try {
-    ghWithRetry(
-      ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
-      2,
-    );
+    runRepairMutation(postFlightLifecycle(null), {
+      kind: "repository_label_create",
+      identity: { repo, name, color, description },
+      component: "post_flight",
+      operation: () =>
+        ghText([
+          "label",
+          "create",
+          name,
+          "--repo",
+          repo,
+          "--color",
+          color,
+          "--description",
+          description,
+        ]),
+      knownNoMutation: (error) => /already exists/i.test(ghErrorText(error)),
+    });
   } catch (error) {
     if (!/already exists/i.test(ghErrorText(error))) return;
   }
@@ -771,9 +947,11 @@ function readSiblingJson(resultPath: string, name: string) {
 }
 
 function writeReport(report: LooseRecord, resultPath: string) {
+  const finalReport = report;
   const reportPath = path.join(path.dirname(resultPath), "post-flight-report.json");
-  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-  console.log(JSON.stringify(report, null, 2));
+  fs.writeFileSync(reportPath, `${JSON.stringify(finalReport, null, 2)}\n`);
+  recordPostFlightWorkflowEventSafely(repairWorkflowTerminalPhase(finalReport));
+  console.log(JSON.stringify(finalReport, null, 2));
 }
 
 function normalizeIssueRef(value: JsonValue) {
