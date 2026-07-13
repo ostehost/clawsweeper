@@ -206,19 +206,10 @@ jobs:
             fi
           else
             legacy_unsealed=true
-            canonical_report="$CLAWSWEEPER_STATE_DIR/$report_path"
-            if [ -f "$canonical_report" ]; then
-              report_repo="openclaw/clawsweeper-state"
-              report_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
-              report_sha256="$(sha256sum "$canonical_report" | cut -d' ' -f1)"
-              report_url=""
-              echo "::notice title=Legacy commit finding payload rebound::Pinned $report_path to state revision $report_revision."
-            else
-              processable=false
-              report_repo="openclaw/clawsweeper-state"
-              report_url=""
-              echo "::warning title=Legacy commit finding skipped::No canonical report exists at $report_path; recording a non-repair audit."
-            fi
+            processable=false
+            report_repo="openclaw/clawsweeper-state"
+            report_url=""
+            echo "::warning title=Legacy commit finding skipped::The dispatch has no immutable report identity; recording a non-repair audit."
           fi
           {
             echo "payload_version=$payload_version"
@@ -273,7 +264,7 @@ jobs:
           # Commit Finding ${sha.slice(0, 12)}
 
           - Decision: \`legacy_report_unsealed\`
-          - Reason: delayed legacy dispatch had no immutable report identity and no canonical state report
+          - Reason: delayed legacy dispatch had no immutable report identity
           - Job: none
           - Run dir: none
           `;
@@ -290,7 +281,7 @@ jobs:
             status: "legacy_report_unsealed",
             should_repair: "false",
             reason:
-              "delayed legacy dispatch had no immutable report identity and no canonical state report",
+              "delayed legacy dispatch had no immutable report identity",
             audit_path: auditPath,
             job_path: "",
             run_dir: "",

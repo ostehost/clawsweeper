@@ -264,6 +264,17 @@ function finalizeFixPr(action: LooseRecord) {
       return { ...prBase, status: "blocked", reason: existingMerge.block };
     }
     if (existingMerge.mergedAt) {
+      const mergeOwned = existingClaim.status === "existing" && existingClaim.dispatched === true;
+      if (!mergeOwned) {
+        return {
+          ...prBase,
+          status: "skipped",
+          reason: "already merged without a dispatched ClawSweeper claim",
+          merged_at: existingMerge.mergedAt,
+          merge_commit_sha: pull.merge_commit_sha ?? null,
+          waited_ms: waitedMs,
+        };
+      }
       recordPostFlightMergeObserved(parsed.number, action.commit);
       return {
         ...prBase,

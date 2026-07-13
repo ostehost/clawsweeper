@@ -236,7 +236,11 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("finalized"\)/);
   assert.match(
     postFlight,
-    /recordPostFlightWorkflowEventSafely\(repairWorkflowTerminalPhase\(finalReport\)\)/,
+    /recordPostFlightWorkflowEventSafely\(repairWorkflowTerminalPhase\(report\)\)/,
+  );
+  assert.match(
+    postFlight,
+    /if \(!mergeOwned\) \{[\s\S]*status: "skipped"[\s\S]*already merged without a dispatched ClawSweeper claim/,
   );
 });
 

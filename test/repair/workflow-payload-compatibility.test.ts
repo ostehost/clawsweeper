@@ -137,7 +137,7 @@ test("legacy repair payloads are rebound to one state commit and forced plan-onl
   }
 });
 
-test("commit finding intake rebinds legacy reports or records a safe skip", () => {
+test("commit finding intake keeps legacy reports audit-only", () => {
   const workflow = readWorkflow(commitFindingWorkflowPath);
   const inputs = workflow.on.workflow_dispatch.inputs;
   assert.equal(inputs.report_revision.required, false);
@@ -176,13 +176,13 @@ test("commit finding intake rebinds legacy reports or records a safe skip", () =
     assert.equal(rebound.status, 0, rebound.stderr);
     assert.deepEqual(parseOutputs(rebound.outputs), {
       payload_version: "1",
-      processable: "true",
+      processable: "false",
       legacy_unsealed: "true",
       target_repo: targetRepo,
       report_repo: "openclaw/clawsweeper-state",
       report_path: reportPath,
-      report_revision: revision,
-      report_sha256: digest,
+      report_revision: "",
+      report_sha256: "",
       report_url: "",
     });
 

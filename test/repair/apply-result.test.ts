@@ -1591,6 +1591,22 @@ test("repair apply reconstructs durable squash proof in a fresh process", () => 
   }
 });
 
+test("repair apply does not claim an external exact-head merge", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "external_exact" });
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "skipped");
+    assert.equal(report.actions[0].reason, "already merged without a dispatched ClawSweeper claim");
+    assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    assert.equal(fs.existsSync(fixture.mergeClaimPath), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply blocks final security drift before the merge request", () => {
   const fixture = writeMergeApplyFixture({ securityOnFinalIssueFetch: true });
   try {
@@ -2153,6 +2169,7 @@ function writeMergeApplyFixture(
       | "timeout_unconfirmed"
       | "definitive_rejection"
       | "pending_after_command"
+      | "external_exact"
       | "wrong_head_merged";
     pendingKind?: "queue" | "auto_merge";
     mergeable?: "MERGEABLE" | "UNKNOWN";
@@ -2438,7 +2455,8 @@ if (args[0] === "api") {
       ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
       : "";
     const mergeCompleted =
-      mergeCount() > 0 && ["success_exact", "ambiguous_exact"].includes(data.mergeMode);
+      data.mergeMode === "external_exact" ||
+      (mergeCount() > 0 && ["success_exact", "ambiguous_exact"].includes(data.mergeMode));
     const claimUpdatedAt =
       comments.length > 0
         ? new Date(Date.parse(latestClaimMutation) + 2_000).toISOString()
@@ -2477,8 +2495,9 @@ if (args[0] === "api") {
     const absoluteFinalSnapshot = dispatchRecorded() && pullSnapshotReadCount() >= 4;
     const attempted = mergeCount() > 0;
     const merged =
-      attempted &&
-      ["success_exact", "ambiguous_exact", "wrong_head_merged"].includes(data.mergeMode);
+      data.mergeMode === "external_exact" ||
+      (attempted &&
+        ["success_exact", "ambiguous_exact", "wrong_head_merged"].includes(data.mergeMode));
     const snapshotHead =
       (attempted && data.mergeMode === "wrong_head_merged") ||
       (absoluteFinalSnapshot && data.postPolicyDrift === "rest_head")

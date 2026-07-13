@@ -686,10 +686,14 @@ function applyMergeAction({
     };
   }
   if (existingMerge.mergedAt) {
+    const mergeOwned =
+      preliminaryClaim.status === "existing" && preliminaryClaim.dispatched === true;
     return {
       ...base,
-      status: "executed",
-      reason: "already merged",
+      status: mergeOwned ? "executed" : "skipped",
+      reason: mergeOwned
+        ? "already merged"
+        : "already merged without a dispatched ClawSweeper claim",
       live_state: "merged",
       live_updated_at: live.updated_at,
       merged_at: existingMerge.mergedAt,
