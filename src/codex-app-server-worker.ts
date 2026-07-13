@@ -6,6 +6,7 @@ import {
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
+  redactCodexText,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree, waitForCodexProcessExit } from "./codex-spawn.js";
 
@@ -244,7 +245,7 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   if (message.method === "item/completed") {
     const item = recordAt(message.params, ["item"]);
     if (item?.type === "agentMessage" && typeof item.text === "string") {
-      finalMessage = item.text;
+      finalMessage = redactCodexText(item.text, input.redactValues);
     }
     return;
   }
@@ -381,7 +382,9 @@ async function updateWorkState(state: string, phase: string, summary: string): P
 }
 
 function terminalWrite(value: string): void {
-  if (terminal?.readyState === WebSocket.OPEN) terminal.send(value);
+  if (terminal?.readyState === WebSocket.OPEN) {
+    terminal.send(redactCodexText(value, input.redactValues));
+  }
 }
 
 async function finish(status: number, signal: NodeJS.Signals | null, error?: Error): Promise<void> {

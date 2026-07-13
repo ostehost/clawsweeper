@@ -261,13 +261,11 @@ const fixDebugMaxBytes = Math.max(
 const configuredStrictTargetValidation =
   process.env.CLAWSWEEPER_STRICT_TARGET_VALIDATION === "1" ||
   String(process.env.CLAWSWEEPER_TARGET_VALIDATION_MODE ?? "changed-only") === "strict";
-const defaultCodexWriteSandbox =
-  process.env.GITHUB_ACTIONS === "true" ? "danger-full-access" : "workspace-write";
+const defaultCodexWriteSandbox = "workspace-write";
 const codexWriteSandbox = String(
   process.env.CLAWSWEEPER_CODEX_WRITE_SANDBOX ?? defaultCodexWriteSandbox,
 );
-const defaultCodexReviewSandbox =
-  process.env.GITHUB_ACTIONS === "true" ? "danger-full-access" : "read-only";
+const defaultCodexReviewSandbox = "read-only";
 const codexReviewSandbox = String(
   process.env.CLAWSWEEPER_CODEX_REVIEW_SANDBOX ?? defaultCodexReviewSandbox,
 );

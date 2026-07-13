@@ -20,6 +20,13 @@ const CODEX_ACTIONS_CREDENTIAL_ENV = [
   "ACTIONS_RUNTIME_URL",
   "GITHUB_ACTIONS_RUNTIME_TOKEN",
 ] as const;
+const CODEX_ACTIONS_COMMAND_ENV = [
+  "GITHUB_ENV",
+  "GITHUB_OUTPUT",
+  "GITHUB_PATH",
+  "GITHUB_STATE",
+  "GITHUB_STEP_SUMMARY",
+] as const;
 const CODEX_EXPLICIT_SENSITIVE_ENV = new Set([
   ...CODEX_ACTIONS_CREDENTIAL_ENV,
   "CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL",
@@ -100,6 +107,7 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
   for (const key of CODEX_ACTIONS_CREDENTIAL_ENV) delete env[key];
+  for (const key of CODEX_ACTIONS_COMMAND_ENV) delete env[key];
   for (const key of Object.keys(env)) {
     if (
       (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key) || CODEX_SENSITIVE_ENV_NAME.test(key)) &&

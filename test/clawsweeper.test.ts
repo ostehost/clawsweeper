@@ -2352,6 +2352,12 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   assert.match(worker, /Codex worker timed out[\s\S]*process\.exit\(1\)/);
   assert.match(worker, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX/);
   assert.match(worker, /\? "danger-full-access"\s*:\s*"read-only"/);
+  assert.match(executor, /const defaultCodexWriteSandbox = "workspace-write"/);
+  assert.match(executor, /const defaultCodexReviewSandbox = "read-only"/);
+  assert.doesNotMatch(
+    executor,
+    /GITHUB_ACTIONS === "true" \? "danger-full-access" : "(?:workspace-write|read-only)"/,
+  );
   assert.match(
     worker,
     /Codex worker completed without a structured result\.json artifact[\s\S]*process\.exit\(1\)/,

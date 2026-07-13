@@ -188,14 +188,57 @@ test("redactSecrets masks common token shapes", () => {
         "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
         '"GITHUB_TOKEN":"github_pat_abcdefghijklmnopqrstuvwxyz123456"',
         "token ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "Authorization: Bearer older-bearer-token-value",
+        "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvbGRlciJ9.abcdefghijklmnop",
+        '"token":"older-file-token-value"',
+        "privateKey: older-private-key-value",
       ].join("\n"),
     ),
     [
       "OPENAI_API_KEY=[REDACTED]",
       '"GITHUB_TOKEN":"[REDACTED]"',
       "token [REDACTED_GITHUB_TOKEN]",
+      "Authorization: Bearer [REDACTED]",
+      "jwt [REDACTED_JWT]",
+      '"token":"[REDACTED]"',
+      "privateKey: [REDACTED]",
     ].join("\n"),
   );
+});
+
+test("collectCodexDebug redacts file-sourced credentials absent from the current environment", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-historical-"));
+  const codexHome = path.join(tmp, ".codex");
+  const outDir = path.join(tmp, "out");
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "historical.jsonl"),
+    [
+      '"actions_token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvbGRlciJ9.abcdefghijklmnop"',
+      "Authorization: Bearer older-bearer-token-value",
+      '"token":"older-file-token-value"',
+    ].join("\n"),
+  );
+
+  try {
+    const result = collectCodexDebug({
+      outDir,
+      label: "historical",
+      sinceMinutes: 60,
+      maxBytes: 1024 * 1024,
+      homeDir: tmp,
+      codexHome,
+    });
+
+    assert.equal(result.manifest.length, 1);
+    const artifact = fs.readFileSync(path.join(outDir, "sessions", "historical.jsonl"), "utf8");
+    assert.doesNotMatch(artifact, /eyJhbGci|older-bearer|older-file-token/);
+    assert.match(artifact, /"actions_token":"\[REDACTED\]"/);
+    assert.match(artifact, /Bearer \[REDACTED\]/);
+    assert.match(artifact, /"token":"\[REDACTED\]"/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("collectCodexDebug redacts the internal model from its environment", () => {

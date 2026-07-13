@@ -33,6 +33,9 @@ type SkippedEntry = {
 
 const DEFAULT_SINCE_MINUTES = 240;
 const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
+const SENSITIVE_FIELD_NAME = String.raw`(?=[A-Za-z_])[A-Za-z0-9_.-]*(?:token|api[_-]?key|secret|password|credential|private[_-]?key)[A-Za-z0-9_.-]*`;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 export function collectCodexDebug(options: CollectOptions) {
   const codexHome = resolveCodexHome(options);
@@ -115,21 +118,48 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_OPENAI_KEY]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
+    .replace(JWT_PATTERN, "[REDACTED_JWT]")
+    .replace(BEARER_PATTERN, "Bearer [REDACTED]")
     .replace(
-      /\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)[A-Z0-9_]*)=([^\s"']+)/g,
+      new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
       "$1=[REDACTED]",
     )
     .replace(
-      /"([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)[A-Z0-9_]*)"\s*:\s*"[^"]*"/g,
+      new RegExp(`"(${SENSITIVE_FIELD_NAME})"\\s*:\\s*"(?:\\\\.|[^"\\\\])*"`, "gi"),
       '"$1":"[REDACTED]"',
+    )
+    .replace(
+      new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*:\\s*([^\\s"',;]+)`, "gi"),
+      "$1: [REDACTED]",
     );
 }
 
 function containsSensitiveValue(text: string, redactValues: string[]): boolean {
-  return redactValues
-    .map((value) => value.trim())
-    .filter((value) => value.length >= 6)
-    .some((value) => text.includes(value));
+  if (
+    redactValues
+      .map((value) => value.trim())
+      .filter((value) => value.length >= 6)
+      .some((value) => text.includes(value))
+  ) {
+    return true;
+  }
+  if (
+    /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(text) ||
+    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(text) ||
+    /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/.test(text) ||
+    new RegExp(JWT_PATTERN.source).test(text) ||
+    new RegExp(BEARER_PATTERN.source, "i").test(text)
+  ) {
+    return true;
+  }
+  const namedValuePatterns = [
+    new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
+    new RegExp(`"(${SENSITIVE_FIELD_NAME})"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "gi"),
+    new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*:\\s*([^\\s"',;]+)`, "gi"),
+  ];
+  return namedValuePatterns.some((pattern) =>
+    [...text.matchAll(pattern)].some((match) => !String(match[2] ?? "").includes("[REDACTED]")),
+  );
 }
 
 function resolveCodexHome(options: CollectOptions): string {

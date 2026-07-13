@@ -29,6 +29,11 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
       ACTIONS_RESULTS_URL: "https://results.example.invalid/runtime",
       ACTIONS_ID_TOKEN_REQUEST_TOKEN: "actions-oidc-secret",
       GITHUB_ACTIONS_RUNTIME_TOKEN: "github-runtime-secret",
+      GITHUB_ENV: "/tmp/github-env",
+      GITHUB_OUTPUT: "/tmp/github-output",
+      GITHUB_PATH: "/tmp/github-path",
+      GITHUB_STATE: "/tmp/github-state",
+      GITHUB_STEP_SUMMARY: "/tmp/github-summary",
       AMBIENT_DEPLOY_SECRET: "ambient-secret",
       CLAWSWEEPER_INTERNAL_MODEL: "secret-model",
       CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "agent-secret",
@@ -54,6 +59,11 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
       assert.equal(env.ACTIONS_RESULTS_URL, undefined);
       assert.equal(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, undefined);
       assert.equal(env.GITHUB_ACTIONS_RUNTIME_TOKEN, undefined);
+      assert.equal(env.GITHUB_ENV, undefined);
+      assert.equal(env.GITHUB_OUTPUT, undefined);
+      assert.equal(env.GITHUB_PATH, undefined);
+      assert.equal(env.GITHUB_STATE, undefined);
+      assert.equal(env.GITHUB_STEP_SUMMARY, undefined);
       assert.equal(env.AMBIENT_DEPLOY_SECRET, undefined);
       assert.equal(env.CLAWSWEEPER_INTERNAL_MODEL, undefined);
       assert.equal(env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN, undefined);
