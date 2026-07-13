@@ -16,7 +16,8 @@ The sequence proves:
 - the read-only drawer's safe GitHub item, job, and workflow-run links;
 - the local-only tide preview advancing through incoming, crest, backwash, and restored states while preserving terminal keys and count;
 - the short static reduced-motion tide cue preserving the same preview state;
-- nine completed outcomes fitting individually in the expanded terminal pool without a hidden overflow, including a two-column constrained-width layout with no reference-label intersections; and
+- completed and failed/cancelled outcomes grouped into their respective terminal pools;
+- twenty completed outcomes fitting individually in the expanded terminal pool without a hidden overflow at the standard desktop width, plus a constrained-width layout that keeps twelve labels readable and makes the remaining eight explicit; and
 - a generated real tide visibly washing terminal crustaceans before clearing the shared buffer; and
 - zero browser-to-GitHub API requests, mutation requests, console errors, or
   uncaught page errors.
@@ -63,9 +64,9 @@ crabbox run \
 
 ## Provenance and privacy
 
-- implementation source: `2d5793c1a0e1b39fd174c3d743118845152eaab6`
+- implementation source: `d4390494189680c25a2aa8fa9454df5f332613a9`
 - provider: Crabbox `local-container`
-- lease: `cbx_320bf6be31c9` (`blue-lobster`)
+- lease: `cbx_a397c065e00e` (`swift-shrimp`)
 - image: `mcr.microsoft.com/playwright:v1.60.0-noble`
 - fixture SHA-256:
   `FC584F8F0521221B77897384BDEB3A167E85AA6C17708A7783740FCDF363CD21`
@@ -77,7 +78,7 @@ crabbox run \
   - `03-retrigger.json`:
     `39DA760BF2E1A9E982404B2F27ABAE8649EF18B21A20E558787921D314BFC4C0`
 - derived real-tide response:
-  `1B1B049ECB65CA4548053E92C99373B6A900B76E409A75029E596E7754746049`
+  `B7F86FC41DC7D3868D9BA17793C262B5A2BA0D4FC5871157A2A8B13768EED880`
 
 The browser allowed only `bay-proof.test:8787`, mapped to the local Wrangler
 Worker. The trace contains no cookies or authorization headers. A binary text
