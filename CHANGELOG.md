@@ -10,8 +10,6 @@ checkpoint, and status-only commits are intentionally omitted.
 ### Added
 
 - Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
-- Added versioned staged repair proof plans with deterministic cheap-to-expensive validation, behavioral profile-command staging, concrete-argv environment resolution and revalidation, structured package-manager option parsing, checkout immutability checks, retention of every allowlisted required command, exact-command deduplication, explicit-only non-live subsumption with digest provenance, fail-closed canonical-gate stalls and runtime budgets, topology-stable retry traces, and bounded machine-readable proof bound to the exact validated head/base after final or fallback history compaction. Thanks @vincentkoc.
-- Required every repair merge owner to verify a non-bypass GitHub App credential and server-enforced strict base-branch status checks from repository rulesets or classic protection before merging, using a fresh trusted finalizer with exact-repository mutation and administration verifier tokens while keeping Codex credentials administration-free.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
   crawl-remote release artifact without production credentials, then requires
   that exact SHA to remain the current main tip on a fresh protected runner
@@ -104,6 +102,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
 - Restored exact-review intake by deriving cancellation from `job.status`, avoiding an unsupported status-check function in step environment expressions that made GitHub reject the sweep workflow, and added checksum-pinned workflow-semantic linting to CI.
 - Made comment-router ledger updates retain refreshed claims at the bounded
@@ -147,61 +146,6 @@ checkpoint, and status-only commits are intentionally omitted.
 - Separated review publication from apply/comment-sync concurrency so long
   mutation runs no longer block completed reviews from publishing, and retried
   GitHub CLI commands whose jq process reports truncated JSON.
-- Bound repair execution to one trusted pre-execution job/repository/run
-  manifest plus the exact source item/revision, base, output operation, and
-  action identity; removed GitHub and state write credentials from Codex
-  execution; replayed the exact normalized proof plan in a disposable,
-  credential-free job; and restricted target mutation to the validated bundle,
-  deterministic publication metadata, and receipt-bound post-flight PR.
-  Failed and cancelled execution or validation remains target report-only,
-  while retryable reports can requeue through a central-repository-only token.
-- Rebuilt every staged repair proof plan from sealed source and patch identity
-  plus current target policy before replay, revalidated every replayed command,
-  made exact-commit publication retries idempotent across partial push/comment
-  failures, restored required replacement labels, honored late pause labels on
-  every sealed source and existing replacement target before each mutation,
-  sealed the exact repair-delta anchor used for independent proof replay,
-  treated exact-head publication-only lanes as successful, derived terminal
-  workflow state from the generated post-flight report, and skipped merge-only
-  App identity probes when merge is disabled.
-- Required durable prior publication checkpoints before accepting already-closed
-  replacement sources, bound every primary and secondary source closeout to its
-  exact head and base revisions, and prevented producer reruns with missing
-  transfers from consuming artifacts emitted by older workflow attempts.
-- Revalidated every sealed issue and pull-request source inside the shared
-  privileged mutation guard immediately before push, create, reopen, label,
-  comment, and close operations, allowing only the exact prepared source head
-  or source closures authorized by a verified durable publication checkpoint.
-- Routed successful issue-implementation completion comments through the sealed
-  publication guard and rebound required-label writes to the exact current
-  validated pull-request head immediately before mutation.
-- Kept deadline-expired pending, missing, or conclusion-less post-flight checks
-  retryable for durable self-heal, blocked malformed check records, and required
-  issue-implementation readiness to match the exact head recorded by the
-  verified publication receipt.
-- Failed closed when a configured canonical changed-gate script disappears from
-  the repaired checkout, and limited package-manager proof commands to explicit
-  read-only script or runner forms while rejecting lifecycle, registry, and
-  account mutations across pnpm, npm, Bun, and Yarn while preserving documented
-  npm workspace selector positions and shorthand.
-- Restricted staged-proof ignored-input checks to dependency, tooling, config,
-  and explicit command inputs; rejected escaping or cyclic symlinks; allowed
-  unrelated ignored generated outputs; and suppressed npm/pnpm pre/post hooks
-  while rejecting Yarn script execution that cannot provide the same guarantee.
-- Evaluated every applicable strict repository ruleset before automerge and
-  failed closed if any ruleset bypasses the repair App, weakens the effective
-  required checks, or cannot be fully verified.
-- Replaced the unsupported GitHub installation identity probe with pinned
-  `create-github-app-token` App slug and installation outputs plus App IDs
-  derived from the authenticated slug, rejected
-  mutating package-manager aliases and lifecycle commands in validation plans,
-  disabled lifecycle scripts during target dependency setup, rejected setup or
-  validation source mutation, stopped retries when their command budget is
-  exhausted, and made proof-budget exhaustion terminal instead of sending it
-  through Codex validation-fix.
-- Made exact comment-router dispatch concurrency item/comment-specific so
-  unrelated pending exact items cannot replace one another, and required
-  already-merged post-flight PRs to match the authorized publication commit.
 - Bound structural, semantic, and content review reuse to the canonical
   persisted durable-comment body hash under the acquired lease, normalizing
   surrounding whitespace while preserving label
@@ -212,7 +156,6 @@ checkpoint, and status-only commits are intentionally omitted.
 - Packaged only planned prior review reports into scheduled shard runtimes and
   rebound structural cache probes to the explicit latest release state,
   restoring safe cache reuse without broad generated-state artifacts.
-- Rejected package-manager directory and external-config overrides in repair proof, deferred workspace-scoped script checks to the selected package manager, and kept path-scoped Python, Go, Node, Cargo, and Vitest integration proof non-subsumable.
 - Coalesced superseded sweep and planner concurrency entries instead of retaining up to 100 pending runs per group, while keeping durable leased reviews and explicit manual apply or comment-sync runs isolated.
 - Required a live `DIRTY` merge conflict and at least 30 days without contributor comments or head activity before publishing or applying low-signal pull-request close verdicts, honoring longer configured stale thresholds and applying the same fail-closed policy to stale-review promotion and trusted close routing.
 - Retried successful GitHub CLI JSON-lines responses when their output is truncated, preventing transient list-page corruption from aborting close-apply runs.

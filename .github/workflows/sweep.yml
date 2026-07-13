@@ -208,7 +208,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  CLAWSWEEPER_APP_ID: "3306130"
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
   CLAWSWEEPER_MODEL: internal
 
@@ -876,14 +875,37 @@ jobs:
             echo "Released unsuccessful review lease comment $lease_id owned by $LEASE_OWNER."
           done <<< "$lease_ids"
 
-      - name: Queue exact verdict router
-        id: queue-exact-verdict-router
-        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' }}
+      - name: Route synced ClawSweeper verdict
+        id: route-synced-verdict
+        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'false' }}
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          CLAWSWEEPER_DISPATCH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
+          CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
+          CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
+          CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
+          CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:comment-router -- \
+            --write-report \
+            --repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --lookback-minutes "$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
+            --max-comments "$CLAWSWEEPER_COMMENT_MAX_COMMENTS" \
+            --execute
+
+      - name: Queue deferred exact verdict router
+        id: queue-deferred-verdict-router
+        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           TARGET_BRANCH: ${{ steps.live-item.outputs.target_branch }}
-          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
@@ -894,7 +916,6 @@ jobs:
             -f execute=true \
             -f target_repo="$TARGET_REPO" \
             -f target_branch="$TARGET_BRANCH" \
-            -f item_numbers="$ITEM_NUMBER" \
             -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
             -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
 
@@ -959,13 +980,15 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish-event-result.outcome }}
-          ROUTE_HANDOFF_OUTCOME: ${{ steps.queue-exact-verdict-router.outcome }}
+          ROUTE_OUTCOME: ${{ steps.route-synced-verdict.outcome }}
+          ROUTE_HANDOFF_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
           INTAKE_GUARDED_OPEN: ${{ steps.live-item.outputs.guarded_open }}
           INTAKE_TERMINAL_MISSING: ${{ steps.live-item.outputs.terminal_missing }}
           TERMINAL_MISSING: ${{ steps.publish-event-result.outputs.terminal_missing }}
           TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
           GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
           REMOTE_TUPLE_VERIFIED: ${{ steps.publish-event-result.outputs.remote_tuple_verified }}
+          ROUTING_DEFERRED: ${{ steps.publish-event-result.outputs.routing_deferred }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
           REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
         run: |
@@ -987,9 +1010,13 @@ jobs:
             state="Complete"
             detail="The item is closed, terminal review leases were released, and no stale verdict was published or routed."
           fi
-          if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$ROUTE_HANDOFF_OUTCOME" = "success" ]; then
+          if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$ROUTE_OUTCOME" = "success" ]; then
             state="Complete"
-            detail="The targeted re-review published an exact durable review comment and queued an exact-item serialized router run."
+            detail="The targeted re-review finished, the durable review comment was updated, and the synced verdict was routed."
+          fi
+          if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$ROUTING_DEFERRED" = "true" ] && [ "$ROUTE_HANDOFF_OUTCOME" = "success" ]; then
+            state="Complete"
+            detail="The targeted re-review published an exact durable review comment and queued an executing target-wide serialized router scan."
           fi
           if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$TERMINAL_CLOSED" = "true" ] && [ "${{ steps.confirm-terminal-item.outputs.confirmed }}" = "true" ]; then
             state="Complete"
@@ -1016,8 +1043,18 @@ jobs:
             --detail "$detail" \
             --run-url "$RUN_URL"
 
+      - name: Commit event comment router ledger
+        if: ${{ !cancelled() && steps.setup-pnpm.outcome == 'success' && steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.route-synced-verdict.outcome == 'success' }}
+        run: |
+          pnpm run repair:publish-main -- \
+            --message "chore: record ClawSweeper event comment routing" \
+            --path results/comment-router.json \
+            --path results/comment-router-latest.json \
+            --path jobs \
+            --rebase-strategy theirs
+
       - name: React to target item completion
-        if: ${{ steps.live-item.outputs.guarded_open == 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-exact-verdict-router.outcome == 'success')) }}
+        if: ${{ steps.live-item.outputs.guarded_open == 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-deferred-verdict-router.outcome == 'success' || steps.route-synced-verdict.outcome == 'success')) }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -1096,7 +1133,8 @@ jobs:
           GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
           REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
-          ROUTE_OUTCOME: ${{ steps.queue-exact-verdict-router.outcome }}
+          DIRECT_ROUTE_OUTCOME: ${{ steps.route-synced-verdict.outcome }}
+          DEFERRED_ROUTE_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
         run: |
           outcome=failure
           if [ "$PRIMARY_JOB_STATUS" = "cancelled" ] || [ "$REVIEW_OUTCOME" = "cancelled" ]; then
@@ -1116,13 +1154,14 @@ jobs:
             { [ "$TERMINAL_MISSING" = "true" ] ||
               [ "$TERMINAL_CLOSED" = "true" ] ||
               [ "$GUARDED_OPEN" = "true" ] ||
-              [ "$ROUTE_OUTCOME" = "success" ]; }; then
+              [ "$DIRECT_ROUTE_OUTCOME" = "success" ] ||
+              [ "$DEFERRED_ROUTE_OUTCOME" = "success" ]; }; then
             outcome=success
           fi
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
 
       - name: Fail unsuccessful exact review
-        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.queue-exact-verdict-router.outcome != 'success')) }}
+        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
         run: exit 1
 
       - name: Publish exact event action ledger

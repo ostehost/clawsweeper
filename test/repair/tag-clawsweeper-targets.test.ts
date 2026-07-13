@@ -15,8 +15,10 @@ test("label tagging uses retrying GitHub helpers", () => {
   assert.match(source, /ghTextWithRetry\(\[\s*"issue",\s*"edit"/);
 });
 
-test("repair workers do not perform unverified label tagging", () => {
+test("label tagging is non-blocking in repair workers", () => {
   const workflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
+  const step = workflow.split("- name: Tag ClawSweeper targets")[1]?.split("\n      - name: ")[0];
 
-  assert.doesNotMatch(workflow, /Tag ClawSweeper targets|repair:tag-clawsweeper/);
+  assert.ok(step, "expected Tag ClawSweeper targets step");
+  assert.match(step, /continue-on-error: true/);
 });

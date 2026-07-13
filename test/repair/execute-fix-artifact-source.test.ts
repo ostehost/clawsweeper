@@ -49,7 +49,7 @@ test("no-op automerge repair updates outcome and re-enters router before exit", 
   );
 });
 
-test("repair source branch writability preflight runs before expensive repair preflights", () => {
+test("repair source branch writability preflight runs before target repair", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
 
@@ -58,17 +58,17 @@ test("repair source branch writability preflight runs before expensive repair pr
   );
   const checkoutIndex = source.indexOf("ensureTargetCheckout(result.repo, targetDir);");
   const validationIndex = source.indexOf("preflightTargetValidationPlan(");
-  const codexPreflightIndex = source.indexOf("const writePreflight = runCodexWritePreflight();");
+  const repairIndex = source.indexOf("outcome = executeRepairBranch({ fixArtifact, targetDir });");
 
   assert.notEqual(branchPreflightIndex, -1);
   assert.notEqual(checkoutIndex, -1);
   assert.notEqual(validationIndex, -1);
-  assert.notEqual(codexPreflightIndex, -1);
+  assert.notEqual(repairIndex, -1);
   assert.ok(
     branchPreflightIndex < checkoutIndex &&
       checkoutIndex < validationIndex &&
-      validationIndex < codexPreflightIndex,
-    "live source-branch writability must be resolved before checkout, validation planning, and Codex write preflight",
+      validationIndex < repairIndex,
+    "live source-branch writability must be resolved before checkout, validation planning, and repair",
   );
 });
 
@@ -143,7 +143,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   );
 });
 
-test("terminal Codex failures do not request repair requeue", () => {
+test("terminal Codex and persistent setup failures do not request repair requeue", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
   const helperStart = source.indexOf("function isRetryableCodexFailure(");
@@ -155,14 +155,19 @@ test("terminal Codex failures do not request repair requeue", () => {
   const terminalGuardIndex = helper.indexOf(
     "if (messages.some((value) => isTerminalCodexErrorMessage(value))) return false;",
   );
+  const setupGuardIndex = helper.indexOf(
+    "if (isPersistentCodexSetupFailure(message)) return false;",
+  );
   const broadFallbackIndex = helper.indexOf("/Codex .*(?:timed out|failed|exited)");
 
   assert.notEqual(terminalGuardIndex, -1);
+  assert.notEqual(setupGuardIndex, -1);
   assert.notEqual(broadFallbackIndex, -1);
   assert.ok(
-    terminalGuardIndex < broadFallbackIndex,
-    "terminal model-access failures must be rejected before the broad Codex failure fallback",
+    terminalGuardIndex < setupGuardIndex && setupGuardIndex < broadFallbackIndex,
+    "terminal and persistent setup failures must be rejected before the broad Codex failure fallback",
   );
+  assert.match(source, /sandbox \(\?:wrapper\|startup\)/);
 });
 
 test("repair Codex heartbeat wrapper uses bounded process capture", () => {
@@ -215,24 +220,9 @@ test("repair contract gates the final cumulative tree, not individual checkpoint
 
   const compact = source.indexOf("const historyCompaction =");
   const enforce = source.indexOf("enforceFinalRepairContract(", compact);
-  const commit = source.indexOf('const commit = run("git", ["rev-parse", "HEAD"]', enforce);
-  const proof = source.indexOf("ensureFinalStagedProof(", commit);
-  const publish = source.indexOf("if (hasRepairContract", proof);
-  assert.ok(compact < enforce && enforce < commit && commit < proof && proof < publish);
-});
-
-test("push-denied replacement fallback re-proves the compacted head before publication", () => {
-  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
-  const start = source.indexOf("function openReplacementPrFromPreparedRepairCheckout(");
-  const end = source.indexOf("function liveRepairPauseBlock(", start);
-  const fallback = source.slice(start, end);
-
-  assert.match(fallback, /sourceHead/);
-  const compact = fallback.indexOf("compactReplacementHistory(");
-  const proof = fallback.indexOf("ensureFinalStagedProof(", compact);
-  const preflight = fallback.indexOf("bindMergePreflightToStagedProof(", proof);
-  const push = fallback.indexOf("pushRecoverableBranch(", preflight);
-  assert.ok(compact < proof && proof < preflight && preflight < push);
+  const publish = source.indexOf("if (hasRepairContract", enforce);
+  const commit = source.indexOf('const commit = run("git", ["rev-parse", "HEAD"]', publish);
+  assert.ok(compact < enforce && enforce < publish && publish < commit);
 });
 
 test("final repair contract compares the repaired tree with the latest base", () => {
@@ -258,19 +248,13 @@ test("contributor repair review loop stays on one pinned target base", () => {
   );
   assert.match(source, /validateAndReviewLoop\(\{[\s\S]*targetBaseSha/);
   assert.match(source, /pinnedBaseRef: targetBaseSha/);
-  assert.match(
-    source,
-    /runTargetValidationProof\([\s\S]*?validationPlan\.options,[\s\S]*?baseBranch/,
-  );
+  assert.match(source, /runDiffCheck\(\{ targetDir, baseRef: targetBaseSha \}\)/);
   assert.match(source, /pinned target base \$\{targetBaseSha\}/);
   assert.match(validation, /pinnedBaseRef\?: string/);
-  assert.match(validation, /const baseRef = validationBaseRef\(cwd, baseBranch, options\)/);
-  assert.match(validation, /\["git", "diff", "--check", `\$\{baseRef\}\.\.\.HEAD`\]/);
   assert.match(source, /classifyExternalBaseValidationFailure\(\{/);
-  assert.match(source, /const repairDeltaBaseHead = sourceHead \?\? targetBaseSha/);
   assert.match(
     source,
-    /const sourceHead = currentHead\(targetDir\);[\s\S]*replacement repair delta base[\s\S]*prepareTargetToolchain/,
+    /rebaseResult\?\.status === "conflicts" \? \(sourceHead \?\? targetBaseSha\) : currentHead\(targetDir\)/,
   );
   assert.match(validation, /if \(!options\.pinnedBaseRef\) \{[\s\S]*ensureMergeBaseAvailable/);
   assert.match(promptBuilder, /Pinned target base SHA: \$\{targetBaseSha\}/);
@@ -280,234 +264,28 @@ test("final synchronized tree is reviewed and reports persist before publication
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
 
   assert.match(source, /reviewAfterFinalBaseSync\(\{/);
-  assert.match(source, /finalBaseSyncRequiresReview\(\{/);
-  assert.match(source, /return \{ status: "already-current", base_sha: baseSha \}/);
   assert.match(source, /validateAndReviewSynchronizedTree\(\{/);
   assert.match(source, /repairDeltaPaths: finalSyncRepairDeltaPaths/);
   assert.match(source, /attempt: "final-sync"/);
   assert.match(source, /finalizeExecutionReport\(\{/);
 });
 
-test("proof runtime budget exhaustion is terminal for validation-fix", () => {
-  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
-  const classifierStart = source.indexOf("function isFixableValidationError(");
-  const classifierEnd = source.indexOf("\nfunction ", classifierStart + 1);
-  const classifier = source.slice(classifierStart, classifierEnd);
-
-  assert.match(classifier, /staged proof runtime budget exhausted/);
-  assert.match(classifier, /validation command runtime budget exhausted/);
-  assert.ok(
-    classifier.indexOf("runtime budget exhausted") <
-      classifier.indexOf("return /validation command failed"),
-  );
-});
-
-test("repair workflow binds one run through no-credential proof and token-only mutation", () => {
+test("repair workflow renews target credentials before deferred outcome publication", () => {
   const workflow = readText(
     path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
   );
-  const authorizeIndex = workflow.indexOf("\n  authorize:");
   const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
-  const handoffIndex = workflow.indexOf("- name: Upload sealed execution handoff");
-  const validateIndex = workflow.indexOf("\n  validate:");
-  const reportIndex = workflow.indexOf("\n  report:");
-  const mutateIndex = workflow.indexOf("\n  mutate:");
-  const receiptIndex = workflow.indexOf(
-    "- name: Verify immutable mutation authorization",
-    mutateIndex,
-  );
-  const mutationTokenIndex = workflow.indexOf(
-    "- name: Create exact-repository mutation token",
-    receiptIndex,
-  );
-  const verifierTokenIndex = workflow.indexOf(
-    "- name: Create exact-repository ruleset verifier token",
-    mutationTokenIndex,
-  );
+  const renewIndex = workflow.indexOf("- name: Renew target write token for post-flight");
+  const publishIndex = workflow.indexOf("- name: Publish deferred fix outcome");
+  const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
 
   assert.ok(
-    authorizeIndex < executeIndex &&
-      executeIndex < handoffIndex &&
-      handoffIndex < validateIndex &&
-      validateIndex < reportIndex &&
-      reportIndex < mutateIndex &&
-      mutateIndex < receiptIndex &&
-      receiptIndex < mutationTokenIndex &&
-      mutationTokenIndex < verifierTokenIndex,
+    executeIndex < renewIndex && renewIndex < publishIndex && publishIndex < postFlightIndex,
   );
-  const authorize = workflow.slice(
-    authorizeIndex,
-    workflow.indexOf("\n  execute:", authorizeIndex),
-  );
-  const execute = workflow.slice(workflow.indexOf("\n  execute:"), validateIndex);
-  const validate = workflow.slice(validateIndex, reportIndex);
-  const report = workflow.slice(reportIndex, mutateIndex);
-  const mutate = workflow.slice(mutateIndex);
-
+  assert.match(workflow.slice(executeIndex, renewIndex), /--latest --defer-publication/);
   assert.match(
-    workflow.slice(workflow.indexOf("\n  cluster:"), authorizeIndex),
-    /Upload worker transfer artifacts[\s\S]*if: \$\{\{ always\(\) && steps\.check_job\.outputs\.job_exists == '1' && steps\.self_heal_head\.outputs\.matched != 'false' && \(inputs\.mode == 'execute' \|\| inputs\.mode == 'autonomous'\) && !inputs\.dry_run \}\}[\s\S]*if-no-files-found: error[\s\S]*retention-days: 90/,
+    workflow.slice(publishIndex, postFlightIndex),
+    /GH_TOKEN: \${{ steps\.target_post_flight_token\.outputs\.token }}/,
   );
-  assert.match(authorize, /repair:execution-handoff -- authorize/);
-  assert.match(authorize, /repair:execution-handoff -- restore-authorization/);
-  assert.ok(
-    authorize.indexOf("Restore checkpoint authorization before live source intake") <
-      authorize.indexOf("Authorize exact job and run"),
-  );
-  assert.match(
-    authorize,
-    /authorization_sha256: \$\{\{ steps\.restore_authorization\.outputs\.authorization_sha256 \|\| steps\.authorize\.outputs\.authorization_sha256 \}\}/,
-  );
-  assert.match(
-    authorize,
-    /Restore checkpoint authorization before live source intake[\s\S]*--source-root \.clawsweeper-repair\/recovery-authorized[\s\S]*--publication-root \.clawsweeper-repair\/recovery-execution[\s\S]*--publication-receipt \.clawsweeper-repair\/recovery-publication\/receipt\.json[\s\S]*--source-job-path "\$JOB_PATH"/,
-  );
-  assert.equal(
-    [
-      ...authorize.matchAll(
-        /--expected-producer-attempt "\$\{\{ steps\.prior_worker_artifact\.outputs\.producer_attempt \}\}"/g,
-      ),
-    ].length,
-    3,
-  );
-  assert.match(
-    authorize,
-    /Resolve prior checkpoint worker artifact[\s\S]*?--max-producer-attempt "\$\{\{ steps\.authorization_publication_artifact\.outputs\.producer_attempt \}\}"[\s\S]*?--required-prefixes "clawsweeper-repair-authorized,clawsweeper-repair-execution,clawsweeper-repair-validation"/,
-  );
-  assert.match(
-    authorize,
-    /Resolve prior checkpoint worker artifact[\s\S]*--prefix clawsweeper-repair-worker[\s\S]*Download prior checkpoint worker artifact[\s\S]*artifact-ids: \$\{\{ steps\.prior_worker_artifact\.outputs\.artifact_id \}\}/,
-  );
-  assert.match(
-    authorize,
-    /Resolve prior checkpoint validation receipt[\s\S]*--prefix clawsweeper-repair-validation[\s\S]*Restore checkpoint authorization before live source intake[\s\S]*--validation-receipt \.clawsweeper-repair\/recovery-validation\/receipt\.json/,
-  );
-  assert.match(
-    authorize,
-    /artifact_id: \$\{\{ steps\.prior_authorized_artifact\.outputs\.artifact_id \|\| steps\.upload\.outputs\.artifact-id \}\}/,
-  );
-  assert.match(
-    authorize,
-    /worker_artifact_id: \$\{\{ steps\.prior_worker_artifact\.outputs\.artifact_id \|\| needs\.cluster\.outputs\.worker_artifact_id \}\}/,
-  );
-  assert.match(authorize, /persist-credentials: "false"/);
-  assert.match(execute, /repair:execution-handoff -- verify/);
-  assert.match(
-    execute,
-    /Reuse exact checkpointed execution handoff[\s\S]*repair:execution-handoff -- verify-execution/,
-  );
-  assert.match(
-    execute,
-    /needs\.authorize\.outputs\.checkpoint_recovered != '1'[\s\S]*Execute credited fix artifact/,
-  );
-  assert.match(execute, /repair:execution-handoff -- seal/);
-  assert.match(execute, /GH_TOKEN: ""/);
-  assert.match(execute, /GITHUB_TOKEN: ""/);
-  assert.match(execute, /--prepare-publication/);
-  assert.match(execute, /--execution-intent/);
-  assert.match(execute, /needs\.authorize\.outputs\.result_path/);
-  assert.doesNotMatch(
-    execute,
-    /create-github-app-token|create-state-token|setup-state|--latest|permission-(?:contents|issues|pull-requests): write/,
-  );
-  assert.match(validate, /GH_TOKEN: ""/);
-  assert.match(validate, /GITHUB_TOKEN: ""/);
-  assert.match(validate, /repair:execution-handoff -- validate/);
-  assert.match(
-    validate,
-    /Reuse exact checkpointed validation receipt[\s\S]*repair:execution-handoff -- verify-receipt/,
-  );
-  assert.match(validate, /Upload validation receipt[\s\S]*retention-days: 90/);
-  assert.doesNotMatch(validate, /create-github-app-token|setup-codex|OPENAI_API_KEY/);
-  assert.match(report, /count-requeue-required/);
-  assert.match(report, /--dashboard-only/);
-  assert.match(report, /repositories: clawsweeper/);
-  assert.doesNotMatch(
-    report,
-    /needs\.authorize\.outputs\.target_name|permission-(?:issues|pull-requests): write|--publish-report-only/,
-  );
-  assert.match(mutate, /repair:execution-handoff -- verify-receipt/);
-  assert.match(mutate, /repair:execution-handoff -- publish/);
-  assert.match(
-    mutate,
-    /repair:execution-handoff -- publish[\s\S]*--mutation-actor "\$\{\{ steps\.target_post_flight_token\.outputs\.app-slug \}\}\[bot\]"/,
-  );
-  assert.match(mutate, /repair:execution-handoff -- verify-publication/);
-  assert.match(mutate, /repair:execution-handoff -- checkpoint-source-closes/);
-  assert.match(mutate, /repair:execution-handoff -- close-sources/);
-  const publishIndex = mutate.indexOf("- name: Publish exact independently validated repair");
-  const verifyPublicationIndex = mutate.indexOf("- name: Verify publication receipt");
-  const prepareCheckpointIndex = mutate.indexOf("- name: Prepare durable source-close checkpoint");
-  const durableCheckpointIndex = mutate.indexOf("- name: Upload durable pre-close checkpoint");
-  const closeSourcesIndex = mutate.indexOf(
-    "- name: Close superseded sources from publication checkpoint",
-  );
-  const completionCheckpointIndex = mutate.indexOf(
-    "- name: Upload completed publication checkpoint",
-  );
-  const postFlightIndex = mutate.indexOf("- name: Post-flight finalize fix PRs");
-  assert.ok(
-    publishIndex < verifyPublicationIndex &&
-      verifyPublicationIndex < prepareCheckpointIndex &&
-      prepareCheckpointIndex < durableCheckpointIndex &&
-      durableCheckpointIndex < closeSourcesIndex &&
-      closeSourcesIndex < completionCheckpointIndex &&
-      completionCheckpointIndex < postFlightIndex &&
-      closeSourcesIndex < postFlightIndex,
-  );
-  assert.match(
-    mutate,
-    /Upload durable pre-close checkpoint[\s\S]*name: clawsweeper-repair-publication-close-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*if-no-files-found: error[\s\S]*Close superseded sources from publication checkpoint/,
-  );
-  assert.match(
-    mutate,
-    /Upload durable pre-close checkpoint[\s\S]*retention-days: 90[\s\S]*Upload completed publication checkpoint[\s\S]*retention-days: 90/,
-  );
-  assert.match(
-    mutate,
-    /checkpoint-source-closes[\s\S]*id: upload_source_close_checkpoint[\s\S]*close-sources[\s\S]*steps\.checkpoint_sources\.outputs\.publication_receipt_sha256/,
-  );
-  assert.equal(
-    [
-      ...mutate.matchAll(
-        /--close-actor "\$\{\{ steps\.target_post_flight_token\.outputs\.app-slug \}\}\[bot\]"/g,
-      ),
-    ].length,
-    2,
-  );
-  assert.match(
-    mutate,
-    /id: close_sources[\s\S]*publication_receipt_sha256[\s\S]*steps\.close_sources\.outputs\.publication_receipt_sha256/,
-  );
-  assert.match(mutate, /needs\.execute\.result == 'success'/);
-  assert.match(mutate, /needs\.execute\.outputs\.execute_fix_outcome == 'success'/);
-  assert.match(mutate, /needs\.execute\.outputs\.mutation_ready == 'true'/);
-  assert.match(mutate, /needs\.validate\.result == 'success'/);
-  assert.match(
-    mutate,
-    /Write final publication provenance[\s\S]*source_close_mutations[\s\S]*preserve_human_reopened_source_pull_request/,
-  );
-  assert.match(
-    mutate,
-    /artifacts: \{[\s\S]*worker: artifact\([\s\S]*authorization: artifact\([\s\S]*execution: artifact\([\s\S]*validation: artifact\([\s\S]*pre_close: artifact\([\s\S]*publication: artifact\([\s\S]*final_worker: artifact\(/,
-  );
-  assert.match(
-    mutate,
-    /Upload final worker artifacts[\s\S]*\.clawsweeper-repair\/publication\/receipt\.json[\s\S]*\.clawsweeper-repair\/provenance\/publication\.json[\s\S]*retention-days: 90/,
-  );
-  assert.match(
-    mutate,
-    /Record final worker artifact provenance[\s\S]*FINAL_WORKER_ARTIFACT_ID[\s\S]*publication_provenance_sha256[\s\S]*Upload final worker provenance[\s\S]*retention-days: 90/,
-  );
-  assert.match(
-    mutate,
-    /WORKER_ARTIFACT_ID: \$\{\{ needs\.authorize\.outputs\.worker_artifact_id \}\}[\s\S]*WORKER_ARTIFACT_DIGEST: \$\{\{ needs\.authorize\.outputs\.worker_artifact_digest \}\}[\s\S]*WORKER_PRODUCER_ATTEMPT: \$\{\{ needs\.authorize\.outputs\.worker_producer_attempt \}\}[\s\S]*AUTHORIZATION_PRODUCER_ATTEMPT: \$\{\{ needs\.authorize\.outputs\.producer_attempt \}\}[\s\S]*EXECUTION_PRODUCER_ATTEMPT: \$\{\{ needs\.execute\.outputs\.producer_attempt \}\}[\s\S]*VALIDATION_PRODUCER_ATTEMPT: \$\{\{ needs\.validate\.outputs\.producer_attempt \}\}/,
-  );
-  assert.doesNotMatch(mutate, /setup-codex|--latest|create-state-token|setup-state/);
-  assert.match(mutate, /npm_config_ignore_scripts: "true"/);
-  assert.doesNotMatch(mutate, /repair:apply-result|repair:tag-clawsweeper/);
-  assert.match(
-    readText(path.join(process.cwd(), "src/repair/post-flight.ts")),
-    /finalized\.status === "executed" && !publicationReceipt/,
-  );
+  assert.match(workflow.slice(publishIndex, postFlightIndex), /--latest --publish-report-only/);
 });

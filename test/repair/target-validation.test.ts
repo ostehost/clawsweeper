@@ -6,34 +6,21 @@ import path from "node:path";
 import test from "node:test";
 
 import {
-  buildTargetValidationProofPlan,
   canSkipInternalCodexReviewForRepairDelta,
   classifyExternalBaseValidationFailure,
   preflightTargetValidationPlan,
   prepareTargetToolchain,
   repairDeltaValidationPlan,
-  replayStagedValidationProof,
   reproduceValidationFailureAtPinnedBase,
   requiredValidationCommands,
   runAllowedValidationCommands,
-  runStagedValidationProof,
-  workspacePackagePaths,
-  workspacePatternMatches,
 } from "../../dist/repair/target-validation.js";
-import {
-  buildStagedProofPlan,
-  stagedProofPlanArtifact,
-} from "../../dist/repair/staged-proof-gates.js";
 import { compactText } from "../../dist/repair/text-utils.js";
 import {
   __resetTargetRepoToolchainCache,
   resolveTargetRepoToolchain,
 } from "../../dist/repair/target-toolchain-config.js";
-import {
-  parseAllowedValidationCommand,
-  resolveValidationCommandEnvironment,
-  validationCommandForExecution,
-} from "../../dist/repair/validation-command-utils.js";
+import { parseAllowedValidationCommand } from "../../dist/repair/validation-command-utils.js";
 import { mockCommandBinEnv } from "../helpers.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
@@ -102,29 +89,6 @@ test("validation preflight reports injected OpenClaw changed gate", () => {
   );
 });
 
-test("configured changed gates fail closed when their script disappears", () => {
-  const cwd = gitPackageFixture({});
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const options = validationOptions("openclaw/openclaw");
-
-  assert.deepEqual(requiredValidationCommands([], cwd, options), ["pnpm check:changed"]);
-  const preflight = preflightTargetValidationPlan(
-    { fixArtifact: { validation_commands: [] }, targetDir: cwd },
-    options,
-  );
-  assert.equal(preflight.status, "blocked");
-  assert.equal(preflight.code, "validation_script_missing");
-  assert.equal(preflight.required, "pnpm check:changed");
-  assert.equal(preflight.missing_script, "check:changed");
-  assert.deepEqual(preflight.resolved_commands, ["pnpm check:changed"]);
-  assert.throws(
-    () => buildTargetValidationProofPlan([], cwd, options),
-    /validation_script_missing: required pnpm check:changed is unavailable/,
-  );
-});
-
 test("validation preflight blocks targets without any validation command", () => {
   const cwd = packageFixture({});
 
@@ -147,29 +111,6 @@ test("validation preflight blocks targets without any validation command", () =>
       reason:
         "validation_command_missing: no configured or artifact validation command is available",
     },
-  );
-});
-
-test("staged proof rejects an empty required gate before adding integrity checks", () => {
-  const cwd = gitPackageFixture({});
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      buildTargetValidationProofPlan(
-        [],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    /validation_command_missing: no configured or artifact validation command is available/,
   );
 });
 
@@ -204,18 +145,15 @@ test("OpenClaw automerge repairs can require CI-parity validation commands", () 
 });
 
 test("validation preflight accepts env-prefixed OpenClaw QA commands", () => {
-  const command =
-    "env QA_PARITY_CONCURRENCY=1 OPENCLAW_BUILD_PRIVATE_QA=1 OPENCLAW_ENABLE_PRIVATE_QA_CLI=1 OPENAI_API_KEY= ANTHROPIC_API_KEY= OPENCLAW_LIVE_OPENAI_KEY= OPENCLAW_LIVE_ANTHROPIC_KEY= OPENCLAW_LIVE_GEMINI_KEY= OPENCLAW_LIVE_SETUP_TOKEN_VALUE= pnpm openclaw qa suite --provider-mode mock-openai --parity-pack agentic --concurrency 1 --model ${OPENCLAW_CI_OPENAI_MODEL:-openai/gpt-5.6-sol} --alt-model example/model-alt --output-dir .artifacts/qa-e2e/gpt54";
-  const cwd = packageFixture({
-    "check:changed": "node check.js",
-    openclaw: "node openclaw.js",
-  });
+  const cwd = packageFixture({ "check:changed": "node check.js" });
 
   assert.deepEqual(
     preflightTargetValidationPlan(
       {
         fixArtifact: {
-          validation_commands: [command],
+          validation_commands: [
+            "env QA_PARITY_CONCURRENCY=1 OPENCLAW_BUILD_PRIVATE_QA=1 OPENCLAW_ENABLE_PRIVATE_QA_CLI=1 OPENAI_API_KEY= ANTHROPIC_API_KEY= OPENCLAW_LIVE_OPENAI_KEY= OPENCLAW_LIVE_ANTHROPIC_KEY= OPENCLAW_LIVE_GEMINI_KEY= OPENCLAW_LIVE_SETUP_TOKEN_VALUE= pnpm openclaw qa suite --provider-mode mock-openai --parity-pack agentic --concurrency 1 --model ${OPENCLAW_CI_OPENAI_MODEL:-openai/gpt-5.6-sol} --alt-model example/model-alt --output-dir .artifacts/qa-e2e/gpt54",
+          ],
         },
         targetDir: cwd,
       },
@@ -223,27 +161,22 @@ test("validation preflight accepts env-prefixed OpenClaw QA commands", () => {
     ),
     {
       status: "passed",
-      resolved_commands: [command, "pnpm check:changed"],
-      available_scripts: ["check:changed", "openclaw"],
+      resolved_commands: ["pnpm check:changed"],
+      available_scripts: ["check:changed"],
     },
   );
 });
 
 test("validation preflight accepts assignment-prefixed OpenClaw test commands", () => {
-  const cwd = packageFixture({
-    "check:changed": "node check.js",
-    "test:serial": "node test.js",
-  });
-  fs.mkdirSync(path.join(cwd, "src", "pairing"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "src", "pairing", "pairing-store.test.ts"), "");
-  const command =
-    "OPENCLAW_VITEST_FS_MODULE_CACHE_PATH=.vitest-cache-pairing pnpm test:serial src/pairing/pairing-store.test.ts";
+  const cwd = packageFixture({ "check:changed": "node check.js" });
 
   assert.deepEqual(
     preflightTargetValidationPlan(
       {
         fixArtifact: {
-          validation_commands: [command],
+          validation_commands: [
+            "OPENCLAW_VITEST_FS_MODULE_CACHE_PATH=.vitest-cache-pairing pnpm test:serial src/pairing/pairing-store.test.ts",
+          ],
         },
         targetDir: cwd,
       },
@@ -251,8 +184,8 @@ test("validation preflight accepts assignment-prefixed OpenClaw test commands", 
     ),
     {
       status: "passed",
-      resolved_commands: [`env ${command}`, "pnpm check:changed"],
-      available_scripts: ["check:changed", "test:serial"],
+      resolved_commands: ["pnpm check:changed"],
+      available_scripts: ["check:changed"],
     },
   );
 });
@@ -361,7 +294,7 @@ test("validation preflight preserves directory-scoped direct Vitest commands", (
   );
 });
 
-test("validation preflight preserves unscoped allowlisted direct Vitest commands", () => {
+test("validation preflight blocks unscoped direct Vitest commands", () => {
   const cwd = packageFixture({});
   fs.writeFileSync(path.join(cwd, "vitest.browser.config.ts"), "");
   const options = validationOptions("steipete/oracle", {
@@ -372,21 +305,14 @@ test("validation preflight preserves unscoped allowlisted direct Vitest commands
     },
   });
 
-  for (const [command, resolved] of [
-    [
-      "pnpm vitest run --config vitest.browser.config.ts",
-      "pnpm exec vitest run --config vitest.browser.config.ts",
-    ],
-    [
-      "pnpm exec vitest run --config vitest.browser.config.ts",
-      "pnpm exec vitest run --config vitest.browser.config.ts",
-    ],
-    [
-      "pnpm vitest run --exclude tests/browser/pageActions.test.ts",
-      "pnpm exec vitest run --exclude tests/browser/pageActions.test.ts",
-    ],
-    ["pnpm vitest run login", "pnpm exec vitest run login"],
-    ["pnpm exec vitest run src", "pnpm exec vitest run src"],
+  for (const command of [
+    "pnpm vitest run --config vitest.browser.config.ts",
+    "pnpm exec vitest run --config vitest.browser.config.ts",
+    "pnpm vitest run --exclude tests/browser/pageActions.test.ts",
+    "pnpm vitest run --update tests/browser/pageActions.test.ts",
+    "pnpm vitest run -u tests/browser/pageActions.test.ts",
+    "pnpm vitest run login",
+    "pnpm exec vitest run src",
   ]) {
     const result = preflightTargetValidationPlan(
       {
@@ -398,534 +324,11 @@ test("validation preflight preserves unscoped allowlisted direct Vitest commands
       options,
     );
 
-    assert.deepEqual(result, {
-      status: "passed",
-      resolved_commands: [resolved],
-      available_scripts: [],
-    });
+    assert.equal(result.status, "blocked");
+    assert.equal(result.code, "validation_script_missing");
+    assert.equal(result.missing_script, "check:changed");
+    assert.deepEqual(result.resolved_commands, ["pnpm check:changed"]);
   }
-});
-
-test("validation parser rejects snapshot-writing and formatter mutation flags", () => {
-  for (const command of [
-    "pnpm vitest run --update tests/browser/pageActions.test.ts",
-    "pnpm exec vitest run -u tests/browser/pageActions.test.ts",
-    "pnpm exec vitest run -u=true tests/browser/pageActions.test.ts",
-    "pnpm --filter app vitest run -u tests/browser/pageActions.test.ts",
-    "pnpm jest -u tests/example.test.ts",
-    "pnpm exec ava -u tests/example.test.ts",
-    "pnpm exec jest --updateSnapshot tests/example.test.ts",
-    "pnpm test:serial --update-snapshots tests/example.test.ts",
-    "pnpm unit -u",
-    "npm test -- -u",
-    "bun test -u",
-    "bun run vitest -u",
-    "uv run vitest -u tests/browser/pageActions.test.ts",
-    "pnpm exec c8 vitest -u tests/browser/pageActions.test.ts",
-    "pnpm exec nyc ava -u tests/example.test.ts",
-    "pnpm exec node ./node_modules/vitest/vitest.mjs -u tests/example.test.ts",
-    "python -u=true -m pytest tests/unit",
-    "python -m pytest -u tests/unit",
-    "python tests/run.py -u",
-    "pnpm lint --fix",
-    "pnpm format",
-    "pnpm format --write",
-    "git checkout main",
-    "git fsck --lost-found",
-    "cargo fmt",
-    "pnpm exec cargo fmt",
-    "go fmt ./...",
-    "go env -w GOFLAGS=-mod=readonly",
-    "go env -u GOFLAGS",
-    "pnpm --dir . install",
-    "pnpm --silent exec cargo clean",
-    "npm --prefix . install",
-    "pnpm --dir . test",
-    "pnpm -C packages/app test",
-    "pnpm --config-dir . test",
-    "pnpm --store-dir .pnpm-store test",
-    "pnpm --config.ignore-scripts=false test",
-    "npm --ignore-scripts=false run check",
-    "npm run check --ignore-scripts=false",
-    "npm i",
-    "npm insta",
-    "npm cit",
-    "npm rm left-pad",
-    "npm rum install",
-    "npm x prettier",
-    "pnpm i",
-    "pnpm --filter app i",
-    "pnpm --filter app deploy",
-    "pnpm pack",
-    "pnpm postinstall",
-    "pnpm prepare",
-    "pnpm preinstall",
-    "pnpm publish",
-    "pnpm config set registry https://registry.example.invalid",
-    "pnpm run install",
-    "pnpm run postinstall",
-    "pnpm run-script postprepare",
-    "npm access list packages",
-    "npm deprecate left-pad broken",
-    "npm pub",
-    "npm run install",
-    "npm run postinstall",
-    "npm whoami",
-    "bun run install",
-    "bun run postinstall",
-    "yarn config set registry https://registry.example.invalid",
-    "yarn npm publish",
-    "yarn postinstall",
-    "yarn prepare",
-    "yarn preinstall",
-    "npm --prefix . run test",
-    "npm --userconfig .npmrc run test",
-    "bun --cwd . test",
-    "make install",
-    "mvn deploy",
-    "gradle publish",
-    "dotnet nuget push package.nupkg",
-    "composer install",
-    "bundle install",
-    "ansible-playbook deploy.yml",
-  ]) {
-    assert.throws(() => parseAllowedValidationCommand(command), /unsafe validation command/);
-  }
-  assert.deepEqual(parseAllowedValidationCommand("cargo fmt --check"), ["cargo", "fmt", "--check"]);
-  assert.deepEqual(parseAllowedValidationCommand("go env -json"), ["go", "env", "-json"]);
-  assert.deepEqual(parseAllowedValidationCommand("go env GOOS GOARCH"), [
-    "go",
-    "env",
-    "GOOS",
-    "GOARCH",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("pnpm format:check"), ["pnpm", "format:check"]);
-  assert.deepEqual(parseAllowedValidationCommand("pnpm run fmt:verify"), [
-    "pnpm",
-    "run",
-    "fmt:verify",
-  ]);
-  assert.throws(() => parseAllowedValidationCommand("yarn run lint"), /unsafe validation command/);
-  assert.throws(() => parseAllowedValidationCommand("yarn test"), /unsafe validation command/);
-  assert.deepEqual(parseAllowedValidationCommand("python -u -m pytest tests/unit"), [
-    "python",
-    "-u",
-    "-m",
-    "pytest",
-    "tests/unit",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("python -B -u -m pytest tests/unit"), [
-    "python",
-    "-B",
-    "-u",
-    "-m",
-    "pytest",
-    "tests/unit",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("python -W error -u -m pytest tests/unit"), [
-    "python",
-    "-W",
-    "error",
-    "-u",
-    "-m",
-    "pytest",
-    "tests/unit",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("uv run python -u -m pytest tests/unit"), [
-    "uv",
-    "run",
-    "python",
-    "-u",
-    "-m",
-    "pytest",
-    "tests/unit",
-  ]);
-  assert.deepEqual(
-    parseAllowedValidationCommand("ansible-playbook -u deploy playbook.yml --syntax-check"),
-    ["ansible-playbook", "-u", "deploy", "playbook.yml", "--syntax-check"],
-  );
-  assert.deepEqual(parseAllowedValidationCommand("gradle -u test"), ["gradle", "-u", "test"]);
-  assert.deepEqual(parseAllowedValidationCommand("mvn verify"), ["mvn", "verify"]);
-  assert.deepEqual(parseAllowedValidationCommand("dotnet test"), ["dotnet", "test"]);
-  assert.deepEqual(parseAllowedValidationCommand("go mod verify"), ["go", "mod", "verify"]);
-  assert.deepEqual(parseAllowedValidationCommand("go mod graph"), ["go", "mod", "graph"]);
-  assert.deepEqual(parseAllowedValidationCommand("go mod why ./..."), [
-    "go",
-    "mod",
-    "why",
-    "./...",
-  ]);
-});
-
-test("validation preflight defers workspace-scoped scripts to the package manager", () => {
-  const cwd = packageFixture({});
-  fs.mkdirSync(path.join(cwd, "packages", "worker"), { recursive: true });
-  fs.writeFileSync(
-    path.join(cwd, "packages", "worker", "package.json"),
-    `${JSON.stringify(
-      {
-        name: "@openclaw/worker",
-        scripts: { test: "node --test" },
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  fs.writeFileSync(path.join(cwd, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
-  const options = validationOptions("openclaw/example", {
-    toolchain: {
-      packageManager: "pnpm",
-      baseValidationCommands: [],
-      changedGate: null,
-    },
-  });
-
-  for (const command of [
-    "pnpm --filter @openclaw/worker test",
-    "pnpm --recursive test",
-    "npm --workspace @openclaw/worker run test",
-    "npm --ws run test",
-    "npm run test --workspace @openclaw/worker",
-    "npm run --workspace @openclaw/worker test",
-    "npm run test --ws",
-    "npm --workspaces run test",
-    "bun --filter @openclaw/worker test",
-    "bun run --filter @openclaw/worker test",
-  ]) {
-    assert.deepEqual(
-      preflightTargetValidationPlan(
-        {
-          fixArtifact: { validation_commands: [command] },
-          targetDir: cwd,
-        },
-        options,
-      ),
-      {
-        status: "passed",
-        resolved_commands: [
-          command.startsWith("pnpm --filter ")
-            ? command.replace("pnpm ", "pnpm --fail-if-no-match ")
-            : command,
-        ],
-        available_scripts: [],
-      },
-    );
-  }
-
-  const missingWorkspace = preflightTargetValidationPlan(
-    {
-      fixArtifact: {
-        validation_commands: ["pnpm --filter __clawsweeper_no_such_workspace__ run test"],
-      },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.deepEqual(missingWorkspace.resolved_commands, [
-    "pnpm --fail-if-no-match --filter __clawsweeper_no_such_workspace__ run test",
-  ]);
-
-  const disabledNoMatchFailure = preflightTargetValidationPlan(
-    {
-      fixArtifact: {
-        validation_commands: [
-          "pnpm --filter __clawsweeper_no_such_workspace__ --fail-if-no-match=false run test",
-        ],
-      },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.deepEqual(disabledNoMatchFailure.resolved_commands, [
-    "pnpm --fail-if-no-match --filter __clawsweeper_no_such_workspace__ run test",
-  ]);
-
-  const disabledWorkspaceResult = preflightTargetValidationPlan(
-    {
-      fixArtifact: { validation_commands: ["npm --workspaces=false run test"] },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.equal(disabledWorkspaceResult.status, "blocked");
-  assert.equal(disabledWorkspaceResult.missing_script, "test");
-
-  const missingSelectedWorkspaceScript = preflightTargetValidationPlan(
-    {
-      fixArtifact: {
-        validation_commands: ["npm --workspace @openclaw/worker run lint"],
-      },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.equal(missingSelectedWorkspaceScript.status, "blocked");
-  assert.equal(missingSelectedWorkspaceScript.missing_script, "lint");
-});
-
-test("recursive pnpm preflight preserves filters and ignores unrelated workspace scripts", () => {
-  const cwd = packageFixture({});
-  for (const [workspace, scripts] of [
-    ["app", { test: "node --test" }],
-    ["docs", {}],
-  ]) {
-    const directory = path.join(cwd, "packages", workspace);
-    fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(
-      path.join(directory, "package.json"),
-      `${JSON.stringify({ name: `@openclaw/${workspace}`, scripts }, null, 2)}\n`,
-    );
-  }
-  fs.writeFileSync(path.join(cwd, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
-  const options = validationOptions("openclaw/example", {
-    toolchain: {
-      packageManager: "pnpm",
-      baseValidationCommands: [],
-      changedGate: null,
-    },
-  });
-
-  for (const [command, resolved] of [
-    ["pnpm --recursive test", "pnpm --recursive test"],
-    [
-      "pnpm --recursive --filter @openclaw/app test",
-      "pnpm --fail-if-no-match --recursive --filter @openclaw/app test",
-    ],
-    [
-      "pnpm --recursive --filter packages/app test",
-      "pnpm --fail-if-no-match --recursive --filter packages/app test",
-    ],
-  ]) {
-    const result = preflightTargetValidationPlan(
-      { fixArtifact: { validation_commands: [command] }, targetDir: cwd },
-      options,
-    );
-    assert.equal(result.status, "passed", command);
-    assert.deepEqual(result.resolved_commands, [resolved]);
-  }
-
-  const missingSelectedScript = preflightTargetValidationPlan(
-    {
-      fixArtifact: {
-        validation_commands: ["pnpm --recursive --filter @openclaw/docs test"],
-      },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.equal(missingSelectedScript.status, "blocked");
-  assert.equal(missingSelectedScript.missing_script, "test");
-
-  const delegatedGraphSelector = preflightTargetValidationPlan(
-    {
-      fixArtifact: {
-        validation_commands: ["pnpm --recursive --filter ...@openclaw/app test"],
-      },
-      targetDir: cwd,
-    },
-    options,
-  );
-  assert.equal(delegatedGraphSelector.status, "passed");
-  assert.deepEqual(delegatedGraphSelector.resolved_commands, [
-    "pnpm --fail-if-no-match --recursive --filter ...@openclaw/app test",
-  ]);
-});
-
-test("workspace glob matching is bounded for adversarial target patterns", () => {
-  const adversarial = `${"*a".repeat(500)}b`;
-  const startedAt = performance.now();
-  assert.throws(() => workspacePatternMatches(adversarial, "a".repeat(500)), /operator budget/);
-  assert.ok(performance.now() - startedAt < 250);
-  assert.equal(workspacePatternMatches("packages/test-?", "packages/test-a"), true);
-  assert.equal(workspacePatternMatches("packages/{app,web}", "packages/web"), true);
-  assert.equal(workspacePatternMatches("packages/[aw]pp", "packages/app"), true);
-  assert.equal(workspacePatternMatches("packages/**/test-*", "packages/test-unit"), true);
-  assert.equal(workspacePatternMatches("packages/**/test-*", "packages/a/b/test-unit"), true);
-  assert.equal(workspacePatternMatches("packages/*", "packages/a/b"), false);
-  assert.equal(workspacePatternMatches("packages/🚀", "packages/🚀"), true);
-  assert.equal(workspacePatternMatches("packages/*", "packages/🚀"), true);
-  assert.throws(
-    () => workspacePatternMatches("*".repeat(1_025), "packages/app"),
-    /maximum supported length/,
-  );
-});
-
-test("workspace discovery enforces directory, depth, entry, and match budgets", () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workspace-budget-"));
-  try {
-    for (const relativePath of ["packages/app", "packages/web", "packages/deep/child"]) {
-      fs.mkdirSync(path.join(cwd, relativePath), { recursive: true });
-      fs.writeFileSync(path.join(cwd, relativePath, "package.json"), "{}\n");
-    }
-    fs.writeFileSync(path.join(cwd, "one.txt"), "1\n");
-    fs.writeFileSync(path.join(cwd, "two.txt"), "2\n");
-
-    assert.deepEqual(workspacePackagePaths(cwd, ["packages/{app,web}"]), [
-      "packages/app",
-      "packages/web",
-    ]);
-    assert.throws(
-      () => workspacePackagePaths(cwd, ["packages/**"], { maxDirectories: 2 }),
-      /directory budget/,
-    );
-    assert.throws(
-      () => workspacePackagePaths(cwd, ["packages/**"], { maxDepth: 2 }),
-      /depth budget/,
-    );
-    assert.throws(
-      () => workspacePackagePaths(cwd, ["packages/**"], { maxEntries: 2 }),
-      /entry budget/,
-    );
-    assert.throws(
-      () =>
-        workspacePackagePaths(cwd, ["packages/nope", "packages/**"], {
-          maxMatchOperations: 1,
-        }),
-      /glob evaluation.*work budget/,
-    );
-    assert.throws(
-      () =>
-        workspacePackagePaths(
-          cwd,
-          Array.from({ length: 257 }, () => "packages/*"),
-        ),
-      /pattern count/,
-    );
-  } finally {
-    fs.rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("validation parser accepts documented workspace run option positions", () => {
-  assert.deepEqual(parseAllowedValidationCommand("bun run --filter @openclaw/worker test"), [
-    "bun",
-    "run",
-    "--filter",
-    "@openclaw/worker",
-    "test",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("npm run test --workspace @openclaw/worker"), [
-    "npm",
-    "run",
-    "test",
-    "--workspace",
-    "@openclaw/worker",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("npm run --workspace @openclaw/worker test"), [
-    "npm",
-    "run",
-    "--workspace",
-    "@openclaw/worker",
-    "test",
-  ]);
-  assert.deepEqual(parseAllowedValidationCommand("npm run test --ws"), [
-    "npm",
-    "run",
-    "test",
-    "--ws",
-  ]);
-  for (const command of [
-    "bun run --cwd packages/worker test",
-    "bun run --unknown @openclaw/worker test",
-    "npm run test --prefix packages/worker",
-    "npm run test --unknown @openclaw/worker",
-    "npm --if-present --workspace @openclaw/worker run test",
-    "npm run test --workspace @openclaw/worker --if-present",
-    "bun run --filter @openclaw/worker postinstall",
-    "npm run install --workspace @openclaw/worker",
-  ]) {
-    assert.throws(() => parseAllowedValidationCommand(command), /unsafe validation command/);
-  }
-});
-
-test("staged target proof rejects a pnpm filter that matches no workspace before execution", () => {
-  const cwd = gitPackageFixture({});
-  fs.writeFileSync(path.join(cwd, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm --filter __clawsweeper_no_such_workspace__ run test"],
-        cwd,
-        validationOptions("openclaw/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    /validation_script_missing: required pnpm --fail-if-no-match --filter __clawsweeper_no_such_workspace__/,
-  );
-});
-
-test("staged target proof rejects a disabled pnpm no-match failure before execution", () => {
-  const cwd = gitPackageFixture({});
-  fs.writeFileSync(path.join(cwd, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm --filter __clawsweeper_no_such_workspace__ --fail-if-no-match=false run test"],
-        cwd,
-        validationOptions("openclaw/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    /validation_script_missing: required pnpm --fail-if-no-match --filter __clawsweeper_no_such_workspace__/,
-  );
-});
-
-test("validation environment defaults resolve without shell execution", () => {
-  assert.deepEqual(
-    resolveValidationCommandEnvironment(
-      [
-        "env",
-        "PROVIDER=mock",
-        "pnpm",
-        "openclaw",
-        "qa",
-        "--provider",
-        "${PROVIDER:-live}",
-        "--model=${MODEL:-example/model-test}",
-      ],
-      { MODEL: "" },
-    ),
-    [
-      "env",
-      "PROVIDER=mock",
-      "pnpm",
-      "openclaw",
-      "qa",
-      "--provider",
-      "mock",
-      "--model=example/model-test",
-    ],
-  );
-  assert.deepEqual(
-    resolveValidationCommandEnvironment(
-      ["env", "TARGET=unit", "pnpm", "test:serial", "test/${TARGET}.test.ts"],
-      {},
-    ),
-    ["env", "TARGET=unit", "pnpm", "test:serial", "test/unit.test.ts"],
-  );
-  assert.throws(
-    () =>
-      resolveValidationCommandEnvironment(["git", "diff", "${AWS_SECRET_ACCESS_KEY}"], {
-        AWS_SECRET_ACCESS_KEY: "secret",
-      }),
-    /unsafe validation environment variable expansion/,
-  );
 });
 
 test("validation preflight blocks direct Vitest commands with missing test paths", () => {
@@ -1002,34 +405,6 @@ test("validation parser requires env assignments before env command", () => {
     () => parseAllowedValidationCommand("env pnpm test:serial src/foo.test.ts"),
     /unsupported validation command/,
   );
-});
-
-test("validation parser rejects execution-control environment assignments", () => {
-  for (const command of [
-    "PATH=./bin pnpm check:changed",
-    "NODE_OPTIONS=--require=./hook.cjs node --test test/example.test.ts",
-    "BASH_ENV=./hook.sh bash tests/run-tests.sh",
-    "LD_PRELOAD=./hook.so make test",
-    "npm_config_userconfig=./malicious.npmrc pnpm check:changed",
-    "GIT_CONFIG_COUNT=1 git diff --check",
-    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./runner cargo test",
-    "GOFLAGS=-toolexec=./hook go test ./...",
-    "MAVEN_OPTS=-javaagent:./hook.jar mvn test",
-    "GRADLE_OPTS=-Dorg.gradle.jvmargs=-javaagent:./hook.jar gradle test",
-    "RUSTFLAGS=-Clinker=./hook cargo test",
-    "CARGO_ENCODED_RUSTFLAGS=-Clinker=./hook cargo test",
-    "CC=./compiler make test",
-    "PERL5OPT=-Mlocal::lib=./hook make test",
-    "PYTEST_ADDOPTS=-p./hook pytest tests",
-  ]) {
-    assert.throws(() => parseAllowedValidationCommand(command), /unsafe validation command/);
-  }
-  assert.deepEqual(parseAllowedValidationCommand("CI=1 pnpm check:changed"), [
-    "env",
-    "CI=1",
-    "pnpm",
-    "check:changed",
-  ]);
 });
 
 test("validation parser accepts common non-Node project commands", () => {
@@ -1134,7 +509,7 @@ test("validation preflight accepts scoped OpenGrep commands", () => {
     ),
     {
       status: "passed",
-      resolved_commands: [command, "pnpm check:changed"],
+      resolved_commands: ["pnpm check:changed"],
       available_scripts: ["check:changed"],
     },
   );
@@ -1452,7 +827,7 @@ test("pinned-base reproduction prepares an independent runtime after normal setu
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "base");
   const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
-  const { binDir } = fakeBunFixture({ failRun: true });
+  const { binDir } = fakeBunFixture(cwd, { failRun: true });
   const options = validationOptions("openclaw/clawhub", {
     ...clawhubToolchain(),
     pinnedBaseRef,
@@ -1572,7 +947,7 @@ test("bun-based target toolchain installs deps and runs configured validation", 
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const { binDir, logPath } = fakeBunFixture();
+  const { binDir, logPath } = fakeBunFixture(cwd);
   withPathPrefix(binDir, () => {
     prepareTargetToolchain(cwd, {
       ...validationOptions("openclaw/clawhub", clawhubToolchain()),
@@ -1586,135 +961,15 @@ test("bun-based target toolchain installs deps and runs configured validation", 
         cwd,
         validationOptions("openclaw/clawhub", clawhubToolchain()),
       ),
-      ["git diff --check origin/main...HEAD", "git diff --check", "bun run check"],
+      ["bun run check"],
     );
   });
 
   assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
     "--version",
-    "install --frozen-lockfile --ignore-scripts",
+    "install --frozen-lockfile",
     "run check",
   ]);
-});
-
-test("bun lockfile fallback keeps lifecycle hooks disabled", () => {
-  const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const { binDir, logPath } = fakeBunFixture({ failFrozenInstall: true });
-  withPathPrefix(binDir, () => {
-    prepareTargetToolchain(cwd, {
-      ...validationOptions("openclaw/clawhub", clawhubToolchain()),
-      installTargetDeps: true,
-      installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-      setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-    });
-  });
-
-  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
-    "--version",
-    "install --frozen-lockfile --ignore-scripts",
-    "install --no-frozen-lockfile --ignore-scripts",
-  ]);
-});
-
-test("npm target setup without a lockfile preserves a clean proof checkout", () => {
-  const cwd = gitPackageFixture({ check: "node check.js" });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-npm-bin-"));
-  const npmPath = path.join(binDir, "npm.js");
-  const logPath = path.join(binDir, "npm.log");
-  fs.writeFileSync(
-    npmPath,
-    `const fs = require("node:fs");
-const path = require("node:path");
-const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(logPath)}, args.join(" ") + "\\n");
-if (!args.includes("--no-package-lock")) {
-  fs.writeFileSync(path.join(process.cwd(), "package-lock.json"), "{}\\n");
-}
-fs.mkdirSync(path.join(process.cwd(), "node_modules"), { recursive: true });
-`,
-  );
-  const previousNpmBin = process.env.NPM_BIN;
-  const previousNpmBinArgs = process.env.NPM_BIN_ARGS;
-  Object.assign(process.env, mockCommandBinEnv("npm", npmPath));
-  try {
-    prepareTargetToolchain(cwd, {
-      ...validationOptions("openclaw/example", {
-        toolchain: {
-          packageManager: "npm",
-          baseValidationCommands: ["npm run check"],
-          changedGate: null,
-        },
-      }),
-      installTargetDeps: true,
-      installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-      setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-    });
-  } finally {
-    restoreEnv("NPM_BIN", previousNpmBin);
-    restoreEnv("NPM_BIN_ARGS", previousNpmBinArgs);
-  }
-
-  assert.equal(git(cwd, "status", "--porcelain"), "");
-  assert.equal(
-    fs.readFileSync(logPath, "utf8").trim(),
-    "install --no-package-lock --ignore-scripts",
-  );
-});
-
-test("dependency setup rejects tracked source mutation even with lifecycle scripts disabled", () => {
-  const cwd = gitPackageFixture({ check: "node check.js" });
-  fs.writeFileSync(path.join(cwd, "source.txt"), "original\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-mutating-npm-bin-"));
-  const npmPath = path.join(binDir, "npm.js");
-  const logPath = path.join(binDir, "npm.log");
-  fs.writeFileSync(
-    npmPath,
-    `const fs = require("node:fs");
-const path = require("node:path");
-const args = process.argv.slice(2);
-fs.writeFileSync(${JSON.stringify(logPath)}, args.join(" ") + "\\n");
-fs.writeFileSync(path.join(process.cwd(), "source.txt"), "mutated\\n");
-`,
-  );
-  const previousNpmBin = process.env.NPM_BIN;
-  const previousNpmBinArgs = process.env.NPM_BIN_ARGS;
-  Object.assign(process.env, mockCommandBinEnv("npm", npmPath));
-  try {
-    assert.throws(
-      () =>
-        prepareTargetToolchain(cwd, {
-          ...validationOptions("openclaw/example", {
-            toolchain: {
-              packageManager: "npm",
-              baseValidationCommands: ["npm run check"],
-              changedGate: null,
-            },
-          }),
-          installTargetDeps: true,
-          installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-          setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-        }),
-      /target dependency setup mutated source or proof identity/,
-    );
-  } finally {
-    restoreEnv("NPM_BIN", previousNpmBin);
-    restoreEnv("NPM_BIN_ARGS", previousNpmBinArgs);
-  }
-
-  assert.equal(
-    fs.readFileSync(logPath, "utf8").trim(),
-    "install --no-package-lock --ignore-scripts",
-  );
-  assert.equal(fs.readFileSync(path.join(cwd, "source.txt"), "utf8"), "mutated\n");
 });
 
 test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from preinstall hooks", () => {
@@ -1730,7 +985,7 @@ test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from 
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const { binDir, envLogPath } = envLoggingBunFixture();
+  const { binDir, envLogPath } = envLoggingBunFixture(cwd);
   const previousUserAgent = process.env.npm_config_user_agent;
   const previousRegistry = process.env.npm_config_registry;
   const previousCache = process.env.npm_config_cache;
@@ -1950,1008 +1205,17 @@ test("resolveTargetRepoToolchain stays total when the config file is malformed J
   }
 });
 
-test("resolveTargetRepoToolchain loads exact proof subsumption contracts", () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-proof-config-"));
-  const configPath = path.join(tmpDir, "target-repositories.json");
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({
-      repositories: [
-        {
-          target_repo: "openclaw/example",
-          package_manager: "pnpm",
-          validation_commands: [],
-          changed_gate: null,
-          proof_subsumptions: [
-            {
-              command: "git diff --check",
-              subsumes: ["pnpm lint"],
-            },
-          ],
-        },
-      ],
-    }),
-  );
-  __resetTargetRepoToolchainCache();
-  try {
-    assert.deepEqual(resolveTargetRepoToolchain("openclaw/example", configPath).proofSubsumptions, [
-      {
-        command: "git diff --check",
-        subsumes: ["pnpm lint"],
-      },
-    ]);
-  } finally {
-    __resetTargetRepoToolchainCache();
-  }
-});
-
-test("staged target proof preserves focused tests before the canonical changed gate", () => {
-  const cwd = gitPackageFixture({
-    "check:changed": "node check.js",
-    "test:serial": "node test.js",
-  });
-  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
-  fs.mkdirSync(path.join(cwd, "test"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 1;\n");
-  fs.writeFileSync(path.join(cwd, "test", "foo.test.ts"), "export {};\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 2;\n");
-
-  const plan = buildTargetValidationProofPlan(
-    ["pnpm test:serial test/foo.test.ts"],
-    cwd,
-    validationOptions("openclaw/openclaw"),
-  );
-
-  assert.deepEqual(
-    plan.commands.map((entry) => [entry.stage, entry.command_kind]),
-    [
-      ["repository_integrity", "git:diff-check"],
-      ["repository_integrity", "git:diff-check"],
-      ["focused_tests", "pnpm:test:serial"],
-      ["canonical_changed_surface", "pnpm:check:changed"],
-    ],
-  );
-  assert.equal("parts" in plan.commands[0], true);
-  assert.deepEqual(plan.commands[2]?.parts, ["pnpm", "test:serial", "test/foo.test.ts"]);
-});
-
-test("repository profile commands are staged by behavior, not all marked canonical", () => {
-  const cwd = gitPackageFixture({
-    "check:changed": "node check.js",
-    lint: "node lint.js",
-    "test:serial": "node test.js",
-    "test:all": "node test-all.js",
-  });
-  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
-  fs.mkdirSync(path.join(cwd, "test"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 1;\n");
-  fs.writeFileSync(path.join(cwd, "test", "foo.test.ts"), "export {};\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 2;\n");
-
-  const plan = buildTargetValidationProofPlan(
-    [],
-    cwd,
-    validationOptions("openclaw/example", {
-      toolchain: {
-        packageManager: "pnpm",
-        baseValidationCommands: ["pnpm lint", "pnpm test:serial test/foo.test.ts", "pnpm test:all"],
-        changedGate: { command: "pnpm check:changed", requiredScript: "check:changed" },
-      },
-    }),
-  );
-
-  assert.deepEqual(
-    plan.commands.map((entry) => [entry.stage, entry.command_kind]),
-    [
-      ["repository_integrity", "git:diff-check"],
-      ["repository_integrity", "git:diff-check"],
-      ["focused_tests", "pnpm:test:serial"],
-      ["static", "pnpm:lint"],
-      ["canonical_changed_surface", "pnpm:check:changed"],
-      ["broad_live_or_e2e", "pnpm:test:all"],
-    ],
-  );
-});
-
-test("staged target proof retains broad commands for elevated-risk surfaces", () => {
-  const cwd = gitPackageFixture({
-    "check:changed": "node check.js",
-    "test:all": "node test-all.js",
-  });
-  fs.mkdirSync(path.join(cwd, ".github", "workflows"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, ".github", "workflows", "repair.yml"), "name: repair\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  fs.appendFileSync(path.join(cwd, ".github", "workflows", "repair.yml"), "on: push\n");
-
-  const plan = buildTargetValidationProofPlan(
-    ["pnpm test:all"],
-    cwd,
-    validationOptions("openclaw/openclaw"),
-  );
-
-  assert.equal(plan.risk.level, "elevated");
-  assert.deepEqual(plan.risk.signals, ["workflow"]);
-  assert.deepEqual(
-    plan.commands.map((entry) => entry.stage),
-    [
-      "repository_integrity",
-      "repository_integrity",
-      "canonical_changed_surface",
-      "broad_live_or_e2e",
-    ],
-  );
-});
-
-test("staged target proof retains explicit live commands for narrow surfaces", () => {
-  const cwd = gitPackageFixture({
-    "check:changed": "node check.js",
-    "test:live": "node test-live.js",
-  });
-  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 1;\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  fs.writeFileSync(path.join(cwd, "src", "foo.ts"), "export const foo = 2;\n");
-
-  const plan = buildTargetValidationProofPlan(
-    ["pnpm test:live"],
-    cwd,
-    validationOptions("openclaw/openclaw"),
-  );
-
-  assert.equal(plan.risk.level, "narrow");
-  assert.deepEqual(
-    plan.commands.map((entry) => [entry.stage, entry.command_kind]),
-    [
-      ["repository_integrity", "git:diff-check"],
-      ["repository_integrity", "git:diff-check"],
-      ["canonical_changed_surface", "pnpm:check:changed"],
-      ["broad_live_or_e2e", "pnpm:test:live"],
-    ],
-  );
-});
-
-test("validation preflight blocks missing required live scripts before execution", () => {
-  const cwd = packageFixture({ "check:changed": "node check.js" });
-  const result = preflightTargetValidationPlan(
-    {
-      fixArtifact: { validation_commands: ["pnpm test:live"] },
-      targetDir: cwd,
-    },
-    validationOptions("openclaw/openclaw"),
-  );
-
-  assert.equal(result.status, "blocked");
-  assert.equal(result.code, "validation_script_missing");
-  assert.equal(result.missing_script, "test:live");
-  assert.deepEqual(result.resolved_commands, ["pnpm test:live", "pnpm check:changed"]);
-});
-
-test("staged target proof rejects unsafe commands before planning", () => {
-  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      buildTargetValidationProofPlan(
-        ["sh -c 'curl https://example.invalid'"],
-        cwd,
-        validationOptions("openclaw/openclaw"),
-      ),
-    /unsupported validation command|unsafe validation command/,
-  );
-});
-
-test("staged proof replay revalidates forged argv before execution", () => {
-  const cwd = gitPackageFixture({});
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const forged = stagedProofPlanArtifact(
-    buildStagedProofPlan({
-      commands: [
-        {
-          parts: ["node", "-e", "process.exit(0)"],
-          source: "artifact",
-          canonical: false,
-          required: true,
-          originalIndex: 0,
-        },
-      ],
-      changedFiles: [],
-    }),
-  );
-
-  assert.throws(
-    () =>
-      replayStagedValidationProof(
-        forged,
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    /unsafe validation command/,
-  );
-});
-
-test("staged target proof fails if an allowlisted script mutates the checkout", () => {
-  const cwd = gitPackageFixture({
-    verify: "node mutate.js",
-  });
-  fs.writeFileSync(
-    path.join(cwd, "mutate.js"),
-    "require('node:fs').writeFileSync('generated.txt', 'mutated\\n');\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const head = git(cwd, "rev-parse", "HEAD");
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    (error) => {
-      assert.match(error.message, /mutated checkout or proof identity/);
-      assert.equal(error.trace.status, "failed");
-      return true;
-    },
-  );
-  assert.equal(git(cwd, "rev-parse", "HEAD"), head);
-});
-
-for (const hiddenFlag of ["--assume-unchanged", "--skip-worktree"]) {
-  test(`staged target proof rejects tracked files hidden with ${hiddenFlag}`, () => {
-    const cwd = gitPackageFixture({ verify: "node --test" });
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-    git(cwd, "update-index", hiddenFlag, "package.json");
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /rejects hidden tracked index flags/,
-    );
-  });
-}
-
-for (const [name, createLink, error] of [
-  [
-    "escape",
-    (cwd) => {
-      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-symlink-outside-"));
-      const target = path.join(outside, "target.json");
-      fs.writeFileSync(target, "{}\n");
-      fs.symlinkSync(target, path.join(cwd, "tracked-config"));
-    },
-    /tracked proof input symlink escapes validation checkout: tracked-config/,
-  ],
-  [
-    "broken",
-    (cwd) => fs.symlinkSync("missing-config.json", path.join(cwd, "tracked-config")),
-    /tracked proof input symlink is broken or cyclic: tracked-config/,
-  ],
-  [
-    "cycle",
-    (cwd) => {
-      fs.symlinkSync("tracked-config-b", path.join(cwd, "tracked-config"));
-      fs.symlinkSync("tracked-config", path.join(cwd, "tracked-config-b"));
-    },
-    /tracked proof input symlink is broken or cyclic: tracked-config/,
-  ],
-]) {
-  test(
-    `staged proof rejects a tracked symlink ${name}`,
-    { skip: process.platform === "win32" },
-    () => {
-      const cwd = gitPackageFixture({ verify: "node --test" });
-      createLink(cwd);
-      git(cwd, "add", ".");
-      git(cwd, "commit", "-m", "initial");
-      attachOrigin(cwd);
-
-      assert.throws(
-        () =>
-          runStagedValidationProof(
-            ["pnpm verify"],
-            cwd,
-            validationOptions("steipete/example", {
-              toolchain: {
-                packageManager: "pnpm",
-                baseValidationCommands: [],
-                changedGate: null,
-              },
-            }),
-          ),
-        error,
-      );
-    },
-  );
-}
-
-test(
-  "staged proof binds ignored content reached through a tracked symlink",
-  { skip: process.platform === "win32" },
-  () => {
-    const cwd = gitPackageFixture({ poison: "node poison.js" });
-    fs.appendFileSync(path.join(cwd, ".gitignore"), "ignored-store/\n");
-    fs.mkdirSync(path.join(cwd, "ignored-store"), { recursive: true });
-    fs.writeFileSync(path.join(cwd, "ignored-store", "config.json"), '{"safe":true}\n');
-    fs.symlinkSync("ignored-store/config.json", path.join(cwd, "tracked-config"));
-    fs.writeFileSync(
-      path.join(cwd, "poison.js"),
-      "require('node:fs').writeFileSync('ignored-store/config.json', '{\"safe\":false}\\n');\n",
-    );
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm poison"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /mutated checkout or proof identity/,
-    );
-  },
-);
-
-test(
-  "staged proof binds ignored target identity reached through a tracked symlink",
-  { skip: process.platform === "win32" },
-  () => {
-    const cwd = gitPackageFixture({ poison: "node poison.js" });
-    fs.appendFileSync(path.join(cwd, ".gitignore"), "ignored-store/\n");
-    fs.mkdirSync(path.join(cwd, "ignored-store"), { recursive: true });
-    fs.writeFileSync(path.join(cwd, "ignored-store", "a.json"), '{"same":true}\n');
-    fs.writeFileSync(path.join(cwd, "ignored-store", "b.json"), '{"same":true}\n');
-    fs.symlinkSync("a.json", path.join(cwd, "ignored-store", "current.json"));
-    fs.symlinkSync("ignored-store/current.json", path.join(cwd, "tracked-config"));
-    fs.writeFileSync(
-      path.join(cwd, "poison.js"),
-      [
-        "const fs = require('node:fs');",
-        "fs.unlinkSync('ignored-store/current.json');",
-        "fs.symlinkSync('b.json', 'ignored-store/current.json');",
-        "",
-      ].join("\n"),
-    );
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm poison"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /mutated checkout or proof identity/,
-    );
-  },
-);
-
-test("staged proof budget includes checkout and recursive proof-input sealing", () => {
-  const cwd = gitPackageFixture({ verify: "node --test" });
-  fs.mkdirSync(path.join(cwd, "node_modules", "fixture"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "node_modules", "fixture", "state.js"), "clean\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const originalNow = Date.now;
-  let calls = 0;
-  Date.now = () => (calls++ === 0 ? 1_000 : 1_101);
-  try {
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            proofBudgetMs: 100,
-            validationTimeoutMs: 1_000,
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /staged proof runtime budget exhausted before/,
-    );
-  } finally {
-    Date.now = originalNow;
-  }
-});
-
-test("staged proof replay budget includes checkout and recursive proof-input sealing", () => {
-  const cwd = gitPackageFixture({ verify: "node --test" });
-  fs.mkdirSync(path.join(cwd, "node_modules", "fixture"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "node_modules", "fixture", "state.js"), "clean\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const options = validationOptions("steipete/example", {
-    proofBudgetMs: 100,
-    validationTimeoutMs: 1_000,
-    toolchain: {
-      packageManager: "pnpm",
-      baseValidationCommands: [],
-      changedGate: null,
-    },
-  });
-  const plan = buildTargetValidationProofPlan(["pnpm verify"], cwd, options);
-
-  const originalNow = Date.now;
-  let calls = 0;
-  Date.now = () => (calls++ === 0 ? 1_000 : 1_101);
-  try {
-    assert.throws(
-      () => replayStagedValidationProof(plan, cwd, options),
-      /staged proof runtime budget exhausted before/,
-    );
-  } finally {
-    Date.now = originalNow;
-  }
-});
-
-test("staged proof rejects ignored dependency poisoning before later commands", () => {
-  const cwd = gitPackageFixture({
-    poison: "node poison.js",
-    verify: "node verify.js",
-  });
-  const dependencyPath = path.join(cwd, "node_modules", "fixture-dependency", "state.js");
-  const markerPath = path.join(cwd, "poison-used.txt");
-  fs.mkdirSync(path.dirname(dependencyPath), { recursive: true });
-  fs.writeFileSync(dependencyPath, "clean\n");
-  fs.writeFileSync(
-    path.join(cwd, "poison.js"),
-    [
-      "const fs = require('node:fs');",
-      "const file = 'node_modules/fixture-dependency/state.js';",
-      "const before = fs.statSync(file);",
-      "fs.writeFileSync(file, 'owned\\n');",
-      "fs.utimesSync(file, before.atime, before.mtime);",
-      "",
-    ].join("\n"),
-  );
-  fs.writeFileSync(
-    path.join(cwd, "verify.js"),
-    [
-      "const fs = require('node:fs');",
-      "if (fs.readFileSync('node_modules/fixture-dependency/state.js', 'utf8') === 'owned\\n') {",
-      "  fs.writeFileSync('poison-used.txt', 'used\\n');",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm poison", "pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    (error) => {
-      assert.match(
-        error.message,
-        /mutated ignored proof input surface: node_modules\/fixture-dependency\/state\.js/,
-      );
-      assert.equal(error.trace.status, "failed");
-      return true;
-    },
-  );
-  assert.equal(git(cwd, "status", "--porcelain"), "");
-  assert.equal(fs.existsSync(markerPath), false);
-});
-
-test("staged proof rejects creation of a nested ignored dependency root", () => {
-  const cwd = gitPackageFixture({
-    poison: "node poison.js",
-    verify: "node verify.js",
-  });
-  fs.appendFileSync(path.join(cwd, ".gitignore"), "node_modules/\n");
-  fs.mkdirSync(path.join(cwd, "packages", "app"), { recursive: true });
-  fs.writeFileSync(path.join(cwd, "packages", "app", "package.json"), "{}\n");
-  fs.writeFileSync(
-    path.join(cwd, "poison.js"),
-    [
-      "const fs = require('node:fs');",
-      "fs.mkdirSync('packages/app/node_modules/fixture-dependency', { recursive: true });",
-      "fs.writeFileSync('packages/app/node_modules/fixture-dependency/state.js', 'owned\\n');",
-      "",
-    ].join("\n"),
-  );
-  fs.writeFileSync(
-    path.join(cwd, "verify.js"),
-    [
-      "const fs = require('node:fs');",
-      "if (fs.readFileSync('packages/app/node_modules/fixture-dependency/state.js', 'utf8') === 'owned\\n') {",
-      "  fs.writeFileSync('poison-used.txt', 'used\\n');",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm poison", "pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    (error) => {
-      assert.match(
-        error.message,
-        /mutated ignored proof input surface: packages\/app\/node_modules/,
-      );
-      assert.equal(error.trace.status, "failed");
-      return true;
-    },
-  );
-  assert.equal(fs.existsSync(path.join(cwd, "poison-used.txt")), false);
-});
-
-test("staged proof allows unrelated ignored generated outputs between commands", () => {
-  const cwd = gitPackageFixture({
-    generate: "node generate.js",
-    verify: "node verify.js",
-  });
-  fs.appendFileSync(path.join(cwd, ".gitignore"), "coverage/\n");
-  fs.writeFileSync(
-    path.join(cwd, "generate.js"),
-    "require('node:fs').mkdirSync('coverage', { recursive: true }); require('node:fs').writeFileSync('coverage/result.json', '{}\\n');\n",
-  );
-  fs.writeFileSync(
-    path.join(cwd, "verify.js"),
-    "if (!require('node:fs').existsSync('coverage/result.json')) process.exit(9);\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const result = runStagedValidationProof(
-    ["pnpm generate", "pnpm verify"],
-    cwd,
-    validationOptions("steipete/example", {
-      toolchain: {
-        packageManager: "pnpm",
-        baseValidationCommands: [],
-        changedGate: null,
-      },
-    }),
-  );
-
-  assert.equal(result.trace.status, "passed");
-  assert.equal(fs.readFileSync(path.join(cwd, "coverage", "result.json"), "utf8"), "{}\n");
-});
-
-test(
-  "staged proof rejects dependency symlinks that escape the checkout",
-  { skip: process.platform === "win32" },
-  () => {
-    const cwd = gitPackageFixture({ verify: "node verify.js" });
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-proof-outside-"));
-    fs.mkdirSync(path.join(cwd, "node_modules"), { recursive: true });
-    fs.symlinkSync(outside, path.join(cwd, "node_modules", "escape"));
-    fs.writeFileSync(path.join(cwd, "verify.js"), "\n");
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /proof input symlink escapes validation checkout: node_modules\/escape/,
-    );
-  },
-);
-
-test(
-  "staged proof rejects cyclic dependency symlinks without traversing them",
-  { skip: process.platform === "win32" },
-  () => {
-    const cwd = gitPackageFixture({ verify: "node verify.js" });
-    fs.mkdirSync(path.join(cwd, "node_modules"), { recursive: true });
-    fs.symlinkSync("loop", path.join(cwd, "node_modules", "loop"));
-    fs.writeFileSync(path.join(cwd, "verify.js"), "\n");
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /proof input symlink is broken or cyclic: node_modules\/loop/,
-    );
-  },
-);
-
-test(
-  "staged proof seals files beneath in-checkout dependency symlinks",
-  { skip: process.platform === "win32" },
-  () => {
-    const cwd = gitPackageFixture({
-      poison: "node poison.js",
-      verify: "node verify.js",
-    });
-    fs.appendFileSync(path.join(cwd, ".gitignore"), "node_modules/\ndependency-store/\n");
-    fs.mkdirSync(path.join(cwd, "dependency-store", "fixture"), { recursive: true });
-    fs.writeFileSync(path.join(cwd, "dependency-store", "fixture", "state.js"), "safe\n");
-    fs.mkdirSync(path.join(cwd, "node_modules"), { recursive: true });
-    fs.symlinkSync(
-      path.join("..", "dependency-store", "fixture"),
-      path.join(cwd, "node_modules", "fixture"),
-    );
-    fs.writeFileSync(
-      path.join(cwd, "poison.js"),
-      "require('node:fs').writeFileSync('dependency-store/fixture/state.js', 'owned\\n');\n",
-    );
-    fs.writeFileSync(
-      path.join(cwd, "verify.js"),
-      [
-        "const fs = require('node:fs');",
-        "if (fs.readFileSync('node_modules/fixture/state.js', 'utf8') === 'owned\\n') {",
-        "  fs.writeFileSync('poison-used.txt', 'used\\n');",
-        "}",
-        "",
-      ].join("\n"),
-    );
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    assert.throws(
-      () =>
-        runStagedValidationProof(
-          ["pnpm poison", "pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-          }),
-        ),
-      /mutated ignored proof input surface: dependency-store\/fixture\/state\.js/,
-    );
-    assert.equal(fs.existsSync(path.join(cwd, "poison-used.txt")), false);
-  },
-);
-
-for (const packageCommand of ["npm run check", "pnpm check"]) {
-  test(`${packageCommand} executes the approved script without pre/post lifecycle hooks`, () => {
-    const cwd = gitPackageFixture({
-      precheck: "node precheck.js",
-      check: "node check.js",
-      postcheck: "node postcheck.js",
-    });
-    fs.appendFileSync(path.join(cwd, ".gitignore"), "proof-events/\n");
-    for (const [file, event] of [
-      ["precheck.js", "pre"],
-      ["check.js", "main"],
-      ["postcheck.js", "post"],
-    ]) {
-      fs.writeFileSync(
-        path.join(cwd, file),
-        `const fs = require("node:fs"); fs.mkdirSync("proof-events", { recursive: true }); fs.appendFileSync("proof-events/events", ${JSON.stringify(`${event}\n`)});\n`,
-      );
-    }
-    git(cwd, "add", ".");
-    git(cwd, "commit", "-m", "initial");
-    attachOrigin(cwd);
-
-    const result = runStagedValidationProof(
-      [packageCommand],
-      cwd,
-      validationOptions("steipete/example", {
-        toolchain: {
-          packageManager: packageCommand.startsWith("npm ") ? "npm" : "pnpm",
-          baseValidationCommands: [],
-          changedGate: null,
-        },
-      }),
-    );
-
-    assert.equal(result.trace.status, "passed");
-    assert.equal(fs.readFileSync(path.join(cwd, "proof-events", "events"), "utf8"), "main\n");
-  });
-}
-
-test("package validation execution injects lifecycle suppression without changing proof argv", () => {
-  assert.deepEqual(validationCommandForExecution(["npm", "run", "check"]), [
-    "npm",
-    "--ignore-scripts",
-    "run",
-    "check",
-  ]);
-  assert.deepEqual(validationCommandForExecution(["pnpm", "--filter", "app", "check"]), [
-    "pnpm",
-    "--config.enable-pre-post-scripts=false",
-    "--filter",
-    "app",
-    "check",
-  ]);
-  assert.throws(
-    () => validationCommandForExecution(["npm", "--ignore-scripts=false", "run", "check"]),
-    /npm lifecycle suppression is overridden/,
-  );
-  assert.throws(
-    () => validationCommandForExecution(["npm", "run", "check", "--ignore-scripts=false"]),
-    /npm lifecycle suppression is overridden/,
-  );
-});
-
-test("staged target proof resolves environment defaults before direct spawn", () => {
-  const cwd = gitPackageFixture({
-    qa: "node qa.js",
-  });
-  fs.writeFileSync(
-    path.join(cwd, "qa.js"),
-    "if (process.argv[2] !== 'example/model-test') process.exit(9);\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const result = runStagedValidationProof(
-    ["env MODEL= pnpm qa ${MODEL:-example/model-test}"],
-    cwd,
-    validationOptions("steipete/example", {
-      toolchain: {
-        packageManager: "pnpm",
-        baseValidationCommands: [],
-        changedGate: null,
-      },
-    }),
-  );
-
-  assert.equal(result.trace.status, "passed");
-  assert.equal(result.trace.validated_head_sha, git(cwd, "rev-parse", "HEAD"));
-  assert.equal(result.trace.validated_base_sha, git(cwd, "rev-parse", "origin/main"));
-  assert.equal(result.commands.includes("env MODEL= pnpm qa ${MODEL:-example/model-test}"), true);
-});
-
-test("staged target proof validates and digests resolved environment argv", () => {
-  const cwd = gitPackageFixture({
-    qa: "node qa.js",
-  });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-  const options = validationOptions("steipete/example", {
-    toolchain: {
-      packageManager: "pnpm",
-      baseValidationCommands: [],
-      changedGate: null,
-    },
-  });
-
-  assert.throws(
-    () => buildTargetValidationProofPlan(["env TASK= pnpm ${TASK:-install}"], cwd, options),
-    /unsafe validation command/,
-  );
-
-  const templated = buildTargetValidationProofPlan(
-    ["env MODEL= pnpm qa ${MODEL:-example/model-test}"],
-    cwd,
-    options,
-  );
-  const concrete = buildTargetValidationProofPlan(
-    ["env MODEL= pnpm qa example/model-test"],
-    cwd,
-    options,
-  );
-  assert.equal(templated.plan_id, concrete.plan_id);
-  assert.equal(templated.commands.at(-1).command_digest, concrete.commands.at(-1).command_digest);
-});
-
-test("staged target proof executes colliding rendered commands by structured argv", () => {
-  const cwd = gitPackageFixture({});
-  const logPath = path.join(os.tmpdir(), `clawsweeper-argv-${process.pid}-${Date.now()}.log`);
-  fs.writeFileSync(
-    path.join(cwd, "record-argv.cjs"),
-    "require('node:fs').appendFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)) + '\\n');\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  try {
-    const result = runStagedValidationProof(
-      [`node record-argv.cjs ${logPath} "a b"`, `node record-argv.cjs ${logPath} a b`],
-      cwd,
-      validationOptions("steipete/example", {
-        toolchain: {
-          packageManager: "pnpm",
-          baseValidationCommands: [],
-          changedGate: null,
-        },
-      }),
-    );
-
-    assert.equal(result.trace.status, "passed");
-    assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split("\n"), ['["a b"]', '["a","b"]']);
-  } finally {
-    fs.rmSync(logPath, { force: true });
-  }
-});
-
-test("staged target proof exposes compact failed traces without command output", () => {
-  const cwd = gitPackageFixture({
-    verify: "node verify.js",
-  });
-  fs.writeFileSync(
-    path.join(cwd, "verify.js"),
-    "console.error('PRIVATE FAILURE LOG'); process.exit(1);\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(
-        ["pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          validationTimeoutMs: 10_000,
-          proofBudgetMs: 10_000,
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
-      ),
-    (error) => {
-      assert.equal(error.trace.status, "failed");
-      assert.equal(JSON.stringify(error.trace).includes("PRIVATE FAILURE LOG"), false);
-      assert.match(error.message, /validation command failed/);
-      return true;
-    },
-  );
-});
-
-test("stalled canonical changed gates fail instead of certifying fallback proof", () => {
-  const cwd = gitPackageFixture({
-    "check:changed": "node stalled-check.js",
-  });
-  fs.writeFileSync(
-    path.join(cwd, "stalled-check.js"),
-    "console.error('no output for 1000ms'); process.exit(1);\n",
-  );
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  assert.throws(
-    () =>
-      runStagedValidationProof(["pnpm check:changed"], cwd, validationOptions("openclaw/openclaw")),
-    (error) => {
-      assert.match(error.message, /no output for 1000ms/);
-      assert.deepEqual(
-        error.trace.commands.map((entry) => [entry.command_kind, entry.status]),
-        [
-          ["git:diff-check", "passed"],
-          ["git:diff-check", "passed"],
-          ["pnpm:check:changed", "failed"],
-        ],
-      );
-      return true;
-    },
-  );
-});
-
 test("changed validation retries one transient check:changed failure", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-attempt-${process.pid}-${Date.now()}.txt`,
-  );
   const cwd = gitPackageFixture({
     "check:changed":
-      "node -e \"const fs=require('fs'); const file=process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); if (count===0) { console.error('transient changed gate failure'); process.exit(1); }\"",
+      "node -e \"const fs=require('fs'); const file='.attempt'; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); if (count===0) { console.error('transient changed gate failure'); process.exit(1); }\"",
   });
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
   const previous = process.env.CLAWSWEEPER_VALIDATION_RETRIES;
-  const previousMarker = process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE;
   process.env.CLAWSWEEPER_VALIDATION_RETRIES = "1";
-  process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE = marker;
   try {
     assert.deepEqual(
       runAllowedValidationCommands(
@@ -2959,51 +1223,11 @@ test("changed validation retries one transient check:changed failure", () => {
         cwd,
         validationOptions("openclaw/openclaw"),
       ),
-      ["git diff --check origin/main...HEAD", "git diff --check", "pnpm check:changed"],
+      ["pnpm check:changed"],
     );
   } finally {
     if (previous === undefined) delete process.env.CLAWSWEEPER_VALIDATION_RETRIES;
     else process.env.CLAWSWEEPER_VALIDATION_RETRIES = previous;
-    restoreEnv("CLAWSWEEPER_TEST_ATTEMPT_FILE", previousMarker);
-    fs.rmSync(marker, { force: true });
-  }
-});
-
-test("changed validation does not retry after its command budget is exhausted", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-budget-attempt-${process.pid}-${Date.now()}.txt`,
-  );
-  const cwd = gitPackageFixture({
-    "check:changed":
-      "node -e \"const fs=require('fs'); const file=process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); setTimeout(() => {}, 5000)\"",
-  });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const previousRetries = process.env.CLAWSWEEPER_VALIDATION_RETRIES;
-  const previousMarker = process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE;
-  process.env.CLAWSWEEPER_VALIDATION_RETRIES = "1";
-  process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE = marker;
-  try {
-    assert.throws(
-      () =>
-        runAllowedValidationCommands(
-          ["pnpm check:changed"],
-          cwd,
-          validationOptions("openclaw/openclaw", {
-            validationTimeoutMs: 5_000,
-            proofBudgetMs: 15_000,
-          }),
-        ),
-      /validation command runtime budget exhausted/,
-    );
-    assert.equal(fs.readFileSync(marker, "utf8"), "1");
-  } finally {
-    restoreEnv("CLAWSWEEPER_VALIDATION_RETRIES", previousRetries);
-    restoreEnv("CLAWSWEEPER_TEST_ATTEMPT_FILE", previousMarker);
-    fs.rmSync(marker, { force: true });
   }
 });
 
@@ -3015,13 +1239,6 @@ test("target validation strips Codex, model, and GitHub write credentials", () =
     "CODEX_HOME",
     "GH_TOKEN",
     "GITHUB_TOKEN",
-    "GITHUB_ENV",
-    "GITHUB_OUTPUT",
-    "GITHUB_PATH",
-    "GITHUB_STEP_SUMMARY",
-    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-    "ACTIONS_RUNTIME_TOKEN",
-    "CLAWSWEEPER_RULESET_GH_TOKEN",
   ];
   const secretNameArray = `[${secretNames.map((name) => `'${name}'`).join(",")}]`;
   const cwd = gitPackageFixture({
@@ -3046,7 +1263,7 @@ test("target validation strips Codex, model, and GitHub write credentials", () =
           },
         }),
       ),
-      ["git diff --check origin/main...HEAD", "git diff --check", "pnpm check:env"],
+      ["pnpm check:env"],
     );
   } finally {
     for (const [key, value] of Object.entries(previous)) restoreEnv(key, value);
@@ -3062,25 +1279,7 @@ test("compactText keeps both head and tail for long validation output", () => {
 
 function packageFixture(scripts) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-"));
-  fs.writeFileSync(
-    path.join(cwd, "package.json"),
-    `${JSON.stringify({ scripts, packageManager: "pnpm@10.33.0" }, null, 2)}\n`,
-  );
-  fs.writeFileSync(
-    path.join(cwd, "pnpm-lock.yaml"),
-    [
-      "lockfileVersion: '9.0'",
-      "",
-      "settings:",
-      "  autoInstallPeers: true",
-      "  excludeLinksFromLockfile: false",
-      "",
-      "importers:",
-      "",
-      "  .: {}",
-      "",
-    ].join("\n"),
-  );
+  fs.writeFileSync(path.join(cwd, "package.json"), `${JSON.stringify({ scripts }, null, 2)}\n`);
   return cwd;
 }
 
@@ -3096,16 +1295,15 @@ function bunPackageFixture(scripts) {
 
 function gitBunPackageFixture(scripts) {
   const cwd = bunPackageFixture(scripts);
-  fs.writeFileSync(path.join(cwd, ".gitignore"), "node_modules/\n");
   git(cwd, "init", "-b", "main");
   git(cwd, "config", "user.email", "clawsweeper@example.invalid");
   git(cwd, "config", "user.name", "ClawSweeper Test");
   return cwd;
 }
 
-function fakeBunFixture({ failRun = false, failFrozenInstall = false } = {}) {
+function fakeBunFixture(cwd, { failRun = false } = {}) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
-  const logPath = path.join(binDir, "fake-bun.log");
+  const logPath = path.join(cwd, "fake-bun.log");
   writeNodeCommandShim(
     binDir,
     "bun",
@@ -3113,7 +1311,6 @@ function fakeBunFixture({ failRun = false, failFrozenInstall = false } = {}) {
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv[2] === "--version") console.log("1.3.10");
-if (${JSON.stringify(failFrozenInstall)} && process.argv[2] === "install" && process.argv.includes("--frozen-lockfile")) { console.error("lockfile is out of date"); process.exit(1); }
 if (process.argv[2] === "install") fs.mkdirSync("node_modules", { recursive: true });
 if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("src/base.ts:1: lint failed"); process.exit(1); }
 `,
@@ -3121,10 +1318,10 @@ if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("sr
   return { binDir, logPath };
 }
 
-function envLoggingBunFixture() {
+function envLoggingBunFixture(cwd) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-env-bin-"));
-  const logPath = path.join(binDir, "fake-bun.log");
-  const envLogPath = path.join(binDir, "fake-bun-env.log");
+  const logPath = path.join(cwd, "fake-bun.log");
+  const envLogPath = path.join(cwd, "fake-bun-env.log");
   writeNodeCommandShim(
     binDir,
     "bun",
@@ -3196,7 +1393,6 @@ function clawhubToolchain() {
 
 function gitPackageFixture(scripts) {
   const cwd = packageFixture(scripts);
-  fs.writeFileSync(path.join(cwd, ".gitignore"), "node_modules/\n");
   git(cwd, "init", "-b", "main");
   git(cwd, "config", "user.email", "clawsweeper@example.invalid");
   git(cwd, "config", "user.name", "ClawSweeper Test");

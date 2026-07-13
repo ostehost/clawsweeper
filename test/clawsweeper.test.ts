@@ -2097,43 +2097,27 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
-  assert.equal(
-    workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
-      ?.length,
-    2,
-  );
-  const executeJob = workflow.slice(
-    workflow.indexOf("\n  execute:"),
-    workflow.indexOf("\n  validate:"),
-  );
-  const reportJob = workflow.slice(
-    workflow.indexOf("\n  report:"),
-    workflow.indexOf("\n  mutate:"),
-  );
-  const mutateJob = workflow.slice(workflow.indexOf("\n  mutate:"));
-  assert.doesNotMatch(executeJob, /create-state-token|setup-state/);
+  assert.equal(workflow.match(/uses: \.\/\.github\/actions\/setup-state/g)?.length, 2);
+  assert.match(workflow, /sparse-checkout: jobs/);
+  assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
   assert.match(workflow, /CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(workflow, /actions\/cache\/restore@v6/);
   assert.match(workflow, /actions\/cache\/save@v6/);
   assert.match(workflow, /repair:action-session -- register/);
   assert.match(workflow, /completion-reason gates_passed/);
+  assert.match(workflow, /post_flight_report=.*post-flight-report\.json/);
+  assert.match(workflow, /\.action == "finalize_fix_pr"/);
+  assert.match(workflow, /\.status == "ready"/);
   assert.match(
-    reportJob,
-    /id: repair_requeue[\s\S]*count-requeue-required[\s\S]*id: requeue_token[\s\S]*repair:requeue/,
+    workflow,
+    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
-  assert.match(reportJob, /if: \$\{\{ always\(\)/);
-  assert.match(reportJob, /Publish terminal report-only status[\s\S]*--dashboard-only/);
-  assert.doesNotMatch(reportJob, /target_post_flight_token|permission-pull-requests/);
   assert.match(
-    mutateJob,
-    /if: \$\{\{ needs\.execute\.result == 'success' && needs\.execute\.outputs\.execute_fix_outcome == 'success' && needs\.execute\.outputs\.mutation_ready == 'true' && needs\.validate\.result == 'success' && needs\.report\.result == 'success' \}\}/,
+    workflow,
+    /if: \$\{\{ always\(\) && failure\(\) && steps\.crabfleet_session\.outcome == 'success' && \(steps\.repair_requeue\.outputs\.count == '' \|\| steps\.repair_requeue\.outputs\.count == '0' \|\| steps\.requeue_dispatch\.outcome != 'success'\) \}\}/,
   );
-  assert.match(mutateJob, /repair:execution-handoff -- verify-publication/);
-  assert.match(mutateJob, /--publication-receipt-sha256/);
-  assert.match(mutateJob, /TRUSTED_PR_URL: \$\{\{ steps\.publish\.outputs\.target_pr_url \}\}/);
-  assert.doesNotMatch(mutateJob, /repair:apply-result|repair:tag-clawsweeper/);
   assert.equal(workflow.match(/id: crabfleet_session/g)?.length, 2);
-  assert.equal(workflow.match(/steps\.crabfleet_session\.outcome == 'success'/g)?.length, 5);
+  assert.equal(workflow.match(/steps\.crabfleet_session\.outcome == 'success'/g)?.length, 6);
   assert.doesNotMatch(workflow, /if: \$\{\{[^\n]*env\.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN/);
 });
 
@@ -2227,7 +2211,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   assert.match(
     eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.queue-exact-verdict-router\.outcome != 'success'/,
+    /steps\.route-synced-verdict\.outcome != 'success'/,
   );
   assert.match(primaryResultStep, /PRIMARY_JOB_STATUS: \$\{\{ job\.status \}\}/);
   assert.doesNotMatch(primaryResultStep, /JOB_CANCELLED|\$\{\{ cancelled\(\) \}\}/);
@@ -2287,6 +2271,7 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
     ".github/workflows/commit-review.yml",
     ".github/workflows/maintainer-activity-report.yml",
     ".github/workflows/repair-cluster-worker.yml",
+    ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/sweep.yml",
   ].map((file) => readText(file));
 
@@ -2393,12 +2378,7 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   ].join("\n");
 
   assert.doesNotMatch(existingRepairWorkflows, /CLAWSWEEPER_FEATURE_REPAIR_ENABLED/);
-  assert.doesNotMatch(sweep, /pnpm run repair:comment-router --/);
-  assert.match(
-    sweep,
-    /gh workflow run repair-comment-router\.yml[\s\S]*-f item_numbers="\$ITEM_NUMBER"/,
-  );
-  assert.match(router, /pnpm run repair:comment-router -- "\$\{args\[@\]\}"/);
+  assert.match(sweep, /pnpm run repair:comment-router -- \\\n[\s\S]*--execute/);
   assert.match(router, /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \]; \}/);
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
@@ -2761,7 +2741,6 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     process.env.GITHUB_TOKEN = "github";
     process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN = "target";
     process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN = "codex-target";
-    process.env.CLAWSWEEPER_RULESET_GH_TOKEN = "ruleset-verifier";
     process.env.CLAWSWEEPER_APP_ID = "123";
     process.env.CLAWSWEEPER_APP_PRIVATE_KEY = "private";
     process.env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN = "agent";
@@ -2779,7 +2758,6 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     assert.equal(env.GITHUB_TOKEN, undefined);
     assert.equal(env.COMMIT_SWEEPER_TARGET_GH_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN, undefined);
-    assert.equal(env.CLAWSWEEPER_RULESET_GH_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_APP_ID, undefined);
     assert.equal(env.CLAWSWEEPER_APP_PRIVATE_KEY, undefined);
     assert.equal(env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN, undefined);

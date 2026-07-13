@@ -442,12 +442,6 @@ function validateMergePreflight(
         failures.push(`${target} merge_preflight.${key} must be a non-empty list`);
       }
     }
-    const validationProof = preflight.validation_proof;
-    if (validationProof != null) {
-      failures.push(
-        `${target} merge_preflight.validation_proof must be omitted until deterministic execution`,
-      );
-    }
     const codexReview = preflight.codex_review;
     if (!codexReview || typeof codexReview !== "object") {
       failures.push(`${target} merge_preflight.codex_review is required`);

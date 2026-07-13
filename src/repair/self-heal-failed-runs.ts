@@ -16,7 +16,6 @@ import {
 import { ghErrorText, ghJson, ghSpawn, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
-import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -185,7 +184,7 @@ function selectCandidates() {
   }
 
   return [...latestByJob.values()]
-    .filter((record: JsonValue) => shouldSelfHealRunRecord(record))
+    .filter((record: JsonValue) => record.workflow_conclusion === "failure")
     .filter((record: JsonValue) => {
       const timestamp = recordTimestampMs(record);
       if (timestamp >= cutoffMs) return true;

@@ -32,7 +32,6 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
-import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
@@ -649,22 +648,6 @@ function applyMergeAction({
     };
   }
 
-  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: result.repo,
-    baseBranch: String(view.baseRefName ?? pullRequest.base?.ref ?? ""),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (strictBaseBindingBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: strictBaseBindingBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-    };
-  }
-
   const mergeMessage = buildRepairSquashMergeMessage({
     target,
     title: view.title ?? pullRequest.title,
@@ -687,22 +670,6 @@ function applyMergeAction({
   ];
   if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
   try {
-    const finalView = fetchPullRequestView(result.repo, target);
-    const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-      repo: result.repo,
-      baseBranch: String(finalView.baseRefName ?? ""),
-      policyReadJson: rulesetPolicyReader(),
-    });
-    if (finalStrictBaseBindingBlock) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: finalStrictBaseBindingBlock,
-        live_state: live.state,
-        live_updated_at: live.updated_at,
-        merge_method: "squash",
-      };
-    }
     ghWithRetry(mergeArgs);
   } catch (error) {
     if (isLockedConversationCommentError(error)) {
@@ -727,15 +694,6 @@ function applyMergeAction({
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
   };
-}
-
-function rulesetPolicyReader() {
-  const token = process.env.CLAWSWEEPER_RULESET_GH_TOKEN?.trim();
-  if (!token) return undefined;
-  return (ghArgs: string[]) =>
-    ghJson(ghArgs, {
-      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
-    });
 }
 
 function validateClosePolicy({ job, actionName }: LooseRecord) {

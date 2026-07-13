@@ -66,7 +66,7 @@ trusts it.
 
 Long Codex calls emit periodic `[clawsweeper repair] ... still running` log
 lines from the wrapper process. This covers both the planning worker and
-execute-side edit, review, rebase-reconcile, and write-preflight subprocesses,
+execute-side edit, review, and rebase-reconcile subprocesses,
 so GitHub Actions does not kill otherwise healthy repair jobs for lack of output
 before the debug artifact collection steps can run.
 

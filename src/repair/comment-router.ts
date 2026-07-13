@@ -128,7 +128,6 @@ import {
 } from "./github-cli.js";
 import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
 import { issueSourceRevisionSha256 } from "./issue-source-guard.js";
-import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
 import {
   flushCommandActionEvents,
@@ -3759,34 +3758,6 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
-  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: command.repo,
-    baseBranch: String(view.baseRefName ?? latestTarget.base_ref ?? targetBranch ?? "main"),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (strictBaseBindingBlock) {
-    return {
-      action: "merge",
-      status: "blocked",
-      reason: strictBaseBindingBlock,
-      merge_method: "squash",
-    };
-  }
-  const finalView = fetchPullRequestView(command.issue_number);
-  const finalTarget = latestAutomergeTarget(command, finalView);
-  const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: command.repo,
-    baseBranch: String(finalView.baseRefName ?? finalTarget.base_ref ?? targetBranch ?? "main"),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (finalStrictBaseBindingBlock) {
-    return {
-      action: "merge",
-      status: "blocked",
-      reason: finalStrictBaseBindingBlock,
-      merge_method: "squash",
-    };
-  }
   const result = runGitHubSpawnMutation(
     command,
     "pull_request_merge",
@@ -3858,15 +3829,6 @@ function executeAutomerge(command: LooseRecord) {
     transient_wait_ms: waitedMs,
     transient_observations: transientObservations,
   };
-}
-
-function rulesetPolicyReader() {
-  const token = process.env.CLAWSWEEPER_RULESET_GH_TOKEN?.trim();
-  if (!token) return undefined;
-  return (ghArgs: string[]) =>
-    ghJson(ghArgs, {
-      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
-    });
 }
 
 function latestAutomergeTarget(command: LooseRecord, view: LooseRecord) {
