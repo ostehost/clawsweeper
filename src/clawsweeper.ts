@@ -8271,19 +8271,21 @@ function collectItemContext(
     );
     pullReviewComments = pullReviewCommentsWindow.items;
     filteredPullReviewComments = filterReviewContextComments(pullReviewComments, item.number);
-    const fullPullReviewComments = pullReviewCommentsWindow.truncated
-      ? ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/comments`)
-      : pullReviewComments;
-    const pullReviews = ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/reviews`);
+    const fullPullReviewComments =
+      options.reviewCacheDigest && pullReviewCommentsWindow.truncated
+        ? ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/comments`)
+        : pullReviewComments;
     digestPullReviewComments =
       fullPullReviewComments === pullReviewComments
         ? filteredPullReviewComments
         : filterReviewContextComments(fullPullReviewComments, item.number);
-    const pullReviewActivityCursor = createReviewedPrActivityCursor({
-      reviews: pullReviews,
-      inlineComments: fullPullReviewComments,
-    });
-    if (pullReviewActivityCursor) context.pullReviewActivityCursor = pullReviewActivityCursor;
+    if (options.reviewCacheDigest) {
+      const pullReviewActivityCursor = createReviewedPrActivityCursor({
+        reviews: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/reviews`),
+        inlineComments: fullPullReviewComments,
+      });
+      if (pullReviewActivityCursor) context.pullReviewActivityCursor = pullReviewActivityCursor;
+    }
     context.pullRequest = compactPullRequest(pullRequest);
     context.pullFiles = compactMappedWindow(pullFiles, pullFilesWindow.total, 80, compactPullFile);
     context.semanticPullFiles =
