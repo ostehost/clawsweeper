@@ -496,24 +496,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          react() {
-            local content="$1"
-            local err
-            err="$(mktemp)"
-            if gh api -X POST \
-              -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions" \
-              -f content="$content" 2>"$err" >/dev/null; then
-              echo "Added $content reaction to $TARGET_REPO#$ITEM_NUMBER."
-            elif grep -qi "HTTP 422\\|already exists" "$err"; then
-              echo "$content reaction already exists on $TARGET_REPO#$ITEM_NUMBER."
-            else
-              cat "$err" >&2
-              return 1
-            fi
-            rm -f "$err"
-          }
-          react "eyes"
+          node dist/repair/sweep-mutation-cli.js reaction add \
+            --repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --content eyes
 
       - uses: actions/cache@v6
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
@@ -659,23 +645,6 @@ jobs:
             echo "::notice::Exact review produced no artifact because the item closed during review."
           fi
 
-      - name: Finalize exact event action ledger
-        if: ${{ always() && steps.live-item.outputs.proceed == 'true' }}
-        continue-on-error: true
-        env:
-          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
-          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
-            args=(--interrupt-open-attempts --reason timeout)
-          elif [ "$REVIEW_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
       - name: Create state token
         id: state-token
         if: ${{ always() && steps.live-item.outputs.proceed == 'true' }}
@@ -753,7 +722,10 @@ jobs:
           )"
           while IFS= read -r lease_id; do
             [ -n "$lease_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/comments/$lease_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js comment delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --comment-id "$lease_id"
             echo "Released unsuccessful review lease comment $lease_id owned by $LEASE_OWNER."
           done <<< "$lease_ids"
 
@@ -792,14 +764,18 @@ jobs:
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
-          gh workflow run repair-comment-router.yml \
+          node dist/repair/sweep-mutation-cli.js workflow dispatch \
             --repo "$GITHUB_REPOSITORY" \
+            --workflow repair-comment-router.yml \
             --ref main \
-            -f execute=true \
-            -f target_repo="$TARGET_REPO" \
-            -f target_branch="$TARGET_BRANCH" \
-            -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
-            -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+            --business-key "exact-verdict-router:$GITHUB_RUN_ID:$ITEM_NUMBER" \
+            --target-repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --field execute=true \
+            --field target_repo="$TARGET_REPO" \
+            --field target_branch="$TARGET_BRANCH" \
+            --field lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
+            --field max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
 
       - name: Release terminal review leases
         id: release-terminal-review-leases
@@ -824,12 +800,18 @@ jobs:
           test "$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state)" = "closed"
           while IFS= read -r lease_id; do
             [ -n "$lease_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/comments/$lease_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js comment delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --comment-id "$lease_id"
             echo "Released terminal review lease comment $lease_id for $TARGET_REPO#$ITEM_NUMBER."
           done <<< "$lease_ids"
           while IFS= read -r reaction_id; do
             [ -n "$reaction_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js reaction delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --reaction-id "$reaction_id"
             echo "Removed terminal eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
           done <<< "$reaction_ids"
 
@@ -948,21 +930,10 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           add_completion_reaction() {
-            local err
-            err="$(mktemp)"
-            if gh api -X POST \
-              -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions" \
-              -f content="+1" 2>"$err" >/dev/null; then
-              echo "Added +1 reaction to $TARGET_REPO#$ITEM_NUMBER."
-            elif grep -qi "HTTP 422\\|already exists" "$err"; then
-              echo "+1 reaction already exists on $TARGET_REPO#$ITEM_NUMBER."
-            else
-              cat "$err" >&2
-              rm -f "$err"
-              exit 1
-            fi
-            rm -f "$err"
+            node dist/repair/sweep-mutation-cli.js reaction add \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --content +1
           }
           remove_own_eyes_reactions() {
             local ids
@@ -982,15 +953,12 @@ jobs:
             rm -f "$err"
             while IFS= read -r reaction_id; do
               [ -n "$reaction_id" ] || continue
-              err="$(mktemp)"
-              if gh api -X DELETE \
-                -H "Accept: application/vnd.github+json" \
-                "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" 2>"$err" >/dev/null; then
+              if node dist/repair/sweep-mutation-cli.js reaction delete \
+                --repo "$TARGET_REPO" \
+                --item-number "$ITEM_NUMBER" \
+                --reaction-id "$reaction_id"; then
                 echo "Removed eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
-              else
-                cat "$err" >&2
               fi
-              rm -f "$err"
             done <<< "$ids"
           }
           if [ "$POLICY_NOOP" != "true" ]; then
@@ -1046,37 +1014,6 @@ jobs:
       - name: Fail unsuccessful exact review
         if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
         run: exit 1
-
-      - name: Publish exact event action ledger
-        if: ${{ always() && steps.setup-state.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
-            echo "No exact event action shards were finalized."
-            exit 0
-          fi
-          event_paths_file=".artifacts/exact-event-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent publish-action-events -- \
-            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" \
-            --expected-producer-job "$GITHUB_JOB" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            echo "Exact event action shards existed but no paths were imported." >&2
-            exit 1
-          fi
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$event_paths_file"
-          node dist/clawsweeper.js publish-action-event-paths \
-            --paths-file "$event_paths_file" \
-            --message "chore: append exact event action ledger"
 
       - name: Complete exact-review queue lease
         id: complete-exact-review-queue
@@ -1193,6 +1130,53 @@ jobs:
             --message "chore: append command status action ledger" \
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
+
+      - name: Finalize exact event action ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
+          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
+        run: |
+          args=()
+          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
+            args=(--interrupt-open-attempts --reason timeout)
+          elif [ "$REVIEW_OUTCOME" != "success" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Publish exact event action ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
+            echo "No exact event action shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/exact-event-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent publish-action-events -- \
+            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" \
+            --expected-producer-job "$GITHUB_JOB" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Exact event action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append exact event action ledger"
 
   publish-exact-review-action-ledger:
     name: Publish immutable exact-review queue action ledger
@@ -2182,6 +2166,31 @@ jobs:
       actions: read
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: source-drift-action-ledger
+
+      - name: Create source-drift state token
+        id: source-drift-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: source-drift-setup-state
+        with:
+          token: ${{ steps.source-drift-state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        id: source-drift-setup-pnpm
+        with:
+          build-script: build:repair
+
       - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
@@ -2216,6 +2225,8 @@ jobs:
             echo "::warning::Ignoring invalid source-revision mismatch marker."
             exit 0
           fi
+          payload_file="$(mktemp)"
+          trap 'rm -f "$payload_file"' EXIT
           jq -n \
             --arg target_repo "$TARGET_REPO" \
             --arg target_branch "$TARGET_BRANCH" \
@@ -2235,8 +2246,50 @@ jobs:
                 expected_source_revision: $expected_source_revision,
                 source_revision_requeue_count: "1"
               }
-            }' | gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input -
+            }' > "$payload_file"
+          node dist/repair/sweep-mutation-cli.js repository dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --event-type clawsweeper_target_sweep \
+            --payload-file "$payload_file" \
+            --business-key "source-drift-requeue:$GITHUB_RUN_ID:$item_number" \
+            --target-repo "$TARGET_REPO" \
+            --item-number "$item_number"
           echo "::notice::Requeued $TARGET_REPO#$item_number at source revision $actual_revision."
+
+      - name: Finalize source-drift dispatch action ledger
+        if: ${{ always() && steps.source-drift-action-ledger.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish source-drift dispatch action ledger
+        if: ${{ always() && steps.source-drift-setup-state.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No source-drift dispatch action shards were finalized."
+            exit 0
+          fi
+          paths_file=".artifacts/source-drift-dispatch-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job requeue-source-revision-drift \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "Source-drift dispatch action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append source-drift dispatch action ledger"
 
   publish:
     name: Publish review artifacts
@@ -2508,14 +2561,19 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching reproducible bug implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=strict_bug \
-              -f report_path="$report_path" \
-              -f report_url="$report_url"
+              --business-key "strict-bug-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=strict_bug \
+              --field report_path="$report_path" \
+              --field report_url="$report_url"
           done < /tmp/issue-implementation-candidates.tsv
 
       - name: Dispatch vision-fit implementation candidates
@@ -2564,14 +2622,19 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching vision-fit implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=vision_fit \
-              -f report_path="$report_path" \
-              -f report_url="$report_url"
+              --business-key "vision-fit-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=vision_fit \
+              --field report_path="$report_path" \
+              --field report_url="$report_url"
           done < /tmp/vision-fit-implementation-candidates.tsv
 
       - name: Backfill viable open issue implementation candidates
@@ -2607,16 +2670,21 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching viable issue implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=viable \
-              -f report_repo=openclaw/clawsweeper-state \
-              -f report_path="$report_path" \
-              -f report_url="$report_url" \
-              -f model=internal
+              --business-key "viable-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=viable \
+              --field report_repo=openclaw/clawsweeper-state \
+              --field report_path="$report_path" \
+              --field report_url="$report_url" \
+              --field model=internal
           done < /tmp/viable-implementation-candidates.tsv
 
       - name: Dispatch background review comment sync
@@ -2631,21 +2699,22 @@ jobs:
             echo "No review artifacts to sync comments for."
             exit 0
           fi
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f target_repo="$TARGET_REPO" \
-              -f apply_existing=true \
-              -f apply_sync_comments_only=true \
-              -f apply_item_numbers="$item_numbers" \
-              -f apply_limit=0 \
-              -f apply_comment_sync_min_age_days=7; then
-              echo "Dispatched background comment sync for item numbers: $item_numbers"
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "::warning::Unable to dispatch background comment sync after three attempts; apply/comment-sync backstops can pick it up later."
+          if node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "background-comment-sync:$GITHUB_RUN_ID" \
+            --target-repo "$TARGET_REPO" \
+            --field target_repo="$TARGET_REPO" \
+            --field apply_existing=true \
+            --field apply_sync_comments_only=true \
+            --field apply_item_numbers="$item_numbers" \
+            --field apply_limit=0 \
+            --field apply_comment_sync_min_age_days=7; then
+            echo "Dispatched background comment sync for item numbers: $item_numbers"
+          else
+            echo "::warning::Unable to dispatch background comment sync; apply/comment-sync backstops can pick it up later."
+          fi
 
       - name: Sync selected review comments
         id: sync-selected-review-comments
@@ -2709,8 +2778,64 @@ jobs:
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
-      - name: Finalize selected review comment action ledger
-        id: finalize-selected-review-comment-action-ledger
+      - name: Dispatch selected safe close proposals to isolated apply
+        if: ${{ always() && !cancelled() && steps.sync-selected-review-comments.outputs.sync_succeeded == 'true' && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+        run: |
+          set -euo pipefail
+          item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
+          if [ -z "$item_numbers" ]; then
+            echo "No review artifacts to dispatch for isolated apply."
+            exit 0
+          fi
+          item_count="$(pnpm run --silent workflow -- count-csv --items "$item_numbers")"
+          close_reasons="${{ github.event.inputs.apply_after_review_close_reasons || 'implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr' }}"
+          min_age_minutes="${{ github.event.inputs.apply_after_review_min_age_minutes || '0' }}"
+          node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "isolated-apply:$GITHUB_RUN_ID" \
+            --target-repo "$TARGET_REPO" \
+            --field target_repo="$TARGET_REPO" \
+            --field apply_existing=true \
+            --field apply_item_numbers="$item_numbers" \
+            --field apply_limit="$item_count" \
+            --field apply_min_age_minutes="$min_age_minutes" \
+            --field apply_kind=all \
+            --field apply_close_reasons="$close_reasons" \
+            --field apply_stale_min_age_days=30 \
+            --field apply_close_delay_ms=1000 \
+            --field apply_comment_sync_min_age_days=0
+          echo "Dispatched isolated apply for item numbers: $item_numbers"
+
+      - name: Continue sweep
+        if: ${{ always() && !cancelled() && steps.apply-review-artifacts.outputs.review_batch_succeeded == 'true' && steps.commit-review-records.outputs.records_published == 'true' && needs.plan.outputs.planned_count == needs.plan.outputs.planned_capacity && github.event_name != 'repository_dispatch' && (github.event_name != 'workflow_dispatch' || (github.event.inputs.item_number == '' && github.event.inputs.item_numbers == '')) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A hard runner loss after acceptance can redeliver this broad batch. The target
+          # concurrency and per-item review leases keep the continuation at-least-once safe.
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "sweep-continuation:$GITHUB_RUN_ID" \
+            --target-repo "${{ needs.plan.outputs.target_repo }}" \
+            --field apply_existing=false \
+            --field hot_intake="${{ needs.plan.outputs.hot_intake }}" \
+            --field target_repo="${{ needs.plan.outputs.target_repo }}" \
+            --field target_branch="${{ needs.plan.outputs.target_branch }}" \
+            --field batch_size="${{ needs.plan.outputs.batch_size }}" \
+            --field shard_count="${{ needs.plan.outputs.shard_count }}" \
+            --field codex_timeout_ms="${{ needs.plan.outputs.codex_timeout_ms }}"; then
+            echo "::warning::Unable to dispatch the next sweep; the scheduled backstop will pick it up."
+          fi
+
+      - name: Finalize sweep caller action ledger
+        id: finalize-sweep-caller-action-ledger
         if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.setup-publish-pnpm.outcome == 'success' }}
         env:
           SELECTED_COMMENT_EXIT_CODE: ${{ steps.sync-selected-review-comments.outputs.exit_code || '' }}
@@ -2728,16 +2853,16 @@ jobs:
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
-      - name: Publish selected review comment action ledger
-        if: ${{ always() && steps.finalize-selected-review-comment-action-ledger.outcome == 'success' }}
+      - name: Publish sweep caller action ledger
+        if: ${{ always() && steps.finalize-sweep-caller-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
-            echo "No selected review comment action shards were finalized."
+            echo "No sweep caller action shards were finalized."
             exit 0
           fi
-          event_paths_file=".artifacts/selected-comment-action-ledger-paths.txt"
+          event_paths_file=".artifacts/sweep-caller-action-ledger-paths.txt"
           mkdir -p .artifacts
           pnpm run --silent publish-action-events -- \
             --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
@@ -2746,7 +2871,7 @@ jobs:
             jq -r '.paths[]?' |
             sort -u > "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "Selected review comment action shards existed but no paths were imported." >&2
+            echo "Sweep caller action shards existed but no paths were imported." >&2
             exit 1
           fi
           while IFS= read -r event_path; do
@@ -2757,64 +2882,7 @@ jobs:
           done < "$event_paths_file"
           node dist/clawsweeper.js publish-action-event-paths \
             --paths-file "$event_paths_file" \
-            --message "chore: append selected review comment action ledger"
-
-      - name: Dispatch selected safe close proposals to isolated apply
-        if: ${{ always() && !cancelled() && steps.sync-selected-review-comments.outputs.sync_succeeded == 'true' && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
-        run: |
-          set -euo pipefail
-          item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
-          if [ -z "$item_numbers" ]; then
-            echo "No review artifacts to dispatch for isolated apply."
-            exit 0
-          fi
-          item_count="$(pnpm run --silent workflow -- count-csv --items "$item_numbers")"
-          close_reasons="${{ github.event.inputs.apply_after_review_close_reasons || 'implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr' }}"
-          min_age_minutes="${{ github.event.inputs.apply_after_review_min_age_minutes || '0' }}"
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f target_repo="$TARGET_REPO" \
-              -f apply_existing=true \
-              -f apply_item_numbers="$item_numbers" \
-              -f apply_limit="$item_count" \
-              -f apply_min_age_minutes="$min_age_minutes" \
-              -f apply_kind=all \
-              -f apply_close_reasons="$close_reasons" \
-              -f apply_stale_min_age_days=30 \
-              -f apply_close_delay_ms=1000 \
-              -f apply_comment_sync_min_age_days=0; then
-              echo "Dispatched isolated apply for item numbers: $item_numbers"
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "Unable to dispatch isolated apply after three attempts." >&2
-          exit 1
-
-      - name: Continue sweep
-        if: ${{ always() && !cancelled() && steps.apply-review-artifacts.outputs.review_batch_succeeded == 'true' && steps.commit-review-records.outputs.records_published == 'true' && needs.plan.outputs.planned_count == needs.plan.outputs.planned_capacity && github.event_name != 'repository_dispatch' && (github.event_name != 'workflow_dispatch' || (github.event.inputs.item_number == '' && github.event.inputs.item_numbers == '')) }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f apply_existing=false \
-              -f hot_intake="${{ needs.plan.outputs.hot_intake }}" \
-              -f target_repo="${{ needs.plan.outputs.target_repo }}" \
-              -f target_branch="${{ needs.plan.outputs.target_branch }}" \
-              -f batch_size="${{ needs.plan.outputs.batch_size }}" \
-              -f shard_count="${{ needs.plan.outputs.shard_count }}" \
-              -f codex_timeout_ms="${{ needs.plan.outputs.codex_timeout_ms }}"; then
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "::warning::Unable to dispatch the next sweep after three attempts; the scheduled backstop will pick it up."
+            --message "chore: append sweep caller action ledger"
 
   recover-review-failures:
     name: Recover failed review shards
@@ -2826,6 +2894,31 @@ jobs:
       actions: write
       contents: read
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: recovery-action-ledger
+
+      - name: Create recovery state token
+        id: recovery-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: recovery-setup-state
+        with:
+          token: ${{ steps.recovery-state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        id: recovery-setup-pnpm
+        with:
+          build-script: build:repair
+
       - uses: actions/download-artifact@v8
         id: failed-shards
         continue-on-error: true
@@ -2894,22 +2987,57 @@ jobs:
               | if . < 1 then 1 else . end
             ' <<<"$MATRIX_JSON"
           )"
-          args=(
-            workflow run sweep.yml
-            --repo "$GITHUB_REPOSITORY"
-            --ref main
-            -f apply_existing=false
-            -f hot_intake=false
-            -f target_repo="${{ needs.plan.outputs.target_repo }}"
-            -f target_branch="${{ needs.plan.outputs.target_branch }}"
-            -f batch_size="${{ needs.plan.outputs.batch_size }}"
-            -f shard_count="$recovery_shard_count"
-            -f codex_timeout_ms="${{ needs.plan.outputs.codex_timeout_ms }}"
-            -f item_numbers="$item_numbers"
-            -f additional_prompt="$recovery_prompt"
-          )
           echo "Requeueing failed review shards $failed_shards with item numbers: $item_numbers"
-          gh "${args[@]}"
+          node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "review-recovery:$GITHUB_RUN_ID" \
+            --target-repo "${{ needs.plan.outputs.target_repo }}" \
+            --field apply_existing=false \
+            --field hot_intake=false \
+            --field target_repo="${{ needs.plan.outputs.target_repo }}" \
+            --field target_branch="${{ needs.plan.outputs.target_branch }}" \
+            --field batch_size="${{ needs.plan.outputs.batch_size }}" \
+            --field shard_count="$recovery_shard_count" \
+            --field codex_timeout_ms="${{ needs.plan.outputs.codex_timeout_ms }}" \
+            --field item_numbers="$item_numbers" \
+            --field additional_prompt="$recovery_prompt"
+
+      - name: Finalize review recovery action ledger
+        if: ${{ always() && steps.recovery-action-ledger.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish review recovery action ledger
+        if: ${{ always() && steps.recovery-setup-state.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No review recovery action shards were finalized."
+            exit 0
+          fi
+          paths_file=".artifacts/review-recovery-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job recover-review-failures \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "Review recovery action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append review recovery action ledger"
 
   retry-failed-reviews:
     name: Retry failed Codex reviews
@@ -3181,6 +3309,19 @@ jobs:
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
+      - name: Refresh state dashboard
+        env:
+          GH_TOKEN: ${{ steps.state-token.outputs.token }}
+        run: |
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo openclaw/clawsweeper-state \
+            --workflow dashboard.yml \
+            --ref main \
+            --business-key "dashboard-refresh:$GITHUB_RUN_ID" \
+            --target-repo openclaw/clawsweeper-state; then
+            echo "Best-effort dashboard refresh dispatch failed; scheduled state dashboard will retry."
+          fi
+
       - name: Finalize sweep audit state action ledger
         id: finalize-audit-state-action-ledger
         if: ${{ always() && steps.audit-action-ledger.outcome == 'success' && steps.audit-setup-pnpm.outcome == 'success' }}
@@ -3222,14 +3363,6 @@ jobs:
           node dist/clawsweeper.js publish-action-event-paths \
             --paths-file .artifacts/sweep-audit-state-action-ledger-paths.txt \
             --message "chore: append sweep audit state action ledger"
-
-      - name: Refresh state dashboard
-        env:
-          GH_TOKEN: ${{ steps.state-token.outputs.token }}
-        run: |
-          gh workflow run dashboard.yml \
-            --repo openclaw/clawsweeper-state \
-            --ref main || echo "Best-effort dashboard refresh dispatch failed; scheduled state dashboard will retry."
 
   apply-proof:
     name: Prove close coverage without write credentials
@@ -4018,51 +4151,6 @@ jobs:
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy apply-records
 
-      - name: Finalize apply action ledger
-        if: ${{ always() }}
-        env:
-          APPLY_OUTCOME: ${{ steps.apply-existing-run.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$APPLY_OUTCOME" = "cancelled" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$APPLY_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
-      - name: Publish apply action events
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"
-          if [ ! -d "$source_root/ledger" ]; then
-            echo "No apply action event shards were finalized."
-            exit 0
-          fi
-          event_paths_file=".artifacts/apply-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent publish-action-events -- \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" \
-            --expected-producer-job "$GITHUB_JOB" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            echo "Apply action event shards existed but no paths were imported." >&2
-            exit 1
-          fi
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$event_paths_file"
-          node dist/clawsweeper.js publish-action-event-paths \
-            --paths-file "$event_paths_file" \
-            --message "chore: append apply action ledger"
-
       - name: Continue apply sweep
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
         env:
@@ -4123,36 +4211,30 @@ jobs:
             fi
           fi
 
-          run_workflow_with_retry() {
-            local label="$1"
-            shift
-            for attempt in 1 2 3; do
-              if gh workflow run sweep.yml "$@"; then
-                return 0
-              fi
-              echo "::warning::Failed to queue ${label} on attempt ${attempt}; retrying."
-              sleep "$((attempt * 10))"
-            done
-            echo "::warning::Unable to queue ${label} after three attempts; scheduled runs will backstop it."
-            return 0
-          }
-
           echo "Apply reached requested limit; queueing another apply run."
-          run_workflow_with_retry "apply continuation" \
+          # Durable receipts cover normal reruns. After a hard runner loss, apply concurrency
+          # and per-item apply leases keep a possible duplicate continuation at-least-once safe.
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
             --ref main \
-            -f apply_existing=true \
-            -f target_repo="$APPLY_TARGET_REPO" \
-            -f apply_limit="$APPLY_LIMIT" \
-            -f apply_min_age_days="$APPLY_MIN_AGE_DAYS" \
-            -f apply_min_age_minutes="$APPLY_MIN_AGE_MINUTES" \
-            -f apply_kind="$APPLY_KIND" \
-            -f apply_close_reasons="$APPLY_CLOSE_REASONS" \
-            -f apply_stale_min_age_days="$APPLY_STALE_MIN_AGE_DAYS" \
-            -f apply_item_numbers="$APPLY_ITEM_NUMBERS" \
-            -f apply_sync_comments_only="$APPLY_SYNC_COMMENTS_ONLY" \
-            -f apply_comment_sync_min_age_days="$APPLY_COMMENT_SYNC_MIN_AGE_DAYS" \
-            -f apply_close_delay_ms="$APPLY_CLOSE_DELAY_MS" \
-            -f apply_checkpoint_size="$APPLY_CHECKPOINT_SIZE"
+            --business-key "apply-continuation:$GITHUB_RUN_ID" \
+            --target-repo "$APPLY_TARGET_REPO" \
+            --field apply_existing=true \
+            --field target_repo="$APPLY_TARGET_REPO" \
+            --field apply_limit="$APPLY_LIMIT" \
+            --field apply_min_age_days="$APPLY_MIN_AGE_DAYS" \
+            --field apply_min_age_minutes="$APPLY_MIN_AGE_MINUTES" \
+            --field apply_kind="$APPLY_KIND" \
+            --field apply_close_reasons="$APPLY_CLOSE_REASONS" \
+            --field apply_stale_min_age_days="$APPLY_STALE_MIN_AGE_DAYS" \
+            --field apply_item_numbers="$APPLY_ITEM_NUMBERS" \
+            --field apply_sync_comments_only="$APPLY_SYNC_COMMENTS_ONLY" \
+            --field apply_comment_sync_min_age_days="$APPLY_COMMENT_SYNC_MIN_AGE_DAYS" \
+            --field apply_close_delay_ms="$APPLY_CLOSE_DELAY_MS" \
+            --field apply_checkpoint_size="$APPLY_CHECKPOINT_SIZE"; then
+            echo "::warning::Unable to queue apply continuation; scheduled runs will backstop it."
+          fi
 
       - name: Queue review backstops
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' && steps.target.outputs.target_repo == 'openclaw/openclaw' }}
@@ -4194,40 +4276,85 @@ jobs:
           NODE
           )"
 
-          run_workflow_with_retry() {
-            local label="$1"
-            shift
-            for attempt in 1 2 3; do
-              if gh workflow run sweep.yml "$@"; then
-                return 0
-              fi
-              echo "::warning::Failed to queue ${label} on attempt ${attempt}; retrying."
-              sleep "$((attempt * 10))"
-            done
-            echo "::warning::Unable to queue ${label} after three attempts; scheduled runs will backstop it."
-            return 0
-          }
-
           if [ "$HOT_RECENT" != "true" ]; then
             echo "No recent hot-intake run found; queueing backstop."
-            run_workflow_with_retry "hot review backstop" \
+            # Broad review backstops are at-least-once after hard runner loss; target
+            # concurrency and per-item review leases absorb a possible duplicate batch.
+            if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow sweep.yml \
               --ref main \
-              -f apply_existing=false \
-              -f hot_intake=true \
-              -f target_repo=openclaw/openclaw \
-              -f batch_size=1 \
-              -f shard_count="$hot_intake_shards" \
-              -f codex_timeout_ms=1200000
+              --business-key "hot-review-backstop:$GITHUB_RUN_ID" \
+              --target-repo openclaw/openclaw \
+              --field apply_existing=false \
+              --field hot_intake=true \
+              --field target_repo=openclaw/openclaw \
+              --field batch_size=1 \
+              --field shard_count="$hot_intake_shards" \
+              --field codex_timeout_ms=1200000; then
+              echo "::warning::Unable to queue hot review backstop; scheduled runs will retry."
+            fi
           fi
 
           if [ "$REVIEW_RECENT" != "true" ]; then
             echo "No recent normal review run found; queueing backstop."
-            run_workflow_with_retry "normal review backstop" \
+            if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow sweep.yml \
               --ref main \
-              -f apply_existing=false \
-              -f hot_intake=false \
-              -f target_repo=openclaw/openclaw \
-              -f batch_size=3 \
-              -f shard_count="$normal_shards" \
-              -f codex_timeout_ms=1200000
+              --business-key "normal-review-backstop:$GITHUB_RUN_ID" \
+              --target-repo openclaw/openclaw \
+              --field apply_existing=false \
+              --field hot_intake=false \
+              --field target_repo=openclaw/openclaw \
+              --field batch_size=3 \
+              --field shard_count="$normal_shards" \
+              --field codex_timeout_ms=1200000; then
+              echo "::warning::Unable to queue normal review backstop; scheduled runs will retry."
+            fi
           fi
+
+      - name: Finalize apply action ledger
+        if: ${{ always() }}
+        env:
+          APPLY_OUTCOME: ${{ steps.apply-existing-run.outcome || 'not_started' }}
+        run: |
+          args=()
+          if [ "$APPLY_OUTCOME" = "cancelled" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$APPLY_OUTCOME" != "success" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Publish apply action events
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No apply action event shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/apply-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent publish-action-events -- \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" \
+            --expected-producer-job "$GITHUB_JOB" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Apply action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append apply action ledger"
