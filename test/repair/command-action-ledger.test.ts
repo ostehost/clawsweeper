@@ -19,6 +19,7 @@ import {
   parseCommandActionLedgerManifest,
   serializeCommandActionLedgerManifest,
 } from "../../dist/repair/command-action-ledger-manifest.js";
+import { recordWorkflowActionEvent } from "../../dist/action-ledger-runtime.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
 test("command manifest permits only explicitly empty finalization", async () => {
@@ -273,6 +274,84 @@ test("command mutation receipts preserve accepted and unknown partial failures",
     assert.equal(terminal?.action.retryable, true);
     assert.equal(terminal?.attributes.completion_reason, "mutation_outcome_unknown");
     assert.equal(new Set(events.map((event) => event.operation_id)).size, 2);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("command finalization recovers an interrupted mutation request", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-interruption-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "interrupted-request",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_SHA: "d".repeat(40),
+    GITHUB_WORKFLOW: "repair comment router",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
+    GITHUB_JOB: "route-comments",
+    GITHUB_RUN_ID: "24345",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ACTION: "route",
+    GITHUB_RUN_STARTED_AT: "2026-07-12T17:15:00Z",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+  });
+
+  try {
+    const started = recordWorkflowActionEvent(root, {
+      scope: "command.mutation",
+      identity: { request: "comment-update", outcome: "attempted" },
+      operation: "command",
+      operationIdentity: { repository: "openclaw/openclaw", number: 42 },
+      attemptIdentity: { runId: "24345", runAttempt: 1 },
+      idempotencyIdentity: { request: "comment-update" },
+      type: "command.mutation",
+      component: "comment_router",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 42,
+      },
+      action: {
+        name: "command.mutation",
+        status: "started",
+        reasonCode: "selected",
+        retryable: true,
+        mutation: false,
+      },
+      attributes: {
+        state: "mutation_attempted",
+        completion_reason: "mutation_attempted",
+      },
+    });
+    assert.ok(started);
+
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events.map((event) => [
+        event.action.status,
+        event.action.mutation,
+        event.attributes.completion_reason,
+      ]),
+      [
+        ["started", false, "mutation_attempted"],
+        ["failed", true, "mutation_outcome_unknown"],
+      ],
+    );
+    assert.equal(events[1]?.parent_event_id, started.event_id);
+    assert.equal(events[1]?.action.retryable, false);
   } finally {
     for (const key of Object.keys(process.env)) {
       if (!(key in previous)) delete process.env[key];

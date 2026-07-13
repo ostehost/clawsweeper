@@ -9,6 +9,7 @@ import {
 } from "../action-ledger.js";
 import {
   flushWorkflowActionEvents,
+  interruptOpenWorkflowActionEvents,
   recordWorkflowActionEvent,
   workflowActionEventsEnabled,
 } from "../action-ledger-runtime.js";
@@ -478,6 +479,7 @@ export function recordCommandLifecycleFailure(
 }
 
 export async function flushCommandActionEvents(): Promise<string[]> {
+  interruptOpenWorkflowActionEvents(commandActionLedgerRoot());
   return flushWorkflowActionEvents(commandActionLedgerRoot());
 }
 
