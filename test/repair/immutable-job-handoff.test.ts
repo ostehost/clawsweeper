@@ -408,10 +408,7 @@ test("repair operational callers resolve immutable state before dedupe and dispa
     /return \{[\s\S]*resolveCurrentStateJobIdentity\(sourceJob\),[\s\S]*legacyUnsealed: true/,
   );
   assert.equal(resolveRunRecord.match(/resolveCurrentStateJobIdentity\(sourceJob\)/g)?.length, 1);
-  assert.match(
-    selfHeal,
-    /mode: retryMode\(\{[\s\S]*legacyUnsealed: immutableJob\.legacyUnsealed/,
-  );
+  assert.match(selfHeal, /mode: retryMode\(\{[\s\S]*legacyUnsealed: immutableJob\.legacyUnsealed/);
   assert.match(selfHeal, /if \(legacyUnsealed\) return "plan"/);
   assert.match(selfHeal, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
   assert.match(finalizer, /const jobPath = normalizedFinalizerDispatchJobPath\(pr\.job_path\)/);
