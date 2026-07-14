@@ -415,6 +415,7 @@ type CommitMutationRecovery = {
   key: string;
   recoveryRoot: string;
   context: CommitActionLedgerContext;
+  content: string;
 };
 
 function beginCommitMutationRecovery(
@@ -422,8 +423,8 @@ function beginCommitMutationRecovery(
   key: string,
   outcome: Omit<CommitMutationRecoveryPayload, "context">,
 ): CommitMutationRecovery {
-  const recovery = { key, recoveryRoot: context.recoveryRoot, context };
-  writeCommitMutationRecovery(recovery, outcome);
+  const recovery = { key, recoveryRoot: context.recoveryRoot, context, content: "" };
+  recovery.content = writeCommitMutationRecovery(recovery, outcome);
   return recovery;
 }
 
@@ -440,7 +441,7 @@ export function recoverCommitMutationOutcomes(): void {
       env: { ...process.env, ...payload.context.env },
     };
     if (commitMutationOutcomeRecorded(payload, context)) {
-      removeMutationRecovery(current.recoveryRoot, "commit", recovery.key);
+      removeMutationRecovery(current.recoveryRoot, "commit", recovery.key, recovery.content);
       continue;
     }
     recordCommitMutationOutcome(
@@ -453,7 +454,7 @@ export function recoverCommitMutationOutcomes(): void {
       payload.parentEventId,
       context,
     );
-    removeMutationRecovery(current.recoveryRoot, "commit", recovery.key);
+    removeMutationRecovery(current.recoveryRoot, "commit", recovery.key, recovery.content);
   }
 }
 
@@ -467,8 +468,8 @@ export async function flushCommitActionEvents(): Promise<string[]> {
 function writeCommitMutationRecovery(
   recovery: CommitMutationRecovery,
   outcome: Omit<CommitMutationRecoveryPayload, "context">,
-): void {
-  writeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key, {
+): string {
+  return writeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key, {
     context: {
       root: recovery.context.root,
       env: actionLedgerRecoveryEnvironment(recovery.context.env),
@@ -483,7 +484,7 @@ function updateCommitMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    writeCommitMutationRecovery(recovery, outcome);
+    recovery.content = writeCommitMutationRecovery(recovery, outcome);
   } catch (error) {
     console.error(
       `[action-ledger] failed to persist ${outcome.kind} ${outcome.outcome} recovery: ${
@@ -498,7 +499,7 @@ function removeCommitMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    removeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key);
+    removeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key, recovery.content);
   } catch (error) {
     console.error(
       `[action-ledger] failed to clear ${recovery.key} recovery: ${

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -10,8 +10,10 @@ import {
   processIncarnationIdentitySha256,
   processIsDefunct,
   readDirectoryEntriesNoFollow,
+  readUtf8FileIfExistsNoFollow,
   readUtf8FileNoFollow,
   removeFileNoFollow,
+  removeUtf8FileIfContentNoFollow,
   writeUtf8FileAtomicReplaceNoFollow,
 } from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
@@ -56,6 +58,7 @@ type MutationRecoveryEnvelope<T> = {
 export type MutationRecoveryRecord<T> = {
   key: string;
   path: string;
+  content: string;
   payload: T;
 };
 
@@ -80,7 +83,7 @@ export function writeMutationRecovery<T>(
   family: string,
   key: string,
   payload: T,
-): void {
+): string {
   assertMutationRecoveryIdentity(family, key);
   const root = path.resolve(recoveryRoot);
   prepareMutationRecoveryDirectory(root, family);
@@ -106,6 +109,7 @@ export function writeMutationRecovery<T>(
     throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes`);
   }
   writeUtf8FileAtomicReplaceNoFollow(target, content, temporaryFilename);
+  return content;
 }
 
 export function readMutationRecoveries<T>(
@@ -139,7 +143,11 @@ export function readMutationRecoveries<T>(
       if (
         mutationRecoveryWriterIsStale(Number(temporary.groups.pid), temporary.groups.incarnation!)
       ) {
-        rmSync(filePath, { force: true });
+        removeMutationRecoveryEntry(
+          safeRoot,
+          path.join(relativeDirectory, entry.name),
+          "stale mutation recovery staging file",
+        );
       }
       continue;
     }
@@ -147,7 +155,11 @@ export function readMutationRecoveries<T>(
     if (legacyTemporary?.groups) {
       if (!assertRecoveryFileIfPresent(filePath, entry.name)) continue;
       if (!processIsAlive(Number(legacyTemporary.groups.pid))) {
-        rmSync(filePath, { force: true });
+        removeMutationRecoveryEntry(
+          safeRoot,
+          path.join(relativeDirectory, entry.name),
+          "stale legacy mutation recovery staging file",
+        );
       }
       continue;
     }
@@ -184,12 +196,17 @@ export function readMutationRecoveries<T>(
     ) {
       throw new Error(`mutation recovery identity is invalid: ${entry.name}`);
     }
-    records.push({ key, path: filePath, payload: envelope.payload });
+    records.push({ key, path: filePath, content, payload: envelope.payload });
   }
   return records;
 }
 
-export function removeMutationRecovery(recoveryRoot: string, family: string, key: string): void {
+export function removeMutationRecovery(
+  recoveryRoot: string,
+  family: string,
+  key: string,
+  expectedContent: string,
+): void {
   assertMutationRecoveryIdentity(family, key);
   const root = path.resolve(recoveryRoot);
   if (!existsSync(root)) return;
@@ -204,10 +221,14 @@ export function removeMutationRecovery(recoveryRoot: string, family: string, key
     if (isNotFoundError(error)) return;
     throw error;
   }
-  const result = removeFileNoFollow(target);
-  if (result === "changed" || result === "replaced") {
+  const content = readUtf8FileIfExistsNoFollow(target, MUTATION_RECOVERY_MAX_BYTES);
+  if (content === null) return;
+  if (content !== expectedContent) {
     throw new Error(`refusing changed mutation recovery file: ${target.path}`);
   }
+  if (removeUtf8FileIfContentNoFollow(target, expectedContent)) return;
+  const raced = readUtf8FileIfExistsNoFollow(target, MUTATION_RECOVERY_MAX_BYTES);
+  if (raced !== null) throw new Error(`refusing changed mutation recovery file: ${target.path}`);
 }
 
 export function mutationRecoveryPath(recoveryRoot: string, family: string, key: string): string {
@@ -314,6 +335,24 @@ function assertRecoveryFileIfPresent(filePath: string, name: string): boolean {
       return false;
     }
     throw error;
+  }
+}
+
+function removeMutationRecoveryEntry(
+  root: ReturnType<typeof prepareSafeReadRoot>,
+  relativePath: string,
+  label: string,
+): void {
+  let target;
+  try {
+    target = prepareSafeReadTarget(root, relativePath, label);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+  const result = removeFileNoFollow(target);
+  if (result === "changed" || result === "replaced") {
+    throw new Error(`refusing changed ${label}: ${target.path}`);
   }
 }
 

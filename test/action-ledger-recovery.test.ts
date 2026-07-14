@@ -242,7 +242,7 @@ test(
       fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-remove-outside-")),
     );
     const key = "3".repeat(64);
-    writeMutationRecovery(root, "repair", key, { state: "pending" });
+    const content = writeMutationRecovery(root, "repair", key, { state: "pending" });
     const directory = path.join(root, ".mutation-recovery", "repair");
     const savedDirectory = `${directory}.saved`;
     fs.writeFileSync(path.join(outside, `${key}.json`), "outside\n");
@@ -250,7 +250,10 @@ test(
     fs.symlinkSync(outside, directory, "dir");
 
     try {
-      assert.throws(() => removeMutationRecovery(root, "repair", key), /symbolic link or junction/);
+      assert.throws(
+        () => removeMutationRecovery(root, "repair", key, content),
+        /symbolic link or junction/,
+      );
       assert.equal(fs.readFileSync(path.join(outside, `${key}.json`), "utf8"), "outside\n");
       assert.equal(fs.existsSync(path.join(savedDirectory, `${key}.json`)), true);
     } finally {
@@ -261,6 +264,32 @@ test(
     }
   },
 );
+
+test("mutation recovery removal preserves a refined replacement envelope", () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-refined-")),
+  );
+  const key = "4".repeat(64);
+
+  try {
+    writeMutationRecovery(root, "repair", key, { state: "unknown" });
+    const [stale] = readMutationRecoveries<{ state: string }>(root, "repair");
+    assert.ok(stale);
+    writeMutationRecovery(root, "repair", key, { state: "accepted" });
+
+    assert.throws(
+      () => removeMutationRecovery(root, "repair", key, stale.content),
+      /refusing changed mutation recovery file/,
+    );
+    const [refined] = readMutationRecoveries<{ state: string }>(root, "repair");
+    assert.deepEqual(refined?.payload, { state: "accepted" });
+    assert.ok(refined);
+    removeMutationRecovery(root, "repair", key, refined.content);
+    assert.deepEqual(readMutationRecoveries(root, "repair"), []);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
 
 test("mutation recovery readers preserve a live writer staging file", async () => {
   const root = fs.realpathSync(

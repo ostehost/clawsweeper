@@ -944,6 +944,7 @@ type RepairMutationRecovery = {
   key: string;
   recoveryRoot: string;
   context: RepairActionLedgerContext;
+  content: string;
 };
 
 function beginRepairMutationRecovery(
@@ -952,8 +953,8 @@ function beginRepairMutationRecovery(
   input: RepairLifecycleInput,
   options: RepairMutationOutcomeOptions,
 ): RepairMutationRecovery {
-  const recovery = { key, recoveryRoot: context.recoveryRoot, context };
-  writeRepairMutationRecovery(recovery, input, options);
+  const recovery = { key, recoveryRoot: context.recoveryRoot, context, content: "" };
+  recovery.content = writeRepairMutationRecovery(recovery, input, options);
   return recovery;
 }
 
@@ -972,7 +973,7 @@ export function recoverRepairMutationOutcomes(): void {
     if (!repairMutationOutcomeRecorded(payload, context)) {
       recordRepairMutationOutcome(payload.input, payload.options, context);
     }
-    removeMutationRecovery(current.recoveryRoot, "repair", recovery.key);
+    removeMutationRecovery(current.recoveryRoot, "repair", recovery.key, recovery.content);
   }
 }
 
@@ -1000,8 +1001,8 @@ function writeRepairMutationRecovery(
   recovery: RepairMutationRecovery,
   input: RepairLifecycleInput,
   options: RepairMutationOutcomeOptions,
-): void {
-  writeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key, {
+): string {
+  return writeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key, {
     context: {
       root: recovery.context.root,
       env: actionLedgerRecoveryEnvironment(recovery.context.env),
@@ -1018,7 +1019,7 @@ function updateRepairMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    writeRepairMutationRecovery(recovery, input, options);
+    recovery.content = writeRepairMutationRecovery(recovery, input, options);
   } catch (error) {
     console.error(
       `[action-ledger] failed to persist ${options.kind} ${options.outcome} recovery: ${errorText(error)}`,
@@ -1031,7 +1032,7 @@ function removeRepairMutationRecoverySafely(
 ): void {
   if (!recovery) return;
   try {
-    removeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key);
+    removeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key, recovery.content);
   } catch (error) {
     console.error(`[action-ledger] failed to clear ${recovery.key} recovery: ${errorText(error)}`);
   }
