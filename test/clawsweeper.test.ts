@@ -2157,7 +2157,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   const workerArtifactDownload = workflow.slice(
     workflow.indexOf("- name: Download worker artifacts"),
     workflow.indexOf(
-      "- name: Seal immutable source in worker artifacts",
+      "- name: Verify immutable source seal in worker artifacts",
       workflow.indexOf("- name: Download worker artifacts"),
     ),
   );
@@ -2458,8 +2458,9 @@ test("failed Codex workers use bounded automatic retry paths", () => {
 test("repair workers keep planning read-only in GitHub Actions", () => {
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
 
-  assert.doesNotMatch(workflow, /planner_sandbox|CLAWSWEEPER_CODEX_PLANNER_SANDBOX/);
-  assert.doesNotMatch(workflow, /danger-full-access/);
+  assert.match(workflow, /PLANNER_SANDBOX: read-only/);
+  assert.doesNotMatch(workflow, /\$\{\{\s*inputs\.planner_sandbox\s*\}\}/);
+  assert.doesNotMatch(workflow, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX/);
 });
 
 test("repair workflows preserve existing dispatch while scheduled cluster intake stays gated", () => {
