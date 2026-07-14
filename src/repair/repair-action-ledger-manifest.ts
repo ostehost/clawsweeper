@@ -50,12 +50,14 @@ export type RepairActionLedgerManifest = RepairActionLedgerManifestIdentity & {
 
 export async function finalizeRepairActionLedgerManifest(
   lane: string,
-  options: { allowEmpty?: boolean } = {},
+  options: { allowEmpty?: boolean; preserveOpenWorkflows?: boolean } = {},
 ): Promise<RepairActionLedgerManifest> {
   assertRepairActionLedgerLane(lane);
   const outputRoot = repairActionLedgerOutputRoot();
   recoverCommitMutationOutcomes();
-  const finalizedPaths = await flushRepairActionEvents();
+  const finalizedPaths = await flushRepairActionEvents(
+    options.preserveOpenWorkflows === true ? { preserveOpenWorkflows: true } : {},
+  );
   const repairShards = repairActionLedgerShards(outputRoot, finalizedPaths);
   const eventPaths = repairShards.map((shard) => shard.relativePath).sort();
   if (eventPaths.length === 0 && options.allowEmpty !== true) {

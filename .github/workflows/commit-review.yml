@@ -509,6 +509,7 @@ jobs:
             --codex-sandbox read-only \
             --codex-timeout-ms 1800000 \
             --require-publishable-report \
+            --defer-workflow-completion \
             --github-context "../${{ steps.commit-context.outputs.context_path }}"
 
       - name: Upload commit review diagnostic
@@ -529,6 +530,7 @@ jobs:
           output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane "commit-review-${{ matrix.sha }}" \
+            --preserve-open-workflows \
             > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Prepare commit review receipt bundle
@@ -777,7 +779,15 @@ jobs:
               --report-path "$report_path" \
               --report-relative-path "$relative_path" \
               --report-repo openclaw/clawsweeper-state \
-              --report-revision "${{ steps.publish-reports.outputs.state_revision }}"
+              --report-revision "${{ steps.publish-reports.outputs.state_revision }}" \
+              --continue-workflow
+            node dist/commit-sweeper.js finish-review \
+              --target-repo "${{ needs.plan.outputs.target_repo }}" \
+              --commit-sha "$sha" \
+              --report-path "$report_path" \
+              --review-outcome success \
+              --check-outcome success \
+              --checks-requested true
           done
 
       - name: Finalize commit reviews without checks
@@ -792,8 +802,7 @@ jobs:
               --report-path "$report_path" \
               --review-outcome success \
               --check-outcome skipped \
-              --checks-requested false \
-              --start-workflow
+              --checks-requested false
           done
 
       - name: Continue commit review range

@@ -19,7 +19,8 @@ test("commit review emits current-attempt report and receipt bundles without wri
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
   assert.match(review, /--codex-sandbox read-only/);
   assert.match(review, /--require-publishable-report/);
-  assert.doesNotMatch(review, /--defer-workflow-completion/);
+  assert.match(review, /--defer-workflow-completion/);
+  assert.match(review, /--preserve-open-workflows/);
   assert.match(review, /remote set-url origin "https:\/\/github\.com\/\$\{TARGET_REPO\}\.git"/);
   assert.doesNotMatch(review, /path: commit-work\/\*\*/);
   assert.match(review, /path: commit-work\/\$\{\{ matrix\.sha \}\}\.diagnostic\.json/);

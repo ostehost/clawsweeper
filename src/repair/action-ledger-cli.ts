@@ -31,6 +31,7 @@ if (command === "finalize") {
   } else if (args.repairLane) {
     const manifest = await finalizeRepairActionLedgerManifest(args.repairLane, {
       allowEmpty: args.allowEmpty === true,
+      preserveOpenWorkflows: args.preserveOpenWorkflows === true,
     });
     process.stdout.write(serializeRepairActionLedgerManifest(manifest));
   } else {
@@ -166,7 +167,7 @@ if (command === "finalize") {
   }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|verify|publish|publish-workflow> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-repository owner/repo --expected-sha sha --expected-workflow workflow --expected-job job --expected-run-id id --expected-run-attempt attempt] [--expected-producer-job job] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
+    "usage: action-ledger-cli.ts <finalize|verify|publish|publish-workflow> [--lane name | --repair-lane name] [--allow-empty] [--preserve-open-workflows] [--manifest path] [--expected-repository owner/repo --expected-sha sha --expected-workflow workflow --expected-job job --expected-run-id id --expected-run-attempt attempt] [--expected-producer-job job] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
   );
 }
 
@@ -181,6 +182,7 @@ function parseArgs(argv: readonly string[]) {
   const parsed: {
     lane?: string;
     allowEmpty?: boolean;
+    preserveOpenWorkflows?: boolean;
     repairLane?: string;
     manifest?: string;
     sourceRoot?: string;
@@ -204,6 +206,7 @@ function parseArgs(argv: readonly string[]) {
     else if (arg === "--source-root") parsed.sourceRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--state-root") parsed.stateRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--allow-empty") parsed.allowEmpty = true;
+    else if (arg === "--preserve-open-workflows") parsed.preserveOpenWorkflows = true;
     else if (arg === "--expected-repository") {
       parsed.expectedRepository = requiredValue(argv, ++index, arg);
     } else if (arg === "--expected-sha") {

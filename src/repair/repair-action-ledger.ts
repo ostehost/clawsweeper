@@ -648,10 +648,12 @@ export function recordRepairLifecycleFailureSafely(
   }
 }
 
-export async function flushRepairActionEvents(): Promise<string[]> {
+export async function flushRepairActionEvents(
+  options: { preserveOpenWorkflows?: boolean } = {},
+): Promise<string[]> {
   const root = repairActionLedgerRoot();
   recoverRepairMutationOutcomes();
-  interruptOpenWorkflowActionEvents(root);
+  if (options.preserveOpenWorkflows !== true) interruptOpenWorkflowActionEvents(root);
   return flushWorkflowActionEvents(root);
 }
 

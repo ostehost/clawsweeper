@@ -135,6 +135,33 @@ test("commit review finalization preserves a completed producer lifecycle", asyn
   }
 });
 
+test("commit review handoff finalization preserves its open producer lifecycle", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-open-finalizer-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+
+  try {
+    recordCommitWorkflowEvent(lifecycle, "started");
+    await finalizeRepairActionLedgerManifest("commit-review", {
+      preserveOpenWorkflows: true,
+    });
+
+    const workflowEvents = readEvents(outputRoot)
+      .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+      .sort((left, right) => left.phase_seq - right.phase_seq);
+    assert.deepEqual(
+      workflowEvents.map((event) => event.attributes?.state),
+      ["started"],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("failed commit review reports cannot complete the workflow lifecycle", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-failed-report-")));
   const outputRoot = path.join(root, "output");
@@ -767,8 +794,13 @@ test("commit check publisher owns every privileged check write and installs atte
   );
   assert.match(
     publisher,
-    /Finalize commit reviews without checks[\s\S]*finish-review[\s\S]*--start-workflow/,
+    /Publish commit checks[\s\S]*publish-check[\s\S]*--continue-workflow[\s\S]*finish-review[\s\S]*--check-outcome success[\s\S]*--checks-requested true/,
   );
+  assert.match(
+    publisher,
+    /Finalize commit reviews without checks[\s\S]*finish-review[\s\S]*--check-outcome skipped[\s\S]*--checks-requested false/,
+  );
+  assert.doesNotMatch(publisher, /finish-review[\s\S]{0,400}--start-workflow/);
   assert.ok(
     publisher.indexOf("repair:action-ledger -- verify") <
       publisher.indexOf("CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT="),
