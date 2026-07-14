@@ -369,7 +369,7 @@ export function writeCommitReviewGitHubContext(
   context: CommitReviewGitHubContext,
 ): void {
   const content = `${JSON.stringify(context, null, 2)}\n`;
-  if (Buffer.byteLength(content, "utf8") > CONTEXT_MAX_BYTES) {
+  if (commitReviewGitHubContextBytes(context) > CONTEXT_MAX_BYTES) {
     throw new Error(`commit review GitHub context exceeds ${CONTEXT_MAX_BYTES} bytes`);
   }
   writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });

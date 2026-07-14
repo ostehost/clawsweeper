@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   readCommitReviewGitHubContext,
   renderCommitReviewGitHubContext,
+  writeCommitReviewGitHubContext,
 } from "../dist/commit-review-context.js";
 
 const CLI = fileURLToPath(new URL("../dist/commit-sweeper.js", import.meta.url));
@@ -347,6 +348,30 @@ process.stdout.write(JSON.stringify(value));
     );
     assert.ok(
       context.limitations.some((limitation) => limitation.startsWith("GitHub context byte budget")),
+    );
+
+    const unsafeContext = structuredClone(context);
+    let boundaryFound = false;
+    for (const reference of unsafeContext.references) {
+      while (reference.body_excerpt.length < 3000) {
+        reference.body_excerpt += 'é"\\\n';
+        const fileBytes = Buffer.byteLength(`${JSON.stringify(unsafeContext, null, 2)}\n`, "utf8");
+        const renderedBytes = Buffer.byteLength(
+          renderCommitReviewGitHubContext(unsafeContext),
+          "utf8",
+        );
+        if (fileBytes <= 64 * 1024 && renderedBytes > 64 * 1024) {
+          boundaryFound = true;
+          break;
+        }
+        if (fileBytes > 64 * 1024) break;
+      }
+      if (boundaryFound) break;
+    }
+    assert.equal(boundaryFound, true);
+    assert.throws(
+      () => writeCommitReviewGitHubContext(path.join(root, "unsafe-context.json"), unsafeContext),
+      /exceeds 65536 bytes/,
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
