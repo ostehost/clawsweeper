@@ -83,6 +83,8 @@ interface FanoutActionLedger {
     | "dispatch_rejected"
     | "dispatch_outcome_unknown"
     | "mutation_outcome_unknown"
+    | "accepted_state_persistence_failed"
+    | "accepted_receipt_write_failed"
     | null;
   failureRetryable: boolean | null;
   terminal: boolean;
@@ -129,9 +131,10 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let primaryError: unknown = null;
   try {
     const repositories = await loadEligibleRepositories(config, options.owners);
+    const currentCursor = readCursor(options.cursorPath);
     const selection = selectRepositories(repositories, {
       limit: options.limit,
-      cursor: readCursor(options.cursorPath),
+      cursor: currentCursor,
     });
     recordFanoutSelection(ledger, repositories.length, selection.repositories.length);
     const commands = selection.repositories.map((repository) =>
@@ -146,7 +149,15 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
         console.log(`dry-run ${commandArgs.join(" ")}`);
         recordFanoutDispatchSkipped(ledger, repository, options);
       } else {
-        recordFanoutDispatch(ledger, repository, options, () => runGh(commandArgs, dispatchEnv()));
+        const acceptedCursor =
+          selection.total === 0 ? 0 : normalizeCursor(currentCursor + index + 1, selection.total);
+        recordFanoutDispatch(
+          ledger,
+          repository,
+          options,
+          () => runGh(commandArgs, dispatchEnv()),
+          () => writeFileSyncWithDirs(options.cursorPath, cursorContent(acceptedCursor)),
+        );
       }
       dispatched.push(repository.targetRepo);
     }
@@ -288,6 +299,7 @@ function recordFanoutDispatch(
   repository: SelectedRepository,
   options: FanoutOptions,
   dispatch: () => void,
+  reserveAccepted: () => void,
 ): void {
   const request = fanoutDispatchRequestIdentity(repository, options);
   const idempotencyIdentity = {
@@ -373,36 +385,50 @@ function recordFanoutDispatch(
     }
     throw error;
   }
-  const completed = recordWorkflowPhaseEvent(repoRoot(), {
-    phase: ACTION_EVENT_TYPES.dispatchLifecycle,
-    status: ACTION_EVENT_STATUSES.dispatched,
-    reasonCode: ACTION_EVENT_REASON_CODES.completed,
-    retryable: false,
-    mutation: true,
-    identity: {
-      slot: "fanout_dispatch_outcome",
-      targetRepo: repository.targetRepo,
-      outcome: "accepted",
-    },
-    operation: "target_fanout",
-    operationIdentity: ledger.operationIdentity,
-    parentEventId: attempt?.event_id ?? ledger.lastEventId,
-    phaseSeq: nextFanoutPhaseSeq(ledger),
-    idempotencyIdentity,
-    component: "target_fanout",
-    subject,
-    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
-    attributes: {
-      attempt: 1,
-      completion_reason: "mutation_accepted",
-      dispatch_kind: fanoutDispatchKind(options.mode),
-      work_kind: options.mode,
-    },
-    privacy: fanoutActionLedgerPrivacy(),
-  });
-  ledger.lastEventId = completed?.event_id ?? ledger.lastEventId;
   ledger.dispatchedCount += 1;
   ledger.mutationObserved = true;
+  try {
+    reserveAccepted();
+  } catch (error) {
+    ledger.failureCompletionReason = "accepted_state_persistence_failed";
+    ledger.failureRetryable = false;
+    throw error;
+  }
+  let completed;
+  try {
+    completed = recordWorkflowPhaseEvent(repoRoot(), {
+      phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+      status: ACTION_EVENT_STATUSES.dispatched,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: true,
+      identity: {
+        slot: "fanout_dispatch_outcome",
+        targetRepo: repository.targetRepo,
+        outcome: "accepted",
+      },
+      operation: "target_fanout",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: attempt?.event_id ?? ledger.lastEventId,
+      phaseSeq: nextFanoutPhaseSeq(ledger),
+      idempotencyIdentity,
+      component: "target_fanout",
+      subject,
+      evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+      attributes: {
+        attempt: 1,
+        completion_reason: "mutation_accepted",
+        dispatch_kind: fanoutDispatchKind(options.mode),
+        work_kind: options.mode,
+      },
+      privacy: fanoutActionLedgerPrivacy(),
+    });
+  } catch (error) {
+    ledger.failureCompletionReason = "accepted_receipt_write_failed";
+    ledger.failureRetryable = false;
+    throw error;
+  }
+  ledger.lastEventId = completed?.event_id ?? ledger.lastEventId;
 }
 
 function recordFanoutDispatchSkipped(

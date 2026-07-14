@@ -717,7 +717,7 @@ test("target fanout keeps a partially dispatched throttled batch replay-unsafe",
       },
     );
     assert.equal(result.status, 1);
-    assert.equal(existsSync(cursorPath), false);
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
 
     const events = readActionLedgerEvents(outputRoot);
     const firstOutcome = events.find(
@@ -752,6 +752,77 @@ test("target fanout keeps a partially dispatched throttled batch replay-unsafe",
   }
 });
 
+test("target fanout reserves an accepted dispatch before writing its receipt", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const outputRoot = join(fixture.root, "action-ledger-output");
+  mkdirSync(outputRoot, { recursive: true });
+
+  try {
+    const first = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7106"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+          FAIL_ACCEPTED_RECEIPT: "1",
+        },
+      },
+    );
+    assert.equal(first.status, 1);
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
+
+    rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
+      force: true,
+      recursive: true,
+    });
+    const second = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7107"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+        },
+      },
+    );
+    assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a", "openclaw/b"]);
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
 test("target fanout publishes its cursor before finalizing and publishing exact shards", () => {
   const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
   const start = workflow.indexOf("\n  target-fanout:");
@@ -765,6 +836,10 @@ test("target fanout publishes its cursor before finalizing and publishing exact 
   assert.match(fanout, /id: setup-state/);
   assert.match(fanout, /id: setup-pnpm/);
   assert.match(fanout, /--receipt-kind target_fanout_cursor_publication/);
+  assert.match(
+    fanout,
+    /Publish fanout cursor[\s\S]*?if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success'/,
+  );
   assert.match(fanout, /repair:action-ledger -- finalize/);
   assert.match(
     fanout,
@@ -822,14 +897,19 @@ function isolatedFanoutFixture(): {
   root: string;
   scriptPath: string;
   ghPath: string;
+  logPath: string;
 } {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "clawsweeper-fanout-ledger-")));
   cpSync("dist", join(root, "dist"), { recursive: true });
   cpSync("config", join(root, "config"), { recursive: true });
   const ghPath = join(root, "gh.js");
+  const logPath = join(root, "dispatch.log");
+  writeFileSync(logPath, "");
   writeFileSync(
     ghPath,
     `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
 const args = process.argv.slice(2);
 if (args[0] === "repo" && args[1] === "list") {
   process.stdout.write(JSON.stringify([
@@ -839,6 +919,10 @@ if (args[0] === "repo" && args[1] === "list") {
   process.exit(0);
 }
 if (args[0] === "api" && args[1].endsWith("/dispatches")) {
+  const target = args.find((arg) => arg.startsWith("client_payload[target_repo]="))?.split("=")[1];
+  if (process.env.DISPATCH_LOG_PATH && target) {
+    fs.appendFileSync(process.env.DISPATCH_LOG_PATH, target + "\\n");
+  }
   if (
     process.env.FAIL_SECOND_DISPATCH === "secondary-rate-limit" &&
     args.includes("client_payload[target_repo]=openclaw/b")
@@ -862,6 +946,12 @@ if (args[0] === "api" && args[1].endsWith("/dispatches")) {
     process.stderr.write("sensitive-dispatch-marker https://example.invalid/private");
     process.exit(7);
   }
+  if (process.env.FAIL_ACCEPTED_RECEIPT === "1") {
+    const eventRoot = path.join(process.cwd(), ".clawsweeper-repair", "action-events");
+    fs.rmSync(eventRoot, { force: true, recursive: true });
+    fs.mkdirSync(path.dirname(eventRoot), { recursive: true });
+    fs.writeFileSync(eventRoot, "receipt writes blocked\\n");
+  }
   process.exit(0);
 }
 process.exit(2);
@@ -872,7 +962,12 @@ process.exit(2);
     root,
     scriptPath: join(root, "dist", "repair", "target-fanout.js"),
     ghPath,
+    logPath,
   };
+}
+
+function readDispatchLog(logPath: string): string[] {
+  return readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
 }
 
 function fanoutActionLedgerEnv(
