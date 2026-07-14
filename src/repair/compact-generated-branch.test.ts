@@ -37,7 +37,6 @@ test("generated branch compaction keeps the reviewed tree and removes checkpoint
     baseRef: "origin/main",
     message: "fix: update runtime",
     trailers: ["Co-authored-by: Contributor <contributor@example.com>"],
-    lifecycle: repairLifecycle(),
   });
 
   assert.equal(result.status, "compacted");
@@ -58,7 +57,6 @@ test("generated branch compaction keeps the reviewed tree and removes checkpoint
     targetDir,
     baseRef: "origin/main",
     message: "fix: update runtime",
-    lifecycle: repairLifecycle(),
   });
   assert.equal(unchanged.status, "unchanged");
   assert.equal(unchanged.previous_commit_count, 1);
@@ -66,14 +64,4 @@ test("generated branch compaction keeps the reviewed tree and removes checkpoint
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
-}
-
-function repairLifecycle() {
-  return {
-    repository: "openclaw/openclaw",
-    workKey: "execute-fix:openclaw/openclaw:test",
-    clusterId: "test",
-    sourceRevision: "test-source",
-    subjectKind: "workflow" as const,
-  };
 }

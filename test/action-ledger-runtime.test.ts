@@ -16,8 +16,6 @@ import {
   importActionEventShards,
   interruptOpenWorkflowActionEvents,
   postActionEventToCrabFleet,
-  readImportedRepairMutationEvents,
-  readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
   recordWorkflowPhaseEvent,
   workflowActionProducer,
@@ -25,7 +23,6 @@ import {
 import {
   ACTION_EVENT_PHASE_TYPES,
   ACTION_EVENT_REASON_CODES,
-  ACTION_EVENT_SHARD_FILE_LIMITS,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
   actionEventId,
@@ -179,97 +176,6 @@ function workflowEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL = `https://crabfleet.openclaw.ai/api/agent/interactive-sessions/${encodeURIComponent(sessionId)}/work-state`;
   }
   return env;
-}
-
-function recordWorkflowAttemptMutationOutcome(
-  root: string,
-  env: NodeJS.ProcessEnv,
-  outcome: "unknown" | "observed",
-  attempt = 1,
-): { started: ActionEvent; mutationOutcome: ActionEvent } {
-  const operationIdentity = { workKey: `openclaw/openclaw:${outcome}` };
-  const attemptIdentity = { workKey: `openclaw/openclaw:${outcome}`, attempt };
-  const subject = {
-    repository: "openclaw/openclaw",
-    kind: "queue_item" as const,
-    subjectId: `openclaw/openclaw:${outcome}`,
-  };
-  const started = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.workflowAttempt,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: false,
-      mutation: false,
-      identity: { state: "started" },
-      operation: "repair",
-      operationIdentity,
-      attemptIdentity,
-      phaseSeq: 1,
-      component: "repair_worker",
-      subject,
-      attributes: { state: "started", completion_reason: "workflow_started" },
-    },
-    { env },
-  );
-  assert.ok(started);
-  const idempotencyIdentity = {
-    operation: operationIdentity,
-    slot: "repair_mutation",
-    outcome,
-  };
-  const mutationAttempt = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.repairMutation,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: true,
-      mutation: false,
-      identity: { state: "mutation_attempted", outcome },
-      operation: "repair",
-      operationIdentity,
-      attemptIdentity,
-      parentEventId: started.event_id,
-      phaseSeq: 2,
-      idempotencyIdentity,
-      component: "repair_worker",
-      subject,
-      attributes: { state: "mutation_attempted", completion_reason: "mutation_attempted" },
-    },
-    { env },
-  );
-  assert.ok(mutationAttempt);
-  const mutationOutcome = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.repairMutation,
-      status: outcome === "unknown" ? ACTION_EVENT_STATUSES.failed : ACTION_EVENT_STATUSES.executed,
-      reasonCode:
-        outcome === "unknown"
-          ? ACTION_EVENT_REASON_CODES.unavailable
-          : ACTION_EVENT_REASON_CODES.alreadyComplete,
-      retryable: outcome === "unknown",
-      mutation: true,
-      identity: { state: `mutation_${outcome}`, outcome },
-      operation: "repair",
-      operationIdentity,
-      attemptIdentity,
-      parentEventId: mutationAttempt.event_id,
-      phaseSeq: 3,
-      idempotencyIdentity,
-      component: "repair_worker",
-      subject,
-      attributes: {
-        state: `mutation_${outcome}`,
-        completion_reason: outcome === "unknown" ? "mutation_outcome_unknown" : "mutation_observed",
-      },
-    },
-    { env },
-  );
-  assert.ok(mutationOutcome);
-  return { started, mutationOutcome };
 }
 
 function recordReview(
@@ -1520,7 +1426,7 @@ test("review interruption recovery aggregates coordination comment mutations", (
   assert.equal(recoveredBatch.action.mutation, true);
 });
 
-test("interruption recovery preserves unknowns across accepted retries and resolves observations", () => {
+test("interruption recovery preserves any earlier unknown mutation outcome", () => {
   const root = tempRoot();
   const env = workflowEnv({
     CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "apply-unknown-then-accepted",
@@ -1657,49 +1563,8 @@ test("interruption recovery preserves unknowns across accepted retries and resol
     return terminal;
   };
 
-  recordAttempt("a".repeat(64), "unknown", 11);
+  const unknown = recordAttempt("a".repeat(64), "unknown", 11);
   recordAttempt("b".repeat(64), "accepted", 21);
-  const observedIdentity = {
-    operation: "apply",
-    slot: "apply_mutation",
-    repository: "openclaw/openclaw",
-    number: 54,
-    sourceRevision: "revision-54",
-    mutationIdentitySha256: "c".repeat(64),
-  };
-  const observedUnknown = recordAttempt("c".repeat(64), "unknown", 31);
-  const observed = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.applyAction,
-      status: ACTION_EVENT_STATUSES.executed,
-      reasonCode: ACTION_EVENT_REASON_CODES.alreadyComplete,
-      retryable: false,
-      mutation: true,
-      identity: {
-        slot: "apply_mutation_outcome",
-        mutationIdentitySha256: "c".repeat(64),
-        outcome: "observed",
-      },
-      operation: "apply",
-      operationIdentity,
-      parentEventId: observedUnknown.event_id,
-      phaseSeq: 33,
-      idempotencyIdentity: observedIdentity,
-      component: "apply_decisions",
-      subject: {
-        repository: "openclaw/openclaw",
-        kind: "pull_request",
-        number: 54,
-        sourceRevision: "revision-54",
-      },
-      attributes: { completion_reason: "mutation_observed" },
-    },
-    { env },
-  );
-  assert.ok(observed);
-  const reopenedUnknown = recordAttempt("c".repeat(64), "unknown", 35);
-  recordAttempt("a".repeat(64), "accepted", 41);
 
   assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
   const allEvents = readAllSpooledActionEvents(root);
@@ -1713,8 +1578,8 @@ test("interruption recovery preserves unknowns across accepted retries and resol
   assert.ok(recovered.every((event) => event.action.retryable === false));
   const itemTerminal = recovered.find((event) => event.subject.number === 54);
   assert.ok(itemTerminal);
-  assert.equal(itemTerminal?.parent_event_id, reopenedUnknown.event_id);
-  assert.ok(reopenedUnknown.phase_seq < itemTerminal.phase_seq);
+  assert.equal(itemTerminal?.parent_event_id, unknown.event_id);
+  assert.ok(unknown.phase_seq < itemTerminal.phase_seq);
   const batchTerminal = recovered.find((event) => event.subject.kind === "workflow");
   assert.ok(batchTerminal);
   assert.equal(batchTerminal.parent_event_id, itemTerminal.event_id);
@@ -1851,269 +1716,6 @@ test("interruption recovery preserves cancellation instead of rewriting it as ti
   );
   assert.equal(terminal?.action.reason_code, ACTION_EVENT_REASON_CODES.cancelled);
   assert.equal(terminal?.attributes?.completion_reason, "cancelled");
-});
-
-test("interruption recovery terminalizes dangling repair workflow attempts", () => {
-  const root = tempRoot();
-  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "repair-attempt" });
-  const started = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.workflowAttempt,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: false,
-      mutation: false,
-      identity: { state: "started" },
-      operation: "repair",
-      operationIdentity: { workKey: "openclaw/openclaw:42" },
-      attemptIdentity: { workKey: "openclaw/openclaw:42", attempt: 1 },
-      phaseSeq: 1,
-      component: "repair_worker",
-      subject: {
-        repository: "openclaw/openclaw",
-        kind: "queue_item",
-        subjectId: "openclaw/openclaw:42",
-      },
-      attributes: { state: "started", completion_reason: "workflow_started" },
-    },
-    { env },
-  );
-  assert.ok(started);
-
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
-  const events = readAllSpooledActionEvents(root);
-  const terminal = events.find(
-    (event) =>
-      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
-      event.action.status === ACTION_EVENT_STATUSES.failed,
-  );
-  assert.ok(terminal);
-  assert.equal(terminal.operation_id, started.operation_id);
-  assert.equal(terminal.attempt_id, started.attempt_id);
-  assert.equal(terminal.parent_event_id, started.event_id);
-  assert.equal(terminal.action.reason_code, ACTION_EVENT_REASON_CODES.timeout);
-  assert.equal(terminal.attributes?.completion_reason, "timeout");
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
-});
-
-test("interruption recovery preserves unknown child mutations on workflow attempts", () => {
-  const root = tempRoot();
-  const env = workflowEnv({
-    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "repair-attempt-unknown-mutation",
-  });
-  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "unknown");
-
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
-  const terminal = readAllSpooledActionEvents(root).find(
-    (event) =>
-      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
-      event.action.status === ACTION_EVENT_STATUSES.failed,
-  );
-  assert.ok(terminal);
-  assert.equal(terminal.parent_event_id, mutationOutcome.event_id);
-  assert.equal(terminal.action.mutation, true);
-  assert.equal(terminal.action.retryable, false);
-  assert.equal(terminal.attributes?.completion_reason, "mutation_outcome_unknown");
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
-});
-
-test("interruption recovery preserves observed child mutations on workflow attempts", () => {
-  const root = tempRoot();
-  const env = workflowEnv({
-    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "repair-attempt-observed-mutation",
-  });
-  const { started } = recordWorkflowAttemptMutationOutcome(root, env, "observed");
-
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
-  const terminal = readAllSpooledActionEvents(root).find(
-    (event) =>
-      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
-      event.action.status === ACTION_EVENT_STATUSES.failed,
-  );
-  assert.ok(terminal);
-  assert.equal(terminal.parent_event_id, started.event_id);
-  assert.equal(terminal.action.mutation, true);
-  assert.equal(terminal.action.retryable, true);
-  assert.equal(terminal.attributes?.completion_reason, "timeout");
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
-});
-
-test("workflow attempt completion closes only its exact commit attempt", () => {
-  const root = tempRoot();
-  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "commit-attempt" });
-  const subject = {
-    repository: "openclaw/openclaw",
-    kind: "commit" as const,
-    subjectId: `commit-${"c".repeat(40)}`,
-    sourceRevision: "c".repeat(40),
-  };
-  const operationIdentity = { repository: "openclaw/openclaw", sha: "c".repeat(40) };
-  const completedStart = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.workflowAttempt,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: false,
-      mutation: false,
-      identity: { state: "started" },
-      operation: "commit_review",
-      operationIdentity,
-      attemptIdentity: { runAttempt: 1 },
-      phaseSeq: 1,
-      component: "commit_review",
-      subject,
-      attributes: { state: "started", completion_reason: "workflow_started" },
-    },
-    { env },
-  );
-  assert.ok(completedStart);
-  const completed = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.workflowAttempt,
-      status: ACTION_EVENT_STATUSES.completed,
-      reasonCode: ACTION_EVENT_REASON_CODES.completed,
-      retryable: false,
-      mutation: false,
-      identity: { state: "completed" },
-      operation: "commit_review",
-      operationIdentity,
-      attemptIdentity: { runAttempt: 1 },
-      parentEventId: completedStart.event_id,
-      phaseSeq: 2,
-      component: "commit_review",
-      subject,
-      attributes: { state: "completed", completion_reason: "workflow_completed" },
-    },
-    { env },
-  );
-  assert.ok(completed);
-  const dangling = recordWorkflowPhaseEvent(
-    root,
-    {
-      phase: ACTION_EVENT_TYPES.workflowAttempt,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: false,
-      mutation: false,
-      identity: { state: "started" },
-      operation: "commit_review",
-      operationIdentity,
-      attemptIdentity: { runAttempt: 2 },
-      phaseSeq: 1,
-      component: "commit_review",
-      subject,
-      attributes: { state: "started", completion_reason: "workflow_started" },
-    },
-    { env },
-  );
-  assert.ok(dangling);
-  const completedAttemptBefore = readAllSpooledActionEvents(root).filter(
-    (event) => event.attempt_id === completedStart.attempt_id,
-  );
-
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
-  const events = readAllSpooledActionEvents(root);
-  assert.deepEqual(
-    events.filter((event) => event.attempt_id === completedStart.attempt_id),
-    completedAttemptBefore,
-  );
-  const interrupted = events.find(
-    (event) =>
-      event.attempt_id === dangling.attempt_id &&
-      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
-      event.action.status === ACTION_EVENT_STATUSES.failed,
-  );
-  assert.ok(interrupted);
-  assert.equal(interrupted.parent_event_id, dangling.event_id);
-  assert.equal(interrupted.action.reason_code, ACTION_EVENT_REASON_CODES.timeout);
-});
-
-test("interruption recovery terminalizes generic repair and commit review starts", () => {
-  const root = tempRoot();
-  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "generic-review" });
-  for (const [component, subject] of [
-    [
-      "execute_fix_codex",
-      {
-        repository: "openclaw/openclaw",
-        kind: "pull_request" as const,
-        number: 42,
-        sourceRevision: "b".repeat(40),
-      },
-    ],
-    [
-      "commit_review",
-      {
-        repository: "openclaw/openclaw",
-        kind: "commit" as const,
-        subjectId: `commit-${"c".repeat(40)}`,
-        sourceRevision: "c".repeat(40),
-      },
-    ],
-  ] as const) {
-    const started = recordWorkflowActionEvent(
-      root,
-      {
-        scope: ACTION_EVENT_TYPES.reviewStarted,
-        identity: { component, phase: "started" },
-        operation: component,
-        operationIdentity: { component, sourceRevision: subject.sourceRevision },
-        type: ACTION_EVENT_TYPES.reviewStarted,
-        component,
-        subject,
-        action: {
-          name: ACTION_EVENT_TYPES.reviewStarted,
-          status: ACTION_EVENT_STATUSES.started,
-          retryable: false,
-          mutation: false,
-        },
-      },
-      { env: { ...env, GITHUB_ACTION: component } },
-    );
-    assert.ok(started);
-    recordWorkflowActionEvent(
-      root,
-      {
-        scope: ACTION_EVENT_TYPES.reviewLogPublication,
-        identity: { component, phase: "log" },
-        operation: component,
-        operationIdentity: { component, sourceRevision: subject.sourceRevision },
-        type: ACTION_EVENT_TYPES.reviewLogPublication,
-        component,
-        subject,
-        action: {
-          name: ACTION_EVENT_TYPES.reviewLogPublication,
-          status: ACTION_EVENT_STATUSES.published,
-          retryable: false,
-          mutation: false,
-        },
-        parentEventId: started.event_id,
-        phaseSeq: 2,
-      },
-      { env: { ...env, GITHUB_ACTION: component } },
-    );
-  }
-
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
-  const terminals = readAllSpooledActionEvents(root).filter(
-    (event) =>
-      event.event_type === ACTION_EVENT_TYPES.reviewStarted &&
-      event.action.status === ACTION_EVENT_STATUSES.failed,
-  );
-  assert.equal(terminals.length, 2);
-  assert.ok(
-    terminals.every(
-      (event) =>
-        event.attributes?.completion_reason === "timeout" &&
-        event.attributes.partial === true &&
-        event.action.retryable &&
-        !event.action.mutation,
-    ),
-  );
-  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
 });
 
 test("workflow retries preserve operation and idempotency identity but change attempts", () => {
@@ -3652,7 +3254,7 @@ test("cleanup-stuck projection rejection is scoped to the affected spool root", 
   const independentEnv = workflowEnv({
     CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "agent-token",
     CLAWSWEEPER_CRABFLEET_SESSION_ID: "session-1",
-    CLAWSWEEPER_CRABFLEET_TIMEOUT_MS: "60000",
+    CLAWSWEEPER_CRABFLEET_TIMEOUT_MS: "1000",
   });
   const cleanupResolvers: Array<() => void> = [];
   const blockedFetch = (async () =>
@@ -3666,40 +3268,37 @@ test("cleanup-stuck projection rejection is scoped to the affected spool root", 
           }),
       },
     }) as unknown as Response) as typeof fetch;
-  let independentStarted = 0;
-  try {
-    for (let index = 0; index < CRABFLEET_PROJECTION_LIMITS.maxConcurrent + 1; index += 1) {
-      assert.ok(recordReviewNumber(blockedRoot, 300 + index, blockedEnv, blockedFetch));
-    }
-    assert.ok(
-      recordReviewNumber(independentRoot, 400, independentEnv, (async () => {
-        independentStarted += 1;
-        return new Response(null, { status: 204 });
-      }) as typeof fetch),
-    );
-
-    const blockedDeadline = Date.now() + 2_000;
-    while (cleanupResolvers.length < CRABFLEET_PROJECTION_LIMITS.maxConcurrent) {
-      if (Date.now() >= blockedDeadline) {
-        throw new Error("blocked root did not enter response cleanup");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(independentStarted, 0);
-
-    cleanupResolvers.shift()!();
-    const independentDeadline = Date.now() + 2_000;
-    while (independentStarted === 0) {
-      if (Date.now() >= independentDeadline) {
-        throw new Error("independent root did not start after a projection slot recovered");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-  } finally {
-    for (const resolve of cleanupResolvers) resolve();
-    await flushPendingCrabFleetPosts();
+  for (let index = 0; index < CRABFLEET_PROJECTION_LIMITS.maxConcurrent + 1; index += 1) {
+    assert.ok(recordReviewNumber(blockedRoot, 300 + index, blockedEnv, blockedFetch));
   }
+  let independentStarted = 0;
+  assert.ok(
+    recordReviewNumber(independentRoot, 400, independentEnv, (async () => {
+      independentStarted += 1;
+      return new Response(null, { status: 204 });
+    }) as typeof fetch),
+  );
+
+  const blockedDeadline = Date.now() + 500;
+  while (cleanupResolvers.length < CRABFLEET_PROJECTION_LIMITS.maxConcurrent) {
+    if (Date.now() >= blockedDeadline) {
+      throw new Error("blocked root did not enter response cleanup");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(independentStarted, 0);
+
+  cleanupResolvers.shift()!();
+  const independentDeadline = Date.now() + 500;
+  while (independentStarted === 0) {
+    if (Date.now() >= independentDeadline) {
+      throw new Error("independent root did not start after a projection slot recovered");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  for (const resolve of cleanupResolvers) resolve();
+  await flushPendingCrabFleetPosts();
   assert.equal(independentStarted, 1);
 });
 
@@ -4245,257 +3844,6 @@ test("state shard imports are validated, create-only, and conflict detecting", a
   );
 });
 
-test("state shard imports create replayable repair mutation idempotency indexes", async () => {
-  const root = tempRoot();
-  const source = trustedChildRoot(root, "source");
-  const destination = trustedChildRoot(root, "destination");
-  const env = workflowEnv();
-  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "unknown");
-  await flushWorkflowActionEvents(root, { env, outputRoot: source });
-
-  const imported = importActionEventShards(source, destination);
-  const indexPaths = imported.completionPaths.filter((relativePath) =>
-    relativePath.includes("repair-mutation-idempotency"),
-  );
-  const reservationPaths = imported.reservationPaths.filter((relativePath) =>
-    relativePath.includes("repair-mutation-idempotency-reservations"),
-  );
-  assert.equal(indexPaths.length, 1);
-  assert.equal(reservationPaths.length, 1);
-  const index = JSON.parse(fs.readFileSync(path.join(destination, indexPaths[0]!), "utf8"));
-  assert.equal(index.schema, "clawsweeper.action-ledger-import-repair-mutation-idempotency");
-  assert.equal(index.idempotency_key_sha256, mutationOutcome.idempotency_key_sha256);
-  assert.equal(index.shard.path, imported.eventPaths[0]);
-  assert.deepEqual(
-    index.events.map((event: { event_id: string }) => event.event_id),
-    readActionEventShardAt(destination, imported.eventPaths[0]!)
-      .filter((event) => event.event_type === ACTION_EVENT_TYPES.repairMutation)
-      .map((event) => event.event_id),
-  );
-
-  const indexed = readImportedRepairMutationEvents(
-    destination,
-    mutationOutcome.producer.repository,
-    mutationOutcome.idempotency_key_sha256,
-  );
-  assert.deepEqual(
-    indexed?.map((event) => event.event_id),
-    index.events.map((event: { event_id: string }) => event.event_id),
-  );
-
-  const replayed = importActionEventShards(source, destination);
-  assert.equal(replayed.unchanged, 1);
-  assert.deepEqual(replayed.completionPaths, imported.completionPaths);
-
-  fs.writeFileSync(path.join(destination, indexPaths[0]!), "{}\n", "utf8");
-  assert.throws(
-    () => importActionEventShards(source, destination),
-    /repair mutation idempotency index binding conflict/,
-  );
-});
-
-test("repair mutation idempotency indexes sort shard paths independently of index hashes", async () => {
-  const root = tempRoot();
-  const destination = trustedChildRoot(root, "destination");
-  const candidates: Array<{
-    source: string;
-    relativePath: string;
-    shardSha256: string;
-    idempotencyKeySha256: string;
-    runId: string;
-  }> = [];
-
-  for (let index = 0; index < 16; index += 1) {
-    const spool = trustedChildRoot(root, `spool-${index}`);
-    const source = trustedChildRoot(root, `source-${index}`);
-    const runId = String(200 + index);
-    const env = workflowEnv({
-      GITHUB_RUN_ID: runId,
-      GITHUB_RUN_ATTEMPT: "1",
-    });
-    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(
-      spool,
-      env,
-      "unknown",
-      index + 1,
-    );
-    const [relativePath] = await flushWorkflowActionEvents(spool, { env, outputRoot: source });
-    assert.ok(relativePath);
-    candidates.push({
-      source,
-      relativePath,
-      shardSha256: createHash("sha256")
-        .update(fs.readFileSync(path.join(source, relativePath)))
-        .digest("hex"),
-      idempotencyKeySha256: mutationOutcome.idempotency_key_sha256,
-      runId,
-    });
-  }
-
-  const byIndexHash = [...candidates].sort((left, right) =>
-    left.shardSha256.localeCompare(right.shardSha256),
-  );
-  const inversion = byIndexHash
-    .flatMap((left, leftIndex) =>
-      byIndexHash
-        .slice(leftIndex + 1)
-        .map((right) => [left, right] as const)
-        .filter(([first, second]) => first.relativePath > second.relativePath),
-    )
-    .at(0);
-  assert.ok(inversion, "fixture must reverse index-hash and shard-path order");
-  const [first, second] = inversion;
-  importActionEventShards(first.source, destination);
-  importActionEventShards(second.source, destination);
-
-  const indexed = readImportedRepairMutationEvents(
-    destination,
-    "openclaw/clawsweeper",
-    first.idempotencyKeySha256,
-  );
-  assert.equal(indexed?.length, 4);
-  assert.deepEqual(
-    [...new Set(indexed?.map((event) => event.producer.run_id))].sort(),
-    [first.runId, second.runId].sort(),
-  );
-});
-
-test("repair mutation idempotency index reads enforce aggregate shard byte limits", async () => {
-  const root = tempRoot();
-  const firstSpool = trustedChildRoot(root, "first-spool");
-  const secondSpool = trustedChildRoot(root, "second-spool");
-  const firstSource = trustedChildRoot(root, "first-source");
-  const secondSource = trustedChildRoot(root, "second-source");
-  const destination = trustedChildRoot(root, "destination");
-  const firstEnv = workflowEnv({ GITHUB_RUN_ID: "100", GITHUB_RUN_ATTEMPT: "1" });
-  const secondEnv = workflowEnv({ GITHUB_RUN_ID: "101", GITHUB_RUN_ATTEMPT: "1" });
-  const first = recordWorkflowAttemptMutationOutcome(firstSpool, firstEnv, "unknown");
-  const second = recordWorkflowAttemptMutationOutcome(secondSpool, secondEnv, "unknown", 2);
-  assert.equal(
-    first.mutationOutcome.idempotency_key_sha256,
-    second.mutationOutcome.idempotency_key_sha256,
-  );
-  await flushWorkflowActionEvents(firstSpool, { env: firstEnv, outputRoot: firstSource });
-  await flushWorkflowActionEvents(secondSpool, { env: secondEnv, outputRoot: secondSource });
-  const firstImport = importActionEventShards(firstSource, destination);
-  const secondImport = importActionEventShards(secondSource, destination);
-  const shardPaths = [...firstImport.eventPaths, ...secondImport.eventPaths];
-  const totalShardBytes = shardPaths.reduce(
-    (total, relativePath) => total + fs.statSync(path.join(destination, relativePath)).size,
-    0,
-  );
-  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
-    maxTotalBytes: number;
-  };
-  const originalMaxTotalBytes = mutableLimits.maxTotalBytes;
-
-  try {
-    mutableLimits.maxTotalBytes = totalShardBytes - 1;
-    assert.throws(
-      () =>
-        readImportedRepairMutationEvents(
-          destination,
-          first.mutationOutcome.producer.repository,
-          first.mutationOutcome.idempotency_key_sha256,
-        ),
-      new RegExp(`${totalShardBytes - 1} total byte limit`),
-    );
-  } finally {
-    mutableLimits.maxTotalBytes = originalMaxTotalBytes;
-  }
-});
-
-test("repair mutation idempotency index reads validate complete multipart shard sets", async () => {
-  const root = tempRoot();
-  const spool = trustedChildRoot(root, "spool");
-  const source = trustedChildRoot(root, "source");
-  const destination = trustedChildRoot(root, "destination");
-  const env = workflowEnv();
-  const mutableLimits = ACTION_EVENT_SHARD_FILE_LIMITS as unknown as { maxEvents: number };
-  const originalMaxEvents = mutableLimits.maxEvents;
-
-  try {
-    mutableLimits.maxEvents = 2;
-    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(spool, env, "unknown");
-    const mutationAttempt = readAllSpooledActionEvents(spool).find(
-      (event) =>
-        event.event_type === ACTION_EVENT_TYPES.repairMutation &&
-        event.action.status === ACTION_EVENT_STATUSES.started,
-    );
-    assert.ok(mutationAttempt);
-    const paths = await flushWorkflowActionEvents(spool, { env, outputRoot: source });
-    assert.equal(paths.length, 2);
-    assert.match(paths[0]!, /-part-000001-of-000002\.jsonl$/);
-    assert.match(paths[1]!, /-part-000002-of-000002\.jsonl$/);
-    importActionEventShards(source, destination);
-
-    const indexed = readImportedRepairMutationEvents(
-      destination,
-      mutationOutcome.producer.repository,
-      mutationOutcome.idempotency_key_sha256,
-    );
-    assert.deepEqual(
-      indexed?.map((event) => event.event_id),
-      [mutationAttempt.event_id, mutationOutcome.event_id],
-    );
-  } finally {
-    mutableLimits.maxEvents = originalMaxEvents;
-  }
-});
-
-test("repair mutation idempotency index reads reject links and oversized manifests", async () => {
-  const root = tempRoot();
-  const source = trustedChildRoot(root, "source");
-  const destination = trustedChildRoot(root, "destination");
-  const env = workflowEnv();
-  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "observed");
-  await flushWorkflowActionEvents(root, { env, outputRoot: source });
-  const imported = importActionEventShards(source, destination);
-  const relativePath = imported.completionPaths.find((entry) =>
-    entry.includes("repair-mutation-idempotency"),
-  );
-  assert.ok(relativePath);
-  const indexPath = path.join(destination, relativePath);
-
-  if (process.platform !== "win32") {
-    const outside = path.join(root, "outside-index.json");
-    fs.writeFileSync(outside, fs.readFileSync(indexPath, "utf8"), "utf8");
-    fs.rmSync(indexPath);
-    fs.symlinkSync(outside, indexPath);
-    assert.throws(
-      () =>
-        readImportedRepairMutationEvents(
-          destination,
-          mutationOutcome.producer.repository,
-          mutationOutcome.idempotency_key_sha256,
-        ),
-      /unsafe repair mutation idempotency index entry/,
-    );
-    fs.rmSync(indexPath);
-  }
-
-  fs.writeFileSync(indexPath, "x".repeat(1024 * 1024 + 1), "utf8");
-  assert.throws(
-    () =>
-      readImportedRepairMutationEvents(
-        destination,
-        mutationOutcome.producer.repository,
-        mutationOutcome.idempotency_key_sha256,
-      ),
-    /byte limit/,
-  );
-  fs.rmSync(indexPath);
-  assert.throws(
-    () =>
-      readImportedRepairMutationEvents(
-        destination,
-        mutationOutcome.producer.repository,
-        mutationOutcome.idempotency_key_sha256,
-      ),
-    /repair mutation idempotency index is incomplete/,
-  );
-});
-
 test("manifest-bound imports reject a missing producer group before state publication", async () => {
   const root = tempRoot();
   const source = trustedChildRoot(root, "source");
@@ -4983,151 +4331,6 @@ test("state shard imports enforce aggregate byte limits before publication", asy
     ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileEvents,
   );
   assert.deepEqual(fs.readdirSync(destination), []);
-});
-
-test("multi-root shard reads enforce aggregate file limits during traversal", () => {
-  const root = tempRoot();
-  const firstSource = trustedChildRoot(root, "first-source");
-  const secondSource = trustedChildRoot(root, "second-source");
-  const firstDirectory = path.join(firstSource, "ledger", "v1", "events");
-  const secondDirectory = path.join(secondSource, "ledger", "v1", "events");
-  fs.mkdirSync(firstDirectory, { recursive: true });
-  fs.mkdirSync(secondDirectory, { recursive: true });
-  for (let index = 0; index < ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles; index += 1) {
-    fs.writeFileSync(path.join(firstDirectory, `entry-${String(index).padStart(4, "0")}.txt`), "");
-  }
-  fs.writeFileSync(path.join(secondDirectory, "overflow.txt"), "");
-
-  assert.throws(
-    () => readValidatedActionEventShardBatch([firstSource, secondSource]),
-    new RegExp(`${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} aggregate file limit`),
-  );
-});
-
-test("multi-root shard reads enforce aggregate directory and entry limits", () => {
-  const root = tempRoot();
-  const firstSource = trustedChildRoot(root, "first-source");
-  const secondSource = trustedChildRoot(root, "second-source");
-  const firstDirectory = path.join(firstSource, "ledger", "v1", "events");
-  const secondDirectory = path.join(secondSource, "ledger", "v1", "events");
-  fs.mkdirSync(path.join(firstDirectory, "nested"), { recursive: true });
-  fs.mkdirSync(secondDirectory, { recursive: true });
-  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
-    maxDirectories: number;
-    maxTotalEntries: number;
-  };
-  const originalMaxDirectories = mutableLimits.maxDirectories;
-  const originalMaxTotalEntries = mutableLimits.maxTotalEntries;
-  try {
-    mutableLimits.maxDirectories = 2;
-    assert.throws(
-      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
-      /aggregate directory limit/,
-    );
-
-    mutableLimits.maxDirectories = originalMaxDirectories;
-    mutableLimits.maxTotalEntries = 1;
-    fs.writeFileSync(path.join(secondDirectory, "entry.json"), "{}\n");
-    assert.throws(
-      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
-      /aggregate entry limit/,
-    );
-  } finally {
-    mutableLimits.maxDirectories = originalMaxDirectories;
-    mutableLimits.maxTotalEntries = originalMaxTotalEntries;
-  }
-});
-
-test("multi-root shard reads stop before opening files beyond the aggregate byte budget", () => {
-  const root = tempRoot();
-  const firstSource = trustedChildRoot(root, "first-source");
-  const secondSource = trustedChildRoot(root, "second-source");
-  const base = recordReview(root);
-  assert.ok(base);
-  const first = recreateActionEvent(base, {
-    eventKey: actionEventKey("review.aggregate-bytes-first", {}),
-    parentEventId: null,
-  });
-  const secondFirst = recreateActionEvent(base, {
-    eventKey: actionEventKey("review.aggregate-bytes-second-first", {}),
-    parentEventId: null,
-    producer: { ...base.producer, component: "review.aggregate_bytes_first" },
-  });
-  const secondLate = recreateActionEvent(base, {
-    eventKey: actionEventKey("review.aggregate-bytes-second-late", {}),
-    parentEventId: null,
-    producer: { ...base.producer, component: "review.aggregate_bytes_late" },
-  });
-  const [firstShard] = writeActionEventShards(firstSource, shardIdentity(first), [first]);
-  const secondShards = [
-    ...writeActionEventShards(secondSource, shardIdentity(secondFirst), [secondFirst]),
-    ...writeActionEventShards(secondSource, shardIdentity(secondLate), [secondLate]),
-  ].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
-  assert.ok(firstShard);
-  assert.equal(secondShards.length, 2);
-  const lateShard = path.join(secondSource, secondShards.at(-1)!.relativePath);
-  const firstBytes = fs.statSync(path.join(firstSource, firstShard.relativePath)).size;
-  const secondFirstBytes = fs.statSync(path.join(secondSource, secondShards[0]!.relativePath)).size;
-  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
-    maxTotalBytes: number;
-  };
-  const originalMaxTotalBytes = mutableLimits.maxTotalBytes;
-  const originalOpenSync = fs.openSync;
-  let lateShardOpened = false;
-  mutableLimits.maxTotalBytes = firstBytes + secondFirstBytes - 1;
-  fs.openSync = ((filePath, flags, mode) => {
-    if (path.resolve(String(filePath)) === lateShard) lateShardOpened = true;
-    return originalOpenSync(filePath, flags, mode);
-  }) as typeof fs.openSync;
-  try {
-    assert.throws(
-      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
-      new RegExp(`${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`),
-    );
-  } finally {
-    fs.openSync = originalOpenSync;
-    mutableLimits.maxTotalBytes = originalMaxTotalBytes;
-  }
-  assert.equal(lateShardOpened, false);
-});
-
-test("multi-root shard reads reject aggregate event overflow before parsing the next root", () => {
-  const root = tempRoot();
-  const firstSource = trustedChildRoot(root, "first-source");
-  const secondSource = trustedChildRoot(root, "second-source");
-  const base = recordReview(root);
-  assert.ok(base);
-  const first = recreateActionEvent(base, {
-    eventKey: actionEventKey("review.aggregate-events-first", {}),
-    parentEventId: null,
-  });
-  const second = recreateActionEvent(base, {
-    eventKey: actionEventKey("review.aggregate-events-second", {}),
-    parentEventId: null,
-  });
-  writeActionEventShards(firstSource, shardIdentity(base), [first]);
-  writeActionEventShards(secondSource, shardIdentity(base), [second]);
-  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
-    maxTotalEvents: number;
-  };
-  const originalMaxTotalEvents = mutableLimits.maxTotalEvents;
-  const originalParse = JSON.parse;
-  let secondEventParsed = false;
-  mutableLimits.maxTotalEvents = 1;
-  JSON.parse = ((text, reviver) => {
-    if (typeof text === "string" && text.includes(second.event_id)) secondEventParsed = true;
-    return originalParse(text, reviver);
-  }) as typeof JSON.parse;
-  try {
-    assert.throws(
-      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
-      /total event limit/,
-    );
-  } finally {
-    JSON.parse = originalParse;
-    mutableLimits.maxTotalEvents = originalMaxTotalEvents;
-  }
-  assert.equal(secondEventParsed, false);
 });
 
 test("state shard imports accept a complete 4097-event producer run", () => {

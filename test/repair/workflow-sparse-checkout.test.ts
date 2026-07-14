@@ -87,7 +87,7 @@ test("sweep workflow preserves manual target branches and hydrates exact branche
   const dispatchTargetBranchResolver =
     /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
   const continuationTargetBranch =
-    /--field target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
+    /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
   const recoveryTargetBranch =
     /--arg target_branch "\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
 

@@ -3,7 +3,6 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { stableJson } from "../stable-json.js";
 import {
   assertAllowedOwner,
   hasDeterministicSecuritySignal,
@@ -14,17 +13,15 @@ import {
 } from "./lib.js";
 import { defaultCloseComment, externalMessageProvenance } from "./external-messages.js";
 import {
+  ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   githubLimitedPagePath,
-  ghJson as ghJsonOnce,
   ghJsonWithRetry as ghJson,
-  ghPagedLimitWithRetry as ghPagedLimit,
   ghPagedWithRetry as ghPaged,
-  ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
 import { issueNumberFromRef } from "./github-ref.js";
-import { ghRetryKind, ghRetryWaitMs, isLockedConversationCommentError } from "../github-retry.js";
+import { isLockedConversationCommentError } from "../github-retry.js";
 import { lockedConversationSkip, lockedConversationSkipIfLocked } from "./apply-locks.js";
 import {
   CLAWSWEEPER_LABEL,
@@ -35,44 +32,6 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
-import {
-  automergeEffectDefinitelyAbsent,
-  automergeUnconfirmedFailureDisposition,
-  expectedSquashCommitMessage,
-  squashAutomergeMethodBlock,
-  squashMergedMethodBlock,
-  squashMergeQueueMethodBlock,
-  type SquashMergeCommitProof,
-} from "./automerge-effect.js";
-import {
-  ensureExactHeadMergeClaim,
-  exactHeadMergeClaimIdentity,
-  exactHeadMergeClaimRecoveryDecision,
-  exactHeadMergeClaimWorkflowRunEnv,
-  exactHeadMergeClaimant,
-  exactHeadMergeClaimOwnsUpdatedAt,
-  exactHeadMergeUpdatedAtMatches,
-  inspectExactHeadMergeClaim,
-  isTrustedExactHeadMergeClaimComment,
-  isTrustedExactHeadMergeClaimDispatchComment,
-  isTrustedExactHeadMergeClaimRejectionComment,
-  isTrustedExactHeadMergeClaimRecoveryComment,
-  isTrustedExactHeadMergeClaimReleaseComment,
-  markExactHeadMergeClaimDispatched,
-  rejectExactHeadMergeClaim,
-  releaseExactHeadMergeClaim,
-  type ExactHeadMergeClaimInspection,
-  type ExactHeadMergeClaimRequest,
-} from "./exact-head-merge-claim.js";
-import { MAX_REVIEWED_TIMELINE_EVENTS, reviewedTimelineTail } from "./timeline-cursor.js";
-import {
-  recordRepairMutationObservedSafely,
-  repairSourceRevision,
-  runRepairMutation,
-  type RepairLifecycleInput,
-  type RepairMutationOptions,
-} from "./repair-action-ledger.js";
-import { sleepMs } from "./timing.js";
 import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
@@ -105,7 +64,6 @@ const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
 const VIABLE_COVERING_PR_MERGE_STATES = new Set(["CLEAN", "BEHIND"]);
 const PR_CLOSE_COVERAGE_PROOF_COMMENT_LIMIT = 50;
 const GITHUB_MAX_PAGE_SIZE = 100;
-const COMMENT_PROPAGATED_ISSUE_FIELDS = new Set(["comments", "updated_at", "updatedAt"]);
 const CLAWSWEEPER_COMMAND_ONLY_PATTERN = /^@clawsweeper\s+(?:re-review|re-run|review)\s*$/i;
 const CLAWSWEEPER_BOT_AUTHORS = new Set(
   [
@@ -542,9 +500,9 @@ function applyCloseAction({
 
   try {
     if (!existingComment) {
-      postIssueComment(result.repo, target, kind, idempotencyKey, body);
+      postIssueComment(result.repo, target, body);
     }
-    closeIssueOrPullRequest(result.repo, target, kind, classification, idempotencyKey);
+    closeIssueOrPullRequest(result.repo, target, kind, classification);
   } catch (error) {
     if (isLockedConversationCommentError(error)) {
       return lockedConversationSkip(base, live, { terminalWriteError: true });
@@ -607,27 +565,7 @@ function applyMergeAction({
     };
   }
 
-  const pullRequest = fetchPullRequest(result.repo, target);
-  const view = fetchPullRequestView(result.repo, target);
-  const authorizedHeadSha = String(pullRequest.head?.sha ?? "");
-  const mergeEnabled = process.env.CLAWSWEEPER_ALLOW_MERGE === "1" && !dryRun;
-  const preliminaryClaim: ExactHeadMergeClaimInspection =
-    mergeEnabled && isFullCommitSha(authorizedHeadSha)
-      ? inspectApplyMergeClaim(result.repo, target, authorizedHeadSha)
-      : { status: "absent", reason: "", claimId: null };
-  if (preliminaryClaim.status === "blocked" || preliminaryClaim.status === "unknown") {
-    return {
-      ...base,
-      status: "blocked",
-      reason: preliminaryClaim.reason,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-      ...(preliminaryClaim.status === "unknown" ? { requeue_required: true } : {}),
-    };
-  }
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
-  const expectedTimelineCursor = action.target_timeline_cursor;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
       ...base,
@@ -637,86 +575,7 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (!expectedTimelineCursor) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "missing target_timeline_cursor; rerun the worker against live GitHub state",
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
-  let existingSquashCommitProof: SquashMergeCommitProof | undefined;
-  if (
-    preliminaryClaim.status === "existing" &&
-    preliminaryClaim.dispatched &&
-    preliminaryClaim.expectedSquashMessage &&
-    pullRequest.merged_at
-  ) {
-    try {
-      existingSquashCommitProof = fetchSquashMergeCommitProof(
-        result.repo,
-        pullRequest,
-        preliminaryClaim.expectedSquashMessage,
-      );
-    } catch (error) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: `durably claimed merge proof could not be read: ${ghErrorText(error)}`,
-        live_state: live.state,
-        live_updated_at: live.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      };
-    }
-  }
-  const existingMerge = confirmExactMergeSnapshot(pullRequest, authorizedHeadSha, {
-    ...(preliminaryClaim.status === "existing" && preliminaryClaim.dispatched
-      ? { requireSquashMethod: true }
-      : {}),
-    ...(existingSquashCommitProof ? { squashCommit: existingSquashCommitProof } : {}),
-  });
-  if (existingMerge.block) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: existingMerge.block,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
-  if (existingMerge.mergedAt) {
-    const mergeOwned =
-      preliminaryClaim.status === "existing" && preliminaryClaim.dispatched === true;
-    if (mergeOwned) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-    }
-    return {
-      ...base,
-      status: mergeOwned ? "executed" : "skipped",
-      reason: mergeOwned
-        ? "already merged"
-        : "already merged without a dispatched ClawSweeper claim",
-      live_state: "merged",
-      live_updated_at: live.updated_at,
-      merged_at: existingMerge.mergedAt,
-      merge_commit_sha: pullRequest.merge_commit_sha ?? null,
-    };
-  }
-  if (
-    expectedUpdatedAt &&
-    preliminaryClaim.status !== "existing" &&
-    !applyMergeUpdatedAtMatches(
-      result.repo,
-      target,
-      authorizedHeadSha,
-      expectedUpdatedAt,
-      expectedTimelineCursor,
-      live.updated_at,
-      preliminaryClaim,
-    )
-  ) {
+  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at) {
     return {
       ...base,
       status: "blocked",
@@ -726,9 +585,34 @@ function applyMergeAction({
       live_state: live.state,
     };
   }
+
+  const pullRequest = fetchPullRequest(result.repo, target);
+  const view = fetchPullRequestView(result.repo, target);
+  const mergedAt = pullRequest.merged_at ?? view.mergedAt ?? null;
+  if (mergedAt) {
+    return {
+      ...base,
+      status: "executed",
+      reason: "already merged",
+      live_state: "merged",
+      live_updated_at: live.updated_at,
+      merged_at: mergedAt,
+      merge_commit_sha: pullRequest.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+    };
+  }
   const lockedSkip = lockedConversationSkipIfLocked(base, live);
   if (lockedSkip) return { ...lockedSkip, merge_method: "squash" };
 
+  const mergeBlock = validateMergeablePullRequest({ pullRequest, view });
+  if (mergeBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: mergeBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
   const mergePreflightBlock = validateMergePreflight({ result, target });
   if (mergePreflightBlock) {
     return {
@@ -739,43 +623,7 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  const headBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view });
-  if (headBindingBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: headBindingBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
   const mergePreflight = findMergePreflight(result, target);
-  const hardMergeBlock = validateMergeablePullRequestHard({ pullRequest, view });
-  if (hardMergeBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: hardMergeBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
-
-  const pendingMerge = exactHeadPendingMerge(view, authorizedHeadSha);
-  if (pendingMerge) {
-    return pendingMergeAction({ base, live, reason: pendingMerge });
-  }
-
-  const mergeBlock = validateMergeablePullRequestReadiness({ view });
-  if (mergeBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: mergeBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
     if (!dryRun) labelForClawSweeperReview(result.repo, target);
@@ -803,12 +651,11 @@ function applyMergeAction({
   const mergeMessage = buildRepairSquashMergeMessage({
     target,
     title: view.title ?? pullRequest.title,
-    headSha: authorizedHeadSha,
+    headSha: pullRequest.head?.sha,
     preflight: mergePreflight,
     reason: "merged by ClawSweeper Repair",
   });
-  const bodyFile = writeRepairSquashMergeBody(target, authorizedHeadSha, mergeMessage.body);
-  const squashCommitMessage = expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body);
+  const bodyFile = writeRepairSquashMergeBody(target, pullRequest.head?.sha, mergeMessage.body);
   const mergeArgs = [
     "pr",
     "merge",
@@ -820,1322 +667,32 @@ function applyMergeAction({
     String(mergeMessage.subject),
     "--body-file",
     bodyFile,
-    "--match-head-commit",
-    authorizedHeadSha,
   ];
-  let commandError: unknown = null;
-  let dispatchedSquashCommitMessage = "";
-  const finalView = fetchPullRequestView(result.repo, target);
-  const finalHeadBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view: finalView });
-  if (finalHeadBindingBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: finalHeadBindingBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-    };
-  }
-  const finalHardMergeBlock = validateMergeablePullRequestHard({
-    pullRequest,
-    view: finalView,
-  });
-  if (finalHardMergeBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: finalHardMergeBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-    };
-  }
-  const finalLive = fetchIssue(result.repo, target);
-  if (hasSecuritySignal(finalLive)) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "security-sensitive target requires central security triage",
-      live_state: finalLive.state,
-      live_updated_at: finalLive.updated_at,
-      merge_method: "squash",
-    };
-  }
-  if (
-    expectedUpdatedAt &&
-    preliminaryClaim.status !== "existing" &&
-    !applyMergeUpdatedAtMatches(
-      result.repo,
-      target,
-      authorizedHeadSha,
-      expectedUpdatedAt,
-      expectedTimelineCursor,
-      finalLive.updated_at,
-      preliminaryClaim,
-    )
-  ) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "target changed during final merge preflight",
-      expected_updated_at: expectedUpdatedAt,
-      live_updated_at: finalLive.updated_at,
-      live_state: finalLive.state,
-      merge_method: "squash",
-    };
-  }
-  const finalPendingMerge = exactHeadPendingMerge(finalView, authorizedHeadSha);
-  if (finalPendingMerge) {
-    return pendingMergeAction({ base, live: finalLive, reason: finalPendingMerge });
-  }
-  const finalMergeBlock = validateMergeablePullRequestReadiness({ view: finalView });
-  if (finalMergeBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: finalMergeBlock,
-      live_state: finalLive.state,
-      live_updated_at: finalLive.updated_at,
-      merge_method: "squash",
-    };
-  }
-  const mergeClaim = claimApplyMergeRequest(result.repo, target, authorizedHeadSha);
-  if (mergeClaim.status === "recovered") {
-    return {
-      ...base,
-      status: "blocked",
-      reason: mergeClaim.reason,
-      live_state: finalLive.state,
-      live_updated_at: finalLive.updated_at,
-      merge_method: "squash",
-      requeue_required: true,
-    };
-  }
-  if (mergeClaim.status === "blocked" || mergeClaim.status === "unknown") {
-    return {
-      ...base,
-      status: "blocked",
-      reason: mergeClaim.reason,
-      live_state: finalLive.state,
-      live_updated_at: finalLive.updated_at,
-      merge_method: "squash",
-      ...(mergeClaim.status === "unknown" ? { requeue_required: true } : {}),
-    };
-  }
-  if (mergeClaim.status !== "acquired" && mergeClaim.status !== "existing") {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "exact-head merge claim entered an unsupported state",
-      live_state: finalLive.state,
-      live_updated_at: finalLive.updated_at,
-      merge_method: "squash",
-      requeue_required: true,
-    };
-  }
-  const reconciliationOnly = mergeClaim.status === "existing";
-  const retireDispatchedClaim = (actionResult: LooseRecord) =>
-    retireApplyMergeClaimAfterDefinitiveNoMutation({
-      actionResult,
-      repository: result.repo,
-      number: target,
-      headSha: authorizedHeadSha,
-      claim: mergeClaim,
-    });
-  if (mergeClaim.status === "existing" && mergeClaim.dispatched) {
-    dispatchedSquashCommitMessage = mergeClaim.expectedSquashMessage ?? "";
-  }
-  if (mergeClaim.status === "acquired") {
-    const releaseBeforeDispatch = (actionResult: LooseRecord) =>
-      releaseApplyMergeClaimBeforeDispatch({
-        actionResult,
-        repository: result.repo,
-        number: target,
-        headSha: authorizedHeadSha,
-        claimId: mergeClaim.claimId,
-      });
-    let claimedPull;
-    let claimedView;
-    try {
-      claimedPull = fetchPullRequestOnce(result.repo, target);
-      claimedView = fetchPullRequestViewOnce(result.repo, target);
-    } catch (error) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: `post-claim merge preflight could not be refreshed: ${ghErrorText(error)}`,
-        live_state: finalLive.state,
-        live_updated_at: finalLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    const claimedRestHeadBlock = validatePullRequestHeadBinding({
-      authorizedHeadSha,
-      pullRequest: claimedPull,
-    });
-    if (claimedRestHeadBlock) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: claimedRestHeadBlock,
-        live_state: claimedPull.state ?? finalLive.state,
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const claimedViewHeadBlock = validateMergeHeadBinding({
-      authorizedHeadSha,
-      view: claimedView,
-    });
-    if (claimedViewHeadBlock) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: claimedViewHeadBlock,
-        live_state: claimedPull.state ?? finalLive.state,
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const claimedMerge = confirmExactMergeSnapshot(claimedPull, authorizedHeadSha, {
-      requireSquashMethod: true,
-    });
-    if (claimedMerge.block) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: claimedMerge.block,
-        live_state: claimedPull.state ?? finalLive.state,
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    if (claimedMerge.mergedAt) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return {
-        ...base,
-        status: "executed",
-        reason: "merge confirmed after exact-head claim",
-        live_state: "merged",
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merged_at: claimedMerge.mergedAt,
-        merge_commit_sha: claimedPull.merge_commit_sha ?? null,
-        merge_method: "squash",
-        commit_subject: mergeMessage.subject,
-        summary_lines: mergeMessage.summaryLines,
-        fixup_lines: mergeMessage.fixupLines,
-      };
-    }
-    const claimedHardBlock = validateMergeablePullRequestHard({
-      pullRequest: claimedPull,
-      view: claimedView,
-    });
-    if (claimedHardBlock) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: claimedHardBlock,
-        live_state: claimedPull.state ?? finalLive.state,
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let claimedLive;
-    try {
-      claimedLive = fetchIssue(result.repo, target);
-    } catch (error) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: `post-claim security state could not be refreshed: ${ghErrorText(error)}`,
-        live_state: claimedPull.state ?? finalLive.state,
-        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    if (hasSecuritySignal(claimedLive)) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: "security-sensitive target requires central security triage",
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    if (
-      expectedUpdatedAt &&
-      !applyMergeUpdatedAtMatches(
-        result.repo,
-        target,
-        authorizedHeadSha,
-        expectedUpdatedAt,
-        expectedTimelineCursor,
-        claimedLive.updated_at,
-        mergeClaim,
-        {
-          verifiedTargetContentUnchanged: issueMutationSensitiveContentMatches(
-            finalLive,
-            claimedLive,
-          ),
-        },
-      )
-    ) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: "target changed after exact-head merge claim",
-        expected_updated_at: expectedUpdatedAt,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const claimedPendingMerge = exactHeadPendingMerge(claimedView, authorizedHeadSha);
-    if (claimedPendingMerge) {
-      return releaseBeforeDispatch(
-        pendingMergeAction({ base, live: claimedLive, reason: claimedPendingMerge }),
-      );
-    }
-    const claimedReadinessBlock = validateMergeablePullRequestReadiness({ view: claimedView });
-    if (claimedReadinessBlock) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: claimedReadinessBlock,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let dispatchBoundary;
-    try {
-      dispatchBoundary = markApplyMergeClaimDispatched(
-        result.repo,
-        target,
-        authorizedHeadSha,
-        mergeClaim.claimId,
-        squashCommitMessage,
-      );
-    } catch (error) {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: `merge dispatch boundary could not be recorded: ${ghErrorText(error)}`,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    if (dispatchBoundary.status !== "dispatched") {
-      return releaseBeforeDispatch({
-        ...base,
-        status: "blocked",
-        reason: dispatchBoundary.reason,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    dispatchedSquashCommitMessage = dispatchBoundary.expectedSquashMessage;
-    const dispatchedClaimState = {
-      ...mergeClaim,
-      lastClaimMutationId: dispatchBoundary.lastClaimMutationId,
-      lastClaimMutationAt: dispatchBoundary.lastClaimMutationAt,
-      claimMutationIds: [
-        ...(mergeClaim.claimMutationIds ?? []),
-        mergeClaim.claimId,
-        dispatchBoundary.lastClaimMutationId,
-      ],
-    };
-    let dispatchLive;
-    let dispatchPull;
-    let dispatchView;
-    try {
-      dispatchLive = fetchIssue(result.repo, target);
-      dispatchPull = fetchPullRequestOnce(result.repo, target);
-      dispatchView = fetchPullRequestViewOnce(result.repo, target);
-    } catch (error) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: `dispatch-boundary merge state could not be refreshed: ${ghErrorText(error)}`,
-        live_state: claimedLive.state,
-        live_updated_at: claimedLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    const dispatchRestHeadBlock = validatePullRequestHeadBinding({
-      authorizedHeadSha,
-      pullRequest: dispatchPull,
-    });
-    if (dispatchRestHeadBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: dispatchRestHeadBlock,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const dispatchViewHeadBlock = validateMergeHeadBinding({
-      authorizedHeadSha,
-      view: dispatchView,
-    });
-    if (dispatchViewHeadBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: dispatchViewHeadBlock,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let dispatchSquashCommitProof: SquashMergeCommitProof | undefined;
-    try {
-      dispatchSquashCommitProof = dispatchedSquashCommitMessage
-        ? fetchSquashMergeCommitProof(result.repo, dispatchPull, dispatchedSquashCommitMessage)
-        : undefined;
-    } catch (error) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: `dispatch-boundary merge proof could not be read: ${ghErrorText(error)}`,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      };
-    }
-    const dispatchMerge = confirmExactMergeSnapshot(dispatchPull, authorizedHeadSha, {
-      requireSquashMethod: true,
-      ...(dispatchSquashCommitProof ? { squashCommit: dispatchSquashCommitProof } : {}),
-    });
-    if (dispatchMerge.block) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: dispatchMerge.block,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      };
-    }
-    if (dispatchMerge.mergedAt) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return {
-        ...base,
-        status: "executed",
-        reason: "merge confirmed at the exact-head dispatch boundary",
-        live_state: "merged",
-        live_updated_at: dispatchLive.updated_at,
-        merged_at: dispatchMerge.mergedAt,
-        merge_commit_sha: dispatchPull.merge_commit_sha ?? null,
-        merge_method: "squash",
-        commit_subject: mergeMessage.subject,
-        summary_lines: mergeMessage.summaryLines,
-        fixup_lines: mergeMessage.fixupLines,
-      };
-    }
-    const dispatchHardMergeBlock = validateMergeablePullRequestHard({
-      pullRequest: dispatchPull,
-      view: dispatchView,
-    });
-    if (dispatchHardMergeBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: dispatchHardMergeBlock,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let dispatchSecuritySignal = false;
-    try {
-      dispatchSecuritySignal = hasSecuritySignal(dispatchLive);
-    } catch (error) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: `dispatch-boundary security state could not be refreshed: ${ghErrorText(error)}`,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    if (dispatchSecuritySignal) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: "security-sensitive target requires central security triage",
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    if (
-      expectedUpdatedAt &&
-      !applyMergeUpdatedAtMatches(
-        result.repo,
-        target,
-        authorizedHeadSha,
-        expectedUpdatedAt,
-        expectedTimelineCursor,
-        dispatchLive.updated_at,
-        dispatchedClaimState,
-        {
-          verifiedTargetContentUnchanged: issueMutationSensitiveContentMatches(
-            claimedLive,
-            dispatchLive,
-          ),
-        },
-      )
-    ) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: "target changed at the merge dispatch boundary",
-        expected_updated_at: expectedUpdatedAt,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const dispatchPendingMerge = exactHeadPendingMerge(dispatchView, authorizedHeadSha);
-    if (dispatchPendingMerge) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return pendingMergeAction({
-        base,
-        live: dispatchLive,
-        reason: dispatchPendingMerge,
-      });
-    }
-    const dispatchReadinessBlock = validateMergeablePullRequestReadiness({
-      view: dispatchView,
-    });
-    if (dispatchReadinessBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: dispatchReadinessBlock,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const dispatchBaseBranch = String(dispatchView.baseRefName ?? dispatchPull.base?.ref ?? "");
-    let absoluteFinalLive;
-    let absoluteFinalPull;
-    let absoluteFinalView;
-    try {
-      absoluteFinalLive = fetchIssue(result.repo, target);
-      absoluteFinalPull = fetchPullRequestOnce(result.repo, target);
-      absoluteFinalView = fetchPullRequestViewOnce(result.repo, target);
-    } catch (error) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: `absolute-final merge state could not be refreshed: ${ghErrorText(error)}`,
-        live_state: dispatchLive.state,
-        live_updated_at: dispatchLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    const absoluteFinalRestHeadBlock = validatePullRequestHeadBinding({
-      authorizedHeadSha,
-      pullRequest: absoluteFinalPull,
-    });
-    if (absoluteFinalRestHeadBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: absoluteFinalRestHeadBlock,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const absoluteFinalViewHeadBlock = validateMergeHeadBinding({
-      authorizedHeadSha,
-      view: absoluteFinalView,
-    });
-    if (absoluteFinalViewHeadBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: absoluteFinalViewHeadBlock,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let absoluteFinalSquashCommitProof: SquashMergeCommitProof | undefined;
-    try {
-      absoluteFinalSquashCommitProof = dispatchedSquashCommitMessage
-        ? fetchSquashMergeCommitProof(result.repo, absoluteFinalPull, dispatchedSquashCommitMessage)
-        : undefined;
-    } catch (error) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: `absolute-final merge proof could not be read: ${ghErrorText(error)}`,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      };
-    }
-    const absoluteFinalMerge = confirmExactMergeSnapshot(absoluteFinalPull, authorizedHeadSha, {
-      requireSquashMethod: true,
-      ...(absoluteFinalSquashCommitProof ? { squashCommit: absoluteFinalSquashCommitProof } : {}),
-    });
-    if (absoluteFinalMerge.block) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: absoluteFinalMerge.block,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      };
-    }
-    if (absoluteFinalMerge.mergedAt) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return {
-        ...base,
-        status: "executed",
-        reason: "merge confirmed at the absolute-final exact-head boundary",
-        live_state: "merged",
-        live_updated_at: absoluteFinalLive.updated_at,
-        merged_at: absoluteFinalMerge.mergedAt,
-        merge_commit_sha: absoluteFinalPull.merge_commit_sha ?? null,
-        merge_method: "squash",
-        commit_subject: mergeMessage.subject,
-        summary_lines: mergeMessage.summaryLines,
-        fixup_lines: mergeMessage.fixupLines,
-      };
-    }
-    const absoluteFinalHardMergeBlock = validateMergeablePullRequestHard({
-      pullRequest: absoluteFinalPull,
-      view: absoluteFinalView,
-    });
-    if (absoluteFinalHardMergeBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: absoluteFinalHardMergeBlock,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let absoluteFinalSecuritySignal = false;
-    try {
-      absoluteFinalSecuritySignal = hasSecuritySignal(absoluteFinalLive);
-    } catch (error) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: `absolute-final security state could not be refreshed: ${ghErrorText(error)}`,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    if (absoluteFinalSecuritySignal) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: "security-sensitive target requires central security triage",
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    if (
-      expectedUpdatedAt &&
-      !applyMergeUpdatedAtMatches(
-        result.repo,
-        target,
-        authorizedHeadSha,
-        expectedUpdatedAt,
-        expectedTimelineCursor,
-        absoluteFinalLive.updated_at,
-        dispatchedClaimState,
-        {
-          verifiedTargetContentUnchanged: issueMutationSensitiveContentMatches(
-            claimedLive,
-            absoluteFinalLive,
-          ),
-        },
-      )
-    ) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: "target changed at the absolute-final merge boundary",
-        expected_updated_at: expectedUpdatedAt,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const absoluteFinalPendingMerge = exactHeadPendingMerge(absoluteFinalView, authorizedHeadSha);
-    if (absoluteFinalPendingMerge) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return pendingMergeAction({
-        base,
-        live: absoluteFinalLive,
-        reason: absoluteFinalPendingMerge,
-      });
-    }
-    const absoluteFinalReadinessBlock = validateMergeablePullRequestReadiness({
-      view: absoluteFinalView,
-    });
-    if (absoluteFinalReadinessBlock) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: absoluteFinalReadinessBlock,
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    const absoluteFinalBaseBranch = String(
-      absoluteFinalView.baseRefName ?? absoluteFinalPull.base?.ref ?? "",
-    );
-    if (absoluteFinalBaseBranch !== dispatchBaseBranch) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: "pull request base changed during final merge preflight",
-        live_state: absoluteFinalLive.state,
-        live_updated_at: absoluteFinalLive.updated_at,
-        merge_method: "squash",
-      });
-    }
-    let mergeRequestStarted = false;
-    try {
-      runRepairMutation(applyResultLifecycle(target), {
-        kind: "apply_result_merge",
-        identity: applyMergeMutationIdentity(target, authorizedHeadSha),
-        component: "apply_result",
-        operation: () => {
-          mergeRequestStarted = true;
-          return ghText(mergeArgs);
-        },
-        knownNoMutation: applyMergeCommandDefinitivelyRejected,
-        outcome: () => "unknown",
-      });
-    } catch (error) {
-      if (!mergeRequestStarted) {
-        return retireDispatchedClaim({
-          ...base,
-          status: "blocked",
-          reason: `merge ledger failed before dispatch: ${ghErrorText(error)}`,
-          live_state: absoluteFinalLive.state,
-          live_updated_at: absoluteFinalLive.updated_at,
-          merge_method: "squash",
-          requeue_required: true,
-        });
-      }
-      commandError = error;
-    }
-  }
-
-  let merged;
-  let squashCommitProof: SquashMergeCommitProof | undefined;
+  if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
   try {
-    merged = fetchPullRequestOnce(result.repo, target);
-    squashCommitProof = dispatchedSquashCommitMessage
-      ? fetchSquashMergeCommitProof(result.repo, merged, dispatchedSquashCommitMessage)
-      : undefined;
+    ghWithRetry(mergeArgs);
   } catch (error) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: `merge outcome could not be reconciled from GitHub REST: ${ghErrorText(error)}`,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-      requeue_required: true,
-    };
-  }
-  const confirmation = confirmExactMergeSnapshot(merged, authorizedHeadSha, {
-    requireSquashMethod: true,
-    ...(squashCommitProof ? { squashCommit: squashCommitProof } : {}),
-  });
-  if (confirmation.block) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: confirmation.block,
-      live_state: merged.state ?? live.state,
-      live_updated_at: merged.updated_at ?? live.updated_at,
-      merge_method: "squash",
-    };
-  }
-  if (!confirmation.mergedAt) {
-    const restHeadBindingBlock = validatePullRequestHeadBinding({
-      authorizedHeadSha,
-      pullRequest: merged,
-    });
-    if (restHeadBindingBlock) {
+    if (isLockedConversationCommentError(error)) {
       return {
-        ...base,
-        status: "blocked",
-        reason: restHeadBindingBlock,
-        live_state: merged.state ?? live.state,
-        live_updated_at: merged.updated_at ?? live.updated_at,
-        merge_method: "squash",
-      };
-    }
-
-    let reconciledView;
-    try {
-      reconciledView = fetchPullRequestViewOnce(result.repo, target);
-    } catch (error) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: `merge outcome could not be reconciled from GitHub GraphQL: ${ghErrorText(error)}`,
-        live_state: merged.state ?? live.state,
-        live_updated_at: merged.updated_at ?? live.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      };
-    }
-    const reconciledHeadBindingBlock = validateMergeHeadBinding({
-      authorizedHeadSha,
-      view: reconciledView,
-    });
-    if (reconciledHeadBindingBlock) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: reconciledHeadBindingBlock,
-        live_state: merged.state ?? live.state,
-        live_updated_at: merged.updated_at ?? live.updated_at,
-        merge_method: "squash",
-      };
-    }
-    const reconciledHardMergeBlock = validateMergeablePullRequestHard({
-      pullRequest: merged,
-      view: reconciledView,
-    });
-    if (reconciledHardMergeBlock) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: reconciledHardMergeBlock,
-        live_state: merged.state ?? live.state,
-        live_updated_at: merged.updated_at ?? live.updated_at,
-        merge_method: "squash",
-      };
-    }
-    const pendingReason = exactHeadPendingMerge(reconciledView, authorizedHeadSha);
-    if (pendingReason) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return pendingMergeAction({
-        base,
-        live: merged,
-        reason: pendingReason,
-      });
-    }
-    if (commandError && isLockedConversationCommentError(commandError)) {
-      return retireDispatchedClaim({
         ...lockedConversationSkip(base, live, { terminalWriteError: true }),
         merge_method: "squash",
-      });
+      };
     }
-    if (commandError && applyMergeCommandDefinitivelyRejected(commandError)) {
-      return retireDispatchedClaim({
-        ...base,
-        status: "blocked",
-        reason: `merge command was definitively rejected: ${ghErrorText(commandError)}`,
-        live_state: merged.state ?? live.state,
-        live_updated_at: merged.updated_at ?? live.updated_at,
-        merge_method: "squash",
-        requeue_required: true,
-      });
-    }
-    return {
-      ...base,
-      status: "blocked",
-      reason: commandError
-        ? `merge command failed and the exact outcome was not confirmed: ${ghErrorText(commandError)}`
-        : reconciliationOnly
-          ? mergeClaim.reason
-          : "merge command completed but GitHub has not confirmed the exact merge",
-      live_state: merged.state ?? live.state,
-      live_updated_at: merged.updated_at ?? live.updated_at,
-      merge_method: "squash",
-      requeue_required: true,
-    };
+    throw error;
   }
-
-  recordApplyMergeObserved(target, authorizedHeadSha);
+  const merged = fetchPullRequest(result.repo, target);
   return {
     ...base,
     status: "executed",
-    reason: commandError
-      ? "merge confirmed after ambiguous response"
-      : reconciliationOnly
-        ? "merge confirmed for durably claimed exact head"
-        : "merged by clawsweeper-repair",
+    reason: "merged by clawsweeper-repair",
     live_state: "merged",
-    live_updated_at: merged.updated_at ?? live.updated_at,
-    merged_at: confirmation.mergedAt,
+    live_updated_at: live.updated_at,
+    merged_at: merged.merged_at ?? null,
     merge_commit_sha: merged.merge_commit_sha ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
-  };
-}
-
-function validateMergeHeadBinding({
-  authorizedHeadSha,
-  view,
-}: {
-  authorizedHeadSha: string;
-  view: LooseRecord;
-}): string {
-  if (!isFullCommitSha(authorizedHeadSha)) {
-    return "pull request head is missing or malformed for exact merge binding";
-  }
-  const viewHeadSha = String(view.headRefOid ?? "");
-  if (!isFullCommitSha(viewHeadSha)) {
-    return "pull request view head is missing or malformed for exact merge binding";
-  }
-  if (viewHeadSha !== authorizedHeadSha) {
-    return "pull request head changed during merge preflight";
-  }
-  return "";
-}
-
-function validatePullRequestHeadBinding({
-  authorizedHeadSha,
-  pullRequest,
-}: {
-  authorizedHeadSha: string;
-  pullRequest: LooseRecord;
-}): string {
-  if (!isFullCommitSha(authorizedHeadSha)) {
-    return "pull request head is missing or malformed for exact merge binding";
-  }
-  const pullRequestHeadSha = String(pullRequest.head?.sha ?? "");
-  if (!isFullCommitSha(pullRequestHeadSha)) {
-    return "pull request REST head is missing or malformed for exact merge binding";
-  }
-  if (pullRequestHeadSha !== authorizedHeadSha) {
-    return "pull request REST head changed during merge reconciliation";
-  }
-  return "";
-}
-
-function confirmExactMergeSnapshot(
-  pullRequest: LooseRecord,
-  authorizedHeadSha: string,
-  proof: {
-    requireSquashMethod?: boolean;
-    squashCommit?: SquashMergeCommitProof;
-  } = {},
-): { mergedAt: string | null; block: string } {
-  const mergedAt = stringOrNull(pullRequest.merged_at);
-  if (!mergedAt) return { mergedAt: null, block: "" };
-  const mergedHeadSha = String(pullRequest.head?.sha ?? "");
-  if (
-    !isFullCommitSha(authorizedHeadSha) ||
-    !isFullCommitSha(mergedHeadSha) ||
-    mergedHeadSha !== authorizedHeadSha
-  ) {
-    return {
-      mergedAt: null,
-      block: "merged pull request head does not match the authorized preflight head",
-    };
-  }
-  const methodBlock =
-    proof.requireSquashMethod === true ? squashMergedMethodBlock(proof.squashCommit) : "";
-  return { mergedAt: methodBlock ? null : mergedAt, block: methodBlock };
-}
-
-function claimApplyMergeRequest(repository: string, number: number, headSha: string) {
-  const request = applyMergeClaimRequest(repository, number, headSha);
-  return ensureExactHeadMergeClaim(request, {
-    listComments: () => listApplyMergeClaimComments(request),
-    createComment: (body, context) =>
-      runRepairMutation(applyResultLifecycle(number), {
-        kind:
-          context.kind === "claim"
-            ? "apply_result_merge_claim"
-            : "apply_result_merge_claim_recovery",
-        identity:
-          context.kind === "claim"
-            ? exactHeadMergeClaimIdentity(request)
-            : {
-                ...exactHeadMergeClaimIdentity(request),
-                claimId: context.claimId,
-                owner: context.owner,
-                claimant: context.claimant,
-              },
-        component: "merge_claim",
-        operation: () =>
-          ghJsonOnce([
-            "api",
-            `repos/${request.repository}/issues/${request.number}/comments`,
-            "-f",
-            `body=${body}`,
-          ]),
-        outcome: (comment) => {
-          const trusted =
-            context.kind === "claim"
-              ? isTrustedExactHeadMergeClaimComment(comment, request)
-              : isTrustedExactHeadMergeClaimRecoveryComment(
-                  comment,
-                  request,
-                  context.claimId,
-                  context.owner,
-                  context.claimant,
-                );
-          return trusted ? "accepted" : "unknown";
-        },
-      }),
-    recoverClaim: (candidate) =>
-      exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
-        ghJsonOnce(["api", path], { env: exactHeadMergeClaimWorkflowRunEnv() }),
-      ),
-    dispatchedClaimEffectAbsent: () => {
-      const pullRequest = fetchPullRequestOnce(repository, number);
-      const view = fetchPullRequestViewOnce(repository, number);
-      return automergeEffectDefinitelyAbsent({ pull: pullRequest, view }, headSha);
-    },
-  });
-}
-
-function markApplyMergeClaimDispatched(
-  repository: string,
-  number: number,
-  headSha: string,
-  claimId: number,
-  expectedSquashMessage: string,
-) {
-  const request = applyMergeClaimRequest(repository, number, headSha);
-  return markExactHeadMergeClaimDispatched(request, claimId, expectedSquashMessage, {
-    listComments: () => listApplyMergeClaimComments(request),
-    createComment: (body) =>
-      runRepairMutation(applyResultLifecycle(number), {
-        kind: "apply_result_merge_claim_dispatch",
-        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
-        component: "merge_claim",
-        operation: () =>
-          ghJsonOnce([
-            "api",
-            `repos/${request.repository}/issues/${request.number}/comments`,
-            "-f",
-            `body=${body}`,
-          ]),
-        outcome: (comment) =>
-          isTrustedExactHeadMergeClaimDispatchComment(
-            comment,
-            request,
-            claimId,
-            expectedSquashMessage,
-          )
-            ? "accepted"
-            : "unknown",
-      }),
-  });
-}
-
-function releaseApplyMergeClaimBeforeDispatch({
-  actionResult,
-  repository,
-  number,
-  headSha,
-  claimId,
-}: {
-  actionResult: LooseRecord;
-  repository: string;
-  number: number;
-  headSha: string;
-  claimId: number;
-}) {
-  let release;
-  try {
-    release = releaseApplyMergeClaim(repository, number, headSha, claimId);
-  } catch (error) {
-    release = {
-      status: "unknown" as const,
-      reason: `exact-head merge claim release failed: ${ghErrorText(error)}`,
-      claimId,
-    };
-  }
-  if (release.status === "released") return actionResult;
-  return {
-    ...actionResult,
-    status: "blocked",
-    reason: `${String(actionResult.reason ?? "merge aborted before dispatch")}; ${release.reason}`,
-    ...(release.status === "unknown" ? { requeue_required: true } : {}),
-  };
-}
-
-function retireApplyMergeClaimAfterDefinitiveNoMutation({
-  actionResult,
-  repository,
-  number,
-  headSha,
-  claim,
-}: {
-  actionResult: LooseRecord;
-  repository: string;
-  number: number;
-  headSha: string;
-  claim:
-    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "acquired" }>
-    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "existing" }>;
-}) {
-  let rejection;
-  try {
-    rejection = rejectApplyMergeClaim(repository, number, headSha, claim);
-  } catch (error) {
-    rejection = {
-      status: "unknown" as const,
-      reason: `exact-head merge claim rejection failed: ${ghErrorText(error)}`,
-      claimId: claim.claimId,
-    };
-  }
-  if (rejection.status === "rejected") return actionResult;
-  return {
-    ...actionResult,
-    status: "blocked",
-    reason: `${String(actionResult.reason ?? "merge produced no effect")}; ${rejection.reason}`,
-    requeue_required: true,
-  };
-}
-
-function applyMergeCommandDefinitivelyRejected(error: unknown): boolean {
-  return (
-    automergeUnconfirmedFailureDisposition({
-      command_error: error,
-    }) === "blocked"
-  );
-}
-
-function rejectApplyMergeClaim(
-  repository: string,
-  number: number,
-  headSha: string,
-  claim:
-    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "acquired" }>
-    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "existing" }>,
-) {
-  const request = applyMergeClaimRequest(repository, number, headSha, {
-    owner: claim.status === "existing" ? claim.owner : "apply_result",
-    claimant: claim.status === "existing" ? claim.claimant : exactHeadMergeClaimant("apply_result"),
-  });
-  return rejectExactHeadMergeClaim(request, claim.claimId, {
-    listComments: () => listApplyMergeClaimComments(request),
-    createComment: (body) =>
-      runRepairMutation(applyResultLifecycle(number), {
-        kind: "apply_result_merge_claim_rejection",
-        identity: { ...exactHeadMergeClaimIdentity(request), claimId: claim.claimId },
-        component: "merge_claim",
-        operation: () =>
-          ghJsonOnce([
-            "api",
-            `repos/${request.repository}/issues/${request.number}/comments`,
-            "-f",
-            `body=${body}`,
-          ]),
-        outcome: (comment) =>
-          isTrustedExactHeadMergeClaimRejectionComment(comment, request, claim.claimId)
-            ? "accepted"
-            : "unknown",
-      }),
-  });
-}
-
-function releaseApplyMergeClaim(
-  repository: string,
-  number: number,
-  headSha: string,
-  claimId: number,
-) {
-  const request = applyMergeClaimRequest(repository, number, headSha);
-  return releaseExactHeadMergeClaim(request, claimId, {
-    listComments: () => listApplyMergeClaimComments(request),
-    createComment: (body) =>
-      runRepairMutation(applyResultLifecycle(number), {
-        kind: "apply_result_merge_claim_release",
-        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
-        component: "merge_claim",
-        operation: () =>
-          ghJsonOnce([
-            "api",
-            `repos/${request.repository}/issues/${request.number}/comments`,
-            "-f",
-            `body=${body}`,
-          ]),
-        outcome: (comment) =>
-          isTrustedExactHeadMergeClaimReleaseComment(comment, request, claimId)
-            ? "accepted"
-            : "unknown",
-      }),
-  });
-}
-
-function inspectApplyMergeClaim(repository: string, number: number, headSha: string) {
-  const request = applyMergeClaimRequest(repository, number, headSha);
-  return inspectExactHeadMergeClaim(request, () => listApplyMergeClaimComments(request));
-}
-
-function applyMergeClaimRequest(
-  repository: string,
-  number: number,
-  headSha: string,
-  claimIdentity: { owner: string; claimant: string } = {
-    owner: "apply_result",
-    claimant: exactHeadMergeClaimant("apply_result"),
-  },
-): ExactHeadMergeClaimRequest {
-  return {
-    repository,
-    number,
-    headSha,
-    method: "squash",
-    owner: claimIdentity.owner,
-    claimant: claimIdentity.claimant,
-    appId: Number(process.env.CLAWSWEEPER_AUTHENTICATED_APP_ID),
-    appSlug: String(process.env.CLAWSWEEPER_AUTHENTICATED_APP_SLUG ?? ""),
-  };
-}
-
-function listApplyMergeClaimComments(request: ExactHeadMergeClaimRequest) {
-  return ghPaged<LooseRecord>(
-    `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
-  );
-}
-
-function applyMergeUpdatedAtMatches(
-  repository: string,
-  number: number,
-  headSha: string,
-  expectedUpdatedAt: JsonValue,
-  expectedTimelineCursor: JsonValue,
-  liveUpdatedAt: JsonValue,
-  claim: {
-    status: string;
-    claimId?: number | null;
-    lastClaimMutationId?: number | null;
-    lastClaimMutationAt?: string | null;
-    claimMutationIds?: number[];
-  },
-  options: { verifiedTargetContentUnchanged?: boolean } = {},
-) {
-  try {
-    const request = applyMergeClaimRequest(repository, number, headSha);
-    const timeline = ghPagedLimit<LooseRecord>(
-      `repos/${request.repository}/issues/${request.number}/timeline`,
-      MAX_REVIEWED_TIMELINE_EVENTS + 1,
-    );
-    if (timeline.length > MAX_REVIEWED_TIMELINE_EVENTS) return false;
-    if (exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, liveUpdatedAt)) {
-      return reviewedTimelineTail(expectedTimelineCursor, timeline) !== null;
-    }
-    if (claim.status !== "acquired" || options.verifiedTargetContentUnchanged !== true) {
-      return false;
-    }
-    return exactHeadMergeClaimOwnsUpdatedAt(
-      claim,
-      expectedTimelineCursor,
-      liveUpdatedAt,
-      timeline,
-      options,
-    );
-  } catch {
-    return false;
-  }
-}
-
-function issueMutationSensitiveContentMatches(before: LooseRecord, after: LooseRecord): boolean {
-  return (
-    stableJson(issueMutationSensitiveContent(before)) ===
-    stableJson(issueMutationSensitiveContent(after))
-  );
-}
-
-function issueMutationSensitiveContent(issue: LooseRecord): LooseRecord {
-  return Object.fromEntries(
-    Object.entries(issue).filter(([key]) => !COMMENT_PROPAGATED_ISSUE_FIELDS.has(key)),
-  );
-}
-
-function applyMergeMutationIdentity(number: number, headSha: string) {
-  return {
-    repo: result.repo,
-    number,
-    headSha,
-    method: "squash",
-  };
-}
-
-function recordApplyMergeObserved(number: number, headSha: string) {
-  recordRepairMutationObservedSafely(applyResultLifecycle(number), {
-    kind: "apply_result_merge",
-    identity: applyMergeMutationIdentity(number, headSha),
-    component: "apply_result",
-  });
-}
-
-function applyResultLifecycle(
-  number: number | null,
-  subjectKind: RepairLifecycleInput["subjectKind"] = "pull_request",
-): RepairLifecycleInput {
-  return {
-    repository: result.repo,
-    workKey: `apply-result:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
-    ...(number && number > 0 ? { number } : {}),
-    sourceRevision:
-      repairSourceRevision(job.frontmatter) ??
-      repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
-    subjectKind: number && number > 0 ? subjectKind : "workflow",
-  };
-}
-
-function exactHeadPendingMerge(view: LooseRecord, authorizedHeadSha: string): string {
-  if (String(view.headRefOid ?? "") !== authorizedHeadSha) return "";
-  if (view.isInMergeQueue === true) {
-    return "merge is pending in GitHub's merge queue for the authorized pull request head";
-  }
-  if (view.autoMergeRequest) {
-    return "auto-merge is pending for the authorized pull request head";
-  }
-  return "";
-}
-
-function pendingMergeAction({ base, live, reason }: LooseRecord) {
-  return {
-    ...base,
-    status: "blocked",
-    reason,
-    live_state: live.state,
-    live_updated_at: live.updated_at,
-    merge_method: "squash",
-    requeue_required: true,
   };
 }
 
@@ -2215,53 +772,13 @@ function validateMergePolicy({ job, action }: LooseRecord) {
 }
 
 function labelForClawSweeperReview(repo: string, target: LooseRecord) {
-  const number = Number(target);
-  ensureLabel(
-    repo,
-    number,
-    CLAWSWEEPER_LABEL,
-    CLAWSWEEPER_LABEL_COLOR,
-    CLAWSWEEPER_LABEL_DESCRIPTION,
-  );
-  try {
-    runApplyResultMutationWithRetry(
-      applyResultLifecycle(number),
-      {
-        kind: "apply_result_blocked_merge_label_add",
-        identity: {
-          repository: repo,
-          number,
-          label: CLAWSWEEPER_LABEL,
-          operation: "blocked_merge_label_add",
-        },
-        component: "apply_result",
-      },
-      ["issue", "edit", String(target), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL],
-    );
-  } catch {
-    // Helpful metadata should not block the primary command path.
-  }
+  ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
+  ghBestEffort(["issue", "edit", String(target), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]);
 }
 
-function ensureLabel(
-  repo: string,
-  number: number,
-  name: string,
-  color: JsonValue,
-  description: JsonValue,
-) {
+function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
   try {
-    runApplyResultMutationWithRetry(
-      applyResultLifecycle(number),
-      {
-        kind: "apply_result_blocked_merge_label_create",
-        identity: {
-          repository: repo,
-          label: name,
-          operation: "blocked_merge_label_create",
-        },
-        component: "apply_result",
-      },
+    ghWithRetry(
       ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
       2,
     );
@@ -2974,37 +1491,16 @@ function validateMergeablePullRequest({
   view,
   allowedMergeStates = CLEAN_MERGE_STATES,
 }: LooseRecord) {
-  const hardBlock = validateMergeablePullRequestHard({ pullRequest, view });
-  if (hardBlock) return hardBlock;
-  return validateMergeablePullRequestReadiness({ view, allowedMergeStates });
-}
-
-function validateMergeablePullRequestHard({ pullRequest, view }: LooseRecord) {
   if (pullRequest.state !== "open") return `pull request is ${pullRequest.state}`;
   if (pullRequest.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pullRequest.base?.ref ?? "") !== "main")
     return "pull request base is not main";
-  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
-    return `review decision is ${view.reviewDecision}`;
-  }
-  const terminalCheckBlock = validateTerminalStatusChecks(view.statusCheckRollup ?? []);
-  if (terminalCheckBlock) return terminalCheckBlock;
-  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
-  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
-  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pullRequest.auto_merge);
-  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
-  const queueMethodBlock = squashMergeQueueMethodBlock(view, pullRequest);
-  if (queueMethodBlock) return queueMethodBlock;
-  return "";
-}
-
-function validateMergeablePullRequestReadiness({
-  view,
-  allowedMergeStates = CLEAN_MERGE_STATES,
-}: LooseRecord) {
   if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
   if (!allowedMergeStates.has(String(view.mergeStateStatus ?? ""))) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
+  }
+  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
+    return `review decision is ${view.reviewDecision}`;
   }
   const checkBlock = validateStatusChecks(view.statusCheckRollup ?? []);
   if (checkBlock) return checkBlock;
@@ -3013,8 +1509,6 @@ function validateMergeablePullRequestReadiness({
 
 function validateStatusChecks(checks: LooseRecord[]) {
   if (!Array.isArray(checks) || checks.length === 0) return "no PR checks found";
-  const terminalBlock = validateTerminalStatusChecks(checks);
-  if (terminalBlock) return terminalBlock;
   const blockers: LooseRecord[] = [];
   for (const check of checks) {
     const name = check.name ?? check.context ?? "unknown check";
@@ -3029,39 +1523,6 @@ function validateStatusChecks(checks: LooseRecord[]) {
     }
   }
   if (blockers.length > 0) return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
-  return "";
-}
-
-function validateTerminalStatusChecks(checks: LooseRecord[]) {
-  if (!Array.isArray(checks)) return "";
-  const blockers: string[] = [];
-  for (const check of checks) {
-    const name = check.name ?? check.context ?? "unknown check";
-    const status = String(check.status ?? "").toUpperCase();
-    const state = String(check.state ?? "").toUpperCase();
-    const conclusion = String(check.conclusion ?? "").toUpperCase();
-    if (conclusion) {
-      if (!PASSING_CHECK_CONCLUSIONS.has(conclusion)) blockers.push(`${name}: ${conclusion}`);
-      continue;
-    }
-    if (!check.status && PASSING_CHECK_CONCLUSIONS.has(state)) continue;
-    const terminalState = status || state;
-    if (["COMPLETED", "SUCCESS"].includes(terminalState)) {
-      blockers.push(`${name}: UNKNOWN (${terminalState} without conclusion)`);
-      continue;
-    }
-    if (
-      terminalState &&
-      ["ACTION_REQUIRED", "CANCELLED", "ERROR", "FAILURE", "STALE", "TIMED_OUT"].includes(
-        terminalState,
-      )
-    ) {
-      blockers.push(`${name}: ${terminalState}`);
-    }
-  }
-  if (blockers.length > 0) {
-    return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
-  }
   return "";
 }
 
@@ -3211,25 +1672,8 @@ function fetchPullRequest(repo: string, number: JsonValue) {
   return ghJson(["api", `repos/${repo}/pulls/${number}`]);
 }
 
-function fetchPullRequestOnce(repo: string, number: JsonValue) {
-  return ghJsonOnce(["api", `repos/${repo}/pulls/${number}`]);
-}
-
-function fetchSquashMergeCommitProof(
-  repo: string,
-  pull: LooseRecord,
-  expectedMessage: string,
-): SquashMergeCommitProof | undefined {
-  if (!pull.merged_at) return undefined;
-  const mergeCommitSha = String(pull.merge_commit_sha ?? "").trim();
-  const commit = mergeCommitSha
-    ? ghJsonOnce(["api", `repos/${repo}/commits/${mergeCommitSha}`])
-    : null;
-  return { mergeCommitSha, commit, expectedMessage };
-}
-
-function pullRequestViewArgs(repo: string, number: JsonValue) {
-  return [
+function fetchPullRequestView(repo: string, number: JsonValue) {
+  return ghJson([
     "pr",
     "view",
     String(number),
@@ -3238,14 +1682,11 @@ function pullRequestViewArgs(repo: string, number: JsonValue) {
     "--json",
     [
       "baseRefName",
-      "headRefOid",
       "isDraft",
-      "isInMergeQueue",
       "mergeable",
       "mergeCommit",
       "mergeStateStatus",
       "mergedAt",
-      "autoMergeRequest",
       "reviewDecision",
       "state",
       "statusCheckRollup",
@@ -3253,15 +1694,7 @@ function pullRequestViewArgs(repo: string, number: JsonValue) {
       "updatedAt",
       "url",
     ].join(","),
-  ];
-}
-
-function fetchPullRequestView(repo: string, number: JsonValue) {
-  return ghJson(pullRequestViewArgs(repo, number));
-}
-
-function fetchPullRequestViewOnce(repo: string, number: JsonValue) {
-  return ghJsonOnce(pullRequestViewArgs(repo, number));
+  ]);
 }
 
 function findExistingComment(repo: string, number: JsonValue, marker: LooseRecord, body: string) {
@@ -3271,31 +1704,16 @@ function findExistingComment(repo: string, number: JsonValue, marker: LooseRecor
   );
 }
 
-function postIssueComment(
-  repo: string,
-  number: JsonValue,
-  subjectKind: RepairLifecycleInput["subjectKind"],
-  actionIdempotencyKey: string,
-  body: string,
-) {
+function postIssueComment(repo: string, number: JsonValue, body: string) {
   const payloadPath = writePayload(`comment-${number}`, { body });
-  // A workflow rerun reconciles the marker; retrying this POST could create a duplicate comment.
-  runApplyResultMutationWithRetry(
-    applyResultLifecycle(Number(number), subjectKind),
-    {
-      kind: "apply_result_closeout_comment",
-      identity: {
-        repository: repo,
-        number: Number(number),
-        clusterId: String(result.cluster_id ?? ""),
-        actionIdempotencyKey,
-        operation: "closeout_comment_create",
-      },
-      component: "apply_result",
-    },
-    ["api", `repos/${repo}/issues/${number}/comments`, "--method", "POST", "--input", payloadPath],
-    1,
-  );
+  ghWithRetry([
+    "api",
+    `repos/${repo}/issues/${number}/comments`,
+    "--method",
+    "POST",
+    "--input",
+    payloadPath,
+  ]);
 }
 
 function closeIssueOrPullRequest(
@@ -3303,33 +1721,9 @@ function closeIssueOrPullRequest(
   number: JsonValue,
   kind: string,
   classification: JsonValue,
-  actionIdempotencyKey: string,
 ) {
-  const lifecycle = applyResultLifecycle(
-    Number(number),
-    kind === "pull_request" ? "pull_request" : "issue",
-  );
-  const mutation = {
-    kind: "apply_result_target_close",
-    identity: {
-      repository: repo,
-      number: Number(number),
-      clusterId: String(result.cluster_id ?? ""),
-      actionIdempotencyKey,
-      targetKind: kind,
-      classification: String(classification ?? ""),
-      operation: "target_close",
-    },
-    component: "apply_result",
-  } satisfies Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">;
   if (kind === "pull_request") {
-    runApplyResultMutationWithRetry(lifecycle, mutation, [
-      "pr",
-      "close",
-      String(number),
-      "--repo",
-      repo,
-    ]);
+    ghWithRetry(["pr", "close", String(number), "--repo", repo]);
     return;
   }
   const stateReason = classification === "fixed_by_candidate" ? "completed" : "not_planned";
@@ -3337,7 +1731,7 @@ function closeIssueOrPullRequest(
     state: "closed",
     state_reason: stateReason,
   });
-  runApplyResultMutationWithRetry(lifecycle, mutation, [
+  ghWithRetry([
     "api",
     `repos/${repo}/issues/${number}`,
     "--method",
@@ -3345,58 +1739,6 @@ function closeIssueOrPullRequest(
     "--input",
     payloadPath,
   ]);
-}
-
-function runApplyResultMutationWithRetry(
-  lifecycle: RepairLifecycleInput,
-  options: Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">,
-  ghArgs: string[],
-  retryAttempts = githubMutationRetryAttempts(),
-): string {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= retryAttempts; attempt += 1) {
-    try {
-      return runRepairMutation(lifecycle, {
-        ...options,
-        knownNoMutation: githubMutationRejectedBeforeWrite,
-        operation: () => ghText(ghArgs),
-      });
-    } catch (error) {
-      lastError = error;
-      const retryKind = ghRetryKind(error);
-      if (
-        attempt >= retryAttempts ||
-        retryKind === "none" ||
-        githubMutationRejectedBeforeWrite(error)
-      ) {
-        throw error;
-      }
-      sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-function githubMutationRetryAttempts(): number {
-  const configured = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
-  if (configured == null || configured.trim() === "") return 6;
-  const attempts = Number(configured);
-  return Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 6;
-}
-
-function githubMutationRejectedBeforeWrite(error: unknown): boolean {
-  const code =
-    error && typeof error === "object" && "code" in error
-      ? String((error as NodeJS.ErrnoException).code ?? "")
-      : "";
-  if (code === "ENOENT" || code === "EACCES") return true;
-  const detail = ghErrorText(error);
-  return (
-    /already exists/i.test(detail) ||
-    /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
-      detail,
-    )
-  );
 }
 
 function writePayload(name: string, value: JsonValue) {
@@ -3417,10 +1759,6 @@ function stringFromUnknown(value: JsonValue) {
 
 function stringOrNull(value: JsonValue) {
   return typeof value === "string" && value.trim() ? value : null;
-}
-
-function isFullCommitSha(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 }
 
 function nonNegativeIntegerFromUnknown(value: JsonValue): number | null {

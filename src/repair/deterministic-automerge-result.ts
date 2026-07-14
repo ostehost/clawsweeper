@@ -96,7 +96,6 @@ export function deterministicAutomergeResult({
         classification: "canonical",
         target_kind: "pull_request",
         target_updated_at: canonical.updated_at ?? null,
-        target_timeline_cursor: canonical.timeline_cursor ?? null,
         canonical: ref,
         duplicate_of: null,
         candidate_fix: ref,

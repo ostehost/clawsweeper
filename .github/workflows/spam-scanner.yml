@@ -49,7 +49,6 @@ on:
     - cron: "17 * * * *"
 
 permissions:
-  actions: read
   contents: write
   issues: read
   pull-requests: read
@@ -79,9 +78,6 @@ jobs:
             results
             schema/clawsweeper-pr-close-coverage-proof.schema.json
             scripts/hydrate-state.ts
-            src/action-ledger-files.ts
-            src/action-ledger-runtime.ts
-            src/action-ledger.ts
             src/clawsweeper-text.ts
             src/command.ts
             src/codex-env.ts
@@ -124,11 +120,7 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
-      - uses: ./.github/actions/setup-action-ledger
-        id: action-ledger
-
       - uses: ./.github/actions/setup-pnpm
-        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -185,10 +177,7 @@ jobs:
           target_repo="${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.target_repo || 'openclaw/openclaw') || github.event.inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
           comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || github.event.client_payload.comment_id || '' }}"
           review_comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.review_comment_ids || github.event.client_payload.review_comment_id || '' }}"
-          publish_args=(
-            --message "chore: record ClawSweeper spam scan"
-            --receipt-kind spam_scanner_state_publication
-          )
+          publish_args=(--message "chore: record ClawSweeper spam scan")
           if [ "${{ github.event_name }}" = "repository_dispatch" ] && { [ -n "$comment_ids" ] || [ -n "$review_comment_ids" ]; }; then
             target_slug="${target_repo//\//-}"
             IFS=',' read -r -a issue_ids <<< "$comment_ids"
@@ -213,49 +202,3 @@ jobs:
           pnpm run repair:publish-main -- \
             "${publish_args[@]}" \
             --rebase-strategy theirs
-
-      - name: Finalize spam state publication action ledger
-        id: finalize-state-publication-action-ledger
-        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts
-          pnpm run --silent repair:action-ledger -- finalize \
-            > .artifacts/spam-state-publication-action-ledger-finalize.json
-
-      - name: Import immutable spam review action ledger
-        id: import-action-ledger
-        if: ${{ always() && steps.finalize-state-publication-action-ledger.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          import_result_file=".artifacts/spam-action-ledger-import.json"
-          paths_file=".artifacts/spam-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent repair:action-ledger -- publish-workflow \
-            --expected-producer-job scan \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
-          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$paths_file"
-
-      - name: Publish immutable spam review action ledger
-        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          paths_file=".artifacts/spam-action-ledger-paths.txt"
-          if [ ! -s "$paths_file" ]; then
-            echo "No immutable spam review action events to publish."
-            exit 0
-          fi
-          publish_args=(--message "chore: append spam review action ledger")
-          while IFS= read -r event_path; do
-            publish_args+=(--path "$event_path")
-          done < "$paths_file"
-          pnpm run repair:publish-main -- "${publish_args[@]}"

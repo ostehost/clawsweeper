@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -40,12 +39,6 @@ const branch = `${String(args["branch-prefix"] ?? args.branch_prefix ?? "clawswe
 const dryRun = Boolean(args["dry-run"] ?? args.dry_run);
 const force = Boolean(args.force);
 const dispatch = Boolean(args.dispatch);
-const stateRevision = immutableHexArg(
-  args["state-revision"] ?? args.state_revision,
-  "state revision",
-  40,
-);
-const jobSha256 = immutableHexArg(args["job-sha256"] ?? args.job_sha256, "job SHA-256", 64);
 const checkExisting = !(args["no-check-existing"] ?? args.no_check_existing);
 
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) die("--repo must be owner/repo");
@@ -55,11 +48,6 @@ if (finalRefs.length === 0)
   die("provide at least one issue/PR ref via args, --refs, or --from-report");
 if (!prompt.trim())
   die("provide --prompt, --prompt-file, or --from-report with a ClawSweeper Work Prompt section");
-if (dispatch && (!stateRevision || !jobSha256)) {
-  die(
-    "--dispatch requires --state-revision and --job-sha256 after the job is published to openclaw/clawsweeper-state",
-  );
-}
 
 if (checkExisting) {
   const existing = findExistingWork({ repo, branch, clusterId });
@@ -120,12 +108,7 @@ console.log(
       branch,
       job: relativeOutPath,
       refs: finalRefs,
-      dispatch_handoff: {
-        status: "publish_required",
-        state_repository: "openclaw/clawsweeper-state",
-        workflow: "repair-cluster-worker.yml",
-        required_inputs: ["state_revision", "job_sha256"],
-      },
+      dispatch_command: `pnpm run repair:dispatch -- ${shellQuote(relativeOutPath)} --mode ${shellQuote(mode)}`,
     },
     null,
     2,
@@ -133,27 +116,12 @@ console.log(
 );
 
 if (dispatch) {
-  verifyPublishedJob(relativeOutPath, stateRevision, jobSha256);
-  const result = spawnSync(
-    "pnpm",
-    [
-      "run",
-      "repair:dispatch",
-      "--",
-      relativeOutPath,
-      "--mode",
-      mode,
-      "--state-revision",
-      stateRevision,
-      "--job-sha256",
-      jobSha256,
-    ],
-    {
-      cwd: repoRoot(),
-      encoding: "utf8",
-      stdio: "inherit",
-    },
-  );
+  assertDispatchable(relativeOutPath);
+  const result = spawnSync("npm", ["run", "dispatch", "--", relativeOutPath, "--mode", mode], {
+    cwd: repoRoot(),
+    encoding: "utf8",
+    stdio: "inherit",
+  });
   process.exit(result.status ?? 1);
 }
 
@@ -375,45 +343,24 @@ function uniqueExisting(existing: JsonValue) {
   });
 }
 
-function verifyPublishedJob(relativePath: string, revision: string, expectedSha256: string) {
-  if (!/^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(relativePath)) {
-    die(`published dispatch requires an inbox job path, got ${relativePath}`);
-  }
-  const stateRoot = String(
-    args["state-root"] ?? args.state_root ?? process.env.CLAWSWEEPER_STATE_DIR ?? "",
-  ).trim();
-  if (!stateRoot) {
-    die(
-      "--dispatch requires CLAWSWEEPER_STATE_DIR or --state-root pointing at openclaw/clawsweeper-state",
-    );
-  }
-  const published = spawnSync("git", ["show", `${revision}:${relativePath}`], {
-    cwd: path.resolve(stateRoot),
+function assertDispatchable(relativePath: string) {
+  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", relativePath], {
+    cwd: repoRoot(),
+    encoding: "utf8",
     stdio: "pipe",
   });
-  if (published.status !== 0) {
-    die(`published job is missing at ${revision}:${relativePath}`);
-  }
-  const publishedBytes = published.stdout;
-  const actualSha256 = createHash("sha256").update(publishedBytes).digest("hex");
-  if (actualSha256 !== expectedSha256) {
-    die(
-      `published job SHA-256 mismatch for ${relativePath}: expected ${expectedSha256}, got ${actualSha256}`,
-    );
-  }
-  const localBytes = fs.readFileSync(path.resolve(repoRoot(), relativePath));
-  if (!localBytes.equals(publishedBytes)) {
-    die(`local job bytes do not match published state at ${revision}:${relativePath}`);
+  const clean = spawnSync("git", ["status", "--porcelain", "--", relativePath], {
+    cwd: repoRoot(),
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+  if (tracked.status !== 0 || clean.stdout.trim()) {
+    die(`refusing --dispatch because ${relativePath} is not committed and pushed yet`);
   }
 }
 
-function immutableHexArg(value: JsonValue | undefined, label: string, length: 40 | 64): string {
-  const normalized = String(value ?? "").trim();
-  if (!normalized) return "";
-  if (!new RegExp(`^[a-f0-9]{${length}}$`).test(normalized)) {
-    die(`${label} must be an exact lowercase ${length}-hex value`);
-  }
-  return normalized;
+function shellQuote(value: JsonValue) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function die(message: string) {

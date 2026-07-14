@@ -2,7 +2,6 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { normalizeRepo, slugForRepo } from "../repository-profiles.js";
 import {
   hasSecuritySignalText,
   makeRunDir,
@@ -13,23 +12,18 @@ import {
 } from "./lib.js";
 import { ghErrorText, ghText } from "./github-cli.js";
 import {
-  assertCommitFindingReportRevision,
-  assertCommitFindingReportSha256,
-  immutableCommitFindingReportUrl,
   isMissingGithubContentError,
   missingCommitFindingReport,
   type CommitFindingReportReadResult,
-  verifyCommitFindingReport,
 } from "./commit-finding-report.js";
 import { readJsonFileIfExists as readJsonIfExists } from "./json-file.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
 import { commitFindingPrTitle } from "./pr-title.js";
 import { escapeRegExp, slug } from "./text-utils.js";
-import { sanitizeResultEvidence } from "./url-safety.js";
+import { isGithubUrl, sanitizeResultEvidence } from "./url-safety.js";
 
 const args = parseArgs(process.argv.slice(2));
 const command = args._[0] ?? "prepare";
-const COMMIT_FINDING_REPORT_REPO = "openclaw/clawsweeper-state";
 
 if (command === "prepare") prepare();
 else if (command === "finalize") finalize();
@@ -38,42 +32,21 @@ else die(`unknown command: ${command}`);
 function prepare() {
   const enabled = stringArg("enabled", "true");
   const targetRepo = stringArg("target-repo", stringArg("target_repo", "openclaw/openclaw"));
-  const reportRepo = stringArg("report-repo", stringArg("report_repo", COMMIT_FINDING_REPORT_REPO));
-  if (reportRepo !== COMMIT_FINDING_REPORT_REPO) {
-    die(`report repository must be ${COMMIT_FINDING_REPORT_REPO}`);
-  }
+  const reportRepo = stringArg("report-repo", stringArg("report_repo", "openclaw/clawsweeper"));
   const sha = assertSha(stringArg("commit-sha", stringArg("commit_sha", "")));
-  const reportRevision = requiredReportRevision(
-    stringArg("report-revision", stringArg("report_revision", "")),
+  const reportPath = stringArg(
+    "report-path",
+    stringArg("report_path", `records/${repoSlug(targetRepo)}/commits/${sha}.md`),
   );
-  const reportSha256 = requiredReportSha256(
-    stringArg("report-sha256", stringArg("report_sha256", "")),
-  );
-  const reportSlug = slugForRepo(normalizeRepo(targetRepo));
-  const expectedReportPath = `records/${reportSlug}/commits/${sha}.md`;
-  const reportPath = stringArg("report-path", stringArg("report_path", expectedReportPath));
-  if (reportPath !== expectedReportPath) {
-    die(`report path must be ${expectedReportPath}`);
-  }
-  const immutableReportUrl = immutableCommitFindingReportUrl(
-    String(reportRepo),
-    String(reportPath),
-    reportRevision,
-  );
+  const defaultReportUrl = `https://github.com/${reportRepo}/blob/main/${reportPath}`;
   const dispatchReportUrl = stringArg("report-url", stringArg("report_url", ""));
-  if (dispatchReportUrl && dispatchReportUrl !== immutableReportUrl) {
-    die(`report URL must match immutable report identity: ${immutableReportUrl}`);
-  }
-  const reportUrl = immutableReportUrl;
+  const reportUrl = isGithubUrl(dispatchReportUrl) ? dispatchReportUrl : defaultReportUrl;
   const active = truthy(enabled);
   const reportRead: CommitFindingReportReadResult = active
-    ? readReport({ reportRepo, reportPath, reportRevision, reportSha256 })
+    ? readReport({ reportRepo, reportPath })
     : ({ ok: true, markdown: "" } satisfies CommitFindingReportReadResult);
   const reportMarkdown = reportRead.ok ? reportRead.markdown : "";
   const report = parseCommitReport(reportMarkdown);
-  if (active && reportRead.ok) {
-    assertCommitReportIdentity(report, targetRepo, sha);
-  }
   const clusterId = slug(`clawsweeper-commit-${repoSlug(targetRepo)}-${sha.slice(0, 12)}`);
   const owner = targetRepo.split("/")[0];
   const jobPath = path.join(repoRoot(), "jobs", owner, "inbox", `${clusterId}.md`);
@@ -99,8 +72,6 @@ function prepare() {
     reportRepo,
     sha,
     reportPath,
-    reportRevision,
-    reportSha256,
     reportUrl,
     report,
     decision,
@@ -125,10 +96,7 @@ function prepare() {
     reason: decision.reason,
     target_repo: targetRepo,
     commit_sha: sha,
-    report_repo: reportRepo,
     report_path: reportPath,
-    report_revision: reportRevision,
-    report_sha256: reportSha256,
     report_url: reportUrl,
     audit_path: relative(auditPath),
     job_path: decision.shouldRepair ? relative(jobPath) : "",
@@ -246,8 +214,6 @@ source: clawsweeper_commit
 commit_sha: ${context.sha}
 clawsweeper_report_repo: ${context.reportRepo}
 clawsweeper_report_path: ${context.reportPath}
-clawsweeper_report_revision: ${context.reportRevision}
-clawsweeper_report_sha256: ${context.reportSha256}
 ---
 
 # ClawSweeper commit finding repair
@@ -341,7 +307,6 @@ function writeSyntheticRun(context: LooseRecord) {
         classification: null,
         target_kind: null,
         target_updated_at: null,
-        target_timeline_cursor: null,
         canonical: null,
         duplicate_of: null,
         candidate_fix: null,
@@ -411,8 +376,6 @@ repo: ${context.targetRepo}
 sha: ${context.sha}
 report_repo: ${context.reportRepo}
 report_path: ${context.reportPath}
-report_revision: ${context.reportRevision}
-report_sha256: ${context.reportSha256}
 decision: ${context.decision.status}
 prepared_at: ${context.preparedAt}
 ---
@@ -424,8 +387,6 @@ prepared_at: ${context.preparedAt}
 - Phase: ${phase}
 - Commit: https://github.com/${context.targetRepo}/commit/${context.sha}
 - Report: ${context.reportUrl}
-- Report revision: \`${context.reportRevision}\`
-- Report SHA-256: \`${context.reportSha256}\`
 - Latest main at intake: ${context.latestMain || "unknown"}
 ${jobLine}
 ${runLine}
@@ -437,42 +398,30 @@ ${context.report.body ? summaryFromReport(context.report.body) : "Report was not
   fs.writeFileSync(context.auditPath, body, "utf8");
 }
 
-function readReport({
-  reportRepo,
-  reportPath,
-  reportRevision,
-  reportSha256,
-}: LooseRecord): CommitFindingReportReadResult {
+function readReport({ reportRepo, reportPath }: LooseRecord): CommitFindingReportReadResult {
   const local = args["report-file"] ?? args.report_file;
+  if (typeof local === "string") {
+    return { ok: true, markdown: fs.readFileSync(path.resolve(local), "utf8") };
+  }
   try {
-    const reportBytes =
-      typeof local === "string"
-        ? fs.readFileSync(path.resolve(local))
-        : Buffer.from(
-            ghText([
-              "api",
-              `repos/${reportRepo}/contents/${reportPath}`,
-              "--method",
-              "GET",
-              "-f",
-              `ref=${reportRevision}`,
-              "--jq",
-              ".content",
-            ]).replace(/\s+/g, ""),
-            "base64",
-          );
+    const content = ghText([
+      "api",
+      `repos/${reportRepo}/contents/${reportPath}`,
+      "--method",
+      "GET",
+      "-f",
+      "ref=main",
+      "--jq",
+      ".content",
+    ]);
     return {
       ok: true,
-      markdown: verifyCommitFindingReport(reportBytes, String(reportSha256)),
+      markdown: Buffer.from(content.replace(/\s+/g, ""), "base64").toString("utf8"),
     };
   } catch (error) {
     const message = ghErrorText(error) || `failed to fetch ${reportRepo}:${reportPath}`;
-    if (typeof local !== "string" && isMissingGithubContentError(message)) {
-      return missingCommitFindingReport(
-        String(reportRepo),
-        String(reportPath),
-        String(reportRevision),
-      );
+    if (isMissingGithubContentError(message)) {
+      return missingCommitFindingReport(String(reportRepo), String(reportPath));
     }
     die(message);
     throw new Error(message);
@@ -493,19 +442,6 @@ function parseCommitReport(markdown: string) {
     ...frontmatter,
     body: match ? markdown.slice(match[0].length) : markdown,
   };
-}
-
-function assertCommitReportIdentity(report: LooseRecord, targetRepo: string, sha: string): void {
-  const expectedRepo = normalizeRepo(targetRepo);
-  const reportRepo = normalizeRepo(String(report.repository ?? ""));
-  const reportSha = String(report.sha ?? "")
-    .trim()
-    .toLowerCase();
-  if (reportRepo !== expectedRepo || reportSha !== sha) {
-    die(
-      `commit finding report identity mismatch: expected ${expectedRepo}@${sha}, got ${reportRepo || "missing"}@${reportSha || "missing"}`,
-    );
-  }
 }
 
 function findingKinds(markdown: string) {
@@ -745,22 +681,6 @@ function assertSha(value: JsonValue) {
   return value.toLowerCase();
 }
 
-function requiredReportRevision(value: JsonValue): string {
-  try {
-    return assertCommitFindingReportRevision(String(value ?? ""));
-  } catch (error) {
-    return die(error instanceof Error ? error.message : String(error));
-  }
-}
-
-function requiredReportSha256(value: JsonValue): string {
-  try {
-    return assertCommitFindingReportSha256(String(value ?? ""));
-  } catch (error) {
-    return die(error instanceof Error ? error.message : String(error));
-  }
-}
-
 function repoSlug(repo: string) {
   return repo
     .toLowerCase()
@@ -817,7 +737,7 @@ function relative(file: JsonValue) {
   return path.relative(repoRoot(), file).replaceAll("\\", "/");
 }
 
-function die(message: string): never {
+function die(message: string) {
   console.error(`commit-finding-intake: ${message}`);
   process.exit(2);
 }

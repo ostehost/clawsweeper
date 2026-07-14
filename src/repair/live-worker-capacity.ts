@@ -170,91 +170,30 @@ export function repairRunNamePrefixForJob(
   automergeRunNamePrefix: JsonValue = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
 ) {
   const job = String(jobPath ?? "");
-  const prefix = job.includes("/inbox/issue-")
-    ? DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX
-    : job.includes("/inbox/automerge-")
-      ? (automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX)
-      : DEFAULT_REPAIR_RUN_NAME_PREFIX;
-  return normalizeRepairRunNamePrefix(prefix);
+  if (job.includes("/inbox/issue-")) return DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX;
+  if (job.includes("/inbox/automerge-")) {
+    return String(automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX);
+  }
+  return DEFAULT_REPAIR_RUN_NAME_PREFIX;
 }
 
 export function repairRunNameForJob(
   jobPath: JsonValue,
   automergeRunNamePrefix: JsonValue = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
   dispatchKey: JsonValue = null,
-  jobSha256: JsonValue = null,
 ) {
-  const job = String(jobPath ?? "");
-  const title = `${repairRunNamePrefixForJob(job, automergeRunNamePrefix)}${job}`;
+  const title = joinRepairRunNamePrefix(
+    repairRunNamePrefixForJob(jobPath, automergeRunNamePrefix),
+    String(jobPath ?? ""),
+  );
   const key = String(dispatchKey ?? "").trim();
-  const digest = String(jobSha256 ?? "").trim();
-  const keyedTitle = key ? `${title} [${key}]` : title;
-  return digest ? `${keyedTitle} (${digest})` : keyedTitle;
-}
-
-export function parseRepairRunTitle(
-  title: JsonValue,
-  automergeRunNamePrefix: JsonValue = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-) {
-  let remaining = String(title ?? "").trim();
-  let jobSha256: string | null = null;
-  let dispatchKey: string | null = null;
-
-  const digestMatch = remaining.match(/ \(([a-f0-9]{64})\)$/);
-  if (digestMatch) {
-    jobSha256 = digestMatch[1] ?? null;
-    remaining = remaining.slice(0, digestMatch.index);
-  } else if (/ \([^)]*\)$/.test(remaining)) {
-    return null;
-  }
-
-  const dispatchMatch = remaining.match(/ \[([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]$/);
-  if (dispatchMatch) {
-    dispatchKey = dispatchMatch[1] ?? null;
-    remaining = remaining.slice(0, dispatchMatch.index);
-  } else if (/ \[[^\]]*\]$/.test(remaining)) {
-    return null;
-  }
-
-  const prefixes = [
-    ...new Set([
-      DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX,
-      normalizeRepairRunNamePrefix(
-        automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-      ),
-      DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-      DEFAULT_REPAIR_RUN_NAME_PREFIX,
-    ]),
-  ].sort((left, right) => right.length - left.length);
-  for (const prefix of prefixes) {
-    if (!remaining.startsWith(prefix)) continue;
-    const jobPath = remaining.slice(prefix.length);
-    if (!/^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(jobPath)) continue;
-    return { jobPath, dispatchKey, jobSha256 };
-  }
-  return null;
-}
-
-export function activeRepairJobGenerations({
-  automergeRunNamePrefix = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-  ...workflowRunOptions
-}: LooseRecord = {}) {
-  const jobs = new Map<string, string[]>();
-  for (const run of listActiveWorkflowRuns(workflowRunOptions)) {
-    const parsed = parseRepairRunTitle(run.displayTitle, automergeRunNamePrefix);
-    if (!parsed) continue;
-    const key = parsed.jobSha256 ? `${parsed.jobPath}:${parsed.jobSha256}` : parsed.jobPath;
-    const runId = String(run.databaseId ?? "");
-    jobs.set(key, [...(jobs.get(key) ?? []), runId].filter(Boolean));
-  }
-  return jobs;
+  return key ? `${title} [${key}]` : title;
 }
 
 export function activeRepairWorkflowRunForJob({
   repo = currentProjectRepo(),
   workflow = REPAIR_CLUSTER_WORKFLOW,
   jobPath,
-  jobSha256 = null,
   automergeRunNamePrefix = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
   activeRunsByPrefix,
   fetchWorkflowRuns,
@@ -264,11 +203,8 @@ export function activeRepairWorkflowRunForJob({
 }: LooseRecord = {}) {
   const job = String(jobPath ?? "");
   if (!job) return null;
-  const digest = String(jobSha256 ?? "").trim();
-  if (digest && !/^[a-f0-9]{64}$/.test(digest)) {
-    throw new Error("job SHA-256 must be an exact lowercase 64-hex value");
-  }
   const prefix = repairRunNamePrefixForJob(job, automergeRunNamePrefix);
+  const expectedTitle = repairRunNameForJob(job, automergeRunNamePrefix);
   if (activeRunsByPrefix instanceof Map && !activeRunsByPrefix.has(prefix)) {
     activeRunsByPrefix.set(
       prefix,
@@ -297,9 +233,8 @@ export function activeRepairWorkflowRunForJob({
         });
   return (
     activeRuns?.find((run: JsonValue) => {
-      const parsed = parseRepairRunTitle(run.displayTitle, automergeRunNamePrefix);
-      if (!parsed || parsed.jobPath !== job) return false;
-      return digest ? parsed.jobSha256 === null || parsed.jobSha256 === digest : true;
+      const title = String(run.displayTitle ?? "");
+      return title === expectedTitle || title.startsWith(`${expectedTitle} [router-`);
     }) ?? null
   );
 }
@@ -353,9 +288,10 @@ function isActiveWorkflowRun(run: LooseRecord, nowMs: number, staleQueuedMs: num
   return Math.max(0, nowMs - lastChangedAt) <= staleQueuedMs;
 }
 
-function normalizeRepairRunNamePrefix(prefix: JsonValue) {
+function joinRepairRunNamePrefix(prefix: JsonValue, jobPath: string) {
   const text = String(prefix ?? "");
-  return text && !/\s$/.test(text) ? `${text} ` : text;
+  if (!text || !jobPath) return `${text}${jobPath}`;
+  return /\s$/.test(text) ? `${text}${jobPath}` : `${text} ${jobPath}`;
 }
 
 function readPositiveInteger(value: JsonValue, name: string) {

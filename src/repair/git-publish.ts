@@ -5,7 +5,6 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -45,11 +44,9 @@ export type GitPublishOptions = {
   remote?: string;
   branch?: string;
   rebaseStrategy?: RebaseStrategy | undefined;
-  refreshFailureMode?: RefreshFailureMode | undefined;
 };
 
 export type RebaseStrategy = "normal" | "theirs" | "apply-records" | "reconcile-records";
-export type RefreshFailureMode = "strict" | "best-effort";
 
 export type GitRunOptions = {
   allowFailure?: boolean;
@@ -66,7 +63,6 @@ const GENERATED_PUBLISH_PATHS = [
   "records",
   "results",
   "assets",
-  "notifications",
 ] as const;
 const GIT_PATHSPEC_BATCH_SIZE = 256;
 const GIT_OBJECT_BATCH_SIZE = 512;
@@ -251,7 +247,6 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   const maxAttempts = positiveInt(options.maxAttempts, 8);
   const pushAttempts = positiveInt(options.pushAttempts, 3);
   const rebaseStrategy = options.rebaseStrategy ?? "normal";
-  const refreshFailureMode = options.refreshFailureMode ?? "strict";
   gitPublishPhase(
     "sync",
     `paths=${uniqueNonEmpty(options.paths).length} strategy=${rebaseStrategy}`,
@@ -273,7 +268,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
     if (!synchronized) {
       throw new Error(`Failed to synchronize unchanged publish with ${remote}/${branch}`);
     }
-    return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
+    return completeStatePublish("unchanged", options.paths, stateBaseCommit);
   }
 
   const commitMessage = commitMessageForPublishedPaths(options.message, options.paths);
@@ -299,7 +294,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       ) {
         throw new Error(`Failed to synchronize unchanged publish with ${remote}/${branch}`);
       }
-      return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
+      return completeStatePublish("unchanged", options.paths, stateBaseCommit);
     }
     const tupleKeys = reconciliationTupleKeysForCommit(sourceCommit);
     reconciliationTupleKeys = new Set(tupleKeys);
@@ -313,7 +308,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         sourceCommit: reconciliationSourceCommit ?? sourceCommit,
         tupleKeys,
       });
-      return completeStatePublish(result, options.paths, stateBaseCommit, refreshFailureMode);
+      return completeStatePublish(result, options.paths, stateBaseCommit);
     }
   }
   restoreWorktree(options.restorePaths ?? []);
@@ -334,7 +329,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         "Failed to publish reconciliation without overwriting concurrent record tuples",
       );
     }
-    return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
+    return completeStatePublish("committed", options.paths, stateBaseCommit);
   }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -346,7 +341,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         rebaseStrategy,
       })
     ) {
-      return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
+      return completeStatePublish("committed", options.paths, stateBaseCommit);
     }
     const rebuildResult = rebuildPublishCommit({
       remote,
@@ -356,7 +351,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       sourceCommit,
     });
     if (rebuildResult === "unchanged") {
-      return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
+      return completeStatePublish("unchanged", options.paths, stateBaseCommit);
     }
     if (attempt === maxAttempts) break;
     const delaySeconds = attempt * 3 + Math.floor(Math.random() * 11);
@@ -374,7 +369,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       rebaseStrategy,
     })
   ) {
-    return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
+    return completeStatePublish("committed", options.paths, stateBaseCommit);
   }
   throw new Error(`Failed to publish commit after ${maxAttempts} attempts`);
 }
@@ -429,10 +424,9 @@ function completeStatePublish(
   result: PublishResult,
   paths: readonly string[],
   stateBaseCommit: string | null,
-  refreshFailureMode: RefreshFailureMode,
 ): PublishResult {
   gitPublishPhase("refresh", `paths=${uniqueNonEmpty(paths).length}`);
-  refreshSourceAfterAcceptedStatePublish(paths, stateBaseCommit, refreshFailureMode);
+  refreshSourceAfterStatePublish(paths, stateBaseCommit);
   gitPublishPhase("complete", `result=${result}`);
   return result;
 }
@@ -576,21 +570,6 @@ export function refreshSourceAfterStatePublish(
   }
 }
 
-export function refreshSourceAfterAcceptedStatePublish(
-  paths: readonly string[],
-  stateBaseCommit: string | null,
-  failureMode: RefreshFailureMode = "strict",
-): void {
-  try {
-    refreshSourceAfterStatePublish(paths, stateBaseCommit);
-  } catch (error) {
-    if (failureMode === "strict") throw error;
-    console.warn(
-      `State publish was accepted, but local source refresh failed: ${errorMessage(error)}`,
-    );
-  }
-}
-
 function learnedClosedRecordPaths(
   changedPaths: readonly string[],
   stateBaseCommit: string,
@@ -653,38 +632,10 @@ function refreshSourcePathFromState(path: string, stateRoot: string): void {
   if (isPathInsideOrEqual(source, stateRoot)) {
     throw new Error(`Refusing to refresh a source path that contains the state root: ${path}`);
   }
-
+  rmSync(source, { force: true, recursive: true });
+  if (!existsSync(published)) return;
   mkdirSync(dirname(source), { recursive: true });
-  const stagingRoot = mkdtempSync(join(dirname(source), `.clawsweeper-refresh-${process.pid}-`));
-  const staged = join(stagingRoot, "next");
-  const previous = join(stagingRoot, "previous");
-  const publishedExists = existsSync(published);
-  let sourceMoved = false;
-  let preserveStaging = false;
-  try {
-    if (publishedExists) cpSync(published, staged, { recursive: true });
-    if (existsSync(source)) {
-      renameSync(source, previous);
-      sourceMoved = true;
-    }
-    if (publishedExists) renameSync(staged, source);
-  } catch (error) {
-    if (sourceMoved && !existsSync(source)) {
-      try {
-        renameSync(previous, source);
-        sourceMoved = false;
-      } catch (rollbackError) {
-        preserveStaging = true;
-        throw new AggregateError(
-          [error, rollbackError],
-          `Failed to refresh ${path} and restore its previous source from ${previous}`,
-        );
-      }
-    }
-    throw error;
-  } finally {
-    if (!preserveStaging) rmSync(stagingRoot, { force: true, recursive: true });
-  }
+  cpSync(published, source, { recursive: true });
 }
 
 function sourcePathMatchesStateCommit(path: string, commit: string): boolean {

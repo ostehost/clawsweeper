@@ -6,7 +6,6 @@ export function deterministicRequeueDispatchKey({
   workflow,
   sourceRunId,
   sourceJobPath,
-  stateRevision,
   authorizationSha256,
   depth,
 }: {
@@ -14,7 +13,6 @@ export function deterministicRequeueDispatchKey({
   workflow: string;
   sourceRunId: string | null;
   sourceJobPath: string;
-  stateRevision: string;
   authorizationSha256: string;
   depth: number;
 }) {
@@ -25,7 +23,6 @@ export function deterministicRequeueDispatchKey({
         workflow,
         source_run_id: sourceRunId,
         source_job_path: sourceJobPath,
-        state_revision: stateRevision,
         authorization_sha256: authorizationSha256,
         depth,
       }),

@@ -126,45 +126,6 @@ confidential-identifier checks as every other durable machine-text field.
   so a changed failed-review record cannot reuse an earlier dispatch receipt.
   Operators must reconcile the workflow run before another launch; automatic
   retry never duplicates an outcome-unknown dispatch.
-- Repair publication uses the same request boundary for branch pushes, PR
-  create/reopen, comments, labels, review-thread resolution, continuation
-  dispatch, source close/reopen compensation, closeout, and post-flight merge.
-  Business idempotency binds the sealed publication and request digest; a
-  request-attempt ordinal keeps repeated wire attempts distinct. Accepted or
-  unknown mutation state survives later verification, reporting, and workflow
-  failures. Finalization converts an interrupted open request into an immutable
-  `mutation_outcome_unknown` child instead of claiming that no write occurred.
-- State-publication identity binds a deterministic pre-push manifest of every
-  selected path, entry type, executable bit, symlink target, and file-content
-  digest. Distinct generated state from the same workflow revision cannot reuse
-  a publication receipt, while replaying the same selected bytes remains stable.
-- Every repair Codex subprocess that persists output (initial repair planning,
-  structured-result repair, edit, base reconcile, validation fix, `/review`,
-  and review-fix) records a typed attempt lifecycle plus SHA-256 evidence for
-  JSONL, stderr, and report artifacts. The action mode and typed attempt bind
-  operation, event, and idempotency identity, so same-numbered actions cannot
-  replay or collide. Final and final-sync attempts use explicit variants rather
-  than coercing display labels back into numbers.
-- Failed-run and conflict self-heal record request-bound receipts for temporary
-  repository-gate updates, status-comment upserts, immutable job publication,
-  and exact-generation worker dispatch. Legacy pre-contract attempts still
-  consume the retry budget for their source job path, while removed source jobs
-  are skipped independently instead of aborting the remaining batch.
-- Commit-review matrix shards bind their producer invocation to the matrix
-  commit SHA, so multi-leg artifact downloads retain one importable shard per
-  commit. Review and optional check publication share one causal workflow
-  lifecycle, which finalizes only after the check outcome is known. When checks
-  are requested, skipped, failed, or cancelled publication cannot produce a
-  completed lifecycle.
-- Commit-check publication, OpenClaw-hook delivery, and status-dashboard
-  delivery use separate request-boundary attempts and outcomes. Their workflow
-  shards are finalized and imported into the state repository; GitHub artifact
-  upload is retention, not the durable audit boundary. Failure-receipt writes
-  are best-effort after a notification delivery error, preserving the primary
-  error and allowing later notifications to continue. Notification start,
-  accepted, rejected, unknown, and terminal failure receipts share one
-  outcome-independent delivery idempotency key; only request-attempt identity
-  distinguishes repeated wire calls.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix
@@ -275,32 +236,11 @@ confidential-identifier checks as every other durable machine-text field.
   first numbered part cannot expose a partial run. Sequential imports therefore
   cannot move a run, replace a reserved numbered set with a different part
   count, or advertise completion before payload publication finishes.
-- Completion also publishes create-only `repair.mutation` secondary indexes
-  under
-  `ledger/v1/import-bindings/repair-mutation-idempotency/<producer-repository-sha256>/<idempotency-key-sha256>/<shard-sha256>.json`.
-  A matching create-only reservation is published before shard payloads under
-  `repair-mutation-idempotency-reservations/`, binding the completion digest so
-  interrupted imports remain visibly incomplete. Each canonical completion
-  manifest binds the exact shard path and replay digest plus every matching
-  event ID and semantic digest. Indexed readers cap directory entries and
-  manifest bytes, require exact reservation/completion filename sets, reject
-  links and malformed or empty directories, reopen the referenced completed
-  shard, and require the replay and matching event set to agree exactly before
-  returning history.
-- Non-idempotent sweep dispatch business keys must contain the current
-  `GITHUB_RUN_ID` as an exact colon-delimited segment. Attempt 1 checks only its
-  local spool. Later workflow attempts use the secondary index; a missing key
-  directory falls back to the bounded legacy history scan for pre-index rollout
-  compatibility, while an existing malformed or incomplete directory fails
-  closed. Run-scoped keys make a global index coverage marker or historical
-  backfill unnecessary.
-- Import results expose `eventPaths`, `reservationPaths`, and `completionPaths`
-  separately. Their sorted, bounded `paths` union is the publication contract,
-  containing every event shard plus its producer-run, event, shard-set,
-  completion, and repair-mutation index reservation/completion bindings.
-  Workflow publishers stage and commit every returned path so replay identity,
-  crash recovery, completion visibility, cross-import conflict detection, and
-  causal protections survive in a fresh state checkout.
+- The importer returns one sorted publication manifest containing every event
+  shard plus its producer-run, event, shard-set, and completion binding. Workflow
+  publishers stage and commit that complete bounded manifest, so a fresh state
+  clone retains the same cross-import conflict and causal protections instead
+  of receiving payload files alone.
 
 ## Privacy Boundary
 
@@ -348,107 +288,22 @@ dropped. The checked-in JSON schema is
 
 The shared taxonomy defines six families:
 
-1. **Review**: review lifecycle, batch, item, retry, log publication, and
-   comment publication.
+1. **Review**: batch, item, retry, log publication, and comment publication.
 2. **Command**: receive, classify, claim refresh, mutation attempt/outcome,
    progress, wait, requeue, and recovery.
 3. **Repair**: intake, dispatch, plan, execute, validate, review, publish,
    post-flight, requeue, recovery, and queue phases. Blocked and failed summary
    types remain available for coarse emitters.
-4. **Apply**: planning and execution compatibility events plus individual
-   action, batch, and publication phases.
+4. **Apply**: individual action, batch, and publication phases.
 5. **Operations**: workflow attempts; dispatch, retry, and queue lifecycles;
    notification delivery; publication, status, dashboard, and session
    lifecycles; cancellation and projection failures.
-6. **Evidence**: Gitcrawl snapshot, query, and binding phases; provider-neutral
-   evidence-service request, deploy, and rollback phases; and proof stage and
-   binding phases.
+6. **Evidence**: Gitcrawl snapshot, query, and binding phases plus proof stage
+   and binding phases.
 
-### Implemented Coverage
-
-The current implementation instruments these production surfaces:
-
-- Review and apply workflows record review batches, selected items, retries,
-  Codex log publication, durable review-comment publication, apply actions,
-  apply batches, apply reports, and interrupted or failed terminals. The repair
-  result applicator also records blocked-merge label creation/addition,
-  closeout-comment creation, and target close as distinct request boundaries.
-  Ambiguous comment creation is one-shot so a workflow rerun can reconcile the
-  durable marker without risking a duplicate comment.
-- Exact-review queue admission records enqueue, claim, completion, and
-  reconciliation request boundaries with stable business idempotency across
-  wire retries. Queue URLs, credentials, lease identifiers, and prompts are
-  excluded from receipts. Untrusted queue producers upload exact finalized
-  manifests; a separate state-authorized job verifies and imports those shards.
-- The comment router records command receipt, classification, durable claims
-  and refreshes, progress, request-bound mutation attempts and outcomes,
-  dispatch, wait, requeue, recovery, completion, skip, and failure.
-- Repair workflows record intake, queue, plan, execution, validation, review,
-  publication, post-flight, requeue, recovery, status, dashboard, notification,
-  session, self-heal, and finalizer lifecycles. Executor Codex attempts bind
-  their persisted logs and reports, while post-flight merge, closeout comment,
-  source close, and compensation requests use pre-request receipts with
-  accepted, rejected-before-write, or unknown outcomes.
-- Spam intake records candidate classification, dispatch attempts and outcomes,
-  report publication, and terminal uncertainty before a separate trusted job
-  imports its producer shards. Spam audit then records review batches, review
-  items, and bounded audit-log publication. Assist records generation, local
-  review output, validated artifact publication, and the request-bound comment
-  mutation. Proof handling records stage results, comment and label mutations,
-  report publication, and proof cursor bindings.
-- Label housekeeping records repository-label creation, target-label addition,
-  and replacement-label removal as request-bound mutations. Each retry gets its
-  own attempt/outcome pair while the target, label, and source revision retain
-  one stable business identity; receipt evidence excludes item titles and label
-  prose.
-- Target fanout records queue selection, each repository dispatch attempt and
-  outcome, and cursor publication. The generic `publish-workflow` path imports
-  shards only from the authenticated workflow producer job, which lets spam,
-  proof, fanout, and similar workflows publish without a lane-specific
-  manifest format.
-- `repair:publish-main` rejects every receipt-free mutable state publication.
-  Only path sets wholly contained under immutable `ledger/` may bypass a
-  publication receipt, preventing recursive ledger writes while making new
-  mutable call sites fail closed. Workflow guards require setup before the
-  first mutable write, finalization after the last write even on continued
-  errors, and immutable shard publication after finalization.
-- State hydration excludes `ledger/` by default. Workflows that need historical
-  ledger data must opt in through the approved `hydrate-paths` input; the
-  hydration helper rejects unknown, nested, or unsafe roots.
-
-Each process owns a monotonic local chain. Cross-job continuity comes from
-stable operation and source identities plus authenticated producer manifests,
-not synthetic parent links across downloaded shards. Repair identity binds the
-sealed target source revision; the ClawSweeper checkout SHA is producer
-provenance, not target provenance.
-
-Credential-isolated repair jobs finalize and upload their own producer-attempt
-shards without state-repository credentials. On a workflow rerun, the trusted
-`repair-publish-results` job resolves a workflow-attempt cohort: the result
-artifact comes from the coordinating attempt, while cluster and execute jobs
-are selected independently from the latest attempt in which each job actually
-ran. The publisher then requires the matching producer-attempt ledger for each
-selected job, verifies repository, SHA, workflow, job, run, and attempt, and
-imports the cohort before mutating durable result state. Missing, ambiguous,
-expired, incomplete, extra, or forged required lanes fail publication. Legacy
-worker heads without the versioned `.github/repair-worker-capabilities.json`
-tree marker remain explicitly marked as legacy. Tree capabilities survive
-squash and rebase landing, unlike feature-branch commit boundaries.
-Once the marker exists, both sealed-source and action-ledger capabilities are
-mandatory; a marker cannot opt a worker back into receipt-free legacy behavior.
-
-Commit review uses the same credential separation. Each Codex matrix invocation
-uploads one producer-attempt bundle containing its report and local ledger. The
-trusted publication job verifies the matrix commit, producer identity, workflow
-attempt, report digest, and bound review-log digests before state or check
-publication. State-authorized result and open-PR finalizers import their own
-finalized shards directly.
-
-The provider-neutral evidence-service request, deploy, and rollback phases are
-taxonomy and schema contracts only. The intended follow-up direction is a
-Gitcrawl-backed evidence service deployed through Cloudflare. The replacement
-service, its deployment, and production emitters for those three phases are not
-implemented.
+This taxonomy is a schema foundation, not a claim that every lane already emits
+every phase. Lanes can migrate independently without changing the v1 shard
+format.
 
 New writers should prefer phase-oriented types from
 `ACTION_EVENT_PHASE_TYPES`, statuses from `ACTION_EVENT_STATUSES`, and optional

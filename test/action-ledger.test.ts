@@ -756,7 +756,6 @@ test("the standard taxonomy covers six families without orphaned or duplicate ty
     "repair.queue",
     "repair.blocked",
     "repair.failed",
-    "repair.mutation",
     "apply.action",
     "apply.batch",
     "apply.publish",
@@ -773,9 +772,6 @@ test("the standard taxonomy covers six families without orphaned or duplicate ty
     "gitcrawl.snapshot",
     "gitcrawl.query",
     "gitcrawl.binding",
-    "evidence.service_request",
-    "evidence.service_deploy",
-    "evidence.service_rollback",
     "proof.stage",
     "proof.binding",
   ]) {

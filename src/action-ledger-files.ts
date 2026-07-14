@@ -160,61 +160,6 @@ export function writeUtf8FileExclusiveNoFollow(target: SafeWriteTarget, content:
   writeUtf8FileExclusiveNoFollowWithIdentity(target, content, false);
 }
 
-export function writeUtf8FileAtomicReplaceNoFollow(
-  target: SafeWriteTarget,
-  content: string,
-  temporaryFilename: string,
-): void {
-  const temporary = safeSiblingWriteTarget(target, temporaryFilename);
-  const parentChain = captureSafeParentChain(target, true);
-  let temporaryIdentity: FileIdentity | undefined;
-  let published = false;
-  let failure: unknown;
-  try {
-    assertStableParentChain(target, parentChain);
-    temporaryIdentity = writeUtf8FileExclusiveNoFollowWithIdentity(temporary, content, true);
-    assertStableParentChain(target, parentChain);
-    assertPathMatchesIdentity(temporary.path, temporaryIdentity, `${target.label} staging`);
-    try {
-      fs.renameSync(temporary.path, target.path);
-      published = true;
-    } catch (error) {
-      try {
-        published = pathMatchesFileIdentity(target.path, temporaryIdentity, target.label);
-      } catch (identityError) {
-        throw new AggregateError(
-          [error, identityError],
-          `failed to determine whether ${target.label} was published`,
-        );
-      }
-      throw error;
-    }
-    assertStableParentChain(target, parentChain);
-    assertPathMatchesIdentity(target.path, temporaryIdentity, target.label);
-    fsyncDirectory(target.parentPath, target.label);
-    assertStableParentChain(target, parentChain);
-    assertPathMatchesIdentity(target.path, temporaryIdentity, target.label);
-  } catch (error) {
-    failure = error;
-  }
-  if (!published && temporaryIdentity) {
-    try {
-      unlinkFileNoFollow(temporary, temporaryIdentity, parentChain);
-    } catch (cleanupError) {
-      if (!isNotFoundError(cleanupError)) {
-        failure =
-          failure === undefined
-            ? cleanupError
-            : new AggregateError(
-                [failure, cleanupError],
-                `failed to clean up ${target.label} staging file`,
-              );
-      }
-    }
-  }
-  if (failure !== undefined) throw failure;
-}
-
 function writeUtf8FileExclusiveNoFollowWithIdentity(
   target: SafeWriteTarget,
   content: string,
@@ -251,7 +196,7 @@ function writeUtf8FileExclusiveNoFollowWithIdentity(
     }
     if (cleanupOnFailure && createdIdentity !== undefined) {
       try {
-        unlinkFileNoFollow(target, createdIdentity, parentChain);
+        removeFileNoFollow(target, createdIdentity);
       } catch (cleanupError) {
         if (!isNotFoundError(cleanupError)) {
           throw new AggregateError(
@@ -314,14 +259,14 @@ export function tryAcquireUtf8FileLockNoFollow(
   }
   if (identity) {
     try {
-      unlinkFileNoFollow(temporary, identity);
+      removeFileNoFollow(temporary, identity);
     } catch (error) {
       if (!isNotFoundError(error) && failure === undefined) failure = error;
     }
   }
   if (failure !== undefined && published && identity) {
     try {
-      unlinkFileNoFollow(target, identity);
+      removeFileNoFollow(target, identity);
     } catch (cleanupError) {
       if (!isNotFoundError(cleanupError)) {
         failure = new AggregateError(
@@ -352,36 +297,11 @@ export function removeUtf8FileIfContentNoFollow(
   return claimAndRemoveUtf8FileNoFollow(target, expectedContent) === "removed";
 }
 
-export type ConditionalRemoveResult = "removed" | "missing" | "changed" | "replaced";
-
-export function removeFileNoFollow(target: SafeWriteTarget): ConditionalRemoveResult {
-  return claimAndRemoveUtf8FileNoFollow(target);
-}
-
-export function unlinkFileIfExistsNoFollow(target: SafeWriteTarget): boolean {
-  const parentChain = captureSafeParentChain(target, false);
-  let descriptor: number | undefined;
-  try {
-    assertStableParentChain(target, parentChain);
-    const pathIdentity = fileIdentity(target.path, `${target.label} claimed file`);
-    descriptor = fs.openSync(target.path, fs.constants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
-    const openedIdentity = descriptorIdentity(descriptor, `${target.label} claimed file`);
-    if (!fileIdentitiesEqual(pathIdentity, openedIdentity)) {
-      throw new FileIdentityMismatchError(`refusing replaced ${target.label}: ${target.path}`);
-    }
-    unlinkFileNoFollow(target, openedIdentity, parentChain);
-    return true;
-  } catch (error) {
-    if (isNotFoundError(error)) return false;
-    throw error;
-  } finally {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-  }
-}
+type ConditionalRemoveResult = "removed" | "missing" | "changed" | "replaced";
 
 function claimAndRemoveUtf8FileNoFollow(
   target: SafeWriteTarget,
-  expectedContent?: string,
+  expectedContent: string,
   expectedIdentity?: FileIdentity,
 ): ConditionalRemoveResult {
   const parentChain = captureSafeParentChain(target, false);
@@ -404,14 +324,12 @@ function claimAndRemoveUtf8FileNoFollow(
     }
     assertStableParentChain(target, parentChain);
     assertPathMatchesIdentity(target.path, openedIdentity, `${target.label} stale lock`);
-    if (expectedContent !== undefined) {
-      const current = readBoundedUtf8File(
-        descriptor,
-        Math.max(1, Buffer.byteLength(expectedContent, "utf8")),
-        target,
-      );
-      if (current !== expectedContent) return "changed";
-    }
+    const current = readBoundedUtf8File(
+      descriptor,
+      Math.max(1, Buffer.byteLength(expectedContent, "utf8")),
+      target,
+    );
+    if (current !== expectedContent) return "changed";
     assertStableParentChain(target, parentChain);
     assertPathMatchesIdentity(target.path, openedIdentity, `${target.label} stale lock`);
     try {
@@ -427,7 +345,7 @@ function claimAndRemoveUtf8FileNoFollow(
       restoreClaimedFileNoFollow(claimed, target, claimedIdentity);
       return "replaced";
     }
-    unlinkFileNoFollow(claimed, openedIdentity);
+    removeFileNoFollow(claimed, openedIdentity);
     removed = true;
   } catch (error) {
     if (isNotFoundError(error)) return "missing";
@@ -452,7 +370,7 @@ function restoreClaimedFileNoFollow(
   identity: FileIdentity,
 ): void {
   linkFileExclusiveNoFollow(claimed, target);
-  unlinkFileNoFollow(claimed, identity);
+  removeFileNoFollow(claimed, identity);
 }
 
 export function processIncarnationIdentitySha256(
@@ -514,7 +432,7 @@ export function writeUtf8FileCreateOnlyNoFollow(
   }
   if (temporaryIdentity) {
     try {
-      unlinkFileNoFollow(temporary, temporaryIdentity);
+      removeFileNoFollow(temporary, temporaryIdentity);
     } catch (error) {
       if (failure === undefined) failure = error;
     }
@@ -772,12 +690,8 @@ function decodeUtf8File(buffer: Uint8Array, target: SafeWriteTarget): string {
   return Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength).toString("utf8");
 }
 
-function unlinkFileNoFollow(
-  target: SafeWriteTarget,
-  expectedIdentity: FileIdentity,
-  expectedParentChain?: ParentChainSnapshot,
-): void {
-  const parentChain = expectedParentChain ?? captureSafeParentChain(target, false);
+function removeFileNoFollow(target: SafeWriteTarget, expectedIdentity: FileIdentity): void {
+  const parentChain = captureSafeParentChain(target, false);
   assertStableParentChain(target, parentChain);
   assertPathMatchesIdentity(target.path, expectedIdentity, `${target.label} staging`);
   fs.unlinkSync(target.path);
@@ -1041,7 +955,7 @@ function validateRelativePath(relativePath: string, label: string): void {
   }
 }
 
-export function fsyncDirectory(directory: string, label: string): void {
+function fsyncDirectory(directory: string, label: string): void {
   if (process.platform === "win32") return;
   const descriptor = fs.openSync(directory, fs.constants.O_RDONLY | DIRECTORY | NO_FOLLOW);
   try {

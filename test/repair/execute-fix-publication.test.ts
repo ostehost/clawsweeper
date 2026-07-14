@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -67,58 +67,6 @@ test("execute-fix CLI defers outcome publication until fresh-token invocation", 
   assert.equal(report.actions.at(-1)?.status, "executed");
 });
 
-test("execute-fix receipts preserve the canonical job revision", () => {
-  const root = fs.realpathSync(
-    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-execute-revision-")),
-  );
-  const jobPath = path.join(root, "job.md");
-  const resultPath = path.join(root, "result.json");
-  const ledgerOutputRoot = path.join(root, "ledger-output");
-  const sourceRevision = "b".repeat(64);
-  fs.mkdirSync(ledgerOutputRoot);
-  fs.writeFileSync(
-    jobPath,
-    [
-      "---",
-      "repo: openclaw/clawsweeper",
-      "cluster_id: issue-openclaw-clawsweeper-521",
-      "mode: autonomous",
-      "allowed_actions: [comment]",
-      "candidates: ['#521']",
-      `source_issue_revision_sha256: "${sourceRevision}"`,
-      "---",
-      "fixture",
-      "",
-    ].join("\n"),
-  );
-  fs.writeFileSync(
-    resultPath,
-    `${JSON.stringify({
-      repo: "openclaw/clawsweeper",
-      cluster_id: "issue-openclaw-clawsweeper-521",
-      mode: "autonomous",
-      reviewed_sha: "c".repeat(40),
-      actions: [],
-    })}\n`,
-  );
-  const env = actionLedgerEnv(root, ledgerOutputRoot, "execute-fix");
-
-  try {
-    runExecutor([jobPath, resultPath], env);
-    execFileSync(
-      process.execPath,
-      [path.join(process.cwd(), "dist/repair/action-ledger-cli.js"), "finalize"],
-      { env, stdio: "pipe" },
-    );
-
-    const events = readActionEvents(ledgerOutputRoot);
-    assert.ok(events.length > 0);
-    assert.ok(events.every((event) => event.subject?.source_revision === sourceRevision));
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
 function runExecutor(args: string[], env: NodeJS.ProcessEnv) {
   const child = spawnSync(process.execPath, [executor, ...args], {
     cwd: process.cwd(),
@@ -126,44 +74,4 @@ function runExecutor(args: string[], env: NodeJS.ProcessEnv) {
     encoding: "utf8",
   });
   assert.equal(child.status, 0, `${child.stderr}\n${child.stdout}`);
-}
-
-function actionLedgerEnv(
-  root: string,
-  ledgerOutputRoot: string,
-  invocation: string,
-): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
-    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
-    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ledgerOutputRoot,
-    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
-    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: invocation,
-    CLAWSWEEPER_ALLOW_EXECUTE: "1",
-    CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
-    GITHUB_ACTION: "execute_fix",
-    GITHUB_JOB: "execute",
-    GITHUB_REPOSITORY: "openclaw/clawsweeper",
-    GITHUB_RUN_ATTEMPT: "1",
-    GITHUB_RUN_ID: "521",
-    GITHUB_SHA: "a".repeat(40),
-    GITHUB_WORKFLOW: "repair cluster worker",
-    GITHUB_WORKFLOW_REF:
-      "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
-  };
-}
-
-function readActionEvents(root: string): Record<string, any>[] {
-  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
-    const target = path.join(root, entry.name);
-    if (entry.isDirectory()) return readActionEvents(target);
-    if (!target.endsWith(".jsonl")) return [];
-    return fs
-      .readFileSync(target, "utf8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
-  });
 }

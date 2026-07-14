@@ -3,41 +3,17 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import test from "node:test";
 
-import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
-  lowSignalCloseReport as baseLowSignalCloseReport,
+  lowSignalCloseReport,
   promotionGhMock,
   reportWithSyncedReviewComment,
   runApplyDecisionsForTest,
-  stalePullRequestReport as baseStalePullRequestReport,
+  stalePullRequestReport,
   tmpPrefix,
   withMockCodexProof,
   withMockGh,
-  workPlanCandidateReport as baseWorkPlanCandidateReport,
+  workPlanCandidateReport,
 } from "./helpers.ts";
-
-const emptyReviewActivityCursor = createReviewedPrActivityCursor({
-  reviews: [],
-  inlineComments: [],
-});
-assert.ok(emptyReviewActivityCursor);
-
-function withEmptyReviewActivityCursor(
-  reportFactory: (overrides?: Record<string, unknown>) => string,
-  overrides: Record<string, unknown> = {},
-): string {
-  return reportFactory({
-    review_activity_cursor: emptyReviewActivityCursor,
-    ...overrides,
-  });
-}
-
-const lowSignalCloseReport = (overrides: Record<string, unknown> = {}) =>
-  withEmptyReviewActivityCursor(baseLowSignalCloseReport, overrides);
-const stalePullRequestReport = (overrides: Record<string, unknown> = {}) =>
-  withEmptyReviewActivityCursor(baseStalePullRequestReport, overrides);
-const workPlanCandidateReport = (overrides: Record<string, unknown> = {}) =>
-  withEmptyReviewActivityCursor(baseWorkPlanCandidateReport, overrides);
 
 function runLowSignalApplyFixture(options: {
   number: number;
@@ -470,7 +446,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
   const files = [{ filename: "src/runtime.ts" }];
   if (args.includes("--jq")) console.log(JSON.stringify(files.map((file) => file.filename)));
   else console.log(JSON.stringify([files]));
-} else if (args[0] === "api" && /\\/pulls\\/322\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/322\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -857,19 +833,6 @@ test("stale F promotion ignores recent pre-review author reviews", () => {
     const authorActivityAt = new Date(now - 4.5 * 60 * 60 * 1000).toISOString();
     const oldHeadActivityAt = new Date(now - 44 * 24 * 60 * 60 * 1000).toISOString();
     const reviewedAt = new Date(now - 4 * 60 * 60 * 1000).toISOString();
-    const reviews = [
-      {
-        id: 9345,
-        submitted_at: authorActivityAt,
-        user: { login: "reporter" },
-        state: "COMMENTED",
-      },
-    ];
-    const reviewActivityCursor = createReviewedPrActivityCursor({
-      reviews,
-      inlineComments: [],
-    });
-    assert.ok(reviewActivityCursor);
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const sourceReport = stalePullRequestReport({
@@ -880,7 +843,6 @@ test("stale F promotion ignores recent pre-review author reviews", () => {
       item_updated_at: reviewedAt,
       reviewed_at: reviewedAt,
       pull_head_sha: headSha,
-      review_activity_cursor: reviewActivityCursor,
     });
     const synced = reportWithSyncedReviewComment(sourceReport, number, "none");
     writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
@@ -906,7 +868,14 @@ test("stale F promotion ignores recent pre-review author reviews", () => {
             body: synced.comment,
           },
         ],
-        reviews,
+        reviews: [
+          {
+            id: 9345,
+            submitted_at: authorActivityAt,
+            user: { login: "reporter" },
+            state: "COMMENTED",
+          },
+        ],
       }),
       () => {
         runApplyDecisionsForTest({

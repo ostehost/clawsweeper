@@ -7,9 +7,8 @@ import {
   renderReviewCommentFromReport,
   renderReviewStartStatusComment,
 } from "../dist/clawsweeper.js";
-import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
-  lowSignalCloseReport as baseLowSignalCloseReport,
+  lowSignalCloseReport,
   markedReviewCommentForTest,
   promotionGhMock,
   reportWithSyncedReviewComment,
@@ -18,18 +17,6 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
-
-const emptyReviewActivityCursor = createReviewedPrActivityCursor({
-  reviews: [],
-  inlineComments: [],
-});
-assert.ok(emptyReviewActivityCursor);
-
-const lowSignalCloseReport = (overrides: Record<string, unknown> = {}) =>
-  baseLowSignalCloseReport({
-    review_activity_cursor: emptyReviewActivityCursor,
-    ...overrides,
-  });
 
 function boundDuplicateCloseComment(number: number, canonicalUrl: string): string {
   const markerFields = [

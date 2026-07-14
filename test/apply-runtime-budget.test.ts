@@ -4,7 +4,6 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { main, referencingMergedPullRequestsForIssueForTest } from "../dist/clawsweeper.js";
-import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   implementedCloseReport,
   lowSignalCloseReport,
@@ -15,37 +14,6 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
-
-const reviewedPrActivity = {
-  reviews: [
-    {
-      id: 7723,
-      user: { login: "peer-reviewer" },
-      author_association: "CONTRIBUTOR",
-      state: "COMMENTED",
-      body: "validated the fallback behavior on this head",
-      submitted_at: "2026-05-01T00:30:00Z",
-      commit_id: "head-sha",
-    },
-  ],
-  inlineComments: [
-    {
-      id: 8723,
-      pull_request_review_id: 7723,
-      user: { login: "peer-reviewer" },
-      author_association: "CONTRIBUTOR",
-      body: "the fallback branch is covered here",
-      created_at: "2026-05-01T00:31:00Z",
-      updated_at: "2026-05-01T00:31:00Z",
-      path: "src/runtime.ts",
-      line: 12,
-      side: "RIGHT",
-      commit_id: "head-sha",
-    },
-  ],
-};
-const reviewedPrActivityCursor = createReviewedPrActivityCursor(reviewedPrActivity);
-if (!reviewedPrActivityCursor) throw new Error("expected bounded review activity cursor");
 
 function runtimeBudgetFixture(number: number) {
   const root = mkdtempSync(tmpPrefix);
@@ -208,7 +176,6 @@ test("apply-decisions preserves a runtime yield through post-proof freshness han
       number: 723,
       title: "Provider route fallback",
       close_reason: "duplicate_or_superseded",
-      review_activity_cursor: reviewedPrActivityCursor,
       work_cluster_refs: JSON.stringify([
         "Superseded by https://github.com/openclaw/openclaw/pull/400",
       ]),
@@ -227,8 +194,6 @@ test("apply-decisions preserves a runtime yield through post-proof freshness han
         number: 723,
         title: "Provider route fallback",
         comment: synced.comment,
-        reviews: reviewedPrActivity.reviews,
-        pullReviewComments: reviewedPrActivity.inlineComments,
         itemUpdatedAtAfterProofLogPath: proofLogPath,
         linkedPullHangAfterProof: true,
         linkedPulls: {
@@ -343,7 +308,6 @@ test("apply-decisions yields instead of starting a post-close delay that cannot 
       number: 725,
       title: "Provider route fallback",
       close_reason: "duplicate_or_superseded",
-      review_activity_cursor: reviewedPrActivityCursor,
       work_cluster_refs: JSON.stringify([
         "Superseded by https://github.com/openclaw/openclaw/pull/400",
       ]),
@@ -363,8 +327,6 @@ test("apply-decisions yields instead of starting a post-close delay that cannot 
         number: 725,
         title: "Provider route fallback",
         comment: synced.comment,
-        reviews: reviewedPrActivity.reviews,
-        pullReviewComments: reviewedPrActivity.inlineComments,
         itemUpdatedAtAfterProofLogPath: proofLogPath,
         linkedPulls: {
           400: {
@@ -430,7 +392,6 @@ test("apply-decisions records a successful close before yielding after it", () =
       number: 727,
       title: "Provider route fallback",
       close_reason: "duplicate_or_superseded",
-      review_activity_cursor: reviewedPrActivityCursor,
       work_cluster_refs: JSON.stringify([
         "Superseded by https://github.com/openclaw/openclaw/pull/400",
       ]),
@@ -449,8 +410,6 @@ test("apply-decisions records a successful close before yielding after it", () =
         number: 727,
         title: "Provider route fallback",
         comment: synced.comment,
-        reviews: reviewedPrActivity.reviews,
-        pullReviewComments: reviewedPrActivity.inlineComments,
         closeCommandDelayMs: 8_000,
         itemUpdatedAtAfterProofLogPath: proofLogPath,
         linkedPulls: {

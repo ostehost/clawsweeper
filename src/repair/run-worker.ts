@@ -9,7 +9,6 @@ import {
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
-  redactCodexOutputLastMessage,
 } from "../codex-output-capture.js";
 import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
 import { spawnCodex, terminateCodexProcessTree } from "../codex-spawn.js";
@@ -27,12 +26,9 @@ import {
   codexLoginConfig,
   codexSubprocessEnv,
   codexModelArgs,
-  repairCodexRedactValues,
   repairCodexReasoningEffort,
   repairCodexServiceTier,
 } from "./process-env.js";
-import { beginRepairCodexAction, repairCodexAttempt } from "./repair-codex-action-ledger.js";
-import { repairSourceRevision, type RepairLifecycleInput } from "./repair-action-ledger.js";
 import { sanitizeResultEvidence } from "./url-safety.js";
 
 const args = parseArgs(process.argv.slice(2));
@@ -50,8 +46,10 @@ const resultRepairTimeoutMs = Number(
 );
 const codexReasoningEffort = repairCodexReasoningEffort();
 const codexServiceTier = repairCodexServiceTier();
-const codexRedactValues = repairCodexRedactValues();
-const codexPlannerSandbox = "read-only";
+const codexPlannerSandbox =
+  process.env.CLAWSWEEPER_CODEX_PLANNER_SANDBOX === "danger-full-access"
+    ? "danger-full-access"
+    : "read-only";
 const codexHeartbeatMs = Math.max(
   10_000,
   Number(process.env.CLAWSWEEPER_CODEX_HEARTBEAT_MS ?? 60_000),
@@ -90,8 +88,6 @@ const runDir = makeRunDir(job, mode);
 const promptPath = path.join(runDir, "prompt.md");
 const resultPath = path.join(runDir, "result.json");
 const transcriptPath = path.join(runDir, "codex.jsonl");
-const codexStderrPath = path.join(runDir, "codex.stderr.log");
-let codexResultTempDir = "";
 const promptContext: Record<string, string> = {};
 const targetCheckout = dryRun ? "" : prepareTargetCheckout(job);
 if (targetCheckout) {
@@ -169,39 +165,22 @@ if (dryRun) {
   process.exit(0);
 }
 
-const plannerAction = beginRepairCodexAction(repairWorkerLifecycle(), {
-  action: "repair_plan",
-  mode: String(mode),
-  attempt: repairCodexAttempt(1),
-  paths: { jsonl: transcriptPath, stderr: codexStderrPath },
-  component: "repair_worker_codex",
+const child = await runCodex({
+  input: prompt,
+  outputPath: resultPath,
+  transcriptPath,
+  stderrPath: path.join(runDir, "codex.stderr.log"),
+  timeoutMs: codexTimeoutMs,
 });
-let child: LooseRecord;
-const initialCodexResultPath = temporaryCodexResultPath("initial");
-try {
-  child = await runCodex({
-    input: prompt,
-    outputPath: initialCodexResultPath,
-    transcriptPath,
-    stderrPath: codexStderrPath,
-    timeoutMs: codexTimeoutMs,
-  });
-} catch (error) {
-  plannerAction.fail(error);
-  throw error;
-}
 
 if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
-  const detail = `Codex worker timed out after ${codexTimeoutMs}ms`;
-  plannerAction.fail(new Error(detail));
-  writeBlockedResult(detail);
-  console.error(detail);
+  writeBlockedResult(`Codex worker timed out after ${codexTimeoutMs}ms`);
+  console.error(`Codex worker timed out after ${codexTimeoutMs}ms`);
   process.exit(1);
 }
 
 if (child.error) {
   const detail = child.error.message || String(child.error);
-  plannerAction.fail(new Error(detail));
   writeBlockedResult(`Codex worker failed: ${detail}`);
   console.error(detail);
   process.exit(1);
@@ -209,25 +188,16 @@ if (child.error) {
 
 if (child.status !== 0) {
   const detail = child.stderr || child.stdout || `Codex worker exited ${child.status}`;
-  plannerAction.fail(new Error(detail.trim()));
   writeBlockedResult(detail.trim());
   console.error(detail);
   process.exit(1);
 }
 
-if (!fs.existsSync(initialCodexResultPath)) {
-  const detail = "Codex worker completed without a structured result.json artifact.";
-  plannerAction.fail(new Error(detail));
-  writeBlockedResult(detail);
+if (!fs.existsSync(resultPath)) {
+  writeBlockedResult("Codex worker completed without a structured result.json artifact.");
   process.exit(1);
 }
-try {
-  publishSanitizedCodexResult(initialCodexResultPath, resultPath);
-  plannerAction.complete();
-} catch (error) {
-  plannerAction.fail(error);
-  throw error;
-}
+sanitizeResultFile(resultPath);
 await repairResultIfNeeded();
 sanitizeResultFile(resultPath);
 
@@ -287,30 +257,25 @@ function spawnCodexWithHeartbeat({
 }: LooseRecord): Promise<LooseRecord> {
   const appServer = codexAppServerProcessOptionsFromEnv("Codex planning worker");
   if (appServer) {
-    const result = runCodexProcess({
-      args: commandArgs,
-      cwd,
-      env: codexEnv(),
-      input,
-      timeoutMs,
-      stdoutPath: codexTranscriptPath,
-      stderrPath,
-      appServer,
-      redactValues: codexRedactValues,
-    });
-    redactCodexOutputLastMessage(commandArgs, codexRedactValues);
-    return Promise.resolve(result);
+    return Promise.resolve(
+      runCodexProcess({
+        args: commandArgs,
+        cwd,
+        env: codexEnv(),
+        input,
+        timeoutMs,
+        stdoutPath: codexTranscriptPath,
+        stderrPath,
+        appServer,
+      }),
+    );
   }
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let settled = false;
     let timeoutError: Error | null = null;
-    const stdout = openCodexOutputCapture(codexTranscriptPath, {
-      redactValues: codexRedactValues,
-    });
-    const stderr = openCodexOutputCapture(stderrPath, {
-      redactValues: codexRedactValues,
-    });
+    const stdout = openCodexOutputCapture(codexTranscriptPath);
+    const stderr = openCodexOutputCapture(stderrPath);
 
     const childEnv = codexEnv();
     const child = spawnCodex(commandArgs, { cwd, env: childEnv });
@@ -334,20 +299,7 @@ function spawnCodexWithHeartbeat({
       clearTimeout(timeout);
       closeCodexOutputCapture(stdout);
       closeCodexOutputCapture(stderr);
-      const completedResult = {
-        ...result,
-        stdout: codexOutputTail(stdout),
-        stderr: codexOutputTail(stderr),
-      };
-      try {
-        redactCodexOutputLastMessage(commandArgs, codexRedactValues);
-        resolve(completedResult);
-      } catch (error) {
-        resolve({
-          ...completedResult,
-          error: error instanceof Error ? error : new Error(String(error)),
-        });
-      }
+      resolve(result);
     };
 
     const append = (stream: "stdout" | "stderr", chunk: Buffer) => {
@@ -363,6 +315,8 @@ function spawnCodexWithHeartbeat({
     child.on("error", (error) => {
       finish({
         status: null,
+        stdout: codexOutputTail(stdout),
+        stderr: codexOutputTail(stderr),
         error,
       });
     });
@@ -370,6 +324,8 @@ function spawnCodexWithHeartbeat({
       finish({
         status,
         signal,
+        stdout: codexOutputTail(stdout),
+        stderr: codexOutputTail(stderr),
         error: timeoutError ?? undefined,
       });
     });
@@ -392,25 +348,13 @@ function codexConfigArgs() {
 }
 
 async function repairResultIfNeeded() {
-  for (let completedRepairs = 0; completedRepairs <= resultRepairAttempts; completedRepairs += 1) {
+  for (let attempt = 1; attempt <= resultRepairAttempts; attempt += 1) {
     const review = reviewResult();
     if (review.status === 0) return;
-    const finalReview = completedRepairs === resultRepairAttempts;
-    const attempt = completedRepairs + 1;
     fs.writeFileSync(
-      path.join(
-        runDir,
-        finalReview ? "review-results-final.json" : `review-results-failed-${attempt}.json`,
-      ),
+      path.join(runDir, `review-results-failed-${attempt}.json`),
       review.stdout || review.stderr || "",
     );
-    if (finalReview) {
-      throw new Error(
-        `worker result failed deterministic validation after ${completedRepairs} repair attempt(s): ${
-          review.stderr || review.stdout || "unknown validation failure"
-        }`.trim(),
-      );
-    }
     if (!fs.existsSync(resultPath)) return;
 
     const beforePath = path.join(runDir, `result.before-repair-${attempt}.json`);
@@ -438,49 +382,24 @@ async function repairResultIfNeeded() {
       "```",
     ].join("\n");
 
-    const repairTranscriptPath = path.join(runDir, `codex-repair-${attempt}.jsonl`);
-    const repairStderrPath = path.join(runDir, `codex-repair-${attempt}.stderr.log`);
-    const repairOutputPath = temporaryCodexResultPath(`repair-${attempt}`);
-    const repairAction = beginRepairCodexAction(repairWorkerLifecycle(), {
-      action: "repair_result_repair",
-      mode: String(mode),
-      attempt: repairCodexAttempt(attempt),
-      paths: { jsonl: repairTranscriptPath, stderr: repairStderrPath },
-      component: "repair_worker_codex",
+    const repair = await runCodex({
+      input: repairPrompt,
+      outputPath: resultPath,
+      transcriptPath: path.join(runDir, `codex-repair-${attempt}.jsonl`),
+      stderrPath: path.join(runDir, `codex-repair-${attempt}.stderr.log`),
+      timeoutMs: resultRepairTimeoutMs,
     });
-    let repair: LooseRecord;
-    try {
-      repair = await runCodex({
-        input: repairPrompt,
-        outputPath: repairOutputPath,
-        transcriptPath: repairTranscriptPath,
-        stderrPath: repairStderrPath,
-        timeoutMs: resultRepairTimeoutMs,
-      });
-    } catch (error) {
-      repairAction.fail(error);
-      throw error;
-    }
     if ((repair.error as JsonValue)?.code === "ETIMEDOUT") {
-      const detail = `Codex result repair timed out after ${resultRepairTimeoutMs}ms`;
-      repairAction.fail(new Error(detail));
-      console.error(detail);
+      console.error(`Codex result repair timed out after ${resultRepairTimeoutMs}ms`);
       return;
     }
     if (repair.status !== 0) {
-      const detail =
-        repair.stderr || repair.stdout || `Codex result repair exited ${repair.status}`;
-      repairAction.fail(new Error(detail));
-      console.error(detail);
+      console.error(
+        repair.stderr || repair.stdout || `Codex result repair exited ${repair.status}`,
+      );
       return;
     }
-    try {
-      publishSanitizedCodexResult(repairOutputPath, resultPath);
-      repairAction.complete();
-    } catch (error) {
-      repairAction.fail(error);
-      throw error;
-    }
+    sanitizeResultFile(resultPath);
   }
 }
 
@@ -498,15 +417,6 @@ function reviewResult() {
 
 function codexEnv() {
   return codexSubprocessEnv();
-}
-
-function repairWorkerLifecycle(): RepairLifecycleInput {
-  return {
-    repository: String(job.frontmatter.repo ?? ""),
-    workKey: `${String(job.frontmatter.repo ?? "")}:${String(job.frontmatter.cluster_id ?? "")}`,
-    clusterId: String(job.frontmatter.cluster_id ?? ""),
-    sourceRevision: repairSourceRevision(job.frontmatter),
-  };
 }
 
 function prepareTargetCheckout(job: LooseRecord): string {
@@ -559,35 +469,6 @@ function writeBlockedResult(summary: LooseRecord) {
   };
   sanitizeResultEvidence(result);
   fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
-}
-
-function temporaryCodexResultPath(label: string): string {
-  if (!codexResultTempDir) {
-    codexResultTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-result-"));
-    process.once("exit", () => fs.rmSync(codexResultTempDir, { recursive: true, force: true }));
-  }
-  return path.join(codexResultTempDir, `${label}.json`);
-}
-
-function publishSanitizedCodexResult(sourcePath: string, destinationPath: string): void {
-  const parsed = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Codex structured result must be a JSON object");
-  }
-  sanitizeResultEvidence(parsed as LooseRecord);
-  const temporaryPath = `${destinationPath}.sanitized-${process.pid}`;
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(parsed, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    fs.renameSync(temporaryPath, destinationPath);
-  } catch (error) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw error;
-  } finally {
-    fs.rmSync(sourcePath, { force: true });
-  }
 }
 
 function sanitizeResultFile(filePath: string) {

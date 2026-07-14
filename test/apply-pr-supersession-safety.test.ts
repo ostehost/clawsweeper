@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import test from "node:test";
 
-import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   promotionGhMock,
   reportWithSyncedReviewComment,
@@ -15,19 +14,6 @@ import {
   withMockGh,
 } from "./helpers.ts";
 
-const emptyReviewActivityCursor = createReviewedPrActivityCursor({
-  reviews: [],
-  inlineComments: [],
-});
-assert.ok(emptyReviewActivityCursor);
-
-function supersessionPullRequestReport(overrides = {}) {
-  return stalePullRequestReport({
-    review_activity_cursor: emptyReviewActivityCursor,
-    ...overrides,
-  });
-}
-
 test("apply-decisions keeps promoted PR close proposals open when coverage proof fails", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
@@ -38,7 +24,7 @@ test("apply-decisions keeps promoted PR close proposals open when coverage proof
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 352,
         title: "Old activity PR",
         pr_rating_overall: "D",
@@ -118,7 +104,7 @@ test("apply-decisions promotes PRs superseded by merged linked pull requests wit
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 333,
         title: "Old merged-replacement PR",
         pr_rating_overall: "D",
@@ -206,7 +192,7 @@ test("apply-decisions does not promote PRs superseded by no-proof linked pull re
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 334,
         title: "Old activity PR",
         pr_rating_overall: "D",
@@ -285,7 +271,7 @@ test("apply-decisions does not promote PRs superseded by unsafe linked pull requ
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 335,
         title: "Old activity PR",
         pr_rating_overall: "D",
@@ -358,7 +344,7 @@ test("apply-decisions does not promote PRs superseded by F-rated linked pull req
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 338,
       title: "Old activity PR",
       labels: JSON.stringify([]),
@@ -436,7 +422,7 @@ test("apply-decisions does not promote PRs superseded by section-only unsafe lin
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 340,
       title: "Old activity PR",
       labels: JSON.stringify([]),
@@ -457,7 +443,7 @@ test("apply-decisions does not promote PRs superseded by section-only unsafe lin
     writeFileSync(
       join(itemsDir, "400.md"),
       stripProofAndRatingFrontMatter(
-        supersessionPullRequestReport({
+        stalePullRequestReport({
           number: 400,
           title: "Canonical PR with old section-only blockers",
           labels: JSON.stringify([]),
@@ -527,7 +513,7 @@ test("apply-decisions promotes PRs when a proof-backed canonical PR is behind", 
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 342,
       title: "Old activity PR",
       labels: JSON.stringify([]),
@@ -547,7 +533,7 @@ test("apply-decisions promotes PRs when a proof-backed canonical PR is behind", 
     writeFileSync(join(itemsDir, "342.md"), synced.report, "utf8");
     writeFileSync(
       join(itemsDir, "400.md"),
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 400,
         title: "Canonical PR with stale proof report",
         labels: JSON.stringify(["status: needs proof"]),
@@ -629,7 +615,7 @@ test("apply-decisions does not promote PRs when live labels supersede stale proo
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 344,
       title: "Old activity PR",
       labels: JSON.stringify([]),
@@ -649,7 +635,7 @@ test("apply-decisions does not promote PRs when live labels supersede stale proo
     writeFileSync(join(itemsDir, "344.md"), synced.report, "utf8");
     writeFileSync(
       join(itemsDir, "400.md"),
-      supersessionPullRequestReport({
+      stalePullRequestReport({
         number: 400,
         title: "Canonical PR with stale sufficient proof report",
         labels: JSON.stringify(["proof: sufficient"]),
@@ -723,7 +709,7 @@ test("apply-decisions does not promote PRs superseded by unknown-mergeability PR
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 343,
       title: "Old activity PR",
       labels: JSON.stringify([]),
@@ -798,7 +784,7 @@ test("apply-decisions does not promote PRs superseded by non-clean linked pull r
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
-    const sourceReport = supersessionPullRequestReport({
+    const sourceReport = stalePullRequestReport({
       number: 345,
       title: "Old activity PR",
       labels: JSON.stringify([]),

@@ -37,10 +37,6 @@ test("issue implementation post-flight waits for green PR checks without merging
       "  }));",
       "  process.exit(0);",
       "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  process.stdout.write('[]');",
-      "  process.exit(0);",
-      "}",
       "if (args[0] === 'pr' && args[1] === 'view') {",
       "  process.stdout.write(JSON.stringify({",
       "    baseRefName: 'main',",
@@ -201,10 +197,6 @@ test("issue implementation post-flight waits for checks to be created", () => {
       "  }));",
       "  process.exit(0);",
       "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  process.stdout.write('[]');",
-      "  process.exit(0);",
-      "}",
       "if (args[0] === 'pr' && args[1] === 'view') {",
       "  const path = process.env.FAKE_GH_VIEW_COUNT_FILE;",
       "  const count = fs.existsSync(path) ? Number(fs.readFileSync(path, 'utf8')) : 0;",
@@ -260,8 +252,6 @@ test("merge post-flight waits when only ignored checks exist", () => {
   const resultPath = path.join(runDir, "result.json");
   const reportPath = path.join(runDir, "post-flight-report.json");
   const mergeFlagPath = path.join(tmp, "merged.txt");
-  const mergeClaimPath = path.join(tmp, "merge-claims.json");
-  const mergeMessagePath = path.join(tmp, "merge-message.txt");
   const viewCountPath = path.join(tmp, "view-count.txt");
 
   fs.mkdirSync(fakeBin, { recursive: true });
@@ -272,11 +262,6 @@ test("merge post-flight waits when only ignored checks exist", () => {
       "#!/usr/bin/env node",
       "const fs = require('node:fs');",
       "const args = process.argv.slice(2);",
-      "function comments() {",
-      "  return fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE)",
-      "    ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8'))",
-      "    : [];",
-      "}",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') {",
       "  const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE);",
       "  process.stdout.write(JSON.stringify({",
@@ -288,31 +273,8 @@ test("merge post-flight waits when only ignored checks exist", () => {
       "  }));",
       "  process.exit(0);",
       "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments' && args.includes('-f')) {",
-      "  const existing = comments();",
-      "  const body = String(args.find((arg) => arg.startsWith('body=')) || '').slice(5);",
-      "  const comment = {",
-      "    id: 1001 + existing.length, body,",
-      "    created_at: new Date(Date.parse('2026-05-24T00:40:00Z') + existing.length * 1000).toISOString(),",
-      "    performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' },",
-      "    user: { login: 'openclaw-clawsweeper[bot]' },",
-      "  };",
-      "  existing.push(comment);",
-      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, JSON.stringify(existing));",
-      "  process.stdout.write(JSON.stringify(comment));",
-      "  process.exit(0);",
-      "}",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  const existing = comments();",
-      "  process.stdout.write(JSON.stringify(args.includes('--slurp') ? [existing] : existing));",
-      "  process.exit(0);",
-      "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb') {",
-      "  process.stdout.write(JSON.stringify({",
-      "    sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',",
-      "    commit: { message: fs.readFileSync(process.env.FAKE_GH_MERGE_MESSAGE_FILE, 'utf8') },",
-      "    parents: [{ sha: 'cccccccccccccccccccccccccccccccccccccccc' }],",
-      "  }));",
+      "  process.stdout.write('');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'graphql') {",
@@ -335,10 +297,6 @@ test("merge post-flight waits when only ignored checks exist", () => {
       "  process.exit(0);",
       "}",
       "if (args[0] === 'pr' && args[1] === 'merge') {",
-      "  const subject = args[args.indexOf('--subject') + 1];",
-      "  const bodyFile = args[args.indexOf('--body-file') + 1];",
-      "  const body = fs.readFileSync(bodyFile, 'utf8').trim();",
-      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_MESSAGE_FILE, `${subject}\\n\\n${body}`);",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
       "  process.exit(0);",
       "}",
@@ -362,14 +320,8 @@ test("merge post-flight waits when only ignored checks exist", () => {
         CLAWSWEEPER_POST_FLIGHT_REQUIRE_PR_CHECKS: "1",
         CLAWSWEEPER_POST_FLIGHT_WAIT_MS: "10000",
         CLAWSWEEPER_POST_FLIGHT_POLL_MS: "1",
-        CLAWSWEEPER_AUTHENTICATED_APP_ID: "3306130",
-        CLAWSWEEPER_AUTHENTICATED_APP_SLUG: "openclaw-clawsweeper",
         FAKE_GH_MERGED_FILE: mergeFlagPath,
-        FAKE_GH_MERGE_CLAIM_FILE: mergeClaimPath,
-        FAKE_GH_MERGE_MESSAGE_FILE: mergeMessagePath,
         FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
-        GITHUB_RUN_ATTEMPT: "1",
-        GITHUB_RUN_ID: "9001",
         ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
@@ -378,7 +330,7 @@ test("merge post-flight waits when only ignored checks exist", () => {
     const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
     assert.equal(report.actions[0]?.status, "executed");
     assert.equal(report.actions[0]?.merge_commit_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    assert.ok(Number(fs.readFileSync(viewCountPath, "utf8")) >= 2);
+    assert.equal(fs.readFileSync(viewCountPath, "utf8"), "2");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -407,10 +359,6 @@ test("post-flight keeps no-timestamp pending duplicate checks visible", () => {
       "    draft: false, labels: [], base: { ref: 'main' }, merged_at: null,",
       "    head: { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },",
       "  }));",
-      "  process.exit(0);",
-      "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'pr' && args[1] === 'view') {",
@@ -589,7 +537,6 @@ function writeMergeReports(runDir: string, resultPath: string) {
             status: "opened",
             pr_url: "https://github.com/openclaw/openclaw/pull/123",
             branch: "clawsweeper/automerge-openclaw-openclaw-123",
-            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             merge_preflight: {
               security_status: "cleared",
               security_evidence: ["no security signal"],

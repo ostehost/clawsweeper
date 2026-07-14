@@ -27,15 +27,6 @@ import {
   selfHealJobPath,
   selfHealStatusMarkerPrefix,
 } from "./conflict-self-heal-core.js";
-import {
-  immutableJobDispatchArgs,
-  resolveCurrentStateJobIdentity,
-} from "./immutable-job-handoff.js";
-import {
-  repairPublicationContentDigest,
-  runRepairMutation,
-  type RepairLifecycleInput,
-} from "./repair-action-ledger.js";
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -212,6 +203,22 @@ function classifyCandidate(
   });
   if (capBlock) return { ...base, status: "skipped", reason: capBlock };
 
+  const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
+    repo: repairRepo,
+    workflow,
+    jobPath,
+    activeRunsByPrefix: activeRepairRunsByPrefix,
+  });
+  if (active) {
+    return {
+      ...base,
+      status: "waiting",
+      reason: "repair worker already active for this self-heal job",
+      active_run_url: active.url ?? null,
+      active_run_id: active.databaseId ?? active.id ?? null,
+    };
+  }
+
   const headKey = `${repo}#${pull.number}:${headSha}`;
   plannedHeads.add(headKey);
   return { ...base, status: "candidate", reason: eligibility.reason };
@@ -266,6 +273,20 @@ function executeDispatches(
   if (process.env.CLAWSWEEPER_ALLOW_FIX_PR !== "1") {
     throw new Error("refusing conflict self-heal dispatch: CLAWSWEEPER_ALLOW_FIX_PR must be 1");
   }
+  summary.live_worker_capacity_before_dispatch = waitForCapacity
+    ? waitForLiveWorkerCapacity({
+        repo: repairRepo,
+        workflow,
+        requested: candidates.length,
+        maxLiveWorkers,
+      })
+    : assertLiveWorkerCapacity({
+        repo: repairRepo,
+        workflow,
+        requested: candidates.length,
+        maxLiveWorkers,
+      });
+
   const batchId = `conflict-self-heal-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const prepared: Array<{ candidate: LooseRecord; attempt: LooseRecord }> = [];
   for (const candidate of candidates) {
@@ -300,16 +321,8 @@ function executeDispatches(
     currentLedger.attempts = [...(currentLedger.attempts ?? []), attempt];
   }
   if (prepared.length > 0) publishSelfHealJobs();
-  const ready: Array<{ candidate: LooseRecord; attempt: LooseRecord }> = [];
   for (const item of prepared) {
     const { candidate, attempt } = item;
-    const immutableJob = resolveCurrentStateJobIdentity(candidate.job_path);
-    candidate.state_revision = immutableJob.stateRevision;
-    candidate.job_sha256 = immutableJob.jobSha256;
-    candidate.immutable_job_key = immutableJob.identityKey;
-    attempt.state_revision = immutableJob.stateRevision;
-    attempt.job_sha256 = immutableJob.jobSha256;
-    attempt.immutable_job_key = immutableJob.identityKey;
     const latest = fetchPullHead(repo, candidate.number);
     attempt.latest_head_sha_after_publish = latest.head_sha;
     if (latest.head_sha !== candidate.head_sha) {
@@ -317,51 +330,13 @@ function executeDispatches(
       attempt.reason = "head SHA changed after state publish";
       continue;
     }
-    const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
-      repo: repairRepo,
-      workflow,
-      jobPath: immutableJob.jobPath,
-      jobSha256: immutableJob.jobSha256,
-      activeRunsByPrefix: activeRepairRunsByPrefix,
-    });
-    if (active) {
-      attempt.status = "waiting";
-      attempt.reason = "repair worker already active for this immutable self-heal job";
-      attempt.run_url = active.url ?? null;
-      attempt.run_id = active.databaseId ?? active.id ?? null;
-      continue;
-    }
-    ready.push(item);
-  }
-  if (ready.length > 0) {
-    summary.live_worker_capacity_before_dispatch = waitForCapacity
-      ? waitForLiveWorkerCapacity({
-          repo: repairRepo,
-          workflow,
-          requested: ready.length,
-          maxLiveWorkers,
-        })
-      : assertLiveWorkerCapacity({
-          repo: repairRepo,
-          workflow,
-          requested: ready.length,
-          maxLiveWorkers,
-        });
-  }
-  for (const item of ready) {
-    const { candidate, attempt } = item;
     postSelfHealStatus(candidate, { status: "dispatching" });
     dispatchRepair(candidate);
     attempt.status = "dispatched";
   }
   currentLedger.updated_at = new Date().toISOString();
   writeLedger(currentLedger);
-  summary.status =
-    ready.length > 0
-      ? "dispatched"
-      : summary.attempts.some((attempt: LooseRecord) => attempt.status === "waiting")
-        ? "waiting"
-        : "skipped";
+  summary.status = "dispatched";
   return summary;
 }
 
@@ -369,24 +344,11 @@ function publishSelfHealJobs() {
   if (!publishRoot()) {
     throw new Error("refusing conflict self-heal dispatch: CLAWSWEEPER_STATE_DIR is required");
   }
-  const publicationContentSha256 = repairPublicationContentDigest(["jobs"], repoRoot());
-  const result = runRepairMutation(conflictPublicationLifecycle(publicationContentSha256), {
-    kind: "conflict_self_heal_job_state",
-    operationName: "conflict_self_heal",
-    component: "conflict_self_heal",
-    identity: {
-      repository: repairRepo,
-      paths: ["jobs"],
-      publicationContentSha256,
-    },
-    operation: () =>
-      publishMainCommit({
-        message: "chore: publish conflict self-heal jobs",
-        paths: ["jobs"],
-        maxAttempts: 12,
-        pushAttempts: 4,
-      }),
-    outcome: (publication) => (publication === "committed" ? "accepted" : "rejected"),
+  const result = publishMainCommit({
+    message: "chore: publish conflict self-heal jobs",
+    paths: ["jobs"],
+    maxAttempts: 12,
+    pushAttempts: 4,
   });
   console.log(`Published conflict self-heal jobs before dispatch: ${result}`);
 }
@@ -428,32 +390,18 @@ function postSelfHealStatus(candidate: LooseRecord, { status }: { status: string
     `conflict-self-heal-status-${candidate.number}-${candidate.head_sha}`,
     { body },
   );
-  const commandArgs = existing?.id
-    ? [
-        "api",
-        `repos/${repo}/issues/comments/${existing.id}`,
-        "--method",
-        "PATCH",
-        "--input",
-        payload,
-      ]
-    : ["api", `repos/${repo}/issues/${candidate.number}/comments`, "--input", payload];
-  runRepairMutation(conflictCandidateLifecycle(candidate, `status:${status}`), {
-    kind: "conflict_self_heal_status",
-    operationName: "conflict_self_heal",
-    component: "conflict_self_heal",
-    identity: {
-      repository: repo,
-      number: candidate.number,
-      headSha: candidate.head_sha,
-      jobPath: candidate.job_path,
-      status,
-      body,
-      method: existing?.id ? "PATCH" : "POST",
-      commentId: existing?.id ?? null,
-    },
-    operation: () => ghText(commandArgs),
-  });
+  if (existing?.id) {
+    ghText([
+      "api",
+      `repos/${repo}/issues/comments/${existing.id}`,
+      "--method",
+      "PATCH",
+      "--input",
+      payload,
+    ]);
+  } else {
+    ghText(["api", `repos/${repo}/issues/${candidate.number}/comments`, "--input", payload]);
+  }
 }
 
 function findSelfHealStatusComment(number: JsonValue) {
@@ -467,84 +415,30 @@ function findSelfHealStatusComment(number: JsonValue) {
 }
 
 function dispatchRepair(candidate: LooseRecord) {
-  const commandArgs = [
-    "workflow",
-    "run",
-    workflow,
-    "--repo",
-    repairRepo,
-    "-f",
-    `job=${candidate.job_path}`,
-    ...immutableJobDispatchArgs({
-      stateRevision: candidate.state_revision,
-      jobSha256: candidate.job_sha256,
-    }),
-    "-f",
-    "mode=autonomous",
-    "-f",
-    `runner=${runner}`,
-    "-f",
-    `execution_runner=${executionRunner}`,
-    "-f",
-    `model=${model}`,
-  ];
-  runRepairMutation(conflictCandidateLifecycle(candidate, "dispatch"), {
-    kind: "repair_dispatch",
-    operationName: "conflict_self_heal",
-    component: "conflict_self_heal",
-    identity: {
-      repository: repairRepo,
+  const result = spawnSync(
+    "gh",
+    [
+      "workflow",
+      "run",
       workflow,
-      jobPath: candidate.job_path,
-      stateRevision: candidate.state_revision,
-      jobSha256: candidate.job_sha256,
-      mode: "autonomous",
-      runner,
-      executionRunner,
-      model,
-      headSha: candidate.head_sha,
-    },
-    operation: () => {
-      const result = spawnSync("gh", commandArgs, {
-        cwd: repoRoot(),
-        encoding: "utf8",
-        stdio: "pipe",
-      });
-      if (result.status !== 0) {
-        throw new Error(
-          `failed to dispatch ${candidate.job_path}: ${result.stderr || result.stdout}`,
-        );
-      }
-      return result;
-    },
-  });
-}
-
-function conflictCandidateLifecycle(
-  candidate: LooseRecord,
-  operation: string,
-): RepairLifecycleInput {
-  const number = Number(candidate.number);
-  return {
-    repository: repo,
-    workKey: `conflict-self-heal:${repo}#${number}:${candidate.immutable_job_key}:${operation}`,
-    number,
-    sourceRevision: String(candidate.head_sha ?? ""),
-    recordPath: String(candidate.job_path ?? ""),
-    subjectKind: "pull_request",
-    subjectId: `pull-request-${number}`,
-  };
-}
-
-function conflictPublicationLifecycle(contentSha256: string): RepairLifecycleInput {
-  return {
-    repository: repairRepo,
-    workKey: `conflict-self-heal:job-publication:${contentSha256}`,
-    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
-    recordPath: "jobs",
-    subjectKind: "workflow",
-    subjectId: "conflict-self-heal-job-publication",
-  };
+      "--repo",
+      repairRepo,
+      "-f",
+      `job=${candidate.job_path}`,
+      "-f",
+      "mode=autonomous",
+      "-f",
+      `runner=${runner}`,
+      "-f",
+      `execution_runner=${executionRunner}`,
+      "-f",
+      `model=${model}`,
+    ],
+    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+  );
+  if (result.status !== 0) {
+    throw new Error(`failed to dispatch ${candidate.job_path}: ${result.stderr || result.stdout}`);
+  }
 }
 
 function verifyJobHead(jobPath: string) {

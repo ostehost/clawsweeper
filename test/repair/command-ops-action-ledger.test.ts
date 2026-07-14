@@ -29,12 +29,8 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   const finalizeStart = workflow.indexOf("- name: Finalize repair requeue action ledger");
   const publishStart = workflow.indexOf("- name: Publish immutable repair requeue action ledger");
   const nextStep = workflow.indexOf("- name: Record requeued work", publishStart);
-  const executeJobStart = workflow.indexOf("\n  execute:");
   const executeFixStart = workflow.indexOf("- name: Execute credited fix artifact");
-  const ledgerSetupStart = workflow.indexOf(
-    "- uses: ./.github/actions/setup-action-ledger",
-    executeJobStart,
-  );
+  const ledgerSetupStart = workflow.indexOf("- uses: ./.github/actions/setup-action-ledger");
   const requeueStart = workflow.indexOf("- name: Requeue source-head repair races");
   const finalizeStep = workflow.slice(finalizeStart, publishStart);
   const publishStep = workflow.slice(publishStart, nextStep);
@@ -49,9 +45,7 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(source, /`job=\$\{jobPath\}`/);
   assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
   assert.match(source, /operationKey: `repair-requeue:/);
-  assert.match(source, /sourceRevision: immutableJob\.stateRevision/);
-  assert.match(source, /immutableJob\.identityKey/);
-  assert.match(source, /sourceJobSha256: authorizationSha256/);
+  assert.match(source, /sourceRevision: authorizationSha256/);
   assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
@@ -59,17 +53,17 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
   assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
-  assert.ok(ledgerSetupStart < executeFixStart && executeFixStart < requeueStart);
+  assert.ok(executeFixStart < ledgerSetupStart && ledgerSetupStart < requeueStart);
   assert.ok(finalizeStart >= 0);
   assert.ok(publishStart > finalizeStart);
   assert.ok(nextStep > publishStart);
   assert.match(
     finalizeStep,
-    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.execute-action-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.execute-action-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);
@@ -82,37 +76,26 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(workflow, /--max-requeue-depth 1/);
 });
 
-test("exact review publishes post-ack status receipts in a second ledger", () => {
+test("exact review publishes status receipts created after its first ledger publication", () => {
   const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
   const source = readText("src/repair/update-command-status.ts");
   const workflow = readText(".github/workflows/sweep.yml");
-  const exactEventFinalize = workflow.indexOf("- name: Finalize exact event action ledger");
-  const exactEventPublish = workflow.indexOf("- name: Publish exact event action ledger");
-  const completeLease = workflow.indexOf("- name: Complete exact-review queue lease");
   const sourceDriftStatus = workflow.indexOf("- name: Mark source-drift re-review queued");
   const lateFinalize = workflow.indexOf("- name: Finalize late command status action ledger");
   const latePublish = workflow.indexOf("- name: Publish late command status action ledger");
-  const exactReviewQueuePublisher = workflow.indexOf(
-    "\n  publish-exact-review-action-ledger:",
-    latePublish,
-  );
   const targetFanout = workflow.indexOf("\n  target-fanout:", latePublish);
   const finalizeStep = workflow.slice(lateFinalize, latePublish);
-  const publishStep = workflow.slice(latePublish, exactReviewQueuePublisher);
+  const publishStep = workflow.slice(latePublish, targetFanout);
 
-  assert.ok(exactEventFinalize >= 0);
-  assert.ok(exactEventPublish > exactEventFinalize);
-  assert.ok(completeLease > exactEventPublish);
-  assert.ok(sourceDriftStatus > completeLease);
+  assert.ok(sourceDriftStatus >= 0);
   assert.ok(lateFinalize > sourceDriftStatus);
   assert.ok(latePublish > lateFinalize);
-  assert.ok(exactReviewQueuePublisher > latePublish);
   assert.ok(targetFanout > latePublish);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' && steps\.finalize-late-command-status-action-ledger\.outcome == 'success' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);

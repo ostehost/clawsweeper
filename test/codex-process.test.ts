@@ -389,71 +389,6 @@ setInterval(() => {}, 1000);
   }
 });
 
-test("Codex process redacts spawn errors before returning them", () => {
-  const root = mkdtempSync(tmpPrefix);
-  const secret = "missing-private-codex-123456";
-  try {
-    const result = runCodexProcess({
-      args: [],
-      cwd: root,
-      env: { ...process.env, CODEX_BIN: join(root, secret) },
-      input: "",
-      timeoutMs: 10_000,
-      redactValues: [secret],
-    });
-
-    assert.ok(result.error);
-    assert.doesNotMatch(result.error.message, new RegExp(secret));
-    assert.match(result.error.message, /\[REDACTED\]/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("Codex app-server redacts JSON-RPC errors before returning them", () => {
-  const root = mkdtempSync(tmpPrefix);
-  const binDir = join(root, "node_modules", ".bin");
-  const secret = "rpc-private-token-123456";
-  mkdirSync(binDir, { recursive: true });
-  const codexPath = join(binDir, "codex");
-  writeFileSync(
-    codexPath,
-    `#!/usr/bin/env node
-const readline = require("node:readline");
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    process.stdout.write(JSON.stringify({
-      id: message.id,
-      error: { code: -32000, message: "request failed for ${secret}" }
-    }) + "\\n");
-  }
-});
-`,
-    { mode: 0o755 },
-  );
-
-  try {
-    const result = runCodexProcess({
-      args: ["exec", "--cd", root, "--sandbox", "read-only", "-"],
-      cwd: root,
-      env: { ...process.env, CODEX_BIN: codexPath },
-      input: "Inspect the checkout.",
-      timeoutMs: 10_000,
-      appServer: { statePath: join(root, "state.json") },
-      redactValues: [secret],
-    });
-
-    assert.equal(result.status, 1);
-    assert.ok(result.error);
-    assert.doesNotMatch(result.error.message, new RegExp(secret));
-    assert.match(result.error.message, /\[REDACTED\]/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("Codex app-server mode persists and resumes a thread", () => {
   const root = mkdtempSync(tmpPrefix);
   const binDir = join(root, "node_modules", ".bin");
@@ -461,7 +396,6 @@ test("Codex app-server mode persists and resumes a thread", () => {
   const outputPath = join(root, "last-message.json");
   const requestsPath = join(root, "requests.jsonl");
   const argsPath = join(root, "args.json");
-  const secret = "runtime-token-123456";
   mkdirSync(binDir, { recursive: true });
   const scriptPath = join(root, "app-server-codex.cjs");
   writeFileSync(
@@ -485,21 +419,11 @@ rl.on("line", (line) => {
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress", items: [] } } });
     setTimeout(() => {
-      send({ method: "item/agentMessage/delta", params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        delta: "runtime-token-"
-      } });
-      send({ method: "item/agentMessage/delta", params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        delta: "123456"
-      } });
       send({ method: "item/completed", params: {
         threadId: "thread-1",
         turnId: "turn-1",
         completedAtMs: Date.now(),
-        item: { type: "agentMessage", id: "message-1", text: '{"status":"planned","token":"runtime-token-123456"}' }
+        item: { type: "agentMessage", id: "message-1", text: '{"status":"planned"}' }
       } });
       send({ method: "turn/completed", params: {
         threadId: "thread-1",
@@ -549,13 +473,10 @@ rl.on("line", (line) => {
         input: "Plan the repair.",
         timeoutMs: 10_000,
         appServer: { statePath, label: "test worker" },
-        redactValues: [secret],
       });
       assert.equal(result.status, 0, result.stderr);
       assert.equal(result.error, undefined);
-      assert.equal(readFileSync(outputPath, "utf8"), '{"status":"planned","token":"[REDACTED]"}');
-      assert.doesNotMatch(result.stdout, new RegExp(secret));
-      assert.match(result.stdout, /\[REDACTED\]/);
+      assert.equal(readFileSync(outputPath, "utf8"), '{"status":"planned"}');
     }
 
     const state = JSON.parse(readFileSync(statePath, "utf8"));

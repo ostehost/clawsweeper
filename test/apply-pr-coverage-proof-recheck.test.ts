@@ -3,9 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import test from "node:test";
 
-import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
-  lowSignalCloseReport as baseLowSignalCloseReport,
+  lowSignalCloseReport,
   promotionGhMock,
   reportWithSyncedReviewComment,
   runApplyDecisionsForTest,
@@ -13,18 +12,6 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
-
-const emptyReviewActivityCursor = createReviewedPrActivityCursor({
-  reviews: [],
-  inlineComments: [],
-});
-assert.ok(emptyReviewActivityCursor);
-
-const lowSignalCloseReport = (overrides: Record<string, unknown> = {}) =>
-  baseLowSignalCloseReport({
-    review_activity_cursor: emptyReviewActivityCursor,
-    ...overrides,
-  });
 
 function boundDuplicateCloseComment(number: number, canonicalUrl: string): string {
   const markerFields = [

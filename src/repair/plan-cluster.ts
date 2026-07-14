@@ -13,7 +13,6 @@ import {
 } from "./lib.js";
 import { ghJson, ghPaged, ghPagedLimit, ghText } from "./github-cli.js";
 import { hasSecurityRepairOptInLabel } from "./security-boundary.js";
-import { createReviewedTimelineCursor, MAX_REVIEWED_TIMELINE_EVENTS } from "./timeline-cursor.js";
 
 function readNonNegativeIntegerEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -93,7 +92,7 @@ while (pending.length > 0) {
 
   const item = offline
     ? offlineItem(job.frontmatter.repo, number, job)
-    : hydrateItem(job.frontmatter.repo, number, job);
+    : hydrateItem(job.frontmatter.repo, number);
   items.set(number, item);
 
   if (offline || next.depth > 0) continue;
@@ -194,7 +193,7 @@ console.log(
   ),
 );
 
-function hydrateItem(repo: string, number: JsonValue, job: LooseRecord) {
+function hydrateItem(repo: string, number: JsonValue) {
   let issue;
   try {
     issue = ghJson(["api", `repos/${repo}/issues/${number}`]);
@@ -214,12 +213,6 @@ function hydrateItem(repo: string, number: JsonValue, job: LooseRecord) {
   const changedFilesCount = countValue(pullRequest?.changed_files, files.length);
   const commitsCount = countValue(pullRequest?.commits, commits.length);
   const checks = pullRequest ? ghPrChecks(repo, number) : [];
-  const timeline =
-    pullRequest && job.frontmatter.allow_merge === true
-      ? ghPagedLimit(`repos/${repo}/issues/${number}/timeline`, MAX_REVIEWED_TIMELINE_EVENTS + 1)
-      : [];
-  const timelineCursor =
-    timeline.length <= MAX_REVIEWED_TIMELINE_EVENTS ? createReviewedTimelineCursor(timeline) : null;
 
   return {
     repo,
@@ -234,7 +227,6 @@ function hydrateItem(repo: string, number: JsonValue, job: LooseRecord) {
     labels: (issue.labels ?? []).map((label: JsonValue) => label.name ?? label).filter(Boolean),
     created_at: issue.created_at,
     updated_at: issue.updated_at,
-    timeline_cursor: timelineCursor,
     closed_at: issue.closed_at,
     body: issue.body ?? "",
     body_excerpt: excerpt(issue.body),
@@ -329,7 +321,6 @@ function unavailableItem(repo: string, number: JsonValue, error: JsonValue) {
     labels: [],
     created_at: null,
     updated_at: null,
-    timeline_cursor: null,
     closed_at: null,
     body: "",
     body_excerpt: reason || "GitHub ref could not be hydrated.",
@@ -359,7 +350,6 @@ function summarizeItem(item: LooseRecord, job: LooseRecord) {
     labels: item.labels,
     created_at: item.created_at,
     updated_at: item.updated_at,
-    timeline_cursor: item.timeline_cursor,
     closed_at: item.closed_at,
     hydration_error: item.hydration_error ?? null,
     body_excerpt: item.body_excerpt,
@@ -763,7 +753,6 @@ function offlineItem(repo: string, number: JsonValue, job: LooseRecord) {
     labels: [],
     created_at: null,
     updated_at: null,
-    timeline_cursor: null,
     closed_at: null,
     body: job.body,
     body_excerpt: excerpt(job.body),

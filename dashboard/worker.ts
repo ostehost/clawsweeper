@@ -39,7 +39,6 @@ type ExactReviewDecision = {
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
   commandStatusMarker?: string;
-  sourceCommentId?: number;
   statusCommentId?: number;
   additionalPrompt?: string;
 };
@@ -427,30 +426,17 @@ export class StatusStore {
           ? current.value
           : null;
       const parsed = currentValue ? JSON.parse(currentValue) : [];
-      const priorEvents = Array.isArray(parsed) ? parsed : [];
-      const upserted = upsertStoredEvent(priorEvents, body.event);
-      const events = upserted.events.slice(0, numberFrom(body.limit, EVENT_LIMIT));
+      const events = [body.event, ...(Array.isArray(parsed) ? parsed : [])].slice(
+        0,
+        numberFrom(body.limit, EVENT_LIMIT),
+      );
       const expiresAt = Date.now() + numberFrom(body.ttl_seconds, EVENT_STORE_TTL_SECONDS) * 1000;
       await this.storage.put("events", {
         value: JSON.stringify(events),
         expires_at: expiresAt,
       });
       await this.scheduleCleanup(expiresAt);
-      const projectedCi = body.ci ? ciForStoredEvent(body.ci, upserted.event) : null;
-      const ciProjected =
-        projectedCi && upserted.isLatestForItem
-          ? await this.projectCiStatus(
-              projectedCi,
-              numberFrom(body.ci_ttl_seconds, CI_STATUS_TTL_SECONDS),
-            )
-          : false;
-      return json({
-        ok: true,
-        event: upserted.event,
-        is_latest: upserted.isLatest,
-        is_latest_for_item: upserted.isLatestForItem,
-        ci_projected: ciProjected,
-      });
+      return json({ ok: true });
     }
 
     return new Response("method not allowed", { status: 405 });
@@ -474,29 +460,6 @@ export class StatusStore {
   private async scheduleCleanup(expiresAt: number) {
     const scheduled = await this.storage.getAlarm();
     if (scheduled === null || expiresAt < scheduled) await this.storage.setAlarm(expiresAt);
-  }
-
-  private async projectCiStatus(ci: unknown, ttlSeconds: number) {
-    const value = objectValue(ci);
-    const repository = nullableString(value.repository);
-    const itemNumber = numberOrNull(value.item_number);
-    if (!repository || !itemNumber) return false;
-
-    const key = ciStatusKey(repository, itemNumber);
-    const current = (await this.storage.get(key)) as StoredValue | undefined;
-    const currentValue =
-      current?.value && (!current.expires_at || current.expires_at > Date.now())
-        ? JSON.parse(current.value)
-        : null;
-    if (!shouldAdvanceCiProjection(currentValue, value)) return false;
-
-    const expiresAt = Date.now() + ttlSeconds * 1000;
-    await this.storage.put(key, {
-      value: JSON.stringify(value),
-      expires_at: expiresAt,
-    });
-    await this.scheduleCleanup(expiresAt);
-    return true;
   }
 }
 
@@ -841,7 +804,6 @@ export class ExactReviewQueue {
       let reconciled = 0;
       let requeued = 0;
       let completed = 0;
-      const bayCompletions = [];
       for (const run of runs) {
         const matches = Object.values(state.items).filter(
           (item) =>
@@ -855,16 +817,9 @@ export class ExactReviewQueue {
         const didRequeue = finishExactReviewQueueItem(state, item, now, run.outcome);
         reconciled += 1;
         if (didRequeue) requeued += 1;
-        else {
-          completed += 1;
-          const completion = exactReviewBayJourneyCompletion(item, run);
-          if (completion) bayCompletions.push(completion);
-        }
+        else completed += 1;
       }
       if (reconciled) {
-        if (bayCompletions.length && this.env.STATUS_STORE) {
-          await updateBayJourneyState(this.env, [], bayCompletions, new Date(now).toISOString());
-        }
         await this.writeState(state);
         await this.scheduleNext(state, now);
       }
@@ -1824,22 +1779,15 @@ async function ingestEvent(request, env) {
   if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) return json({ error: "unauthorized" }, 401);
   const body = await request.json().catch(() => null);
   if (!body || typeof body !== "object") return json({ error: "invalid_json" }, 400);
-  const idempotencyKey =
-    nullableString(request.headers.get("idempotency-key")) ?? nullableString(body.idempotency_key);
-  if (idempotencyKey && idempotencyKey.length > 256) {
-    return json({ error: "idempotency_key_too_long" }, 400);
-  }
-  const receivedAt = new Date().toISOString();
-  const ci = normalizeCiStatus(body, idempotencyKey, receivedAt);
-  const event = normalizeEvent(body, idempotencyKey, ci, receivedAt);
-  const stored = await prependStoredEvent(env, event, ci);
-  const writes = [];
-  if (stored.isLatest) {
-    writes.push(writeStoredJson(env, "latest-event", stored.event, EVENT_STORE_TTL_SECONDS));
-  }
-  if (stored.ci && stored.shouldWriteCi) writes.push(writeCiStatus(env, stored.ci));
+  const event = normalizeEvent(body);
+  const writes = [
+    prependStoredEvent(env, event),
+    writeStoredJson(env, "latest-event", event, EVENT_STORE_TTL_SECONDS),
+  ];
+  const ci = normalizeCiStatus(body);
+  if (ci) writes.push(writeCiStatus(env, ci));
   await Promise.all(writes);
-  return json({ ok: true, event: stored.event });
+  return json({ ok: true, event });
 }
 
 async function githubWebhook(request, env, ctx) {
@@ -1863,6 +1811,12 @@ async function githubWebhook(request, env, ctx) {
       },
       202,
     );
+  }
+
+  const completion = bayJourneyCompletionFromGithubWebhook({ event, payload, env });
+  if (completion) {
+    await recordBayJourneyTelemetry(env, ctx, [], [completion]);
+    return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
   }
 
   const decision = classifyGithubWebhook({ event, payload });
@@ -1968,6 +1922,46 @@ function bayJourneyTriggerFromGithubWebhook({ decision, payload, deliveryId }) {
     source_comment_id: decision.commentId,
     source_delivery_id: sourceDeliveryId,
     triggered_at: triggerAt,
+  };
+}
+
+function bayJourneyCompletionFromGithubWebhook({ event, payload, env }) {
+  if (event !== "issue_comment") return null;
+  const comment = objectValue(payload?.comment);
+  if (!clawsweeperBotLogins(env).has(normalizedLogin(objectValue(comment.user).login))) return null;
+  const issue = objectValue(payload?.issue);
+  const repo = objectValue(payload?.repository);
+  if (!isEligibleGithubWebhookRepository(repo)) return null;
+  const repository = String(repo.full_name || "").toLowerCase();
+  const number = Number(issue.number);
+  const body = String(comment.body || "");
+  const sourceCommentId = Number(body.match(/<!--\s*clawsweeper-command-ack:(\d+)\s*-->/i)?.[1]);
+  const status = body.match(/<!--\s*clawsweeper-command-status:(\d+):(review|re_review):[^>]*-->/i);
+  const completedAt = exactWebhookTimestamp(comment.updated_at || comment.created_at);
+  const completed =
+    /<!--\s*clawsweeper-command-progress:start\s*-->[\s\S]*?^- State:\s*Complete\s*$[\s\S]*?<!--\s*clawsweeper-command-progress:end\s*-->/im.test(
+      body,
+    );
+  if (
+    !repository ||
+    !Number.isInteger(number) ||
+    number <= 0 ||
+    !Number.isSafeInteger(sourceCommentId) ||
+    sourceCommentId <= 0 ||
+    !status ||
+    Number(status[1]) !== number ||
+    !completedAt ||
+    !completed
+  ) {
+    return null;
+  }
+  return {
+    repository,
+    number,
+    source_comment_id: sourceCommentId,
+    completed_at: completedAt,
+    completion_kind: "final_command_status",
+    completion_comment_id: Number(comment.id),
   };
 }
 
@@ -2291,18 +2285,6 @@ async function authenticatedExactReviewReconcile(request, env) {
         },
       );
   const unavailable = checked.filter((result) => result === undefined).length;
-  const requiredUnavailable = checked.filter((result, index) => {
-    const candidate = candidates[index];
-    return (
-      result === undefined &&
-      (!includeAllClaimed ||
-        requestedRuns.some(
-          (requested) =>
-            requested.runId === candidate?.runId &&
-            (requested.runAttempt === undefined || requested.runAttempt === candidate.runAttempt),
-        ))
-    );
-  }).length;
   const terminalRuns = checked.filter(
     (
       result,
@@ -2335,14 +2317,14 @@ async function authenticatedExactReviewReconcile(request, env) {
   }
   return json(
     {
-      ok: requiredUnavailable === 0,
+      ok: unavailable === 0,
       requested: requestedRuns.length,
       claimed: candidates.length,
       terminal: terminalRuns.length,
       unavailable,
       ...reconciliation,
     },
-    requiredUnavailable ? 502 : 200,
+    unavailable ? 502 : 200,
   );
 }
 
@@ -2379,8 +2361,6 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
   const sourceAction = String(decision.sourceAction || "");
   const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
   const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
-  const hasSourceCommentId = Object.hasOwn(decision, "sourceCommentId");
-  const sourceCommentId = hasSourceCommentId ? Number(decision.sourceCommentId) : undefined;
   const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
   const statusCommentId = hasStatusCommentId ? Number(decision.statusCommentId) : undefined;
   const hasAdditionalPrompt = Object.hasOwn(decision, "additionalPrompt");
@@ -2395,12 +2375,6 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
     hasCommandStatusMarker &&
     (typeof commandStatusMarker !== "string" ||
       !EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN.test(commandStatusMarker))
-  ) {
-    return null;
-  }
-  if (
-    hasSourceCommentId &&
-    (!Number.isSafeInteger(sourceCommentId) || Number(sourceCommentId) <= 0)
   ) {
     return null;
   }
@@ -2433,7 +2407,6 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
       ? { mediaProofTimeoutMs: Number(decision.mediaProofTimeoutMs) }
       : {}),
     ...(hasCommandStatusMarker ? { commandStatusMarker } : {}),
-    ...(hasSourceCommentId ? { sourceCommentId } : {}),
     ...(hasStatusCommentId ? { statusCommentId } : {}),
     ...(hasAdditionalPrompt ? { additionalPrompt } : {}),
   };
@@ -2450,13 +2423,6 @@ function mergePendingExactReviewDecision(
     !Object.hasOwn(next, "statusCommentId")
   ) {
     delete merged.statusCommentId;
-  }
-  if (
-    Object.hasOwn(next, "commandStatusMarker") &&
-    next.commandStatusMarker !== current.commandStatusMarker &&
-    !Object.hasOwn(next, "sourceCommentId")
-  ) {
-    delete merged.sourceCommentId;
   }
   return merged;
 }
@@ -2521,7 +2487,6 @@ function exactReviewTerminalRuns(value) {
       runAttempt: number;
       claimedRunAttempt?: number;
       outcome: ExactReviewCompletionOutcome;
-      completedAt?: string;
     }
   > = [];
   const seen = new Set<string>();
@@ -2535,30 +2500,20 @@ function exactReviewTerminalRuns(value) {
         : exactReviewRunAttempt(record.claimed_run_attempt);
     const claimGeneration = Number(record.claim_generation);
     const outcome = exactReviewCompletionOutcome(record.outcome);
-    const completedAt =
-      record.completed_at === undefined ? null : exactWebhookTimestamp(record.completed_at);
     if (
       !/^\d+$/.test(runId) ||
       !runAttempt ||
       claimedRunAttempt === null ||
       !Number.isInteger(claimGeneration) ||
       claimGeneration < 0 ||
-      !outcome ||
-      (record.completed_at !== undefined && !completedAt)
+      !outcome
     ) {
       return null;
     }
     const key = `${runId}:${runAttempt}:${claimGeneration}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    runs.push({
-      runId,
-      runAttempt,
-      claimedRunAttempt,
-      claimGeneration,
-      outcome,
-      ...(completedAt ? { completedAt } : {}),
-    });
+    runs.push({ runId, runAttempt, claimedRunAttempt, claimGeneration, outcome });
   }
   return runs;
 }
@@ -2649,36 +2604,6 @@ function finishExactReviewQueueItem(
     delete state.items[item.key];
   }
   return requeued;
-}
-
-function exactReviewBayJourneyCompletion(
-  item: ExactReviewQueueItem,
-  run: {
-    runId: string;
-    runAttempt: number;
-    outcome: ExactReviewCompletionOutcome;
-    completedAt?: string;
-  },
-) {
-  const decision = item.leaseDecision || item.decision;
-  if (
-    run.outcome !== "success" ||
-    !run.completedAt ||
-    !Number.isSafeInteger(decision.sourceCommentId) ||
-    Number(decision.sourceCommentId) <= 0
-  ) {
-    return null;
-  }
-  return {
-    repository: decision.targetRepo,
-    number: decision.itemNumber,
-    source_comment_id: Number(decision.sourceCommentId),
-    completed_at: run.completedAt,
-    completion_kind: "exact_review_terminal",
-    completion_comment_id: decision.statusCommentId ?? null,
-    completion_run_id: run.runId,
-    completion_run_attempt: run.runAttempt,
-  };
 }
 
 function exactReviewCompletionRetryAt(value, now: number): number | null {
@@ -3101,7 +3026,6 @@ async function exactReviewTerminalRunFromSummary(
   }
   const conclusion = String(payload.conclusion || "").trim();
   if (!conclusion) throw new Error("ClawSweeper completed run missing conclusion");
-  const completedAt = exactWebhookTimestamp(payload.updated_at || latest.updated_at);
   return {
     run_id: candidate.runId,
     run_attempt: latestRunAttempt,
@@ -3109,14 +3033,12 @@ async function exactReviewTerminalRunFromSummary(
     claim_generation: candidate.claimGeneration,
     outcome:
       conclusion === "success" ? "success" : conclusion === "cancelled" ? "cancelled" : "failure",
-    ...(completedAt ? { completed_at: completedAt } : {}),
   } satisfies {
     run_id: string;
     run_attempt: number;
     claimed_run_attempt: number | null;
     claim_generation: number;
     outcome: ExactReviewCompletionOutcome;
-    completed_at?: string;
   };
 }
 
@@ -3348,7 +3270,6 @@ async function dispatchClawsweeperItem({
     ...(decision.commandStatusMarker
       ? { command_status_marker: decision.commandStatusMarker }
       : {}),
-    ...(decision.sourceCommentId ? { source_comment_id: decision.sourceCommentId } : {}),
     ...(decision.statusCommentId ? { status_comment_id: decision.statusCommentId } : {}),
     ...(decision.additionalPrompt ? { additional_prompt: decision.additionalPrompt } : {}),
   };
@@ -4814,16 +4735,7 @@ function bayJourneyCompletionId(
   sourceCommentId,
   completionCommentId,
   completedAt,
-  completionRunId,
-  completionRunAttempt,
 ) {
-  if (
-    /^\d+$/.test(String(completionRunId || "")) &&
-    Number.isInteger(Number(completionRunAttempt)) &&
-    Number(completionRunAttempt) > 0
-  ) {
-    return `${String(repository || "").toLowerCase()}#${Number(itemNumber)}:command:${Number(sourceCommentId)}:completion:run:${completionRunId}:attempt:${Number(completionRunAttempt)}`;
-  }
   const completedMarker = Date.parse(completedAt);
   const marker =
     Number.isSafeInteger(Number(completionCommentId)) && Number(completionCommentId) > 0
@@ -4873,8 +4785,6 @@ function normalizeBayJourneyCompletion(value) {
   const completedAt = bayJourneyTimestamp(completion.completed_at);
   const completionKind = nullableString(completion.completion_kind);
   const completionCommentId = Number(completion.completion_comment_id);
-  const completionRunId = nullableString(completion.completion_run_id);
-  const completionRunAttempt = Number(completion.completion_run_attempt);
   if (
     !repository ||
     !Number.isInteger(number) ||
@@ -4892,8 +4802,6 @@ function normalizeBayJourneyCompletion(value) {
       sourceCommentId,
       completionCommentId,
       completedAt,
-      completionRunId,
-      completionRunAttempt,
     ),
     item_key: `${repository}#${number}`,
     repository,
@@ -4905,15 +4813,6 @@ function normalizeBayJourneyCompletion(value) {
       Number.isSafeInteger(completionCommentId) && completionCommentId > 0
         ? completionCommentId
         : null,
-    ...(completionRunId &&
-    /^\d+$/.test(completionRunId) &&
-    Number.isInteger(completionRunAttempt) &&
-    completionRunAttempt > 0
-      ? {
-          completion_run_id: completionRunId,
-          completion_run_attempt: completionRunAttempt,
-        }
-      : {}),
   };
 }
 
@@ -4934,12 +4833,6 @@ function normalizeBayJourneyRecord(value) {
     completed_at: completion?.completed_at || null,
     completion_kind: completion?.completion_kind || null,
     completion_comment_id: completion?.completion_comment_id || null,
-    ...(completion?.completion_run_id
-      ? {
-          completion_run_id: completion.completion_run_id,
-          completion_run_attempt: completion.completion_run_attempt,
-        }
-      : {}),
   };
 }
 
@@ -6885,7 +6778,7 @@ async function writeStoredJson(
   );
 }
 
-async function prependStoredEvent(env, event, ci = null) {
+async function prependStoredEvent(env, event) {
   const store = env.STATUS_STORE;
   if (isDurableStatusStore(store)) {
     const response = await durableStatusStoreStub(store).fetch(
@@ -6894,175 +6787,21 @@ async function prependStoredEvent(env, event, ci = null) {
         method: "POST",
         body: JSON.stringify({
           event,
-          ci,
           limit: EVENT_LIMIT,
           ttl_seconds: EVENT_STORE_TTL_SECONDS,
-          ci_ttl_seconds: numberFrom(env.CI_STATUS_TTL_SECONDS, CI_STATUS_TTL_SECONDS),
         }),
       },
     );
     if (!response.ok) throw new Error(`status store event write failed: ${response.status}`);
-    const stored = await response.json();
-    return {
-      event: stored.event,
-      isLatest: stored.is_latest === true,
-      isLatestForItem: stored.is_latest_for_item === true,
-      shouldWriteCi: false,
-      ci: null,
-    };
+    return;
   }
   const current = await readEvents(env);
-  const upserted = upsertStoredEvent(current, event);
-  const projectedCi = ci === null ? null : ciForStoredEvent(ci, upserted.event);
   await writeStoredJson(
     env,
     "events",
-    upserted.events.slice(0, EVENT_LIMIT),
+    [event, ...current].slice(0, EVENT_LIMIT),
     EVENT_STORE_TTL_SECONDS,
   );
-  return {
-    event: upserted.event,
-    isLatest: upserted.isLatest,
-    isLatestForItem: upserted.isLatestForItem,
-    ci: projectedCi,
-    shouldWriteCi:
-      projectedCi !== null &&
-      upserted.isLatestForItem &&
-      shouldAdvanceCiProjection(
-        await readStoredJson(env, ciStatusKey(projectedCi.repository, projectedCi.item_number)),
-        projectedCi,
-      ),
-  };
-}
-
-function ciForStoredEvent(ci, event) {
-  const receivedAt = canonicalCiSourceTimestamp(event?.received_at);
-  return receivedAt ? { ...ci, received_at: receivedAt } : ci;
-}
-
-function upsertStoredEvent(events, event) {
-  const key = nullableString(event?.idempotency_key);
-  if (!key) return storedEventResult([event, ...events], event, 0);
-  const index = events.findIndex((candidate) => nullableString(candidate?.idempotency_key) === key);
-  if (index < 0) return storedEventResult([event, ...events], event, 0);
-
-  const storedEvent = {
-    ...event,
-    received_at: nullableString(events[index]?.received_at) ?? event.received_at,
-  };
-  const next = [...events];
-  next[index] = storedEvent;
-  return storedEventResult(next, storedEvent, index);
-}
-
-function storedEventResult(events, event, index) {
-  const itemKey = storedEventItemKey(event);
-  const projectionIndex = latestStoredEventProjectionIndex(events, itemKey);
-  return {
-    events,
-    event,
-    isLatest: index === 0,
-    isLatestForItem: projectionIndex !== -1 && projectionIndex === index,
-  };
-}
-
-function storedEventItemKey(event) {
-  const repository = nullableString(event?.repository);
-  const itemNumber = numberOrNull(event?.item_number);
-  return repository && itemNumber ? `${repository}#${itemNumber}` : null;
-}
-
-function latestStoredEventProjectionIndex(events, itemKey) {
-  if (itemKey === null) return -1;
-  let winner = -1;
-  for (let index = 0; index < events.length; index += 1) {
-    if (storedEventItemKey(events[index]) !== itemKey) continue;
-    const order = storedCiProjectionOrder(events[index]);
-    if (!order) continue;
-    if (
-      winner === -1 ||
-      compareStoredCiProjectionOrder(order, storedCiProjectionOrder(events[winner])) > 0
-    ) {
-      winner = index;
-    }
-  }
-  return winner;
-}
-
-function shouldAdvanceCiProjection(current, incoming) {
-  const incomingOrder = ciProjectionOrder(incoming);
-  if (!incomingOrder) return false;
-  const currentOrder = storedCiProjectionOrder(current);
-  if (!currentOrder) return true;
-  if (
-    currentOrder.legacy &&
-    incomingOrder.timestamp === currentOrder.timestamp &&
-    incomingOrder.receivedAt === currentOrder.receivedAt
-  ) {
-    return false;
-  }
-  const order = compareCiProjectionOrder(incomingOrder, currentOrder);
-  return order > 0 || (order === 0 && incomingOrder.key === currentOrder.key);
-}
-
-function ciProjectionOrder(value) {
-  const key = nullableString(value?.ci_projection_key);
-  if (!key) return null;
-  const receivedAt = canonicalCiSourceTimestamp(value?.received_at);
-  const timestamp = canonicalCiSourceTimestamp(value?.ci_projection_updated_at) ?? receivedAt;
-  return timestamp && receivedAt ? { timestamp, receivedAt, key, legacy: false } : null;
-}
-
-function storedCiProjectionOrder(value) {
-  const order = ciProjectionOrder(value);
-  if (order) return order;
-  if (!isLegacyCiProjection(value)) return null;
-  const timestamp =
-    canonicalCiSourceTimestamp(value?.ci_projection_updated_at) ??
-    canonicalCiSourceTimestamp(value?.updated_at) ??
-    canonicalCiSourceTimestamp(value?.received_at);
-  if (!timestamp) return null;
-  return {
-    timestamp,
-    receivedAt: canonicalCiSourceTimestamp(value?.received_at) ?? timestamp,
-    key: "",
-    legacy: true,
-  };
-}
-
-function isLegacyCiProjection(value) {
-  const eventType = nullableString(value?.event_type);
-  if (eventType) return eventType === "ci.status";
-  const itemNumber = numberOrNull(value?.item_number);
-  return Boolean(
-    nullableString(value?.repository) &&
-    Number.isInteger(itemNumber) &&
-    itemNumber > 0 &&
-    nullableString(value?.source) &&
-    nullableString(value?.state),
-  );
-}
-
-function compareStoredCiProjectionOrder(left, right) {
-  if (!right) return 1;
-  const timestampOrder = compareCanonicalText(left.timestamp, right.timestamp);
-  if (timestampOrder) return timestampOrder;
-  const receiptOrder = compareCanonicalText(left.receivedAt, right.receivedAt);
-  if (receiptOrder) return receiptOrder;
-  return left.legacy || right.legacy ? 0 : compareCanonicalText(left.key, right.key);
-}
-
-function compareCiProjectionOrder(left, right) {
-  if (!right) return 1;
-  const timestampOrder = compareCanonicalText(left.timestamp, right.timestamp);
-  if (timestampOrder) return timestampOrder;
-  const receiptOrder = compareCanonicalText(left.receivedAt, right.receivedAt);
-  return receiptOrder || compareCanonicalText(left.key, right.key);
-}
-
-function compareCanonicalText(left, right) {
-  if (left === right) return 0;
-  return left > right ? 1 : -1;
 }
 
 async function readStatusStoreText(store, key) {
@@ -7383,23 +7122,17 @@ async function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
-function normalizeEvent(
-  body,
-  idempotencyKey = null,
-  ci = null,
-  receivedAt = new Date().toISOString(),
-) {
-  const itemNumber = numberOrNull(ci?.item_number ?? body.item_number);
+function normalizeEvent(body) {
+  const itemNumber = numberOrNull(body.item_number);
   const sourceItemNumber = numberOrNull(body.source_item_number);
   return {
-    id: idempotencyKey || crypto.randomUUID(),
-    idempotency_key: idempotencyKey,
-    received_at: receivedAt,
+    id: crypto.randomUUID(),
+    received_at: new Date().toISOString(),
     event_type: stringField(body.event_type, "status.event"),
     mode: stringField(body.mode, "unknown"),
     stage: stringField(body.stage, "unknown"),
     status: stringField(body.status, "unknown"),
-    repository: nullableString(ci?.repository ?? body.repository),
+    repository: nullableString(body.repository),
     item_url: nullableString(body.item_url),
     run_url: nullableString(body.run_url),
     title: nullableString(body.title),
@@ -7412,18 +7145,10 @@ function normalizeEvent(
     cluster_id: nullableString(body.cluster_id),
     duration_ms: numberOrNull(body.duration_ms),
     note: nullableString(body.note),
-    ...(ci?.ci_projection_key
-      ? {
-          ...(ci.ci_projection_updated_at
-            ? { ci_projection_updated_at: ci.ci_projection_updated_at }
-            : {}),
-          ci_projection_key: ci.ci_projection_key,
-        }
-      : {}),
   };
 }
 
-function normalizeCiStatus(body, idempotencyKey = null, receivedAt = new Date().toISOString()) {
+function normalizeCiStatus(body) {
   const ci =
     body.ci && typeof body.ci === "object"
       ? body.ci
@@ -7435,9 +7160,7 @@ function normalizeCiStatus(body, idempotencyKey = null, receivedAt = new Date().
   const itemNumber = numberOrNull(ci.item_number ?? body.item_number);
   if (!repository || !Number.isInteger(itemNumber) || itemNumber <= 0) return null;
   const state = normalizeCiState(ci.state ?? ci.status ?? body.status);
-  const suppliedUpdatedAt = nullableString(ci.updated_at);
-  const projectionUpdatedAt = canonicalCiSourceTimestamp(suppliedUpdatedAt);
-  const normalized = {
+  return {
     state,
     source: stringField(ci.source ?? body.source, "stored"),
     label: nullableString(ci.label),
@@ -7451,38 +7174,9 @@ function normalizeCiStatus(body, idempotencyKey = null, receivedAt = new Date().
     total: Math.max(0, numberOrNull(ci.total) ?? 0),
     failing: Math.max(0, numberOrNull(ci.failing) ?? 0),
     pending: Math.max(0, numberOrNull(ci.pending) ?? 0),
-    updated_at: projectionUpdatedAt ?? suppliedUpdatedAt ?? receivedAt,
-    received_at: receivedAt,
+    updated_at: nullableString(ci.updated_at) || new Date().toISOString(),
+    received_at: new Date().toISOString(),
   };
-  if (suppliedUpdatedAt && !projectionUpdatedAt) return normalized;
-  return {
-    ...normalized,
-    ...(projectionUpdatedAt ? { ci_projection_updated_at: projectionUpdatedAt } : {}),
-    ci_projection_key: ciProjectionKey(normalized, idempotencyKey),
-  };
-}
-
-function canonicalCiSourceTimestamp(value) {
-  const text = nullableString(value);
-  if (!text) return null;
-  const timestamp = Date.parse(text);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
-}
-
-function ciProjectionKey(ci, idempotencyKey) {
-  if (idempotencyKey) return `idempotency:${idempotencyKey}`;
-  return `snapshot:${JSON.stringify([
-    ci.repository,
-    ci.item_number,
-    ci.source,
-    ci.label,
-    ci.run_url,
-    ci.head_sha,
-    ci.state,
-    ci.total,
-    ci.failing,
-    ci.pending,
-  ])}`;
 }
 
 function normalizeCiState(value) {

@@ -9,7 +9,6 @@ import {
 } from "../action-ledger.js";
 import {
   flushWorkflowActionEvents,
-  interruptOpenWorkflowActionEvents,
   recordWorkflowActionEvent,
   workflowActionEventsEnabled,
 } from "../action-ledger-runtime.js";
@@ -417,7 +416,6 @@ export function recordCommandRequeue(
   options: {
     dispatchKey: string;
     sourceJobPath: string;
-    sourceStateRevision: string;
     sourceJobSha256: string;
     depth: number;
   },
@@ -431,7 +429,6 @@ export function recordCommandRequeue(
     eventIdentity: {
       dispatchKey: options.dispatchKey,
       sourceJobPath: options.sourceJobPath,
-      sourceStateRevision: options.sourceStateRevision,
       sourceJobSha256: options.sourceJobSha256,
       depth: options.depth,
     },
@@ -440,7 +437,6 @@ export function recordCommandRequeue(
       mutation: "requeue_dispatch",
       dispatchKey: options.dispatchKey,
       sourceJobPath: options.sourceJobPath,
-      sourceStateRevision: options.sourceStateRevision,
       sourceJobSha256: options.sourceJobSha256,
       depth: options.depth,
     },
@@ -482,7 +478,6 @@ export function recordCommandLifecycleFailure(
 }
 
 export async function flushCommandActionEvents(): Promise<string[]> {
-  interruptOpenWorkflowActionEvents(commandActionLedgerRoot());
   return flushWorkflowActionEvents(commandActionLedgerRoot());
 }
 

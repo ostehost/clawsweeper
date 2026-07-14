@@ -1,10 +1,10 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { pipeline } from "node:stream";
 import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
-  redactCodexText,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree } from "./codex-spawn.js";
 
@@ -20,16 +20,13 @@ interface WorkerOptions {
 }
 
 const options = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as WorkerOptions;
-const input = await readWorkerInput();
 const stdout = openCodexOutputCapture(options.stdoutPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
-  redactValues: input.redactValues,
 });
 const stderr = openCodexOutputCapture(options.stderrPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
-  redactValues: input.redactValues,
 });
 process.env.CODEX_BIN = options.command;
 const child = spawnCodex(options.args, { cwd: process.cwd(), env: process.env });
@@ -50,7 +47,9 @@ child.stderr.on("data", (chunk: Buffer) => {
   appendCodexOutputCapture(stderr, chunk);
 });
 child.stdin.on("error", () => {});
-child.stdin.end(input.prompt);
+pipeline(process.stdin, child.stdin, (error) => {
+  if (error && !terminating && !spawnError) spawnError = error;
+});
 
 child.once("error", (error) => {
   spawnError = error;
@@ -66,7 +65,7 @@ child.once("close", (status, signal) => {
       status,
       signal,
       ...(timeoutError || spawnError
-        ? { error: serializedError(timeoutError ?? spawnError!, input.redactValues) }
+        ? { error: serializedError(timeoutError ?? spawnError!) }
         : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
@@ -86,33 +85,10 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-function serializedError(
-  error: Error,
-  redactValues: readonly string[],
-): {
-  message: string;
-  code?: string;
-} {
+function serializedError(error: Error): { message: string; code?: string } {
   const code = "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
-    message: redactCodexText(error.message, redactValues),
+    message: error.message,
     ...(typeof code === "string" ? { code } : {}),
-  };
-}
-
-async function readWorkerInput(): Promise<{ prompt: string; redactValues: string[] }> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
-    input?: unknown;
-    redactValues?: unknown;
-  };
-  return {
-    prompt: typeof value.input === "string" ? value.input : "",
-    redactValues: Array.isArray(value.redactValues)
-      ? value.redactValues.filter((entry): entry is string => typeof entry === "string")
-      : [],
   };
 }

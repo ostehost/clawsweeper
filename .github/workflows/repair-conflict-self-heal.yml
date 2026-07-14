@@ -83,10 +83,6 @@ jobs:
         with:
           build-script: build:repair
 
-      - name: Setup conflict self-heal action ledger
-        id: self-heal-action-ledger
-        uses: ./.github/actions/setup-action-ledger
-
       - name: Plan conflict self-heal
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
@@ -121,52 +117,4 @@ jobs:
             --path results/conflict-self-heal-dispatch.json \
             --path results/conflict-self-heal.json \
             --path results/conflict-self-heal.md \
-            --receipt-kind conflict_self_heal_state \
             --rebase-strategy theirs
-
-      - name: Finalize conflict self-heal action ledger
-        if: ${{ always() && steps.self-heal-action-ledger.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          mkdir -p .artifacts
-          pnpm run --silent repair:action-ledger -- finalize \
-            --repair-lane conflict-self-heal \
-            --allow-empty \
-            > .artifacts/conflict-self-heal-action-ledger-manifest.json
-
-      - name: Publish immutable conflict self-heal action ledger
-        if: ${{ always() && steps.self-heal-action-ledger.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          manifest_file=".artifacts/conflict-self-heal-action-ledger-manifest.json"
-          event_paths_file=".artifacts/conflict-self-heal-action-ledger-paths.txt"
-          import_result_file=".artifacts/conflict-self-heal-action-ledger-import.json"
-          test -s "$manifest_file"
-          pnpm run --silent repair:action-ledger -- publish \
-            --repair-lane conflict-self-heal \
-            --manifest "$manifest_file" \
-            --allow-empty \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
-          jq -e --slurpfile manifest "$manifest_file" \
-            '.eventPaths == $manifest[0].event_paths' \
-            "$import_result_file" >/dev/null
-          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            exit 0
-          fi
-          action_ledger_args=()
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-            action_ledger_args+=(--path "$event_path")
-          done < "$event_paths_file"
-          pnpm run repair:publish-main -- \
-            --message "chore: append conflict self-heal action ledger" \
-            "${action_ledger_args[@]}" \
-            --rebase-strategy normal

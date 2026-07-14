@@ -1,15 +1,11 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
-  rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -22,46 +18,16 @@ import {
 } from "./commit-classifier.js";
 import { publishCheckFromReport, splitFrontMatter } from "./commit-checks.js";
 import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweeper-args.js";
-import {
-  codexEnv,
-  codexInternalModelValues,
-  codexLoginConfig,
-  codexModelArgs,
-  codexSensitiveEnvValues,
-  PUBLIC_CODEX_MODEL,
-} from "./codex-env.js";
-import {
-  codexProcessErrorCode,
-  runCodexProcess,
-  type CodexProcessResult,
-} from "./codex-process.js";
-import { redactCodexText } from "./codex-output-capture.js";
-import {
-  hydrateCommitReviewGitHubContext,
-  readCommitReviewGitHubContext,
-  renderCommitReviewGitHubContext,
-  writeCommitReviewGitHubContext,
-  type CommitReviewGitHubContext,
-} from "./commit-review-context.js";
+import { safeOutputTail } from "./clawsweeper-text.js";
+import { codexEnv, codexLoginConfig, codexModelArgs, PUBLIC_CODEX_MODEL } from "./codex-env.js";
+import { codexProcessErrorCode, runCodexProcess } from "./codex-process.js";
 import { runText } from "./command.js";
+import { ghRetryKind, ghRetryWaitMs } from "./github-retry.js";
 import {
   configuredRepositoryProfileFor,
   DEFAULT_TARGET_REPO,
   repositoryProfileFor,
 } from "./repository-profiles.js";
-import {
-  commitReviewLifecycleSucceeded,
-  recordCommitArtifactPrepared,
-  recordCommitLifecycleEvent,
-  recordCommitWorkflowEvent,
-  runCommitMutation,
-  type CommitLifecycleInput,
-} from "./commit-action-ledger.js";
-import {
-  ACTION_EVENT_REASON_CODES,
-  ACTION_EVENT_STATUSES,
-  ACTION_EVENT_TYPES,
-} from "./action-ledger.js";
 
 export { isReviewableCommitPath } from "./commit-classifier.js";
 
@@ -85,25 +51,6 @@ const DEFAULT_CODEX_MODEL = PUBLIC_CODEX_MODEL;
 const DEFAULT_REASONING_EFFORT = "high";
 const DEFAULT_SERVICE_TIER = "";
 const COMMIT_REVIEW_CHECK_NAME = "ClawSweeper Commit Review";
-const COMMIT_REVIEW_SUCCESS_RESULTS = new Set([
-  "nothing_found",
-  "findings",
-  "inconclusive",
-  "skipped_non_code",
-]);
-const COMMIT_REVIEW_DIAGNOSTIC_VERSION = 1;
-
-interface CommitReviewDiagnostic {
-  diagnostic_version: number;
-  commit_sha: string;
-  outcome: "completed" | "failed";
-  failure_reason: "none" | "timeout" | "process_error" | "nonzero_exit" | "missing_report";
-  exit_status: number | null;
-  signal: NodeJS.Signals | null;
-  stdout_capture_bytes: number;
-  stderr_capture_bytes: number;
-  report_produced: boolean;
-}
 
 function run(command: string, commandArgs: string[], options: { cwd?: string } = {}): string {
   return runText(command, commandArgs, { cwd: options.cwd });
@@ -117,13 +64,6 @@ function assertSha(value: string, label = "sha"): string {
   const sha = value.trim();
   if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`Invalid ${label}: ${value}`);
   return sha.toLowerCase();
-}
-
-function commitLifecycle(repository: string, sha: string): CommitLifecycleInput {
-  return {
-    repository,
-    sha,
-  };
 }
 
 function repoSlug(targetRepo: string): string {
@@ -149,15 +89,6 @@ function personLabel(name: string, githubLogin: string): string {
   const login = githubLogin.trim();
   if (login && login !== "unknown") return `@${login}`;
   return stripEmailIdentity(name) || "unknown";
-}
-
-function prehydratedGitHubLogin(value: string, label: string): string {
-  const login = value.trim();
-  if (!login) return "";
-  if (login.length > 100 || !/^[A-Za-z0-9-]+(?:\[bot\])?$/.test(login)) {
-    throw new Error(`Invalid ${label}: ${value}`);
-  }
-  return login;
 }
 
 export function parseCoAuthors(body: string): string[] {
@@ -261,7 +192,6 @@ function promptForCommit(options: {
   sha: string;
   baseSha: string;
   metadata: CommitMetadata;
-  githubContext: CommitReviewGitHubContext | null;
   additionalPrompt: string;
 }): string {
   const prompt = readFileSync(join(ROOT, "prompts", "review-commit.md"), "utf8");
@@ -270,9 +200,6 @@ function promptForCommit(options: {
     : "- none";
   const additionalPrompt = options.additionalPrompt.trim()
     ? `\n## Additional Manual Prompt\n\n${options.additionalPrompt.trim()}\n`
-    : "";
-  const githubContext = options.githubContext
-    ? `\n${renderCommitReviewGitHubContext(options.githubContext)}\n`
     : "";
   return `${prompt}
 
@@ -292,7 +219,6 @@ function promptForCommit(options: {
 - Co-authors:
 ${coAuthors}
 
-${githubContext}
 ${commitDiffSummary(options.targetDir, options.baseSha, options.sha)}
 ${additionalPrompt}`;
 }
@@ -365,7 +291,6 @@ function runCodex(options: {
   sha: string;
   baseSha: string;
   metadata: CommitMetadata;
-  githubContext: CommitReviewGitHubContext | null;
   model: string;
   reasoningEffort: string;
   sandboxMode: string;
@@ -375,177 +300,64 @@ function runCodex(options: {
   additionalPrompt: string;
   extraCodexConfig?: readonly string[];
 }): string {
-  const lifecycle = commitLifecycle(options.targetRepo, options.sha);
   ensureDir(options.workDir);
-  const diagnosticPath = join(options.workDir, `${options.sha}.diagnostic.json`);
-  const captureDir = mkdtempSync(join(tmpdir(), "clawsweeper-commit-review-"));
-  const rawOutputPath = join(captureDir, `${options.sha}.md`);
-  const stdoutPath = join(captureDir, `${options.sha}.jsonl`);
-  const stderrPath = join(captureDir, `${options.sha}.stderr.log`);
-  const prompt = promptForCommit({
-    targetDir: options.targetDir,
-    targetRepo: options.targetRepo,
-    sha: options.sha,
-    baseSha: options.baseSha,
-    metadata: options.metadata,
-    githubContext: options.githubContext,
-    additionalPrompt: options.additionalPrompt,
-  });
+  const promptPath = join(options.workDir, `${options.sha}.prompt.md`);
+  const outputPath = join(options.workDir, `${options.sha}.md`);
+  writeFileSync(
+    promptPath,
+    promptForCommit({
+      targetDir: options.targetDir,
+      targetRepo: options.targetRepo,
+      sha: options.sha,
+      baseSha: options.baseSha,
+      metadata: options.metadata,
+      additionalPrompt: options.additionalPrompt,
+    }),
+    "utf8",
+  );
   const codexConfig = [
     `model_reasoning_effort="${options.reasoningEffort}"`,
     codexLoginConfig(),
     'approval_policy="never"',
     ...(options.extraCodexConfig ?? []),
   ];
-  recordCommitLifecycleEvent(lifecycle, {
-    type: ACTION_EVENT_TYPES.reviewStarted,
-    status: ACTION_EVENT_STATUSES.started,
-    reasonCode: ACTION_EVENT_REASON_CODES.selected,
-    mutation: false,
-    component: "commit_review",
-    state: "started",
-    reviewMode: "commit_review",
-    eventIdentity: { sha: options.sha },
-  });
   if (options.serviceTier) codexConfig.splice(1, 0, `service_tier="${options.serviceTier}"`);
-  const processEnv = codexEnv();
-  const redactionSecrets = [
-    ...new Set([...codexSensitiveEnvValues(process.env), ...codexInternalModelValues()]),
-  ].filter((value) => value.length >= 6);
-  let result: CodexProcessResult;
-  let report = "";
-  try {
-    result = runCodexProcess({
-      args: [
-        "exec",
-        ...codexModelArgs(options.model),
-        ...codexConfig.flatMap((config) => ["-c", config]),
-        "-C",
-        options.targetDir,
-        "--output-last-message",
-        rawOutputPath,
-        "--json",
-        "--sandbox",
-        options.sandboxMode,
-        "-",
-      ],
-      cwd: options.targetDir,
-      env: processEnv,
-      input: prompt,
-      stdoutPath,
-      stderrPath,
-      timeoutMs: options.timeoutMs,
-      redactValues: redactionSecrets,
-    });
-    if (existsSync(rawOutputPath)) {
-      report = redactCommitReviewText(readFileSync(rawOutputPath, "utf8"), redactionSecrets);
-    }
-    const diagnostic = commitReviewDiagnostic({
+  const result = runCodexProcess({
+    args: [
+      "exec",
+      ...codexModelArgs(options.model),
+      ...codexConfig.flatMap((config) => ["-c", config]),
+      "-C",
+      options.targetDir,
+      "--output-last-message",
+      outputPath,
+      "--sandbox",
+      options.sandboxMode,
+      "-",
+    ],
+    cwd: options.targetDir,
+    env: codexEnv({ ghToken: process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN }),
+    input: readFileSync(promptPath, "utf8"),
+    timeoutMs: options.timeoutMs,
+  });
+  if (result.error || result.status !== 0 || !existsSync(outputPath)) {
+    const timeout = codexProcessErrorCode(result.error) === "ETIMEDOUT";
+    const detail =
+      result.error instanceof Error
+        ? `${result.error.message}\n${safeOutputTail(result.stderr) || safeOutputTail(result.stdout)}`
+        : `exit ${result.status ?? "unknown"}\n${
+            safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."
+          }`;
+    return failureReport({
+      targetRepo: options.targetRepo,
       sha: options.sha,
-      result,
-      reportProduced: report.length > 0,
-      stdoutPath,
-      stderrPath,
+      baseSha: options.baseSha,
+      metadata: options.metadata,
+      detail: detail.trim(),
+      timeout,
     });
-    writeFileSync(diagnosticPath, `${JSON.stringify(diagnostic, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    recordCommitArtifactPrepared(lifecycle, {
-      path: diagnosticPath,
-      kind: "commit_review_diagnostic",
-      logKind: "diagnostic",
-    });
-    if (diagnostic.outcome === "failed") {
-      const timeout = diagnostic.failure_reason === "timeout";
-      const detail = commitReviewFailureDetail(diagnostic);
-      recordCommitLifecycleEvent(lifecycle, {
-        type: ACTION_EVENT_TYPES.reviewFailed,
-        status: ACTION_EVENT_STATUSES.failed,
-        reasonCode: timeout
-          ? ACTION_EVENT_REASON_CODES.timeout
-          : ACTION_EVENT_REASON_CODES.exception,
-        mutation: false,
-        component: "commit_review",
-        state: "failed",
-        reviewMode: "commit_review",
-        eventIdentity: {
-          sha: options.sha,
-          errorKind: diagnostic.failure_reason,
-        },
-      });
-      return failureReport({
-        targetRepo: options.targetRepo,
-        sha: options.sha,
-        baseSha: options.baseSha,
-        metadata: options.metadata,
-        detail,
-        timeout,
-      });
-    }
-    recordCommitLifecycleEvent(lifecycle, {
-      type: ACTION_EVENT_TYPES.reviewCompleted,
-      status: ACTION_EVENT_STATUSES.completed,
-      reasonCode: ACTION_EVENT_REASON_CODES.completed,
-      mutation: false,
-      component: "commit_review",
-      state: "completed",
-      reviewMode: "commit_review",
-      eventIdentity: { sha: options.sha },
-    });
-    return stripMarkdownFence(report);
-  } finally {
-    rmSync(captureDir, { recursive: true, force: true });
   }
-}
-
-function redactCommitReviewText(value: string, secrets: readonly string[]): string {
-  return redactCodexText(value, secrets);
-}
-
-function commitReviewDiagnostic(options: {
-  sha: string;
-  result: CodexProcessResult;
-  reportProduced: boolean;
-  stdoutPath: string;
-  stderrPath: string;
-}): CommitReviewDiagnostic {
-  const timedOut = codexProcessErrorCode(options.result.error) === "ETIMEDOUT";
-  const failureReason = timedOut
-    ? "timeout"
-    : options.result.error
-      ? "process_error"
-      : options.result.status !== 0
-        ? "nonzero_exit"
-        : !options.reportProduced
-          ? "missing_report"
-          : "none";
-  return {
-    diagnostic_version: COMMIT_REVIEW_DIAGNOSTIC_VERSION,
-    commit_sha: options.sha,
-    outcome: failureReason === "none" ? "completed" : "failed",
-    failure_reason: failureReason,
-    exit_status: options.result.status,
-    signal: options.result.signal,
-    stdout_capture_bytes: fileSize(options.stdoutPath),
-    stderr_capture_bytes: fileSize(options.stderrPath),
-    report_produced: options.reportProduced,
-  };
-}
-
-function fileSize(path: string): number {
-  return existsSync(path) ? statSync(path).size : 0;
-}
-
-function commitReviewFailureDetail(diagnostic: CommitReviewDiagnostic): string {
-  return [
-    `reason: ${diagnostic.failure_reason}`,
-    `exit_status: ${diagnostic.exit_status ?? "unknown"}`,
-    `signal: ${diagnostic.signal ?? "none"}`,
-    `stdout_capture_bytes: ${diagnostic.stdout_capture_bytes}`,
-    `stderr_capture_bytes: ${diagnostic.stderr_capture_bytes}`,
-    `report_produced: ${diagnostic.report_produced}`,
-  ].join("\n");
+  return stripMarkdownFence(readFileSync(outputPath, "utf8"));
 }
 
 function reviewCommand(args: Args): void {
@@ -554,105 +366,37 @@ function reviewCommand(args: Args): void {
     argString(args, "target_dir", repositoryProfileFor(targetRepo).checkoutDir),
   );
   const sha = assertSha(argString(args, "commit_sha", ""));
-  const lifecycle = commitLifecycle(targetRepo, sha);
-  const deferWorkflowCompletion = argBool(args, "defer_workflow_completion");
-  recordCommitWorkflowEvent(lifecycle, "started");
-  try {
-    const githubContextPath = argString(args, "github_context", "");
-    const githubContext = githubContextPath
-      ? readCommitReviewGitHubContext(resolve(githubContextPath), {
-          targetRepo,
-          sha,
-        })
-      : null;
-    const prehydratedGitHubMetadata =
-      argBool(args, "prehydrated_github_metadata") || githubContext !== null;
-    const metadata = commitMetadata(targetDir, targetRepo, sha, prehydratedGitHubMetadata);
-    if (githubContext) {
-      metadata.githubAuthor = githubContext.github_author;
-      metadata.githubCommitter = githubContext.github_committer;
-    } else if (prehydratedGitHubMetadata) {
-      metadata.githubAuthor = prehydratedGitHubLogin(
-        argString(args, "github_author", ""),
-        "GitHub author login",
-      );
-      metadata.githubCommitter = prehydratedGitHubLogin(
-        argString(args, "github_committer", ""),
-        "GitHub committer login",
-      );
-    }
-    const baseSha = assertSha(argString(args, "base_sha", metadata.parents[0] ?? ""), "base sha");
-    const reportDir = resolve(argString(args, "report_dir", "records"));
-    const artifactMode = argBool(args, "artifact_mode");
-    const outputPath = artifactMode
-      ? join(reportDir, artifactReportRelativePath(targetRepo, sha))
-      : resolve(commitReportRelativePath(targetRepo, sha));
-    const additionalPrompt = argString(
-      args,
-      "additional_prompt",
-      process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
-    );
-    const markdown = ensureCommitReportTimestamps(
-      runCodex({
-        targetDir,
-        targetRepo,
-        sha,
-        baseSha,
-        metadata,
-        githubContext,
-        model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
-        reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
-        sandboxMode: argString(args, "codex_sandbox", "danger-full-access"),
-        serviceTier: argString(args, "codex_service_tier", DEFAULT_SERVICE_TIER),
-        timeoutMs: argNumber(args, "codex_timeout_ms", 1_800_000),
-        workDir: resolve(argString(args, "work_dir", join(reportDir, ".codex"))),
-        additionalPrompt,
-      }),
-      metadata,
-    );
-    ensureDir(dirname(outputPath));
-    writeFileSync(outputPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
-    recordCommitArtifactPrepared(lifecycle, {
-      path: outputPath,
-      kind: "commit_review_report",
-    });
-    const reportResult = commitReviewReportResult(outputPath);
-    if (
-      argBool(args, "require_publishable_report") &&
-      !COMMIT_REVIEW_SUCCESS_RESULTS.has(reportResult)
-    ) {
-      throw new Error(`commit review report result is not publishable: ${reportResult}`);
-    }
-    if (!deferWorkflowCompletion) {
-      recordCommitWorkflowEvent(lifecycle, "completed");
-      recordCommitWorkflowEvent(lifecycle, "finalized");
-    }
-    console.log(outputPath);
-  } catch (error) {
-    if (!deferWorkflowCompletion) {
-      recordCommitWorkflowEvent(lifecycle, "failed", error);
-      recordCommitWorkflowEvent(lifecycle, "finalized");
-    }
-    throw error;
-  }
-}
-
-function hydrateGitHubContextCommand(args: Args): void {
-  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
-  const targetDir = resolve(
-    argString(args, "target_dir", repositoryProfileFor(targetRepo).checkoutDir),
+  const metadata = commitMetadata(targetDir, targetRepo, sha);
+  const baseSha = assertSha(argString(args, "base_sha", metadata.parents[0] ?? ""), "base sha");
+  const reportDir = resolve(argString(args, "report_dir", "records"));
+  const artifactMode = argBool(args, "artifact_mode");
+  const outputPath = artifactMode
+    ? join(reportDir, artifactReportRelativePath(targetRepo, sha))
+    : resolve(commitReportRelativePath(targetRepo, sha));
+  const additionalPrompt = argString(
+    args,
+    "additional_prompt",
+    process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
   );
-  const sha = assertSha(argString(args, "commit_sha", ""));
-  const outputPath = resolve(argString(args, "output", `${sha}.github-context.json`));
-  ensureDir(dirname(outputPath));
-  writeCommitReviewGitHubContext(
-    outputPath,
-    hydrateCommitReviewGitHubContext({
+  const markdown = ensureCommitReportTimestamps(
+    runCodex({
       targetDir,
       targetRepo,
       sha,
+      baseSha,
+      metadata,
+      model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
+      reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
+      sandboxMode: argString(args, "codex_sandbox", "danger-full-access"),
+      serviceTier: argString(args, "codex_service_tier", DEFAULT_SERVICE_TIER),
+      timeoutMs: argNumber(args, "codex_timeout_ms", 1_800_000),
+      workDir: resolve(argString(args, "work_dir", join(reportDir, ".codex"))),
+      additionalPrompt,
     }),
+    metadata,
   );
+  ensureDir(dirname(outputPath));
+  writeFileSync(outputPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
   console.log(outputPath);
 }
 
@@ -780,7 +524,6 @@ function localReviewCommand(args: Args): void {
       sha: headSha,
       baseSha,
       metadata,
-      githubContext: null,
       model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
       reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
       sandboxMode: argString(args, "codex_sandbox", "read-only"),
@@ -842,7 +585,6 @@ function publishCheckCommand(args: Args): void {
     "report_repo",
     process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper",
   );
-  const reportRevision = argString(args, "report_revision", "main");
   const reportPath = argString(args, "report_path", "");
   if (!reportPath) throw new Error("Missing --report-path");
   const markdown = readFileSync(reportPath, "utf8");
@@ -850,144 +592,14 @@ function publishCheckCommand(args: Args): void {
   const sha = assertSha(argString(args, "commit_sha", frontMatter.sha ?? ""));
   const reportRelativePath =
     argString(args, "report_relative_path", "") || commitReportRelativePath(targetRepo, sha);
-  const lifecycle = commitLifecycle(targetRepo, sha);
-  const continueWorkflow = argBool(args, "continue_workflow");
-  if (!continueWorkflow) recordCommitWorkflowEvent(lifecycle, "started");
-  try {
-    runCommitMutation(lifecycle, {
-      kind: "commit_check_publication",
-      identity: {
-        targetRepo,
-        reportRepo,
-        reportRevision,
-        reportRelativePath,
-        sha,
-        checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
-        reportSha256: createHash("sha256").update(markdown).digest("hex"),
-      },
-      operation: () =>
-        publishCheckFromReport({
-          targetRepo,
-          reportRepo,
-          reportRevision,
-          reportPath,
-          reportRelativePath,
-          sha,
-          checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
-        }),
-    });
-    if (!continueWorkflow) {
-      recordCommitWorkflowEvent(lifecycle, "completed");
-      recordCommitWorkflowEvent(lifecycle, "finalized");
-    }
-  } catch (error) {
-    if (!continueWorkflow) {
-      recordCommitWorkflowEvent(lifecycle, "failed", error);
-      recordCommitWorkflowEvent(lifecycle, "finalized");
-    }
-    throw error;
-  }
-}
-
-function finishReviewCommand(args: Args): void {
-  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
-  const sha = assertSha(argString(args, "commit_sha", ""));
-  const lifecycle = commitLifecycle(targetRepo, sha);
-  const reviewOutcome = argString(args, "review_outcome", "unknown");
-  const checkOutcome = argString(args, "check_outcome", "unknown");
-  const checksRequested = argBool(args, "checks_requested");
-  const reportPath = argString(args, "report_path", "");
-  const reportResult = commitReviewReportResult(reportPath);
-  if (argBool(args, "start_workflow")) recordCommitWorkflowEvent(lifecycle, "started");
-  if (
-    commitReviewLifecycleSucceeded({
-      reviewOutcome,
-      checkOutcome,
-      checksRequested,
-      reportResult,
-    })
-  ) {
-    recordCommitWorkflowEvent(lifecycle, "completed");
-  } else {
-    recordCommitWorkflowEvent(
-      lifecycle,
-      "failed",
-      new Error(
-        argString(
-          args,
-          "error_kind",
-          `review=${reviewOutcome},report=${reportResult},checks_requested=${checksRequested},check=${checkOutcome}`,
-        ),
-      ),
-    );
-  }
-  recordCommitWorkflowEvent(lifecycle, "finalized");
-}
-
-function attestReviewCommand(args: Args): void {
-  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
-  const sha = assertSha(argString(args, "commit_sha", ""));
-  const reportPath = resolve(argString(args, "report_path", ""));
-  const lifecycle = commitLifecycle(targetRepo, sha);
-  try {
-    if (!existsSync(reportPath)) throw new Error("commit review report is missing");
-    const markdown = readFileSync(reportPath, "utf8");
-    const { frontMatter } = splitFrontMatter(markdown);
-    if (assertSha(String(frontMatter.sha ?? "")) !== sha) {
-      throw new Error("commit review report SHA does not match the attested commit");
-    }
-    if (
-      String(frontMatter.repository ?? "")
-        .trim()
-        .toLowerCase() !== targetRepo.toLowerCase()
-    ) {
-      throw new Error("commit review report repository does not match the attested target");
-    }
-    const reportResult = commitReviewReportResult(reportPath);
-    if (!COMMIT_REVIEW_SUCCESS_RESULTS.has(reportResult)) {
-      throw new Error(`commit review report result is not publishable: ${reportResult}`);
-    }
-    recordCommitArtifactPrepared(lifecycle, {
-      path: reportPath,
-      kind: "commit_review_report",
-    });
-    recordCommitLifecycleEvent(lifecycle, {
-      type: ACTION_EVENT_TYPES.reviewCompleted,
-      status: ACTION_EVENT_STATUSES.completed,
-      reasonCode: ACTION_EVENT_REASON_CODES.completed,
-      mutation: false,
-      component: "commit_review_attestor",
-      state: "attested",
-      reviewMode: "commit_review",
-      eventIdentity: { sha, reportResult },
-    });
-  } catch (error) {
-    recordCommitLifecycleEvent(lifecycle, {
-      type: ACTION_EVENT_TYPES.reviewFailed,
-      status: ACTION_EVENT_STATUSES.failed,
-      reasonCode: ACTION_EVENT_REASON_CODES.validationFailed,
-      mutation: false,
-      component: "commit_review_attestor",
-      state: "attestation_failed",
-      reviewMode: "commit_review",
-      eventIdentity: { sha },
-    });
-    throw error;
-  }
-}
-
-function commitReviewReportResult(reportPath: string): string {
-  if (!reportPath || !existsSync(reportPath)) return "missing";
-  try {
-    const { frontMatter } = splitFrontMatter(readFileSync(reportPath, "utf8"));
-    return (
-      String(frontMatter.result ?? "missing")
-        .trim()
-        .toLowerCase() || "missing"
-    );
-  } catch {
-    return "invalid";
-  }
+  publishCheckFromReport({
+    targetRepo,
+    reportRepo,
+    reportPath,
+    reportRelativePath,
+    sha,
+    checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
+  });
 }
 
 function collectMarkdownFiles(dir: string): string[] {
@@ -1021,8 +633,6 @@ interface CommitFindingDispatch {
   targetRepo: string;
   reportPath: string;
   reportUrl: string;
-  reportRevision: string;
-  reportSha256: string;
   highestSeverity: string;
   checkConclusion: string;
 }
@@ -1169,35 +779,15 @@ function githubRunUrl(): string {
   return repository && runId ? `${server}/${repository}/actions/runs/${runId}` : "";
 }
 
-function commitFindingDispatchKey(dispatch: CommitFindingDispatch, reportRepo: string): string {
-  const digest = createHash("sha256")
-    .update(
-      JSON.stringify({
-        targetRepo: dispatch.targetRepo,
-        sha: dispatch.sha,
-        reportRepo,
-        reportPath: dispatch.reportPath,
-        reportSha256: dispatch.reportSha256,
-      }),
-    )
-    .digest("hex")
-    .slice(0, 24);
-  return `commit-finding-${digest}`;
-}
-
 function dispatchPayload(dispatch: CommitFindingDispatch, reportRepo: string): string {
   return `${JSON.stringify({
     event_type: "clawsweeper_commit_finding",
     client_payload: {
-      payload_version: 2,
-      dispatch_key: commitFindingDispatchKey(dispatch, reportRepo),
       target_repo: dispatch.targetRepo,
       commit_sha: dispatch.sha,
       report_repo: reportRepo,
       report_path: dispatch.reportPath,
       report_url: dispatch.reportUrl,
-      report_revision: dispatch.reportRevision,
-      report_sha256: dispatch.reportSha256,
       highest_severity: dispatch.highestSeverity,
       check_conclusion: dispatch.checkConclusion,
       source_run_url: githubRunUrl(),
@@ -1224,20 +814,17 @@ function workflowDispatchArgs(
     "-f",
     `commit_sha=${dispatch.sha}`,
     "-f",
-    `dispatch_key=${commitFindingDispatchKey(dispatch, reportRepo)}`,
-    "-f",
-    "payload_version=2",
-    "-f",
     `report_repo=${reportRepo}`,
     "-f",
     `report_path=${dispatch.reportPath}`,
     "-f",
     `report_url=${dispatch.reportUrl}`,
-    "-f",
-    `report_revision=${dispatch.reportRevision}`,
-    "-f",
-    `report_sha256=${dispatch.reportSha256}`,
   ];
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function dispatchFailureError(
@@ -1266,37 +853,33 @@ function dispatchCommitFinding(options: {
       : workflowDispatchArgs(options.dispatch, options.reportRepo, options.workflow).map((arg) =>
           arg === "PLACEHOLDER" ? options.repairRepo : arg,
         );
-  const lifecycle = commitLifecycle(options.dispatch.targetRepo, options.dispatch.sha);
-  const dispatchKey = commitFindingDispatchKey(options.dispatch, options.reportRepo);
-  runCommitMutation(lifecycle, {
-    kind: "commit_finding_dispatch",
-    identity: {
-      dispatchKey,
-      repairRepo: options.repairRepo,
-      workflow: options.workflow,
-      mode: options.mode,
-      reportRepo: options.reportRepo,
-      dispatch: options.dispatch,
-    },
-    operation: () => {
-      const result = spawnSync("gh", commandArgs, {
-        input:
-          options.mode === "repository_dispatch"
-            ? dispatchPayload(options.dispatch, options.reportRepo)
-            : undefined,
-        encoding: "utf8",
-        env: process.env,
-      });
-      if (result.status !== 0) throw dispatchFailureError(options, result);
-      return result;
-    },
-  });
+  const maxAttempts = 3;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result = spawnSync("gh", commandArgs, {
+      input:
+        options.mode === "repository_dispatch"
+          ? dispatchPayload(options.dispatch, options.reportRepo)
+          : undefined,
+      encoding: "utf8",
+      env: process.env,
+    });
+    if (result.status === 0) return;
+
+    const error = dispatchFailureError(options, result);
+    const retryKind = ghRetryKind(error);
+    if (attempt >= maxAttempts - 1 || retryKind === "none") throw error;
+
+    const waitMs = ghRetryWaitMs(retryKind, attempt);
+    console.warn(
+      `dispatch failed with ${retryKind} GitHub error; retrying in ${Math.round(waitMs / 1000)}s`,
+    );
+    sleepSync(waitMs);
+  }
 }
 
 function dispatchFindingsCommand(args: Args): void {
   const enabled = argString(args, "enabled", "true");
   if (!boolString(enabled)) {
-    writeCommitPublicationOutput("dispatch_count", "0");
     console.log("commit finding dispatch disabled");
     return;
   }
@@ -1305,12 +888,15 @@ function dispatchFindingsCommand(args: Args): void {
   const repairRepo = argString(args, "repair_repo", "openclaw/clawsweeper");
   const dispatchMode = argString(args, "dispatch_mode", "workflow_dispatch");
   const repairWorkflow = argString(args, "repair_workflow", "repair-commit-finding-intake.yml");
-  const reportRepo = argString(args, "report_repo", "openclaw/clawsweeper-state");
-  const reportRevision = assertSha(argString(args, "report_revision", ""), "report revision");
+  const reportRepo = argString(
+    args,
+    "report_repo",
+    process.env.GITHUB_REPOSITORY || "openclaw/clawsweeper",
+  );
   const reportBaseUrl = argString(
     args,
     "report_base_url",
-    `https://github.com/${reportRepo}/blob/${reportRevision}`,
+    `https://github.com/${reportRepo}/blob/main`,
   );
   const dryRun = argBool(args, "dry_run");
   const dispatches: CommitFindingDispatch[] = [];
@@ -1329,20 +915,16 @@ function dispatchFindingsCommand(args: Args): void {
       targetRepo,
       reportPath,
       reportUrl: `${reportBaseUrl.replace(/\/$/, "")}/${reportPath}`,
-      reportRevision,
-      reportSha256: createHash("sha256").update(markdown).digest("hex"),
       highestSeverity: frontMatter.highest_severity ?? "unknown",
       checkConclusion: frontMatter.check_conclusion ?? "neutral",
     });
   }
 
   if (!dispatches.length) {
-    writeCommitPublicationOutput("dispatch_count", "0");
     console.log("No commit finding reports to dispatch.");
     return;
   }
 
-  let dispatchCount = 0;
   for (const dispatch of dispatches) {
     if (dryRun) {
       if (dispatchMode === "repository_dispatch") {
@@ -1361,114 +943,20 @@ function dispatchFindingsCommand(args: Args): void {
         repairRepo,
         workflow: repairWorkflow,
       });
-      dispatchCount += 1;
       console.log(`dispatched ${dispatch.targetRepo}@${dispatch.sha} to ${repairRepo}`);
     }
   }
-  writeCommitPublicationOutput("dispatch_count", String(dryRun ? 0 : dispatchCount));
-}
-
-function dispatchContinuationCommand(args: Args): void {
-  const repository = argString(
-    args,
-    "repository",
-    process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper",
-  );
-  const workflow = argString(args, "workflow", "commit-review.yml");
-  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
-  const afterSha = assertSha(argString(args, "after_sha", argString(args, "commit_sha", "")));
-  const beforeValue = argString(args, "before_sha", "").trim();
-  const beforeSha = beforeValue ? assertSha(beforeValue, "before sha") : "";
-  const commitOffset = argNumber(args, "commit_offset", 0);
-  if (!Number.isSafeInteger(commitOffset) || commitOffset < 0) {
-    throw new Error("Invalid --commit-offset");
-  }
-  const createChecks = argBool(args, "create_checks");
-  const additionalPrompt = argString(
-    args,
-    "additional_prompt",
-    process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
-  );
-  const continuationIdentity = {
-    repository,
-    workflow,
-    targetRepo,
-    afterSha,
-    beforeSha: beforeSha || null,
-    commitOffset,
-    createChecks,
-    additionalPromptSha256: createHash("sha256").update(additionalPrompt).digest("hex"),
-  };
-  const continuationKey = `commit-review-continuation-${createHash("sha256")
-    .update(JSON.stringify(continuationIdentity))
-    .digest("hex")
-    .slice(0, 24)}`;
-  const commandArgs = [
-    "workflow",
-    "run",
-    workflow,
-    "--repo",
-    repository,
-    "-f",
-    "enabled=true",
-    "-f",
-    `target_repo=${targetRepo}`,
-    "-f",
-    `commit_sha=${afterSha}`,
-    "-f",
-    `before_sha=${beforeSha}`,
-    "-f",
-    `commit_offset=${commitOffset}`,
-    "-f",
-    `create_checks=${createChecks ? "true" : "false"}`,
-    "-f",
-    `additional_prompt=${additionalPrompt}`,
-    "-f",
-    `continuation_key=${continuationKey}`,
-  ];
-  runCommitMutation(commitLifecycle(targetRepo, afterSha), {
-    kind: "commit_review_continuation_dispatch",
-    identity: {
-      ...continuationIdentity,
-      continuationKey,
-    },
-    operation: () => {
-      const result = spawnSync("gh", commandArgs, {
-        encoding: "utf8",
-        env: process.env,
-      });
-      if (result.status !== 0) {
-        const detail =
-          result.stderr || result.stdout || result.error?.message || "unknown gh error";
-        throw new Error(`failed to dispatch commit review continuation: ${detail}`);
-      }
-      return result;
-    },
-  });
-  console.log(
-    `dispatched commit review continuation for ${targetRepo}@${afterSha} at offset ${commitOffset}`,
-  );
-}
-
-function writeCommitPublicationOutput(name: string, value: string): void {
-  const output = process.env.GITHUB_OUTPUT;
-  if (!output) return;
-  appendFileSync(output, `${name}=${value}\n`, "utf8");
 }
 
 export function main(argv = process.argv.slice(2)): void {
   const args = parseArgs(argv);
   const command = args._[0] ?? "review";
   if (command === "review") reviewCommand(args);
-  else if (command === "hydrate-github-context") hydrateGitHubContextCommand(args);
   else if (command === "classify") classifyCommand(args);
   else if (command === "publish-check") publishCheckCommand(args);
-  else if (command === "finish-review") finishReviewCommand(args);
-  else if (command === "attest-review") attestReviewCommand(args);
   else if (command === "reports") reportsCommand(args);
   else if (command === "copy-artifacts") copyArtifactsCommand(args);
   else if (command === "dispatch-findings") dispatchFindingsCommand(args);
-  else if (command === "dispatch-continuation") dispatchContinuationCommand(args);
   else if (command === "local-review") localReviewCommand(args);
   else {
     console.error(`Unknown command: ${command}`);

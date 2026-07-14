@@ -152,27 +152,6 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      - name: Bind authenticated mutation App identity
-        id: mutation_app
-        if: ${{ vars.CLAWSWEEPER_ALLOW_MERGE == '1' }}
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
-          EXPECTED_APP_SLUG: ${{ env.CLAWSWEEPER_APP_SLUG }}
-        run: |
-          set -euo pipefail
-          if [ -z "$APP_SLUG" ] || [ "$APP_SLUG" != "$EXPECTED_APP_SLUG" ]; then
-            echo "Authenticated mutation App slug is missing or unexpected: ${APP_SLUG:-<empty>}." >&2
-            exit 1
-          fi
-          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
-          if ! printf '%s' "$app_id" | grep -Eq '^[1-9][0-9]*$'; then
-            echo "Authenticated mutation App ID is invalid: ${app_id:-<empty>}." >&2
-            exit 1
-          fi
-          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
-          echo "app_slug=$APP_SLUG" >> "$GITHUB_OUTPUT"
-
       - name: Create central dispatch token
         id: dispatch-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -208,11 +187,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
-          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
-          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: initial
         run: |
           set -euo pipefail
@@ -323,7 +299,6 @@ jobs:
           fi
           pnpm run repair:publish-main -- \
             --message "chore: record ClawSweeper comment routing" \
-            --receipt-kind comment_router_state_publication \
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \
@@ -345,11 +320,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
-          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
-          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: retry
         run: |
           set -euo pipefail
@@ -454,7 +426,6 @@ jobs:
         run: |
           pnpm run repair:publish-main -- \
             --message "chore: record ClawSweeper repair dispatch retry" \
-            --receipt-kind comment_router_retry_state_publication \
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \

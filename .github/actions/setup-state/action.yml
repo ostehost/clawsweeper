@@ -28,10 +28,6 @@ inputs:
     description: Optional newline-separated state paths to hydrate.
     required: false
     default: ""
-  hydrate-paths:
-    description: Optional newline-separated approved generated roots to hydrate. Defaults to the standard roots; ledger must be selected explicitly.
-    required: false
-    default: ""
   persist-credentials:
     description: Persist the checkout token in local git config for later state publication.
     required: false
@@ -62,5 +58,4 @@ runs:
       shell: bash
       env:
         CLAWSWEEPER_STATE_DIR: ${{ inputs.state-path }}
-        CLAWSWEEPER_HYDRATE_PATHS: ${{ inputs.hydrate-paths }}
       run: node "${{ inputs.worktree-path }}/scripts/hydrate-state.ts" --state-dir "${{ inputs.state-path }}" --worktree "${{ inputs.worktree-path }}"

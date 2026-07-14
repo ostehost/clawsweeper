@@ -11,7 +11,6 @@ import {
   commitMessageForPublishedPaths,
   hardResetToRemoteMain,
   publishMainCommit,
-  refreshSourceAfterAcceptedStatePublish,
   refreshSourceAfterStatePublish,
   setTokenOrigin,
   stagePaths,
@@ -46,67 +45,10 @@ test("commitMessageForPublishedPaths skips CI for generated-only publishes", () 
     "chore: publish\n\n[skip ci]",
   );
   assert.equal(
-    commitMessageForPublishedPaths("chore: claim notifications", ["notifications"]),
-    "chore: claim notifications\n\n[skip ci]",
-  );
-  assert.equal(
     commitMessageForPublishedPaths("fix: update scheduler", ["src/repair/git-publish.ts"]),
     "fix: update scheduler",
   );
 });
-
-test("accepted state publishes may tolerate only local refresh failure", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-refresh-failure-"));
-  const source = path.join(root, "source");
-  const state = path.join(root, "state");
-  fs.mkdirSync(source);
-  fs.mkdirSync(state);
-
-  try {
-    withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
-      withCwd(source, () => {
-        assert.throws(
-          () => refreshSourceAfterAcceptedStatePublish(["../outside"], null, "strict"),
-          /Refusing to refresh outside source root/,
-        );
-        assert.doesNotThrow(() =>
-          refreshSourceAfterAcceptedStatePublish(["../outside"], null, "best-effort"),
-        );
-      }),
-    );
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test(
-  "best-effort accepted refresh preserves local claims when state copying fails",
-  { skip: process.platform === "win32" },
-  () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-refresh-rollback-"));
-    const source = path.join(root, "source");
-    const state = path.join(root, "state");
-    const sourceClaim = path.join(source, "notifications", "claim.json");
-    const stateClaim = path.join(state, "notifications", "claim.json");
-    write(sourceClaim, '{"claim":"local"}\n');
-    write(stateClaim, '{"claim":"merged"}\n');
-    fs.chmodSync(stateClaim, 0o000);
-
-    try {
-      withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
-        withCwd(source, () => {
-          assert.doesNotThrow(() =>
-            refreshSourceAfterAcceptedStatePublish(["notifications"], null, "best-effort"),
-          );
-          assert.equal(fs.readFileSync(sourceClaim, "utf8"), '{"claim":"local"}\n');
-        }),
-      );
-    } finally {
-      fs.chmodSync(stateClaim, 0o600);
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  },
-);
 
 test("stagePaths normalizes tracked deletion pathspecs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-stage-paths-"));
@@ -2181,7 +2123,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
   run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
   run("git", ["checkout", "-B", "main", "origin/main"], work);
 
-  write(path.join(work, "ledger/from-cli.txt"), "from cli\n");
+  write(path.join(work, "results/from-cli.txt"), "from cli\n");
   run(
     process.execPath,
     [
@@ -2190,7 +2132,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
       "--message",
       "chore: publish cli ledger",
       "--path",
-      "ledger/from-cli.txt",
+      "results",
       "--rebase-strategy",
       "theirs",
       "--max-attempts",
@@ -2202,7 +2144,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
   );
 
   assert.equal(
-    run("git", ["--git-dir", origin, "show", "main:ledger/from-cli.txt"], root),
+    run("git", ["--git-dir", origin, "show", "main:results/from-cli.txt"], root),
     "from cli\n",
   );
 });
