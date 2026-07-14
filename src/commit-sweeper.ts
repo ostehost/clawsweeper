@@ -35,6 +35,7 @@ import {
   runCodexProcess,
   type CodexProcessResult,
 } from "./codex-process.js";
+import { redactCodexText } from "./codex-output-capture.js";
 import { runText } from "./command.js";
 import {
   configuredRepositoryProfileFor,
@@ -485,7 +486,7 @@ function runCodex(options: {
 }
 
 function redactCommitReviewText(value: string, secrets: readonly string[]): string {
-  return secrets.reduce((redacted, secret) => redacted.split(secret).join("[REDACTED]"), value);
+  return redactCodexText(value, secrets);
 }
 
 function commitReviewDiagnostic(options: {

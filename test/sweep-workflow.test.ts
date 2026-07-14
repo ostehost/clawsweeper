@@ -769,6 +769,8 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
     workflow,
     /startsWith\(github\.event\.workflow_run\.display_title, 'Review event item '\)/,
   );
+  assert.match(producer, /permissions:\s+actions: read\s+contents: read/);
+  assert.doesNotMatch(producer, /actions: write/);
   assert.match(
     workflow,
     /SOURCE_RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \}\}/,

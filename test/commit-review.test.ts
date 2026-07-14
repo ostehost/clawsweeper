@@ -119,6 +119,7 @@ test("commit review retains only content-safe diagnostics", () => {
     git(targetDir, "commit", "-q", "-m", "base");
     const baseSha = git(targetDir, "rev-parse", "HEAD");
     const sourceSecret = "fixture-source-private-token-123456";
+    const escapedSecret = "fixture-private-key-123456\nfixture-private-line-abcdef";
     const promptSecret = "fixture-prompt-private-token-123456";
     fs.writeFileSync(path.join(targetDir, "review.txt"), `${sourceSecret}\n`);
     git(targetDir, "commit", "-qam", "review target");
@@ -178,6 +179,7 @@ if (!prompt.includes(${JSON.stringify(promptSecret)})) {
   process.exit(8);
 }
 const sourceSecret = fs.readFileSync(path.join(process.cwd(), "review.txt"), "utf8").trim();
+const escapedSecret = ${JSON.stringify(escapedSecret)};
 const outputIndex = args.indexOf("--output-last-message");
 const outputPath = args[outputIndex + 1];
 process.stdout.write(JSON.stringify({
@@ -208,6 +210,7 @@ fs.writeFileSync(outputPath, [
   "# Commit Review",
   "",
   "Model echo: private-model-name",
+  JSON.stringify({ credential: escapedSecret }),
   "",
   "No findings.",
   ""
@@ -256,6 +259,7 @@ fs.writeFileSync(outputPath, [
           CODEX_HOME: codexHome,
           GH_TOKEN: "ghs_review-read-token-123456",
           COMMIT_SWEEPER_TARGET_GH_TOKEN: "ghs_review-secret-token-123456",
+          CLAWSWEEPER_APP_PRIVATE_KEY: escapedSecret,
           COMMIT_SWEEPER_ADDITIONAL_PROMPT: promptSecret,
           CODEX_BIN: codexPath,
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
@@ -297,6 +301,7 @@ fs.writeFileSync(outputPath, [
     assert.doesNotMatch(report, /ghs_review-read-token-123456/);
     assert.doesNotMatch(report, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(report, /private-model-name/);
+    assert.doesNotMatch(report, /fixture-private-line-abcdef/);
     assert.match(report, /\[REDACTED\]/);
     const uploadedArtifactContents = [diagnosticText, report].join("\n");
     assert.doesNotMatch(uploadedArtifactContents, new RegExp(sourceSecret));

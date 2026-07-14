@@ -2781,6 +2781,8 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     process.env.ACTIONS_RESULTS_URL = "https://example.invalid/results";
     process.env.ACTIONS_RUNTIME_TOKEN = "runtime-token";
     process.env.ACTIONS_RUNTIME_URL = "https://example.invalid/runtime";
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = "/tmp/google-credentials.json";
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/tmp/aws-credentials";
     process.env.TEST_SECRET = "ambient-secret";
     process.env.OPENAI_API_KEY = "openai";
     process.env.CODEX_API_KEY = "codex";
@@ -2802,6 +2804,8 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     assert.equal(env.ACTIONS_RESULTS_URL, undefined);
     assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
     assert.equal(env.ACTIONS_RUNTIME_URL, undefined);
+    assert.equal(env.GOOGLE_APPLICATION_CREDENTIALS, undefined);
+    assert.equal(env.AWS_SHARED_CREDENTIALS_FILE, undefined);
     assert.equal(env.TEST_SECRET, undefined);
     assert.equal(env.OPENAI_API_KEY, undefined);
     assert.equal(env.CODEX_API_KEY, undefined);

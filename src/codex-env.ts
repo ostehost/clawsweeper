@@ -10,7 +10,8 @@ export type CodexEnvOptions = {
 export type CodexLoginMethod = "api" | "chatgpt";
 
 export const PUBLIC_CODEX_MODEL = "internal";
-const CODEX_SENSITIVE_ENV_NAME = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)(?:_|$)/i;
+const CODEX_SENSITIVE_ENV_NAME =
+  /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS?|PRIVATE)(?:_|$)/i;
 const CODEX_ACTIONS_CREDENTIAL_ENV = [
   "ACTIONS_CACHE_URL",
   "ACTIONS_ID_TOKEN_REQUEST_TOKEN",

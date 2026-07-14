@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      actions: write
+      actions: read
       contents: read
     outputs:
       action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
