@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   realpathSync,
   readFileSync,
@@ -15,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { resolveSpawnCommand } from "../command.js";
+import { mergeCommentRouterLedgerJson } from "./comment-router-ledger-merge.js";
 import { clawsweeperGitUserEmail, clawsweeperGitUserName } from "./process-env.js";
 import {
   chooseRecordTupleWinner,
@@ -48,7 +50,12 @@ export type GitPublishOptions = {
   rebaseStrategy?: RebaseStrategy | undefined;
 };
 
-export type RebaseStrategy = "normal" | "theirs" | "apply-records" | "reconcile-records";
+export type RebaseStrategy =
+  | "normal"
+  | "theirs"
+  | "apply-records"
+  | "reconcile-records"
+  | "comment-router-ledger";
 
 export type GitRunOptions = {
   allowFailure?: boolean;
@@ -65,6 +72,14 @@ const GENERATED_PUBLISH_PATHS = [
   "records",
   "results",
   "assets",
+] as const;
+const COMMENT_ROUTER_LEDGER_PATH = "results/comment-router.json";
+const COMMENT_ROUTER_LATEST_PATH = "results/comment-router-latest.json";
+const COMMENT_ROUTER_JOBS_PATH = "jobs";
+const COMMENT_ROUTER_TRANSACTION_PATHS = [
+  COMMENT_ROUTER_LEDGER_PATH,
+  COMMENT_ROUTER_LATEST_PATH,
+  COMMENT_ROUTER_JOBS_PATH,
 ] as const;
 const STATE_RESET_OWNED_FILES = new Set([
   "README.md",
@@ -219,6 +234,7 @@ function safeGitDisplayAction(action: string | undefined): string {
     case "diff":
     case "fetch":
     case "checkout":
+    case "cherry-pick":
     case "cat-file":
     case "ls-files":
     case "push":
@@ -315,6 +331,9 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   const maxAttempts = positiveInt(options.maxAttempts, 8);
   const pushAttempts = positiveInt(options.pushAttempts, 3);
   const rebaseStrategy = options.rebaseStrategy ?? "normal";
+  if (rebaseStrategy === "comment-router-ledger") {
+    assertCommentRouterLedgerPublishPaths(options.paths);
+  }
   gitPublishPhase(
     "sync",
     `paths=${uniqueNonEmpty(options.paths).length} strategy=${rebaseStrategy}`,
@@ -329,10 +348,12 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   if (!hasStagedChanges()) {
     console.log("No publish changes");
     const synchronized =
-      !stateBaseCommit ||
-      (rebaseStrategy === "reconcile-records"
-        ? pushReconciliationCommit({ remote, branch, pushAttempts, maxAttempts })
-        : pushCommit({ remote, branch, pushAttempts, rebaseStrategy }));
+      rebaseStrategy === "comment-router-ledger"
+        ? synchronizeUnchangedCommentRouterLedger(remote, branch)
+        : !stateBaseCommit ||
+          (rebaseStrategy === "reconcile-records"
+            ? pushReconciliationCommit({ remote, branch, pushAttempts, maxAttempts })
+            : pushCommit({ remote, branch, pushAttempts, rebaseStrategy }));
     if (!synchronized) {
       throw new Error(`Failed to synchronize unchanged publish with ${remote}/${branch}`);
     }
@@ -342,6 +363,9 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   const commitMessage = commitMessageForPublishedPaths(options.message, options.paths);
   runGit(["commit", "-m", commitMessage]);
   let sourceCommit = runGit(["rev-parse", "HEAD"]).trim();
+  if (rebaseStrategy === "comment-router-ledger") {
+    assertCommentRouterLedgerCandidate(sourceCommit);
+  }
   // Keep the original candidate as the three-way reconciliation source. When
   // normalization discards the entire candidate and returns its hydrated base,
   // the original candidate still preserves that base and the attempted tuple
@@ -417,13 +441,22 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
     ) {
       return completeStatePublish("committed", options.paths, stateBaseCommit);
     }
-    const rebuildResult = rebuildPublishCommit({
-      remote,
-      branch,
-      message: commitMessage,
-      paths: options.paths,
-      sourceCommit,
-    });
+    let rebuildResult: PublishResult;
+    if (rebaseStrategy === "comment-router-ledger") {
+      runGit(["fetch", remote, branch]);
+      rebuildResult = rebuildCommentRouterLedgerCommit({
+        remoteRef: `${remote}/${branch}`,
+        sourceCommit: runGit(["rev-parse", "HEAD"], { quiet: true }).trim(),
+      });
+    } else {
+      rebuildResult = rebuildPublishCommit({
+        remote,
+        branch,
+        message: commitMessage,
+        paths: options.paths,
+        sourceCommit,
+      });
+    }
     if (rebuildResult === "unchanged") {
       return completeStatePublish("unchanged", options.paths, stateBaseCommit);
     }
@@ -446,6 +479,22 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
     return completeStatePublish("committed", options.paths, stateBaseCommit);
   }
   throw new Error(`Failed to publish commit after ${maxAttempts} attempts`);
+}
+
+function synchronizeUnchangedCommentRouterLedger(remote: string, branch: string): boolean {
+  assertCommentRouterPublishWorktreeClean();
+  if (spawnGit(["push", remote, `HEAD:${branch}`]).status === 0) return true;
+  runGit(["fetch", remote, branch]);
+  const remoteRef = `${remote}/${branch}`;
+  if (spawnGit(["merge-base", "--is-ancestor", "HEAD", remoteRef], { quiet: true }).status === 0) {
+    runGit(["reset", "--hard", remoteRef]);
+    return true;
+  }
+  if (spawnGit(["merge-base", "--is-ancestor", remoteRef, "HEAD"], { quiet: true }).status === 0) {
+    return spawnGit(["push", remote, `HEAD:${branch}`]).status === 0;
+  }
+  console.log("Refusing to discard a divergent unchanged comment router state checkout");
+  return false;
 }
 
 function pushReconciliationCommit(options: {
@@ -756,8 +805,111 @@ export function syncPublishPaths(
   paths: readonly string[],
   options: { rebaseStrategy?: RebaseStrategy } = {},
 ): void {
+  const rebaseStrategy = options.rebaseStrategy ?? "normal";
+  if (rebaseStrategy === "comment-router-ledger") {
+    assertCommentRouterLedgerPublishPaths(paths);
+    const stateRoot = publishRoot();
+    assertCommentRouterTransactionSources();
+    syncCommentRouterLedgerPublishPath(stateRoot);
+    if (stateRoot) {
+      syncStatePublishPaths(
+        [COMMENT_ROUTER_LATEST_PATH, COMMENT_ROUTER_JOBS_PATH],
+        stateRoot,
+        "theirs",
+      );
+    }
+    return;
+  }
   const stateRoot = publishRoot();
-  if (stateRoot) syncStatePublishPaths(paths, stateRoot, options.rebaseStrategy ?? "normal");
+  if (stateRoot) syncStatePublishPaths(paths, stateRoot, rebaseStrategy);
+}
+
+function assertCommentRouterLedgerPublishPaths(paths: readonly string[]): void {
+  const normalized = uniqueNonEmpty(paths).map(normalizedPublishPath).sort();
+  const expected = [...COMMENT_ROUTER_TRANSACTION_PATHS].sort();
+  if (
+    normalized.length !== expected.length ||
+    normalized.some((path, index) => path !== expected[index])
+  ) {
+    throw new Error(
+      `comment-router-ledger publish requires exactly ${COMMENT_ROUTER_TRANSACTION_PATHS.join(", ")}`,
+    );
+  }
+}
+
+function assertCommentRouterTransactionSources(): void {
+  const latest = resolve(COMMENT_ROUTER_LATEST_PATH);
+  const jobs = resolve(COMMENT_ROUTER_JOBS_PATH);
+  const latestStat = lstatIfExists(latest);
+  const jobsStat = lstatIfExists(jobs);
+  if (!latestStat?.isFile() || latestStat.isSymbolicLink()) {
+    throw new Error(`Missing safe comment router output: ${COMMENT_ROUTER_LATEST_PATH}`);
+  }
+  if (!jobsStat?.isDirectory() || jobsStat.isSymbolicLink()) {
+    throw new Error(`Missing safe comment router output: ${COMMENT_ROUTER_JOBS_PATH}`);
+  }
+}
+
+function syncCommentRouterLedgerPublishPath(stateRoot: string | undefined): void {
+  const source = resolve(COMMENT_ROUTER_LEDGER_PATH);
+  if (!existsSync(source)) {
+    throw new Error(`Missing comment router ledger publish source: ${COMMENT_ROUTER_LEDGER_PATH}`);
+  }
+  assertSafeCommentRouterLedgerPath(resolve("."), source, "source");
+  const localText = readFileSync(source, "utf8");
+  if (!stateRoot) {
+    // Validate before the candidate is committed even when publishing directly
+    // from the current worktree.
+    mergeCommentRouterLedgerJson({
+      baseText: localText,
+      localText,
+      remoteText: localText,
+    });
+    return;
+  }
+  const destination = resolve(stateRoot, COMMENT_ROUTER_LEDGER_PATH);
+  if (!isPathInsideOrEqual(stateRoot, destination)) {
+    throw new Error(`Refusing to publish outside state root: ${COMMENT_ROUTER_LEDGER_PATH}`);
+  }
+  assertSafeCommentRouterLedgerPath(stateRoot, destination, "state destination");
+  const remoteText = existsSync(destination) ? readFileSync(destination, "utf8") : null;
+  const content = mergeCommentRouterLedgerJson({
+    baseText: remoteText,
+    localText,
+    remoteText,
+  });
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, content, "utf8");
+}
+
+function assertSafeCommentRouterLedgerPath(root: string, file: string, label: string): void {
+  if (!isPathInsideOrEqual(root, file)) {
+    throw new Error(`Refusing comment router ledger ${label} outside its root`);
+  }
+  const parentRelative = relative(root, dirname(file));
+  let cursor = root;
+  for (const part of parentRelative.split(sep).filter(Boolean)) {
+    cursor = resolve(cursor, part);
+    const stat = lstatIfExists(cursor);
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing unsafe comment router ledger ${label} parent`);
+    }
+  }
+  const stat = lstatIfExists(file);
+  if (!stat) return;
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Refusing unsafe comment router ledger ${label}`);
+  }
+}
+
+function lstatIfExists(path: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 function syncStatePublishPaths(
@@ -1033,7 +1185,17 @@ export function pushCommit(options: {
     console.log(`Push attempt ${pushAttempt} lost the ${branch} race; rebasing`);
     const localCommit = runGit(["rev-parse", "HEAD"], { quiet: true }).trim();
     const localCommitMessage = runGit(["log", "-1", "--format=%B"], { quiet: true });
-    runGit(["fetch", remote, branch], { allowFailure: true });
+    runGit(
+      ["fetch", remote, branch],
+      rebaseStrategy === "comment-router-ledger" ? {} : { allowFailure: true },
+    );
+    if (rebaseStrategy === "comment-router-ledger") {
+      rebuildCommentRouterLedgerCommit({
+        remoteRef: `${remote}/${branch}`,
+        sourceCommit: localCommit,
+      });
+      continue;
+    }
     if (rebaseStrategy === "reconcile-records") {
       const remoteRef = `${remote}/${branch}`;
       const overlaps = reconciliationChangesOverlap(
@@ -1078,6 +1240,115 @@ export function pushCommit(options: {
     }
   }
   return spawnGit(["push", remote, `HEAD:${branch}`]).status === 0;
+}
+
+function rebuildCommentRouterLedgerCommit(options: {
+  remoteRef: string;
+  sourceCommit: string;
+}): PublishResult {
+  const sourceParent = assertCommentRouterLedgerCandidate(options.sourceCommit);
+  assertCommentRouterRebuildSafety({
+    remoteRef: options.remoteRef,
+    sourceParent,
+  });
+  const content = mergeCommentRouterLedgerJson({
+    baseText: readCommentRouterLedgerAt(sourceParent),
+    localText: readCommentRouterLedgerAt(options.sourceCommit),
+    remoteText: readCommentRouterLedgerAt(options.remoteRef),
+  });
+  try {
+    runGit(["reset", "--hard", options.remoteRef]);
+    const replay = spawnGit(["cherry-pick", "--no-commit", "-X", "theirs", options.sourceCommit]);
+    if (replay.status !== 0) {
+      throw new Error(
+        `Failed to replay the atomic comment router transaction: ${replay.stderr || replay.stdout}`,
+      );
+    }
+    const root = publishRoot() ?? resolve(".");
+    const destination = resolve(root, COMMENT_ROUTER_LEDGER_PATH);
+    if (!isPathInsideOrEqual(root, destination)) {
+      throw new Error(`Refusing to merge outside publish root: ${COMMENT_ROUTER_LEDGER_PATH}`);
+    }
+    assertSafeCommentRouterLedgerPath(root, destination, "merge destination");
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, content, "utf8");
+    stagePaths([COMMENT_ROUTER_LEDGER_PATH]);
+    if (!hasStagedChanges()) {
+      console.log("No comment router transaction changes remain after preserving the remote state");
+      return "unchanged";
+    }
+    runGit(["commit", "-C", options.sourceCommit]);
+    return "committed";
+  } catch (error) {
+    runGit(["cherry-pick", "--abort"], { allowFailure: true });
+    const restored = spawnGit(["reset", "--hard", options.sourceCommit], { quiet: true });
+    if (restored.status !== 0) {
+      throw new Error(
+        `Failed to restore the atomic comment router transaction after rebuild failure: ${restored.stderr || restored.stdout}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function assertCommentRouterLedgerCandidate(sourceCommit: string): string {
+  const sourceParent = runGit(["rev-parse", `${sourceCommit}^`], { quiet: true }).trim();
+  const changedPaths = changedPathsBetween(sourceParent, sourceCommit);
+  if (
+    changedPaths.length === 0 ||
+    changedPaths.some((path) => {
+      const normalized = normalizedPublishPath(path);
+      return !COMMENT_ROUTER_TRANSACTION_PATHS.some((root) => pathIsWithin(root, normalized));
+    })
+  ) {
+    throw new Error(
+      `comment-router-ledger candidate must change only ${COMMENT_ROUTER_TRANSACTION_PATHS.join(", ")}`,
+    );
+  }
+  return sourceParent;
+}
+
+function assertCommentRouterRebuildSafety(options: {
+  remoteRef: string;
+  sourceParent: string;
+}): void {
+  if (
+    spawnGit(["merge-base", "--is-ancestor", options.sourceParent, options.remoteRef], {
+      quiet: true,
+    }).status !== 0
+  ) {
+    throw new Error(
+      "Refusing comment router rebuild: candidate parent is not contained in the remote branch",
+    );
+  }
+  assertCommentRouterPublishWorktreeClean();
+}
+
+function assertCommentRouterPublishWorktreeClean(): void {
+  const dirtyPaths = [
+    ...runGit(["diff", "--no-renames", "--name-only", "-z", "HEAD"], { quiet: true })
+      .split("\0")
+      .filter(Boolean),
+    ...runGit(["diff", "--cached", "--no-renames", "--name-only", "-z", "HEAD"], {
+      quiet: true,
+    })
+      .split("\0")
+      .filter(Boolean),
+    ...runGit(["ls-files", "--others", "--exclude-standard", "-z"], { quiet: true })
+      .split("\0")
+      .filter(Boolean),
+  ];
+  if (dirtyPaths.length > 0) {
+    throw new Error(
+      `Refusing comment router rebuild with dirty publish path: ${dirtyPaths.sort()[0]}`,
+    );
+  }
+}
+
+function readCommentRouterLedgerAt(commit: string): string | null {
+  const spec = gitObjectSpec(commit, COMMENT_ROUTER_LEDGER_PATH);
+  return readGitObjects([{ commit, path: COMMENT_ROUTER_LEDGER_PATH }]).get(spec) ?? null;
 }
 
 function reconciliationChangesOverlap(

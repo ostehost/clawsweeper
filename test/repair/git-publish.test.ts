@@ -25,6 +25,12 @@ for (const key of [
   delete process.env[key];
 }
 
+const routerTransactionPaths = [
+  "results/comment-router.json",
+  "results/comment-router-latest.json",
+  "jobs",
+];
+
 test("uniqueNonEmpty trims, drops blanks, and deduplicates paths", () => {
   assert.deepEqual(uniqueNonEmpty([" jobs ", "", "results", "jobs", "results "]), [
     "jobs",
@@ -237,6 +243,440 @@ test("publishMainCommit preserves status and health across apply and theirs publ
   assert.equal(second.state, "Local event two");
   assert.deepEqual(second.apply_health, secondCloseHealth);
   assert.deepEqual(second.last_close_apply_health, secondCloseHealth);
+});
+
+test("comment router ledger publication unions commands across repeated two-clone push races", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-ledger-publish-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const other = path.join(root, "other");
+  const ledgerFile = "results/comment-router.json";
+  const latestFile = "results/comment-router-latest.json";
+  const routerJobFile = "jobs/openclaw/inbox/router.md";
+  const unrelatedJobFile = "jobs/openclaw/inbox/unrelated.md";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+  const local = routerCommand("local", "2026-07-13T10:01:00Z");
+  const remoteOne = routerCommand("remote-one", "2026-07-13T10:02:00Z");
+  const remoteTwo = routerCommand("remote-two", "2026-07-13T10:03:00Z");
+  const remoteThree = routerCommand("remote-three", "2026-07-13T10:04:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  writeRouterLedger(path.join(work, ledgerFile), [base]);
+  writeJson(path.join(work, latestFile), { marker: "base" });
+  write(path.join(work, routerJobFile), "base router job\n");
+  write(path.join(work, unrelatedJobFile), "base unrelated job\n");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial router ledger"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remoteOne]);
+  writeJson(path.join(other, latestFile), { marker: "remote-one" });
+  write(path.join(other, routerJobFile), "remote-one router job\n");
+  run("git", ["commit", "-am", "first racing router command"], other);
+  run("git", ["push", "origin", "HEAD:main"], other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remoteOne, remoteTwo]);
+  writeJson(path.join(other, latestFile), { marker: "remote-two" });
+  write(path.join(other, routerJobFile), "remote-two router job\n");
+  run("git", ["commit", "-am", "second racing router command"], other);
+  run("git", ["branch", "race-two"], other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remoteOne, remoteTwo, remoteThree]);
+  writeJson(path.join(other, latestFile), { marker: "remote-three" });
+  write(path.join(other, routerJobFile), "remote-three router job\n");
+  write(path.join(other, unrelatedJobFile), "remote-three unrelated job\n");
+  run("git", ["commit", "-am", "third racing router command"], other);
+  run("git", ["branch", "race-three"], other);
+  installRouterLedgerRaceHook(work, other);
+
+  writeRouterLedger(path.join(work, ledgerFile), [base, local]);
+  writeJson(path.join(work, latestFile), { marker: "local" });
+  write(path.join(work, routerJobFile), "local router job\n");
+  assert.equal(
+    withCwd(work, () =>
+      publishMainCommit({
+        message: "chore: publish concurrent router command",
+        paths: routerTransactionPaths,
+        maxAttempts: 1,
+        pushAttempts: 2,
+        rebaseStrategy: "comment-router-ledger",
+      }),
+    ),
+    "committed",
+  );
+
+  const published = readOriginJson(origin, `main:${ledgerFile}`, root);
+  assert.deepEqual(
+    published.commands.map((command) => command.comment_id),
+    ["base", "local", "remote-one", "remote-two", "remote-three"],
+  );
+  assert.deepEqual(readOriginJson(origin, `main:${latestFile}`, root), { marker: "local" });
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", `main:${routerJobFile}`], root),
+    "local router job\n",
+  );
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", `main:${unrelatedJobFile}`], root),
+    "remote-three unrelated job\n",
+  );
+  assert.equal(
+    Number(run("git", ["rev-list", "--count", "main"], work).trim()) >= 5,
+    true,
+    "the test must exercise rebuilt commits rather than a conflict-free first push",
+  );
+});
+
+test("comment router ledger publication fails closed on a malformed racing ledger", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-ledger-malformed-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const other = path.join(root, "other");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  writeRouterLedger(path.join(work, ledgerFile), [base]);
+  writeRouterTransactionOutputs(work, "base");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial router ledger"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  write(path.join(other, ledgerFile), "{malformed\n");
+  run("git", ["commit", "-am", "malformed racing router ledger"], other);
+  run("git", ["push", "origin", "HEAD:main"], other);
+  writeRouterLedger(path.join(work, ledgerFile), [
+    base,
+    routerCommand("local", "2026-07-13T10:01:00Z"),
+  ]);
+
+  assert.throws(
+    () =>
+      withCwd(work, () =>
+        publishMainCommit({
+          message: "chore: reject malformed racing router ledger",
+          paths: routerTransactionPaths,
+          maxAttempts: 1,
+          pushAttempts: 1,
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /Failed to parse results\/comment-router\.json remote/,
+  );
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", `main:${ledgerFile}`], root),
+    "{malformed\n",
+  );
+});
+
+test("comment router ledger publication rejects an incomplete transaction", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-ledger-scope-"));
+  run("git", ["init"], root);
+  configureUser(root);
+  writeRouterLedger(path.join(root, "results/comment-router.json"), [
+    routerCommand("base", "2026-07-13T10:00:00Z"),
+  ]);
+
+  assert.throws(
+    () =>
+      withCwd(root, () =>
+        publishMainCommit({
+          message: "chore: invalid incomplete router publish",
+          paths: ["results/comment-router.json", "jobs"],
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /requires exactly results\/comment-router\.json/,
+  );
+});
+
+test("comment router ledger publication rejects a symlinked ledger source", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-ledger-symlink-"));
+  const outside = path.join(root, "outside.json");
+  const ledger = path.join(root, "results/comment-router.json");
+  run("git", ["init"], root);
+  configureUser(root);
+  writeRouterLedger(outside, [routerCommand("base", "2026-07-13T10:00:00Z")]);
+  writeRouterTransactionOutputs(root, "base");
+  fs.mkdirSync(path.dirname(ledger), { recursive: true });
+  fs.symlinkSync(outside, ledger);
+
+  assert.throws(
+    () =>
+      withCwd(root, () =>
+        publishMainCommit({
+          message: "chore: reject symlinked router ledger",
+          paths: routerTransactionPaths,
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /unsafe comment router ledger source/,
+  );
+});
+
+test("comment router ledger publication semantically syncs a separate state checkout", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-ledger-state-"));
+  const origin = path.join(root, "origin.git");
+  const source = path.join(root, "source");
+  const state = path.join(root, "state");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+  const local = routerCommand("local", "2026-07-13T10:01:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  writeRouterLedger(path.join(state, ledgerFile), [base]);
+  writeRouterTransactionOutputs(state, "base");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial router state"], state);
+  run("git", ["push", "origin", "HEAD:state"], state);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], state);
+  writeRouterLedger(path.join(source, ledgerFile), [base, local]);
+  writeRouterTransactionOutputs(source, "local");
+
+  const result = withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
+    withCwd(source, () =>
+      publishMainCommit({
+        message: "chore: publish router state",
+        paths: routerTransactionPaths,
+        rebaseStrategy: "comment-router-ledger",
+      }),
+    ),
+  );
+
+  assert.equal(result, "committed");
+  assert.deepEqual(
+    readOriginJson(origin, `state:${ledgerFile}`, root).commands.map(
+      (command) => command.comment_id,
+    ),
+    ["base", "local"],
+  );
+  assert.deepEqual(readOriginJson(origin, "state:results/comment-router-latest.json", root), {
+    marker: "local",
+  });
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", "state:jobs/openclaw/inbox/router.md"], root),
+    "local router job\n",
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(source, ledgerFile), "utf8")).commands.map(
+      (command) => command.comment_id,
+    ),
+    ["base", "local"],
+  );
+});
+
+test("comment router unchanged synchronization refuses to erase direct worktree dirt", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-direct-dirt-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const other = path.join(root, "other");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+  const remote = routerCommand("remote", "2026-07-13T10:01:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  writeRouterLedger(path.join(work, ledgerFile), [base]);
+  writeRouterTransactionOutputs(work, "base");
+  write(path.join(work, "operator.txt"), "preserved baseline\n");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial router state"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remote]);
+  writeRouterTransactionOutputs(other, "remote");
+  run("git", ["commit", "-am", "remote router state"], other);
+  run("git", ["push", "origin", "HEAD:main"], other);
+  write(path.join(work, "operator.txt"), "UNCOMMITTED OPERATOR WORK\n");
+
+  assert.throws(
+    () =>
+      withCwd(work, () =>
+        publishMainCommit({
+          message: "chore: synchronize unchanged router state",
+          paths: routerTransactionPaths,
+          maxAttempts: 1,
+          pushAttempts: 1,
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /Refusing comment router rebuild with dirty publish path: operator\.txt/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(work, "operator.txt"), "utf8"),
+    "UNCOMMITTED OPERATOR WORK\n",
+  );
+});
+
+test("comment router unchanged synchronization refuses dirt before an up-to-date push", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-aligned-dirt-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  writeRouterLedger(path.join(work, ledgerFile), [base]);
+  writeRouterTransactionOutputs(work, "base");
+  write(path.join(work, "operator.txt"), "preserved baseline\n");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial router state"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+  write(path.join(work, "operator.txt"), "UNCOMMITTED OPERATOR WORK\n");
+
+  assert.throws(
+    () =>
+      withCwd(work, () =>
+        publishMainCommit({
+          message: "chore: synchronize aligned router state",
+          paths: routerTransactionPaths,
+          maxAttempts: 1,
+          pushAttempts: 1,
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /Refusing comment router rebuild with dirty publish path: operator\.txt/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(work, "operator.txt"), "utf8"),
+    "UNCOMMITTED OPERATOR WORK\n",
+  );
+});
+
+test("comment router rebuild refuses to discard an unpublished parent commit", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-parent-"));
+  const origin = path.join(root, "origin.git");
+  const source = path.join(root, "source");
+  const state = path.join(root, "state");
+  const other = path.join(root, "other");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+  const local = routerCommand("local", "2026-07-13T10:01:00Z");
+  const remote = routerCommand("remote", "2026-07-13T10:02:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  writeRouterLedger(path.join(state, ledgerFile), [base]);
+  writeRouterTransactionOutputs(state, "base");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial router state"], state);
+  run("git", ["push", "origin", "HEAD:state"], state);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["checkout", "-B", "state", "origin/state"], state);
+
+  write(path.join(state, "results/earlier-unpublished.json"), '{"local":true}\n');
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "earlier unpublished state"], state);
+  const unpublishedParent = run("git", ["rev-parse", "HEAD"], state).trim();
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remote]);
+  writeRouterTransactionOutputs(other, "remote");
+  run("git", ["commit", "-am", "remote router state"], other);
+  run("git", ["push", "origin", "HEAD:state"], other);
+
+  writeRouterLedger(path.join(source, ledgerFile), [base, local]);
+  writeRouterTransactionOutputs(source, "local");
+  assert.throws(
+    () =>
+      withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
+        withCwd(source, () =>
+          publishMainCommit({
+            message: "chore: publish router state with unpublished parent",
+            paths: routerTransactionPaths,
+            maxAttempts: 1,
+            pushAttempts: 1,
+            rebaseStrategy: "comment-router-ledger",
+          }),
+        ),
+      ),
+    /candidate parent is not contained in the remote branch/,
+  );
+  assert.equal(run("git", ["rev-parse", "HEAD^"], state).trim(), unpublishedParent);
+  assert.equal(
+    fs.readFileSync(path.join(state, "results/earlier-unpublished.json"), "utf8"),
+    '{"local":true}\n',
+  );
+});
+
+test("comment router rebuild restores its source transaction after replay failure", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-replay-failure-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const other = path.join(root, "other");
+  const ledgerFile = "results/comment-router.json";
+  const base = routerCommand("base", "2026-07-13T10:00:00Z");
+  const local = routerCommand("local", "2026-07-13T10:01:00Z");
+  const remote = routerCommand("remote", "2026-07-13T10:02:00Z");
+
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  writeRouterLedger(path.join(work, ledgerFile), [base]);
+  writeRouterTransactionOutputs(work, "base");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial router state"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  writeRouterLedger(path.join(other, ledgerFile), [base, remote]);
+  writeRouterTransactionOutputs(other, "remote");
+  write(path.join(other, "jobs/collision"), "remote file\n");
+  run("git", ["add", "."], other);
+  run("git", ["commit", "-m", "remote file collision"], other);
+  run("git", ["push", "origin", "HEAD:main"], other);
+
+  writeRouterLedger(path.join(work, ledgerFile), [base, local]);
+  writeRouterTransactionOutputs(work, "local");
+  write(path.join(work, "jobs/collision/local.md"), "local nested job\n");
+  assert.throws(
+    () =>
+      withCwd(work, () =>
+        publishMainCommit({
+          message: "chore: preserve failed router transaction",
+          paths: routerTransactionPaths,
+          maxAttempts: 1,
+          pushAttempts: 1,
+          rebaseStrategy: "comment-router-ledger",
+        }),
+      ),
+    /Failed to replay the atomic comment router transaction/,
+  );
+  assert.equal(
+    run("git", ["log", "-1", "--format=%s"], work),
+    "chore: preserve failed router transaction\n",
+  );
+  assert.equal(run("git", ["show", "HEAD:jobs/collision/local.md"], work), "local nested job\n");
+  assert.deepEqual(
+    readOriginJson(origin, `main:${ledgerFile}`, root).commands.map((entry) => entry.comment_id),
+    ["base", "remote"],
+  );
 });
 
 test("publishMainCommit drops a status commit fully superseded by the remote", () => {
@@ -2371,6 +2811,29 @@ function writeJson(file, value) {
   write(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function routerCommand(commentId, processedAt) {
+  return {
+    idempotency_key: `router:${commentId}`,
+    comment_id: commentId,
+    comment_version_key: `${commentId}:${processedAt}`,
+    comment_updated_at: processedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    intent: "re_review",
+    status: "executed",
+    processed_at: processedAt,
+  };
+}
+
+function writeRouterLedger(file, commands) {
+  writeJson(file, { updated_at: "2026-07-13T12:00:00Z", commands });
+}
+
+function writeRouterTransactionOutputs(root, marker) {
+  writeJson(path.join(root, "results/comment-router-latest.json"), { marker });
+  write(path.join(root, "jobs/openclaw/inbox/router.md"), `${marker} router job\n`);
+}
+
 function writeRecordTuple(
   root,
   {
@@ -2488,6 +2951,23 @@ if test -f "${counter}"; then count=$(cat "${counter}"); fi
 count=$((count + 1))
 printf '%s\\n' "$count" > "${counter}"
 if test "$count" -eq 2; then git -C "${other}" push origin HEAD:main; fi
+`,
+  );
+  fs.chmodSync(hook, 0o755);
+}
+
+function installRouterLedgerRaceHook(work, other) {
+  const hook = path.join(work, ".git/hooks/pre-push");
+  const counter = path.join(work, ".git/hooks/router-ledger-pre-push-count");
+  fs.writeFileSync(
+    hook,
+    `#!/bin/sh
+count=0
+if test -f "${counter}"; then count=$(cat "${counter}"); fi
+count=$((count + 1))
+printf '%s\\n' "$count" > "${counter}"
+if test "$count" -eq 2; then git -C "${other}" push origin race-two:main; fi
+if test "$count" -eq 3; then git -C "${other}" push origin race-three:main; fi
 `,
   );
   fs.chmodSync(hook, 0o755);

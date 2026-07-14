@@ -15,10 +15,8 @@ test("label tagging uses retrying GitHub helpers", () => {
   assert.match(source, /ghTextWithRetry\(\[\s*"issue",\s*"edit"/);
 });
 
-test("label tagging is non-blocking in repair workers", () => {
+test("isolated repair workers do not recursively tag targets", () => {
   const workflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
-  const step = workflow.split("- name: Tag ClawSweeper targets")[1]?.split("\n      - name: ")[0];
-
-  assert.ok(step, "expected Tag ClawSweeper targets step");
-  assert.match(step, /continue-on-error: true/);
+  assert.doesNotMatch(workflow, /- name: Tag ClawSweeper targets/);
+  assert.doesNotMatch(workflow, /repair:tag-targets|tag-clawsweeper-targets\.js/);
 });

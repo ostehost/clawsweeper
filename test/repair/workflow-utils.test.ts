@@ -855,30 +855,132 @@ test("workflow utilities count nested command actions by status", () => {
   assert.equal(countCommandActions(report, "dispatch_clawsweeper", "waiting"), 1);
 });
 
-test("workflow utilities count repair results that require requeue", () => {
+test("workflow utilities discover post-flight requeue outcomes once per exact job", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
-  write(
-    path.join(root, "runs/a/result.json"),
-    JSON.stringify({
-      actions: [
-        { action: "repair_contributor_branch", status: "blocked", requeue_required: true },
-        { action: "automerge_repair_outcome_comment", status: "updated" },
-      ],
-    }),
-  );
-  write(
-    path.join(root, "runs/b/result.json"),
-    JSON.stringify({ actions: [{ action: "repair_contributor_branch", status: "pushed" }] }),
-  );
-  write(
-    path.join(root, "runs/c/apply-report.json"),
-    JSON.stringify({
-      actions: [{ action: "close_duplicate", status: "blocked", requeue_required: true }],
-    }),
-  );
+  try {
+    const identity = requeueIdentity();
+    const runDir = path.join(root, ".clawsweeper-repair/runs/a");
+    writeRequeueRun(runDir, identity);
+    write(
+      path.join(runDir, "post-flight-report.json"),
+      JSON.stringify({
+        repo: identity.repo,
+        cluster_id: identity.clusterId,
+        dry_run: false,
+        result_path: ".clawsweeper-repair/runs/a/result.json",
+        actions: [
+          {
+            action: "finalize_fix_pr",
+            status: "blocked",
+            retry_recommended: true,
+            requeue_required: true,
+          },
+        ],
+      }),
+    );
 
-  assert.equal(countRequeueRequired(path.join(root, "runs")), 2);
+    const reportDir = path.join(root, ".clawsweeper-repair/runs");
+    assert.equal(countRequeueRequired(reportDir, identity), 1);
+
+    write(
+      path.join(runDir, "apply-report.json"),
+      JSON.stringify({
+        repo: identity.repo,
+        cluster_id: identity.clusterId,
+        dry_run: false,
+        result_path: ".clawsweeper-repair/runs/a/result.json",
+        actions: [{ action: "merge_candidate", status: "blocked", requeue_required: true }],
+      }),
+    );
+    assert.equal(countRequeueRequired(reportDir, identity), 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
+
+test("workflow utilities ignore requeue reports outside the exact job identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
+  try {
+    const identity = requeueIdentity();
+    const runDir = path.join(root, ".clawsweeper-repair/runs/a");
+    writeRequeueRun(runDir, identity);
+    const reportPath = path.join(runDir, "post-flight-report.json");
+    const report = {
+      repo: identity.repo,
+      cluster_id: identity.clusterId,
+      dry_run: false,
+      result_path: ".clawsweeper-repair/runs/a/result.json",
+      actions: [
+        {
+          action: "finalize_fix_pr",
+          status: "blocked",
+          retry_recommended: true,
+          requeue_required: true,
+        },
+      ],
+    };
+    const reportDir = path.join(root, ".clawsweeper-repair/runs");
+
+    write(reportPath, JSON.stringify({ ...report, repo: "openclaw/other" }));
+    assert.equal(countRequeueRequired(reportDir, identity), 0);
+
+    write(reportPath, JSON.stringify({ ...report, result_path: "other/result.json" }));
+    assert.equal(countRequeueRequired(reportDir, identity), 0);
+
+    write(
+      reportPath,
+      JSON.stringify({
+        ...report,
+        actions: [{ ...report.actions[0], retry_recommended: false }],
+      }),
+    );
+    assert.equal(countRequeueRequired(reportDir, identity), 0);
+
+    write(
+      path.join(runDir, "cluster-plan.json"),
+      JSON.stringify({
+        repo: identity.repo,
+        cluster_id: identity.clusterId,
+        mode: identity.mode,
+        source_job: "jobs/openclaw/inbox/a-different-job.md",
+      }),
+    );
+    write(reportPath, JSON.stringify(report));
+    assert.equal(countRequeueRequired(reportDir, identity), 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function requeueIdentity() {
+  return {
+    repo: "openclaw/openclaw",
+    clusterId: "automerge-openclaw-openclaw-123",
+    mode: "execute",
+    sourceJob: "jobs/openclaw/inbox/automerge-openclaw-openclaw-123.md",
+  };
+}
+
+function writeRequeueRun(runDir: string, identity: ReturnType<typeof requeueIdentity>) {
+  write(
+    path.join(runDir, "cluster-plan.json"),
+    JSON.stringify({
+      repo: identity.repo,
+      cluster_id: identity.clusterId,
+      mode: identity.mode,
+      source_job: identity.sourceJob,
+    }),
+  );
+  write(
+    path.join(runDir, "result.json"),
+    JSON.stringify({
+      repo: identity.repo,
+      cluster_id: identity.clusterId,
+      mode: identity.mode,
+      actions: [{ action: "repair_contributor_branch", status: "pushed" }],
+    }),
+  );
+}
 
 test("workflow utilities merge checkpoint reports in numeric order", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));

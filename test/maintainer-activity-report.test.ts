@@ -41,10 +41,32 @@ test("maintainer report jobs isolate generation, publication, and deployment cre
   assert.doesNotMatch(generate, /permission-contents: write/);
   assert.doesNotMatch(generate, /maintainers_write_token|git push|CLOUDFLARE_API_TOKEN/);
   assert.equal(generate.match(/persist-credentials: false/g)?.length, 2);
+  assert.match(generate, /artifact_attempt: \$\{\{ steps\.producer-attempt\.outputs\.value \}\}/);
+  assert.match(
+    generate,
+    /id: producer-attempt\n\s+run: echo "value=\$GITHUB_RUN_ATTEMPT" >> "\$GITHUB_OUTPUT"/,
+  );
+  assert.match(
+    generate,
+    /name: maintainer-reports-\$\{\{ github\.run_id \}\}-\$\{\{ steps\.producer-attempt\.outputs\.value \}\}/,
+  );
+  assert.match(generate, /REPORT_PERIOD: \$\{\{ github\.event_name/);
+  assert.match(generate, /REPORT_DATE: \$\{\{ github\.event_name/);
+  assert.match(generate, /case "\$period" in/);
+  assert.match(generate, /all \| day \| week \| month/);
+  assert.match(generate, /\^\[0-9\]\{4\}-\[0-9\]\{2\}-\[0-9\]\{2\}\$/);
+  assert.match(generate, /normalized_date=.*date -u -d "\$report_date" \+%F/);
+  const generateRun = generate.slice(generate.indexOf("        run: |"));
+  assert.doesNotMatch(generateRun, /\$\{\{[^}]*\b(?:github\.event(?:\.|_name)|inputs\.)/);
 
   assert.match(publish, /permission-contents: write/);
   assert.match(publish, /prepare-maintainer-report-publication\.sh/);
   assert.match(publish, /steps\.prepare\.outputs\.changed == 'true'/);
+  assert.match(
+    publish,
+    /name: maintainer-reports-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.generate\.outputs\.artifact_attempt \}\}/,
+  );
+  assert.doesNotMatch(publish, /github\.run_attempt/);
   assert.doesNotMatch(publish, /setup-codex|OPENAI_API_KEY|CLOUDFLARE_API_TOKEN/);
 
   assert.match(deploy, /permission-contents: read/);

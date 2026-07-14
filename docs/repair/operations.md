@@ -224,7 +224,7 @@ They still must not mutate GitHub directly. Missing checkout, failing checks, co
 
 When a canonical PR exists, autonomous follow-through must not skip the maintainer loop. The required path is: review current PR state, clear security-sensitive concerns, inspect actionable review comments, inspect review-bot comments from Greptile, Codex, Asile, CodeRabbit, Copilot, and similar reviewers, address findings or mark them blocked, run Codex `/review`, address every Codex review finding, rebase/refactor to the narrowest safe change, run targeted validation, confirm changelog/credit, then only recommend merge after checks and review state are clean. After the PR lands, rerun duplicate classification against the landed PR/commit before recommending closeout.
 
-Every merge action must carry `merge_preflight`. Missing security clearance, unresolved human or bot comments, missing/failed Codex `/review`, unaddressed findings, or missing validation commands blocks merge. The fix executor runs the agentic prep loop before pushing: give Codex the normalized changed-surface gate, edit, have Codex run and fix validation fallout, deterministic revalidate, Codex `/review`, address findings, revalidate again, then resolve review threads when `CLAWSWEEPER_RESOLVE_REVIEW_THREADS=1`. The applicator also checks live GitHub review threads immediately before squash merge.
+Every merge action must carry `merge_preflight`. Missing security clearance, unresolved human or bot comments, missing/failed Codex `/review`, unaddressed findings, or missing validation commands blocks merge. The fix executor runs the agentic prep loop before finalizing the reviewed bundle: give Codex the normalized changed-surface gate, edit, have Codex run and fix validation fallout, deterministic revalidate, Codex `/review`, address findings, and revalidate again. Even a fully clean action remains blocked from automated merge until GitHub offers an atomic expected-base condition.
 
 ## Runner Strategy
 
@@ -245,7 +245,7 @@ that proxy config and run without raw OpenAI or Codex API key environment
 variables. The legacy `codex login` path remains available only through the
 local `setup-codex` action's `auth-mode: login` input.
 
-Codex runs in a read-only sandbox for classification and receives no GitHub token. GitHub read access is scoped to deterministic preflight scripts. For reviewed fix artifacts, `execute-fix-artifact` gives Codex a temporary target checkout without GitHub credentials, then the deterministic executor commits, pushes, opens the replacement PR, and closes uneditable source PRs only after the replacement exists. When a replacement carries contributor work forward, non-bot source PR authors are added as `Co-authored-by` trailers and named in the replacement PR body and source close comment. Remaining write access is scoped to `apply-result`.
+Codex classification and fix preparation receive no GitHub write token. The workflow runs target-controlled work under a dedicated capability-free UID, drains that UID, and transfers only exact bounded reviewed files to a fresh publisher. The publisher independently validates the immutable job, result, plan, base, tree, paths, and bundle. Prepared code is not pushed: the exact evidence and a hash-bound deferred receipt are retained for 30 days until a fork-based or target-native publisher can avoid privileged target-workflow execution. Only the no-publication path may mint a narrow issues/pull-requests token for guarded comment and closeout actions. Automated merge is also disabled because GitHub cannot atomically bind the expected base branch at merge time.
 
 The repair worker wrapper emits a heartbeat while Codex is running. Execute-side
 edit, review, and final rebase subprocesses emit the same
@@ -462,19 +462,20 @@ ClawSweeper must emit an accepted repair verdict or action marker to dispatch
 the repair/rebase loop.
 
 After a pause, `/clawsweeper approve` is maintainer-only exact-head approval. It
-clears `clawsweeper:human-review`, then merges through the same readiness checks
-and global merge gate as a trusted ClawSweeper pass marker.
+clears `clawsweeper:human-review` and reruns the same readiness checks as a
+trusted ClawSweeper pass marker; automated merge remains disabled.
 
-Repair workers do one final latest-`main` sync before pushing a repaired branch.
+Repair workers do one final latest-`main` sync before finalizing a repaired bundle.
 If `main` advanced after validation, the worker rebases again; any conflicts are
 handed back to Codex for resolution, then validation and Codex `/review` rerun
-before push.
+before the deferred publication receipt is recorded.
 
 The scheduled workflow is dry by default. Set
 `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1` in repo variables to let scheduled runs
 post replies and dispatch workers. Manual workflow dispatch can also pass
-`execute=true`. Branch mutation still requires the downstream execution gates,
-including `CLAWSWEEPER_ALLOW_EXECUTE=1` and `CLAWSWEEPER_ALLOW_FIX_PR=1`.
+`execute=true`. Fix preparation still requires the downstream execution gates,
+including `CLAWSWEEPER_ALLOW_EXECUTE=1` and `CLAWSWEEPER_ALLOW_FIX_PR=1`, but
+the production workflow defers branch publication.
 
 ## Token Strategy
 

@@ -76,11 +76,12 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CLAWSWEEPER_APP_SLUG: clawsweeper
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
   CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
 
 concurrency:
-  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.comment_id && format('repair-comment-router-{0}-comment-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.comment_id) || format('repair-comment-router-{0}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
+  group: ${{ format('repair-comment-router-{0}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
   cancel-in-progress: false
 
 jobs:
@@ -171,6 +172,20 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
+      - name: Bind authenticated mutation App identity
+        id: mutation-app
+        if: ${{ vars.CLAWSWEEPER_ALLOW_MERGE == '1' && steps.app_token.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_SLUG"
+          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
+          test "$app_id" -gt 0
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+
       - name: Create central dispatch token
         id: dispatch-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -205,6 +220,9 @@ jobs:
         id: route-comments
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation-app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.app_token.outputs.installation-id }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
@@ -291,8 +309,11 @@ jobs:
 
       - name: Commit comment router ledger
         if: always()
+        env:
+          ROUTE_COMMENTS_OUTCOME: ${{ steps.route-comments.outcome }}
         run: |
-          if jq -e '.short_circuited == true' results/comment-router-latest.json >/dev/null 2>&1; then
+          if [ "$ROUTE_COMMENTS_OUTCOME" = "success" ] &&
+             jq -e '.short_circuited == true' results/comment-router-latest.json >/dev/null 2>&1; then
             echo "Exact terminal comment version already recorded; skipping state publication."
             exit 0
           fi
@@ -301,7 +322,7 @@ jobs:
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \
-            --rebase-strategy theirs
+            --rebase-strategy comment-router-ledger
 
       - name: Detect waiting repair dispatches
         id: waiting-repair-dispatches
@@ -318,6 +339,9 @@ jobs:
         if: ${{ steps.waiting-repair-dispatches.outputs.count != '' && steps.waiting-repair-dispatches.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation-app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.app_token.outputs.installation-id }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
@@ -411,7 +435,7 @@ jobs:
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \
-            --rebase-strategy theirs
+            --rebase-strategy comment-router-ledger
 
       - name: Finalize command action ledger
         id: finalize-command-action-ledger

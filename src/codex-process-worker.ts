@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { pipeline } from "node:stream";
 import {
   appendCodexOutputCapture,
@@ -7,6 +7,14 @@ import {
   openCodexOutputCapture,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree } from "./codex-spawn.js";
+import {
+  handOffExactFilesToPrincipal,
+  proveIsolatedPrincipalRuntime,
+  reclaimExactPrincipalFiles,
+  terminateAndProvePrincipalEmpty,
+  type IsolatedPrincipalIdentity,
+  type PrincipalWritableFile,
+} from "./trusted-principal-runtime.js";
 
 interface WorkerOptions {
   args: string[];
@@ -17,9 +25,17 @@ interface WorkerOptions {
   stderrPath: string;
   tailBytes: number;
   maxOutputFileBytes: number;
+  env?: NodeJS.ProcessEnv;
+  isolatedPrincipal?: IsolatedPrincipalIdentity;
+  hostIdentity?: IsolatedPrincipalIdentity;
+  principalFiles?: PrincipalWritableFile[];
+  proofPath?: string;
+  setprivPath?: string;
 }
 
 const options = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as WorkerOptions;
+const childEnv: NodeJS.ProcessEnv = { ...(options.env ?? process.env), CODEX_BIN: options.command };
+if (options.isolatedPrincipal) prepareIsolatedPrincipal();
 const stdout = openCodexOutputCapture(options.stdoutPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
@@ -28,8 +44,12 @@ const stderr = openCodexOutputCapture(options.stderrPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
 });
-process.env.CODEX_BIN = options.command;
-const child = spawnCodex(options.args, { cwd: process.cwd(), env: process.env });
+const child = spawnCodex(options.args, {
+  cwd: process.cwd(),
+  env: childEnv,
+  ...(options.isolatedPrincipal ? { isolatedPrincipal: options.isolatedPrincipal } : {}),
+  ...(options.setprivPath ? { setprivPath: options.setprivPath } : {}),
+});
 let spawnError: Error | undefined;
 let timeoutError: Error | undefined;
 let terminating = false;
@@ -59,13 +79,14 @@ child.once("close", (status, signal) => {
   clearTimeout(timeout);
   closeCodexOutputCapture(stdout);
   closeCodexOutputCapture(stderr);
+  const boundaryError = cleanupIsolatedPrincipal();
   writeFileSync(
     options.resultPath,
     JSON.stringify({
       status,
       signal,
-      ...(timeoutError || spawnError
-        ? { error: serializedError(timeoutError ?? spawnError!) }
+      ...(boundaryError || timeoutError || spawnError
+        ? { error: serializedError(boundaryError ?? timeoutError ?? spawnError!) }
         : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
@@ -74,6 +95,64 @@ child.once("close", (status, signal) => {
   );
   process.exit(0);
 });
+
+function prepareIsolatedPrincipal(): void {
+  const principal = options.isolatedPrincipal!;
+  const host = requiredHostIdentity();
+  const files = requiredPrincipalFiles();
+  const proofPath = options.proofPath;
+  if (!proofPath) throw new Error("isolated Codex principal proof path is required");
+  for (const name of ["HOME", "TMPDIR", "CODEX_HOME"] as const) {
+    const directory = childEnv[name];
+    if (!directory) throw new Error(`isolated Codex ${name} is required`);
+    const metadata = lstatSync(directory);
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      metadata.uid !== principal.uid ||
+      (metadata.mode & 0o077) !== 0
+    ) {
+      throw new Error(`isolated Codex ${name} is not a secure principal-owned directory`);
+    }
+  }
+  proveIsolatedPrincipalRuntime({
+    identity: principal,
+    proofPath,
+    cwd: process.cwd(),
+    env: childEnv,
+    ...(options.setprivPath ? { setprivPath: options.setprivPath } : {}),
+  });
+  handOffExactFilesToPrincipal({ files, hostUid: host.uid, principal });
+}
+
+function cleanupIsolatedPrincipal(): Error | undefined {
+  if (!options.isolatedPrincipal) return undefined;
+  try {
+    terminateAndProvePrincipalEmpty(options.isolatedPrincipal.uid);
+    const host = requiredHostIdentity();
+    reclaimExactPrincipalFiles({
+      files: requiredPrincipalFiles(),
+      hostUid: host.uid,
+      hostGid: host.gid,
+      principal: options.isolatedPrincipal,
+    });
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+function requiredHostIdentity(): IsolatedPrincipalIdentity {
+  if (!options.hostIdentity) throw new Error("isolated Codex host identity is required");
+  return options.hostIdentity;
+}
+
+function requiredPrincipalFiles(): PrincipalWritableFile[] {
+  if (!options.principalFiles?.length) {
+    throw new Error("isolated Codex exact output file is required");
+  }
+  return options.principalFiles;
+}
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.once(signal, () => {

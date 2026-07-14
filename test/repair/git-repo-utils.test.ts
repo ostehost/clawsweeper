@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   completeRebaseIfResolved,
+  ensureMergeBaseAvailable,
   rebaseOntoBase,
   runGitCommand,
   unmergedPaths,
@@ -91,12 +92,70 @@ test("rebaseOntoBase rebases a repair branch onto latest origin main", () => {
   run("git", ["push", "origin", "main"], { cwd: work });
   run("git", ["checkout", "feature"], { cwd: work });
 
-  const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
+  const result = rebaseMain(work);
 
   assert.equal(result.status, "rebased");
   run("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { cwd: work });
   assert.equal(fs.readFileSync(path.join(work, "feature.txt"), "utf8"), "feature\n");
   assert.equal(fs.readFileSync(path.join(work, "main.txt"), "utf8"), "main\n");
+});
+
+test(
+  "rebaseOntoBase ignores poisoned global Git hooks",
+  { skip: process.platform === "win32" },
+  () => {
+    const { root, work } = fixtureRepo();
+    run("git", ["checkout", "-b", "feature"], { cwd: work });
+    fs.writeFileSync(path.join(work, "feature.txt"), "feature\n");
+    run("git", ["add", "feature.txt"], { cwd: work });
+    run("git", ["commit", "-m", "feature"], { cwd: work });
+
+    run("git", ["checkout", "main"], { cwd: work });
+    fs.writeFileSync(path.join(work, "main.txt"), "main\n");
+    run("git", ["add", "main.txt"], { cwd: work });
+    run("git", ["commit", "-m", "main update"], { cwd: work });
+    run("git", ["push", "origin", "main"], { cwd: work });
+    run("git", ["checkout", "feature"], { cwd: work });
+
+    const hooks = path.join(root, "poisoned-hooks");
+    const marker = path.join(root, "poisoned-rebase-hook-ran");
+    const globalConfig = path.join(root, "poisoned-global-config");
+    fs.mkdirSync(hooks);
+    const hook = path.join(hooks, "pre-rebase");
+    fs.writeFileSync(hook, `#!/bin/sh\nprintf ran > "${marker}"\nexit 73\n`);
+    fs.chmodSync(hook, 0o700);
+    const referenceHook = path.join(hooks, "reference-transaction");
+    fs.copyFileSync(hook, referenceHook);
+    fs.chmodSync(referenceHook, 0o700);
+    run("git", ["config", "--file", globalConfig, "core.hooksPath", hooks]);
+
+    const previous = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      assert.equal(rebaseMain(work).status, "rebased");
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previous;
+    }
+    assert.equal(fs.existsSync(marker), false);
+  },
+);
+
+test("merge-base discovery delegates every target fetch when a trusted fetcher is supplied", () => {
+  const { work } = fixtureRepo();
+  const calls: string[][] = [];
+
+  const mergeBase = ensureMergeBaseAvailable({
+    targetDir: work,
+    baseBranch: "main",
+    gitFetch: (args, cwd) => {
+      calls.push(args);
+      run("git", ["fetch", ...args], { cwd });
+    },
+  });
+
+  assert.match(mergeBase, /^[0-9a-f]{40}$/);
+  assert.deepEqual(calls, [["origin", "main:refs/remotes/origin/main"]]);
 });
 
 test("rebaseOntoBase leaves conflicts for Codex repair instead of aborting", () => {
@@ -113,7 +172,7 @@ test("rebaseOntoBase leaves conflicts for Codex repair instead of aborting", () 
   run("git", ["push", "origin", "main"], { cwd: work });
   run("git", ["checkout", "feature"], { cwd: work });
 
-  const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
+  const result = rebaseMain(work);
 
   assert.equal(result.status, "conflicts");
   assert.deepEqual(unmergedPaths(work), ["shared.txt"]);
@@ -134,11 +193,11 @@ test("completeRebaseIfResolved continues a resolved conflicting rebase", () => {
   run("git", ["push", "origin", "main"], { cwd: work });
   run("git", ["checkout", "feature"], { cwd: work });
 
-  const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
+  const result = rebaseMain(work);
   assert.equal(result.status, "conflicts");
 
   fs.writeFileSync(path.join(work, "shared.txt"), "main\nfeature\n");
-  const continued = completeRebaseIfResolved({ targetDir: work });
+  const continued = completeRebase(work);
 
   assert.equal(continued.status, "continued");
   run("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { cwd: work });
@@ -159,12 +218,12 @@ test("completeRebaseIfResolved does not stage unrelated worktree files", () => {
   run("git", ["push", "origin", "main"], { cwd: work });
   run("git", ["checkout", "feature"], { cwd: work });
 
-  const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
+  const result = rebaseMain(work);
   assert.equal(result.status, "conflicts");
 
   fs.writeFileSync(path.join(work, "shared.txt"), "main\nfeature\n");
   fs.writeFileSync(path.join(work, "unrelated-untracked.txt"), "do not stage\n");
-  const continued = completeRebaseIfResolved({ targetDir: work });
+  const continued = completeRebase(work);
 
   assert.equal(continued.status, "continued");
   assert.equal(
@@ -187,12 +246,12 @@ test("completeRebaseIfResolved continues an already staged resolution", () => {
   run("git", ["push", "origin", "main"], { cwd: work });
   run("git", ["checkout", "feature"], { cwd: work });
 
-  assert.equal(rebaseOntoBase({ targetDir: work, baseBranch: "main" }).status, "conflicts");
+  assert.equal(rebaseMain(work).status, "conflicts");
   fs.writeFileSync(path.join(work, "shared.txt"), "main\nfeature\n");
   run("git", ["add", "shared.txt"], { cwd: work });
   assert.deepEqual(unmergedPaths(work), []);
 
-  const continued = completeRebaseIfResolved({ targetDir: work });
+  const continued = completeRebase(work);
 
   assert.equal(continued.status, "continued");
   run("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { cwd: work });
@@ -221,12 +280,12 @@ test(
     run("git", ["push", "origin", "main"], { cwd: work });
     run("git", ["checkout", "feature"], { cwd: work });
 
-    assert.equal(rebaseOntoBase({ targetDir: work, baseBranch: "main" }).status, "conflicts");
+    assert.equal(rebaseMain(work).status, "conflicts");
     assert.deepEqual(unmergedPaths(work), [conflictPath]);
     fs.writeFileSync(path.join(work, conflictPath), "main\nfeature\n");
     fs.writeFileSync(path.join(work, "unrelated.txt"), "do not stage\n");
 
-    assert.equal(completeRebaseIfResolved({ targetDir: work }).status, "continued");
+    assert.equal(completeRebase(work).status, "continued");
     assert.equal(
       run("git", ["status", "--short", "--", "unrelated.txt"], { cwd: work }),
       "?? unrelated.txt",
@@ -251,6 +310,21 @@ function fixtureRepo() {
   run("git", ["commit", "-m", "base"], { cwd: work });
   run("git", ["push", "-u", "origin", "main"], { cwd: work });
   return { root, remote, work };
+}
+
+function rebaseMain(targetDir: string) {
+  return rebaseOntoBase({
+    targetDir,
+    baseBranch: "main",
+    trustedRoot: path.dirname(targetDir),
+  });
+}
+
+function completeRebase(targetDir: string) {
+  return completeRebaseIfResolved({
+    targetDir,
+    trustedRoot: path.dirname(targetDir),
+  });
 }
 
 function fakeGitFixture() {
@@ -280,7 +354,10 @@ function run(command, args, options = {}) {
   const child = spawnSync(command, args, {
     ...options,
     encoding: "utf8",
-    env: process.env,
+    env:
+      command === "git"
+        ? { ...process.env, GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_NOSYSTEM: "1" }
+        : process.env,
   });
   assert.equal(
     child.status,

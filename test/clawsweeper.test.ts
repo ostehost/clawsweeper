@@ -2100,6 +2100,27 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.equal(workflow.match(/uses: \.\/\.github\/actions\/setup-state/g)?.length, 2);
   assert.match(workflow, /sparse-checkout: jobs/);
   assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
+  assert.match(
+    workflow,
+    /cluster:[\s\S]*?producer_attempt: \$\{\{ steps\.producer_attempt\.outputs\.value \}\}/,
+  );
+  assert.match(
+    workflow,
+    /name: Record producer attempt\n\s+id: producer_attempt\n\s+run: echo "value=\$GITHUB_RUN_ATTEMPT" >> "\$GITHUB_OUTPUT"/,
+  );
+  assert.match(
+    workflow,
+    /Upload worker transfer artifacts[\s\S]*?name: clawsweeper-repair-worker-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  const workerArtifactDownload = workflow.slice(
+    workflow.indexOf("- name: Download worker artifacts"),
+    workflow.indexOf("- name: Validate job", workflow.indexOf("- name: Download worker artifacts")),
+  );
+  assert.match(
+    workerArtifactDownload,
+    /name: clawsweeper-repair-worker-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.cluster\.outputs\.producer_attempt \}\}/,
+  );
+  assert.doesNotMatch(workerArtifactDownload, /github\.run_attempt/);
   assert.match(workflow, /CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(workflow, /actions\/cache\/restore@v6/);
   assert.match(workflow, /actions\/cache\/save@v6/);
@@ -2755,6 +2776,17 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     process.env.LINEAR_TOKEN = "linear-token";
     process.env.OPENAI_API_KEY = "openai";
     process.env.CODEX_API_KEY = "codex";
+    process.env.ACTIONS_RUNTIME_TOKEN = "runner-runtime";
+    process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "oidc";
+    process.env.GITHUB_ENV = "/tmp/github-env";
+    process.env.GITHUB_OUTPUT = "/tmp/github-output";
+    process.env.GITHUB_PATH = "/tmp/github-path";
+    process.env.GITHUB_STATE = "/tmp/github-state";
+    process.env.GITHUB_STEP_SUMMARY = "/tmp/github-summary";
+    process.env.RUNNER_TRACKING_ID = "runner-tracking";
+    process.env.LD_PRELOAD = "/tmp/loader.so";
+    process.env.DYLD_INSERT_LIBRARIES = "/tmp/loader.dylib";
+    process.env.NODE_OPTIONS = "--require=/tmp/loader.js";
 
     const env = codexEnv();
 
@@ -2772,6 +2804,17 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     assert.equal(env.LINEAR_TOKEN, undefined);
     assert.equal(env.OPENAI_API_KEY, undefined);
     assert.equal(env.CODEX_API_KEY, undefined);
+    assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
+    assert.equal(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, undefined);
+    assert.equal(env.GITHUB_ENV, undefined);
+    assert.equal(env.GITHUB_OUTPUT, undefined);
+    assert.equal(env.GITHUB_PATH, undefined);
+    assert.equal(env.GITHUB_STATE, undefined);
+    assert.equal(env.GITHUB_STEP_SUMMARY, undefined);
+    assert.equal(env.RUNNER_TRACKING_ID, undefined);
+    assert.equal(env.LD_PRELOAD, undefined);
+    assert.equal(env.DYLD_INSERT_LIBRARIES, undefined);
+    assert.equal(env.NODE_OPTIONS, undefined);
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
   } finally {
     process.env = originalEnv;

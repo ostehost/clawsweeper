@@ -123,15 +123,20 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.match(exactPublish.if ?? "", /review-exact-event-item\.outcome == 'success'/);
   assert.match(exactPublish.if ?? "", /setup-state\.outcome == 'success'/);
   assert.doesNotMatch(exactPublish.if ?? "", /action-ledger/);
-  const terminalCommandStateCondition =
-    "${{ always() && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}";
   const exactStateToken = step("event-review-apply", "Create state token");
   const exactSetupState = job("event-review-apply").steps.find(
     (candidate) => candidate.id === "setup-state",
   );
   assert.ok(exactSetupState);
-  assert.equal(exactStateToken.if, terminalCommandStateCondition);
-  assert.equal(exactSetupState.if, terminalCommandStateCondition);
+  for (const condition of [exactStateToken.if ?? "", exactSetupState.if ?? ""]) {
+    assert.match(condition, /always\(\)/);
+    assert.match(
+      condition,
+      /steps\.live-item\.outputs\.proceed != 'true' \|\| steps\.review-exact-event-item\.outputs\.principal_drained == 'true'/,
+    );
+    assert.match(condition, /steps\.live-item\.outputs\.proceed == 'true'/);
+    assert.match(condition, /steps\.target\.outputs\.has_command_context == 'true'/);
+  }
   const exactStatusIndex = job("event-review-apply").steps.findIndex(
     (candidate) => candidate.name === "Mark re-review complete",
   );
@@ -271,8 +276,9 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.match(workflow, /CLAWSWEEPER_PROOF_INSPECTION_TOKEN/);
   assert.match(
     exactReviewStep,
-    /CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \|\| github\.token \}\}/,
+    /CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{ steps\.codex-inspection-token\.outputs\.token \}\}/,
   );
+  assert.match(exactReviewStep, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
   assert.match(
     exactReviewStep,
     /report_path="artifacts\/event\/\$\{\{ steps\.target\.outputs\.item_number \}\}\.md"/,
@@ -285,6 +291,15 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.match(exactReviewStep, /--codex-sandbox read-only/);
   assert.match(reviewJob, /--codex-sandbox read-only/);
   assert.doesNotMatch(workflow, /--codex-sandbox danger-full-access/);
+  assert.doesNotMatch(exactReviewStep, /--skip-start-comment/);
+  assert.doesNotMatch(reviewJob, /--skip-start-comment/);
+  assert.match(reviewJob, /runs-on: ubuntu-latest/);
+  for (const job of [eventReviewJob, reviewJob]) {
+    assert.match(job, /name: Prepare isolated Codex principal/);
+    assert.match(job, /--no-create-home --shell \/usr\/sbin\/nologin --user-group/);
+    assert.match(job, /dist\/trusted-principal-drain\.js/);
+    assert.match(job, /echo "principal_drained=true" >> "\$GITHUB_OUTPUT"/);
+  }
 });
 
 test("review execution tokens can read check runs and commit statuses", () => {
@@ -314,6 +329,23 @@ test("review execution tokens can read check runs and commit statuses", () => {
     eventReviewJob,
     /Review exact event item[\s\S]*GH_TOKEN: \$\{\{ steps\.target-write-token\.outputs\.token \}\}/,
   );
+});
+
+test("renewed direct-routing token retains check run and commit status reads", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const eventReviewStart = workflow.indexOf("\n  event-review-apply:");
+  const planStart = workflow.indexOf("\n  plan:", eventReviewStart);
+  const eventReviewJob = workflow.slice(eventReviewStart, planStart);
+  const renewalStart = eventReviewJob.indexOf(
+    "- name: Renew exact-repository mutation token for direct routing",
+  );
+  const renewalEnd = eventReviewJob.indexOf("\n      - ", renewalStart);
+  const renewal = eventReviewJob.slice(renewalStart, renewalEnd);
+
+  assert.ok(renewalStart > 0);
+  assert.match(renewal, /id: router-mutation-token/);
+  assert.match(renewal, /permission-checks: read/);
+  assert.match(renewal, /permission-statuses: read/);
 });
 
 test("scheduled review shards receive the compiler-backed runtime artifact", () => {
@@ -1629,7 +1661,11 @@ test("sweep target tokens fall back when an org app installation is missing", ()
   );
   assert.match(
     workflow,
-    /CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{ steps\.codex-inspection-token\.outputs\.token \|\| github\.token \}\}/,
+    /CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{ steps\.codex-inspection-token\.outputs\.token \}\}/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{[^\n]*\|\| github\.token/,
   );
   assert.ok(
     workflow.includes(
@@ -1804,6 +1840,25 @@ test("trusted comment router owns command ledger capacity retries", () => {
   assert.match(routerWorkflow, /Detect waiting repair dispatches/);
   assert.match(routerWorkflow, /--status waiting,active/);
   assert.match(routerWorkflow, /--wait-for-capacity/);
+});
+
+test("comment router publishes its compact ledger with the semantic race strategy", () => {
+  const workflow = readText(".github/workflows/repair-comment-router.yml");
+  const atomicPublishes = workflow.match(
+    /--path results\/comment-router\.json \\\n\s+--path results\/comment-router-latest\.json \\\n\s+--path jobs \\\n\s+--rebase-strategy comment-router-ledger/g,
+  );
+
+  assert.equal(atomicPublishes?.length, 2);
+  assert.doesNotMatch(workflow, /--rebase-strategy theirs/);
+  const initialPublish = workflow.slice(
+    workflow.indexOf("- name: Commit comment router ledger"),
+    workflow.indexOf("- name: Detect waiting repair dispatches"),
+  );
+  assert.match(
+    initialPublish,
+    /ROUTE_COMMENTS_OUTCOME: \$\{\{ steps\.route-comments\.outcome \}\}/,
+  );
+  assert.match(initialPublish, /\[ "\$ROUTE_COMMENTS_OUTCOME" = "success" \] &&/);
 });
 
 test("comment commands keep the router-to-sweep dispatch contract", () => {

@@ -12,6 +12,7 @@ import {
   windowsSystemExecutable,
   type CommandInvocation,
 } from "./command.js";
+import { setprivArguments, type IsolatedPrincipalIdentity } from "./trusted-principal-runtime.js";
 
 export type CodexSpawnInvocation = CommandInvocation;
 
@@ -82,16 +83,31 @@ export function spawnCodex(
   options: {
     cwd: string;
     env: NodeJS.ProcessEnv;
+    isolatedPrincipal?: IsolatedPrincipalIdentity;
+    setprivPath?: string;
   },
 ): ChildProcessWithoutNullStreams {
   const invocation = codexSpawnInvocation(args, options.env, process.platform, options.cwd);
-  return spawn(invocation.command, invocation.args, {
+  const isolatedInvocation = options.isolatedPrincipal
+    ? {
+        command: options.setprivPath ?? "/usr/bin/setpriv",
+        args: setprivArguments({
+          principalUid: options.isolatedPrincipal.uid,
+          principalGid: options.isolatedPrincipal.gid,
+          command: invocation.command,
+          commandArgs: invocation.args,
+        }),
+      }
+    : invocation;
+  return spawn(isolatedInvocation.command, isolatedInvocation.args, {
     cwd: options.cwd,
     env: options.env,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
     windowsHide: true,
-    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    ...(!options.isolatedPrincipal && invocation.windowsVerbatimArguments
+      ? { windowsVerbatimArguments: true }
+      : {}),
   });
 }
 

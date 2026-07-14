@@ -2996,7 +2996,10 @@ test("renderResponse gives command replies stateful lobster badges", () => {
   );
   assert.match(reviewBody, /\n🦞🧹\nClawSweeper re-review requested/);
   assert.match(repairBody, /\n🦞🔧\nClawSweeper issue implementation requested/);
-  assert.match(doneBody, /\n🦞✅\nClawSweeper merged this PR/);
+  assert.match(
+    doneBody,
+    /\n🦞✅\nThis PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
+  );
   assert.match(body, /@clawsweeper fix/);
   assert.match(body, /\/clawsweeper visualize \[lens\]/);
 });
@@ -3503,7 +3506,7 @@ test("renderResponse reports automerge completion", () => {
     {
       merge: {
         status: "executed",
-        reason: "merged by ClawSweeper automerge",
+        reason: "merge request accepted and pull request confirmed merged",
         merged_at: "2026-04-29T05:00:00Z",
         merge_commit_sha: "def789abcdef789abcdef789abcdef789abcdef7",
         summary_lines: ["Added queued retry handling for Discord REST 429s."],
@@ -3514,7 +3517,8 @@ test("renderResponse reports automerge completion", () => {
     },
   );
 
-  assert.match(body, /merged this PR/);
+  assert.match(body, /confirmed merged after ClawSweeper submitted the exact-head merge request/);
+  assert.doesNotMatch(body, /ClawSweeper merged this PR/);
   assert.doesNotMatch(body, /Thanks, ClawSweeper/);
   assert.match(body, /What merged:/);
   assert.match(body, /Added queued retry handling/);
@@ -3526,6 +3530,87 @@ test("renderResponse reports automerge completion", () => {
   );
   assert.match(body, /automerge loop is complete/);
   assert.doesNotMatch(body, /ClawSweeper Repair/i);
+});
+
+test("renderResponse does not attribute a recovered exact-head merge to ClawSweeper", () => {
+  const body = renderResponse(
+    {
+      comment_id: "791",
+      intent: "clawsweeper_auto_merge",
+      repo: "openclaw/openclaw",
+      trusted_bot_author: "clawsweeper[bot]",
+      repair_reason: "structured ClawSweeper verdict: pass",
+      target: { head_sha: "abc791" },
+    },
+    {
+      merge: {
+        status: "executed",
+        recovered: true,
+        reason: "pull request is confirmed merged after the recorded ClawSweeper merge request",
+        merged_at: "2026-04-29T05:00:00Z",
+        merge_commit_sha: "def791abcdef791abcdef791abcdef791abcdef7",
+      },
+    },
+  );
+
+  assert.match(
+    body,
+    /This PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
+  );
+  assert.doesNotMatch(body, /ClawSweeper merged this PR/);
+});
+
+test("renderResponse keeps an unreceipted external merge actor-neutral", () => {
+  const body = renderResponse(
+    {
+      comment_id: "792",
+      intent: "clawsweeper_auto_merge",
+      repo: "openclaw/openclaw",
+      trusted_bot_author: "clawsweeper[bot]",
+      target: { head_sha: "abc792" },
+    },
+    {
+      merge: {
+        status: "skipped",
+        reason:
+          "pull request is already merged without a recorded accepted ClawSweeper merge request",
+        merged_at: "2026-04-29T05:00:00Z",
+        merge_commit_sha: "def792abcdef792abcdef792abcdef792abcdef7",
+      },
+    },
+  );
+
+  assert.match(body, /This PR was already merged/);
+  assert.match(body, /no accepted exact-head merge request receipt to attribute/);
+  assert.match(body, /No merge completion was attributed to ClawSweeper/);
+  assert.doesNotMatch(body, /ClawSweeper merged this PR|did not merge yet|left the PR open/);
+});
+
+test("renderResponse keeps an uncertain merge outcome actor-neutral", () => {
+  const body = renderResponse(
+    {
+      comment_id: "793",
+      intent: "clawsweeper_auto_merge",
+      repo: "openclaw/openclaw",
+      trusted_bot_author: "clawsweeper[bot]",
+      target: { head_sha: "abc793" },
+    },
+    {
+      merge: {
+        status: "skipped",
+        reason:
+          "pull request is confirmed merged after a ClawSweeper merge attempt with an unknown outcome; merge actor is not attributed",
+        merge_mutation_status: "unknown",
+        merged_at: "2026-04-29T05:00:00Z",
+        merge_commit_sha: "def793abcdef793abcdef793abcdef793abcdef7",
+      },
+    },
+  );
+
+  assert.match(body, /This PR was already merged/);
+  assert.match(body, /merge actor is not attributed/);
+  assert.match(body, /No merge completion was attributed to ClawSweeper/);
+  assert.doesNotMatch(body, /ClawSweeper merged this PR|did not merge yet|left the PR open/);
 });
 
 test("renderResponse reports maintainer-approved automerge completion", () => {
@@ -3541,7 +3626,7 @@ test("renderResponse reports maintainer-approved automerge completion", () => {
     {
       merge: {
         status: "executed",
-        reason: "merged by ClawSweeper automerge",
+        reason: "merge request accepted and pull request confirmed merged",
         merged_at: "2026-04-29T05:00:00Z",
         merge_commit_sha: "def790abcdef790abcdef790abcdef790abcdef7",
         summary_lines: ["Updated queue scheduling defaults."],
@@ -3550,7 +3635,10 @@ test("renderResponse reports maintainer-approved automerge completion", () => {
     },
   );
 
-  assert.match(body, /Maintainer-approved ClawSweeper automerge is complete/);
+  assert.match(
+    body,
+    /maintainer-approved PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
+  );
   assert.match(body, /Approver: `steipete`/);
   assert.match(body, /Head: `abc790`/);
   assert.match(

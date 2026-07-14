@@ -13,9 +13,12 @@ import {
   dispatchReceiptKeyMaterial,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
+  hasAcceptedMergeMutationReceipt,
   hasSuccessfulDispatchExecutionJob,
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
+  mergeMutationReceiptStatus,
+  mergeMutationReceiptStatusForOutcome,
   normalizeGitHubActor,
   readLedger,
   routerDispatchReceiptKey,
@@ -24,9 +27,186 @@ import {
   sortCommentsForRouting,
   supersededReReviewCommentVersions,
   summarizeChecks,
+  waitingMergeReplay,
   writeLedger,
 } from "../../dist/repair/comment-router-utils.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
+
+function unresolvedMergeReceipts(count) {
+  return Array.from({ length: count }, (_, index) => ({
+    idempotency_key: `unresolved-merge-${index}`,
+    comment_id: String(5000 + index),
+    comment_version_key: `${5000 + index}:2026-04-29T05:00:00Z`,
+    comment_updated_at: "2026-04-29T05:00:00Z",
+    processed_at: "2026-04-29T05:00:01Z",
+    status: "waiting",
+    intent: "clawsweeper_auto_merge",
+    issue_number: 76000 + index,
+    repo: "openclaw/openclaw",
+    expected_head_sha: index.toString(16).padStart(40, "0"),
+    actions: [
+      {
+        action: "merge",
+        status: "waiting",
+        merge_mutation_status: "unknown",
+      },
+    ],
+  }));
+}
+
+test("waiting merge replay requires the exact durable command and reviewed head", () => {
+  const command = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-13T20:00:00Z:clawsweeper_auto_merge",
+    comment_version_key: "991122:2026-07-13T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    intent: "clawsweeper_auto_merge",
+    expected_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  };
+  const waiting = {
+    ...command,
+    status: "waiting",
+    actions: [
+      {
+        action: "merge",
+        status: "waiting",
+        merge_mutation_status: "accepted",
+      },
+    ],
+  };
+
+  assert.deepEqual(waitingMergeReplay({ commands: [waiting] }, command), waiting);
+  assert.equal(hasAcceptedMergeMutationReceipt(waiting), true);
+  assert.equal(mergeMutationReceiptStatus(waiting), "accepted");
+  assert.equal(
+    hasAcceptedMergeMutationReceipt({
+      ...waiting,
+      actions: [{ action: "merge", status: "waiting" }],
+    }),
+    false,
+  );
+  assert.equal(
+    waitingMergeReplay(
+      {
+        commands: [
+          {
+            ...waiting,
+            actions: [{ action: "merge", status: "waiting" }],
+          },
+        ],
+      },
+      command,
+    ),
+    null,
+    "a readiness wait before the merge mutation must not become a replay receipt",
+  );
+  for (const status of ["attempted", "accepted", "unknown"]) {
+    const receipt = {
+      ...waiting,
+      actions: [
+        {
+          action: "merge",
+          status: "waiting",
+          merge_mutation_status: status,
+        },
+      ],
+    };
+    assert.equal(
+      mergeMutationReceiptStatus(waitingMergeReplay({ commands: [receipt] }, command) ?? {}),
+      status,
+      `${status} must reconcile without being promoted or resubmitted`,
+    );
+  }
+  assert.equal(
+    waitingMergeReplay(
+      {
+        commands: [
+          {
+            ...waiting,
+            actions: [
+              {
+                action: "merge",
+                status: "waiting",
+                merge_mutation_status: "rejected",
+              },
+            ],
+          },
+        ],
+      },
+      command,
+    ),
+    null,
+    "a definitely rejected merge request may be retried",
+  );
+  assert.equal(
+    waitingMergeReplay(
+      { commands: [waiting] },
+      { ...command, expected_head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    ),
+    null,
+  );
+  assert.equal(
+    waitingMergeReplay(
+      { commands: [{ ...waiting, actions: [{ action: "merge", status: "blocked" }] }] },
+      command,
+    ),
+    null,
+  );
+  assert.equal(
+    waitingMergeReplay(
+      { commands: [{ ...waiting, attempt_id: "forced-replay-1" }] },
+      { ...command, attempt_id: "forced-replay-2" },
+    ),
+    null,
+  );
+  const { expected_head_sha: _expectedHeadSha, ...maintainerReplay } = command;
+  assert.equal(
+    waitingMergeReplay({ commands: [waiting] }, maintainerReplay)?.expected_head_sha,
+    command.expected_head_sha,
+  );
+});
+
+test("merge mutation outcome receipts fail closed on ambiguous process completion", () => {
+  assert.equal(
+    mergeMutationReceiptStatusForOutcome({
+      outcome: "accepted",
+      repairReason: null,
+      status: 0,
+      signal: null,
+    }),
+    "accepted",
+  );
+  assert.equal(
+    mergeMutationReceiptStatusForOutcome({
+      outcome: "unknown",
+      repairReason: "merge conflicts require repair",
+      status: 1,
+      signal: null,
+    }),
+    "rejected",
+  );
+  assert.equal(
+    mergeMutationReceiptStatusForOutcome({
+      outcome: "unknown",
+      repairReason: "merge conflicts require repair",
+      status: null,
+      signal: "SIGTERM",
+    }),
+    "unknown",
+    "buffered conflict text cannot override an ambiguous signal outcome",
+  );
+  assert.equal(
+    mergeMutationReceiptStatusForOutcome({
+      outcome: "unknown",
+      repairReason: "merge conflicts require repair",
+      status: null,
+      signal: null,
+      error: new Error("transport ended"),
+    }),
+    "unknown",
+  );
+});
 
 test("exact terminal comment versions short-circuit duplicate created deliveries", () => {
   const body = "@clawsweeper re-review";
@@ -452,6 +632,228 @@ test("appendLedger records waiting commands without making them terminal", () =>
   assert.equal(ledger.commands.length, 1);
   assert.equal(ledger.commands[0].status, "waiting");
   assert.equal(shouldSuppressProcessedCommentVersion(ledger.commands[0]), false);
+});
+
+test("appendLedger durably promotes bounded merge mutation receipts in place", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-merge-receipt-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const ledger = { updated_at: null, commands: [] };
+  const command = {
+    idempotency_key: "merge-request-receipt",
+    comment_id: "124",
+    comment_version_key: "124:2026-04-29T03:00:00Z",
+    comment_updated_at: "2026-04-29T03:00:00Z",
+    status: "waiting",
+    intent: "clawsweeper_auto_merge",
+    issue_number: 74499,
+    repo: "openclaw/openclaw",
+  };
+
+  for (const status of ["attempted", "accepted", "unknown", "rejected"]) {
+    assert.equal(
+      appendLedger(ledger, [
+        {
+          ...command,
+          actions: [
+            {
+              action: "merge",
+              status: "waiting",
+              merge_mutation_status: status,
+              ignored_detail: "not persisted",
+            },
+          ],
+        },
+      ]),
+      true,
+    );
+    assert.equal(ledger.commands.length, 1, "promotion must replace the exact command receipt");
+    writeLedger(ledgerPath, ledger);
+    const restored = readLedger(ledgerPath);
+    assert.equal(mergeMutationReceiptStatus(restored.commands[0]), status);
+    assert.deepEqual(restored.commands[0].actions, [
+      {
+        action: "merge",
+        status: "waiting",
+        label: null,
+        job_path: null,
+        merge_mutation_status: status,
+      },
+    ]);
+  }
+});
+
+test("appendLedger preserves a confirmed-unmerged receipt tombstone", () => {
+  const ledger = { updated_at: null, commands: [] };
+  assert.equal(
+    appendLedger(ledger, [
+      {
+        idempotency_key: "confirmed-unmerged",
+        comment_id: "124",
+        comment_version_key: "124:2026-04-29T03:00:00Z",
+        comment_updated_at: "2026-04-29T03:00:00Z",
+        status: "executed",
+        intent: "clawsweeper_auto_merge",
+        issue_number: 74499,
+        repo: "openclaw/openclaw",
+        actions: [
+          {
+            action: "merge",
+            status: "skipped",
+            merge_mutation_status: "accepted",
+            confirmation_status: "confirmed_unmerged",
+            live_rest_state: "closed",
+            live_graphql_state: "CLOSED",
+            prepared_head_sha: "a".repeat(40),
+          },
+        ],
+      },
+    ]),
+    true,
+  );
+  assert.deepEqual(ledger.commands[0].actions, [
+    {
+      action: "merge",
+      status: "skipped",
+      label: null,
+      job_path: null,
+      merge_mutation_status: "accepted",
+      prepared_head_sha: "a".repeat(40),
+      confirmation_status: "confirmed_unmerged",
+      live_rest_state: "closed",
+      live_graphql_state: "CLOSED",
+    },
+  ]);
+});
+
+test("appendLedger retains unresolved merge receipts through compaction and disk round trips", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-merge-receipt-retention-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const expectedHeadSha = "a".repeat(40);
+  const receipt = {
+    idempotency_key: "old-unresolved-merge",
+    comment_id: "100",
+    comment_version_key: "100:2026-04-29T03:00:00Z",
+    comment_updated_at: "2026-04-29T03:00:00Z",
+    processed_at: "2026-04-29T03:00:01Z",
+    status: "waiting",
+    intent: "clawsweeper_auto_merge",
+    issue_number: 74499,
+    repo: "openclaw/openclaw",
+    expected_head_sha: expectedHeadSha,
+    actions: [
+      {
+        action: "merge",
+        status: "waiting",
+        merge_mutation_status: "attempted",
+      },
+    ],
+  };
+  const terminalEntries = Array.from({ length: 1000 }, (_, index) => ({
+    idempotency_key: `terminal-${index}`,
+    comment_id: String(1000 + index),
+    comment_version_key: `${1000 + index}:2026-04-29T04:00:00Z`,
+    comment_updated_at: "2026-04-29T04:00:00Z",
+    processed_at: "2026-04-29T04:00:01Z",
+    status: "executed",
+    intent: "clawsweeper_re_review",
+    issue_number: 75000 + index,
+    repo: "openclaw/openclaw",
+  }));
+  const ledger = { updated_at: null, commands: [] };
+
+  assert.equal(appendLedger(ledger, [receipt, ...terminalEntries]), true);
+  assert.equal(ledger.commands.length, 1000);
+  assert.equal(
+    ledger.commands.some((entry) => entry.idempotency_key === "terminal-0"),
+    false,
+    "the oldest ordinary entry should be evicted before an unresolved merge receipt",
+  );
+  writeLedger(ledgerPath, ledger);
+  const restored = readLedger(ledgerPath);
+  const replay = waitingMergeReplay(restored, receipt);
+  assert.equal(replay?.idempotency_key, receipt.idempotency_key);
+  assert.equal(mergeMutationReceiptStatus(replay ?? {}), "attempted");
+});
+
+test("appendLedger fails closed before mutation when unresolved merge receipts exceed the bound", () => {
+  const receipts = unresolvedMergeReceipts(1001);
+  const ledger = { updated_at: null, commands: [] };
+
+  assert.throws(() => appendLedger(ledger, receipts), /more than 1000 protected mutation receipts/);
+  assert.deepEqual(ledger, { updated_at: null, commands: [] });
+});
+
+test("appendLedger refuses a dispatch claim when protected capacity is full", () => {
+  const ledger = { updated_at: null, commands: [] };
+  assert.equal(appendLedger(ledger, unresolvedMergeReceipts(1000)), true);
+  const before = JSON.stringify(ledger);
+  const claim = {
+    idempotency_key: "claim-at-capacity",
+    comment_id: "999999",
+    comment_version_key: "999999:2026-04-29T06:00:00Z",
+    comment_updated_at: "2026-04-29T06:00:00Z",
+    processed_at: "2026-04-29T06:00:01Z",
+    status: "claimed",
+    intent: "clawsweeper_re_review",
+    issue_number: 79999,
+    repo: "openclaw/openclaw",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+
+  assert.throws(() => appendLedger(ledger, [claim]), /more than 1000 protected mutation receipts/);
+  assert.equal(JSON.stringify(ledger), before);
+  assert.equal(
+    ledger.commands.some((entry) => entry.idempotency_key === claim.idempotency_key),
+    false,
+  );
+});
+
+test("appendLedger retains dispatch claims and active waits within protected capacity", () => {
+  const ledger = { updated_at: null, commands: [] };
+  const claim = {
+    idempotency_key: "claim-with-capacity",
+    comment_id: "999998",
+    comment_version_key: "999998:2026-04-29T06:00:00Z",
+    comment_updated_at: "2026-04-29T06:00:00Z",
+    processed_at: "2026-04-29T06:00:01Z",
+    status: "claimed",
+    intent: "clawsweeper_re_review",
+    issue_number: 79998,
+    repo: "openclaw/openclaw",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  assert.equal(appendLedger(ledger, [...unresolvedMergeReceipts(999), claim]), true);
+  assert.equal(ledger.commands.length, 1000);
+  assert.equal(
+    ledger.commands.some((entry) => entry.idempotency_key === claim.idempotency_key),
+    true,
+  );
+
+  const active = {
+    ...claim,
+    idempotency_key: "active-repair",
+    comment_id: "999997",
+    comment_version_key: "999997:2026-04-29T06:00:00Z",
+    status: "waiting",
+    actions: [{ action: "dispatch_repair", status: "active" }],
+  };
+  const terminal = Array.from({ length: 1000 }, (_, index) => ({
+    ...claim,
+    idempotency_key: `terminal-${index}`,
+    comment_id: String(800000 + index),
+    comment_version_key: `${800000 + index}:2026-04-29T07:00:00Z`,
+    status: "executed",
+    actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
+  }));
+  const compacted = { updated_at: null, commands: [] };
+  assert.equal(appendLedger(compacted, [active, ...terminal]), true);
+  assert.equal(compacted.commands.length, 1000);
+  assert.equal(
+    compacted.commands.some((entry) => entry.idempotency_key === active.idempotency_key),
+    true,
+  );
 });
 
 test("appendLedger records claimed dispatch commands as recoverable idempotency claims", () => {
@@ -1038,6 +1440,42 @@ test("appendLedger refreshes a stale dispatch claim before retry", () => {
 
   assert.equal(ledger.commands.length, 1);
   assert.equal(ledger.commands[0]?.processed_at, "2026-04-29T03:10:00Z");
+});
+
+test("appendLedger compaction preserves an immutable repair dispatch binding", () => {
+  const ledger = { updated_at: null, commands: [] };
+  const action = {
+    action: "dispatch_repair",
+    status: "claimed",
+    job_path: "jobs/openclaw/inbox/automerge-openclaw-openclaw-74499.md",
+    dispatch_repo: "openclaw/clawsweeper",
+    dispatch_workflow: "repair-cluster-worker.yml",
+    dispatch_event: "workflow_dispatch",
+    dispatch_title: "Repair automerge-openclaw-openclaw-74499 [router-abc]",
+    dispatch_mode: "automerge",
+    dispatch_runner: "ubuntu-latest",
+    dispatch_execution_runner: "blacksmith-4vcpu-ubuntu-2404",
+    dispatch_model: "gpt-5.4",
+  };
+
+  assert.equal(
+    appendLedger(ledger, [
+      {
+        idempotency_key: "repair-dispatch-binding",
+        comment_id: "125",
+        comment_version_key: "125:2026-04-29T03:01:00Z",
+        comment_updated_at: "2026-04-29T03:01:00Z",
+        repo: "openclaw/openclaw",
+        issue_number: 74499,
+        status: "claimed",
+        processed_at: "2026-04-29T03:01:01Z",
+        actions: [action],
+      },
+    ]),
+    true,
+  );
+
+  assert.deepEqual(ledger.commands[0]?.actions, [{ ...action, label: null }]);
 });
 
 test("stale dispatch claims without an exact receipt become retryable", () => {

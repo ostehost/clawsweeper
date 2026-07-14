@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SpawnSyncReturns } from "node:child_process";
 import { runCommandResult } from "./command-runner.js";
+import {
+  assertNoUnsafeGitMutationConfig,
+  trustedGitArgs,
+  trustedGitContext,
+} from "./trusted-git.js";
 import { uniqueStrings } from "./validation-command-utils.js";
 
 const gitNetworkTimeoutMs = Math.max(
@@ -18,12 +23,19 @@ type TargetDir = {
   targetDir: string;
 };
 
+export type GitFetch = (args: string[], targetDir: string) => void;
+
 type TargetBranch = TargetDir & {
   branch: string;
 };
 
 type TargetBaseBranch = TargetDir & {
   baseBranch: string;
+  gitFetch?: GitFetch | undefined;
+};
+
+type TrustedTargetBaseBranch = TargetBaseBranch & {
+  trustedRoot: string;
 };
 
 export type RebaseOntoBaseResult = {
@@ -86,14 +98,18 @@ export function remoteBranchSha({ targetDir, branch }: TargetBranch): string {
   return /^[0-9a-f]{40}$/.test(sha) ? sha : "";
 }
 
-export function branchHasBaseDiff({ targetDir, baseBranch }: TargetBaseBranch): boolean {
+export function branchHasBaseDiff({
+  targetDir,
+  baseBranch,
+  gitFetch: trustedFetch,
+}: TargetBaseBranch): boolean {
   const range = `origin/${baseBranch}...HEAD`;
   const first = runGitCommand(["diff", "--name-only", range], { targetDir });
   if (first.status === 0) return Boolean(first.stdout.trim());
   const detail = `${first.stderr ?? ""}\n${first.stdout ?? ""}`;
   if (!/no merge base/i.test(detail)) throw new Error(detail.trim());
 
-  fetchDeeperHistory({ targetDir, baseBranch });
+  fetchDeeperHistory({ targetDir, baseBranch, gitFetch: trustedFetch });
   const retry = runGitCommand(["diff", "--name-only", range], { targetDir });
   if (retry.status === 0) return Boolean(retry.stdout.trim());
   const retryDetail = `${retry.stderr ?? ""}\n${retry.stdout ?? ""}`;
@@ -101,13 +117,17 @@ export function branchHasBaseDiff({ targetDir, baseBranch }: TargetBaseBranch): 
   throw new Error(retryDetail.trim());
 }
 
-export function ensureMergeBaseAvailable({ targetDir, baseBranch }: TargetBaseBranch): string {
-  gitFetch(targetDir, ["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`]);
+export function ensureMergeBaseAvailable({
+  targetDir,
+  baseBranch,
+  gitFetch: trustedFetch,
+}: TargetBaseBranch): string {
+  fetchGit(targetDir, ["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], trustedFetch);
   const baseRef = `origin/${baseBranch}`;
   const first = runGitCommand(["merge-base", baseRef, "HEAD"], { targetDir });
   if (first.status === 0 && first.stdout.trim()) return first.stdout.trim();
 
-  fetchDeeperHistory({ targetDir, baseBranch });
+  fetchDeeperHistory({ targetDir, baseBranch, gitFetch: trustedFetch });
   const retry = runGitCommand(["merge-base", baseRef, "HEAD"], { targetDir });
   if (retry.status === 0 && retry.stdout.trim()) return retry.stdout.trim();
 
@@ -115,12 +135,32 @@ export function ensureMergeBaseAvailable({ targetDir, baseBranch }: TargetBaseBr
   throw new Error(detail || `no merge base between ${baseRef} and HEAD`);
 }
 
-export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): RebaseOntoBaseResult {
-  ensureMergeBaseAvailable({ targetDir, baseBranch });
+export function rebaseOntoBase(options: TrustedTargetBaseBranch): RebaseOntoBaseResult {
+  const { targetDir, baseBranch, trustedRoot } = options;
+  const gitFetch: GitFetch =
+    options.gitFetch ??
+    ((args, cwd) => {
+      assertNoUnsafeGitMutationConfig({ targetDir: cwd, trustedRoot });
+      const fetchContext = trustedGitContext(trustedRoot);
+      gitOutput(trustedGitArgs(fetchContext, ["fetch", ...args]), {
+        targetDir: cwd,
+        env: fetchContext.env,
+        timeoutMs: gitNetworkTimeoutMs,
+      });
+    });
+  ensureMergeBaseAvailable({ ...options, gitFetch });
+  assertNoUnsafeGitMutationConfig({ targetDir, trustedRoot });
+  const context = trustedGitContext(trustedRoot);
+  const trustedOutput = (args: string[]) =>
+    gitOutput(trustedGitArgs(context, args), { targetDir, env: context.env }).trim();
   const baseRef = `origin/${baseBranch}`;
-  const baseSha = gitOutput(["rev-parse", baseRef], { targetDir }).trim();
-  const previousHead = currentHead(targetDir);
-  if (isAncestor({ targetDir, ancestor: baseRef, descendant: "HEAD" })) {
+  const baseSha = trustedOutput(["rev-parse", baseRef]);
+  const previousHead = trustedOutput(["rev-parse", "HEAD"]);
+  const ancestor = runGitCommand(
+    trustedGitArgs(context, ["merge-base", "--is-ancestor", baseRef, "HEAD"]),
+    { targetDir, env: context.env },
+  );
+  if (ancestor.status === 0) {
     return {
       status: "already-current",
       base_ref: baseRef,
@@ -130,7 +170,10 @@ export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): Reb
     };
   }
 
-  const child = runGitCommand(["rebase", baseRef], { targetDir });
+  const child = runGitCommand(trustedGitArgs(context, ["rebase", baseRef]), {
+    targetDir,
+    env: context.env,
+  });
   const detail = `${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
   if (child.status === 0) {
     return {
@@ -138,7 +181,7 @@ export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): Reb
       base_ref: baseRef,
       base_sha: baseSha,
       previous_head: previousHead,
-      current_head: currentHead(targetDir),
+      current_head: trustedOutput(["rev-parse", "HEAD"]),
       detail,
     };
   }
@@ -148,15 +191,25 @@ export function rebaseOntoBase({ targetDir, baseBranch }: TargetBaseBranch): Reb
       base_ref: baseRef,
       base_sha: baseSha,
       previous_head: previousHead,
-      current_head: currentHead(targetDir),
+      current_head: trustedOutput(["rev-parse", "HEAD"]),
       detail,
     };
   }
   throw new Error(detail || `git rebase ${baseRef} failed`);
 }
 
-export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteRebaseResult {
-  const previousHead = currentHead(targetDir);
+export function completeRebaseIfResolved({
+  targetDir,
+  trustedRoot,
+}: TargetDir & { trustedRoot: string }): CompleteRebaseResult {
+  assertNoUnsafeGitMutationConfig({ targetDir, trustedRoot });
+  const context = trustedGitContext(trustedRoot);
+  const gitArgsPrefix = context.argsPrefix;
+  const gitEnv = context.env;
+  const previousHead = gitOutput([...gitArgsPrefix, "rev-parse", "HEAD"], {
+    targetDir,
+    env: gitEnv,
+  }).trim();
   if (!hasRebaseInProgress(targetDir)) {
     return {
       status: "not-in-progress",
@@ -168,7 +221,10 @@ export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteReba
   const resolvedPaths = unmergedPaths(targetDir);
   assertNoConflictMarkers({ targetDir, paths: resolvedPaths });
   if (resolvedPaths.length > 0) {
-    gitOutput(["--literal-pathspecs", "add", "--", ...resolvedPaths], { targetDir });
+    gitOutput([...gitArgsPrefix, "--literal-pathspecs", "add", "--", ...resolvedPaths], {
+      targetDir,
+      env: gitEnv,
+    });
   }
   const unresolved = unmergedPaths(targetDir);
   if (unresolved.length > 0) {
@@ -176,9 +232,13 @@ export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteReba
   }
   let detail = "";
   while (hasRebaseInProgress(targetDir)) {
-    const child = runGitCommand(["-c", "core.editor=true", "rebase", "--continue"], {
-      targetDir,
-    });
+    const child = runGitCommand(
+      [...gitArgsPrefix, "-c", "core.editor=true", "rebase", "--continue"],
+      {
+        targetDir,
+        env: gitEnv,
+      },
+    );
     detail = `${detail}\n${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
     if (child.status !== 0) {
       const remaining = unmergedPaths(targetDir);
@@ -192,7 +252,10 @@ export function completeRebaseIfResolved({ targetDir }: TargetDir): CompleteReba
   return {
     status: "continued",
     previous_head: previousHead,
-    current_head: currentHead(targetDir),
+    current_head: gitOutput([...gitArgsPrefix, "rev-parse", "HEAD"], {
+      targetDir,
+      env: gitEnv,
+    }).trim(),
     detail,
   };
 }
@@ -224,19 +287,27 @@ export function unmergedPaths(targetDir: string): string[] {
   return child.stdout.split("\0").filter(Boolean);
 }
 
-function fetchDeeperHistory({ targetDir, baseBranch }: TargetBaseBranch): void {
+function fetchDeeperHistory({
+  targetDir,
+  baseBranch,
+  gitFetch: trustedFetch,
+}: TargetBaseBranch): void {
   const shallow = runGitCommand(["rev-parse", "--is-shallow-repository"], {
     targetDir,
   }).stdout.trim();
   if (shallow === "true" || fs.existsSync(path.join(targetDir, ".git", "shallow"))) {
-    gitFetch(targetDir, ["--unshallow", "origin"]);
+    fetchGit(targetDir, ["--unshallow", "origin"], trustedFetch);
   } else {
-    gitFetch(targetDir, ["origin", "--prune"]);
+    fetchGit(targetDir, ["origin", "--prune"], trustedFetch);
   }
-  gitFetch(targetDir, ["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`]);
+  fetchGit(targetDir, ["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], trustedFetch);
 }
 
-function gitFetch(targetDir: string, args: string[]): void {
+function fetchGit(targetDir: string, args: string[], trustedFetch?: GitFetch): void {
+  if (trustedFetch) {
+    trustedFetch(args, targetDir);
+    return;
+  }
   gitOutput(["fetch", ...args], { targetDir, timeoutMs: gitNetworkTimeoutMs });
 }
 

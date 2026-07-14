@@ -930,7 +930,9 @@ test("non-gated target repos replace stale changed gates with git validation", (
 test("repair execution provisions pinned Bun before target validation can invoke it", () => {
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
   const setupBunIndex = workflow.indexOf("- name: Setup pinned Bun for target validation");
-  const executeFixIndex = workflow.indexOf("- name: Execute credited fix artifact");
+  const executeFixIndex = workflow.indexOf(
+    "- name: Execute isolated fix preparation and stage exact publication",
+  );
 
   assert.ok(setupBunIndex >= 0, "expected repair execution workflow to set up Bun");
   assert.ok(executeFixIndex >= 0, "expected repair execution workflow to execute fix artifacts");
@@ -939,6 +941,229 @@ test("repair execution provisions pinned Bun before target validation can invoke
   const setupBunStep = workflow.slice(setupBunIndex, executeFixIndex);
   assert.match(setupBunStep, /uses: oven-sh\/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6/);
   assert.match(setupBunStep, /bun-version: 1\.3\.14/);
+});
+
+test("pnpm target dependency setup disables lifecycle scripts", () => {
+  const cwd = committedGitPackageFixture({ check: "node check.js" });
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-pnpm-bin-"));
+  const logPath = temporaryLogPath("fake-pnpm.log");
+  for (const command of ["corepack", "pnpm"]) {
+    writeNodeCommandShim(
+      binDir,
+      command,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(logPath)}, ${JSON.stringify(command)} + " " + process.argv.slice(2).join(" ") + "\\n");
+`,
+    );
+  }
+
+  withCommandOverrides(
+    {
+      corepack: path.join(binDir, "corepack.js"),
+      pnpm: path.join(binDir, "pnpm.js"),
+    },
+    () =>
+      prepareTargetToolchain(cwd, {
+        ...validationOptions("example/pnpm", {
+          toolchain: {
+            packageManager: "pnpm",
+            baseValidationCommands: ["pnpm check"],
+            changedGate: null,
+          },
+        }),
+        installTargetDeps: true,
+        installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+      }),
+  );
+
+  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
+    "corepack enable",
+    "corepack prepare pnpm@10.33.0 --activate",
+    "pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --ignore-pnpmfile --config.engine-strict=false --config.enable-pre-post-scripts=false",
+  ]);
+});
+
+test("pnpm target dependency setup rejects mutable or malformed Corepack descriptors", () => {
+  for (const packageManager of [
+    "pnpm@latest",
+    "pnpm@^10.0.0",
+    "pnpm@https://example.invalid/pnpm.tgz",
+    "pnpm@10.33.0+sha512.deadbeef",
+  ]) {
+    const cwd = committedGitPackageFixture({ check: "node check.js" });
+    const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+    packageJson.packageManager = packageManager;
+    fs.writeFileSync(path.join(cwd, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    assert.throws(
+      () =>
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("example/pnpm", {
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: ["pnpm check"],
+              changedGate: null,
+            },
+          }),
+          installTargetDeps: true,
+          installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+          setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        }),
+      /unsupported target package manager/,
+    );
+  }
+});
+
+test("pnpm target dependency setup disables project Corepack environment overrides", () => {
+  const cwd = committedGitPackageFixture({ check: "node check.js" });
+  const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+  packageJson.packageManager = `pnpm@11.2.2+sha512.${"a".repeat(128)}`;
+  packageJson.devEngines = {
+    packageManager: {
+      name: "pnpm",
+      version: "https://attacker.invalid/pnpm.tgz",
+    },
+  };
+  fs.writeFileSync(path.join(cwd, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
+  fs.writeFileSync(
+    path.join(cwd, ".corepack.env"),
+    [
+      "COREPACK_ENABLE_UNSAFE_CUSTOM_URLS=1",
+      "COREPACK_ENABLE_PROJECT_SPEC=1",
+      "COREPACK_HOME=.attacker-corepack",
+      "COREPACK_INTEGRITY_KEYS=0",
+    ].join("\n"),
+  );
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-safe-corepack-bin-"));
+  const logPath = temporaryLogPath("safe-corepack.log");
+  for (const command of ["corepack", "pnpm"]) {
+    writeNodeCommandShim(
+      binDir,
+      command,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const safe = process.env.COREPACK_ENV_FILE === "0" && process.env.COREPACK_ENABLE_UNSAFE_CUSTOM_URLS === "0" && process.env.COREPACK_DEFAULT_TO_LATEST === "0" && process.env.COREPACK_ENABLE_AUTO_PIN === "0" && process.env.COREPACK_ENABLE_PROJECT_SPEC === "0" && process.env.COREPACK_ENABLE_STRICT === "1";
+if (!safe) process.exit(9);
+fs.appendFileSync(${JSON.stringify(logPath)}, ${JSON.stringify(command)} + " " + process.argv.slice(2).join(" ") + "\\n");
+`,
+    );
+  }
+
+  withCommandOverrides(
+    {
+      corepack: path.join(binDir, "corepack.js"),
+      pnpm: path.join(binDir, "pnpm.js"),
+    },
+    () =>
+      prepareTargetToolchain(cwd, {
+        ...validationOptions("example/pnpm", {
+          toolchain: {
+            packageManager: "pnpm",
+            baseValidationCommands: ["pnpm check"],
+            changedGate: null,
+          },
+        }),
+        installTargetDeps: true,
+        installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+      }),
+  );
+
+  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
+    "corepack enable",
+    `corepack prepare pnpm@11.2.2+sha512.${"a".repeat(128)} --activate`,
+    "pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --ignore-pnpmfile --config.engine-strict=false --config.enable-pre-post-scripts=false",
+  ]);
+});
+
+test("pnpm target dependency setup pins the default before ignoring project selectors", () => {
+  const cwd = committedGitPackageFixture({ check: "node check.js" });
+  const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+  packageJson.devEngines = {
+    packageManager: {
+      name: "pnpm",
+      version: "latest",
+    },
+  };
+  fs.writeFileSync(path.join(cwd, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-project-spec-bin-"));
+  const logPath = temporaryLogPath("project-spec.log");
+  for (const command of ["corepack", "pnpm"]) {
+    writeNodeCommandShim(
+      binDir,
+      command,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.env.COREPACK_ENABLE_PROJECT_SPEC !== "0") process.exit(9);
+fs.appendFileSync(${JSON.stringify(logPath)}, ${JSON.stringify(command)} + " " + process.argv.slice(2).join(" ") + "\\n");
+`,
+    );
+  }
+
+  withCommandOverrides(
+    {
+      corepack: path.join(binDir, "corepack.js"),
+      pnpm: path.join(binDir, "pnpm.js"),
+    },
+    () =>
+      prepareTargetToolchain(cwd, {
+        ...validationOptions("example/pnpm", {
+          toolchain: {
+            packageManager: "pnpm",
+            baseValidationCommands: ["pnpm check"],
+            changedGate: null,
+          },
+        }),
+        installTargetDeps: true,
+        installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+      }),
+  );
+
+  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
+    "corepack enable",
+    "corepack prepare pnpm@10.33.0 --activate",
+    "pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --ignore-pnpmfile --config.engine-strict=false --config.enable-pre-post-scripts=false",
+  ]);
+});
+
+test("npm target dependency setup disables lifecycle scripts and lockfile creation", () => {
+  for (const hasLockfile of [true, false]) {
+    const cwd = committedGitPackageFixture({ check: "node check.js" });
+    if (hasLockfile) fs.writeFileSync(path.join(cwd, "package-lock.json"), "{}\n");
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-npm-bin-"));
+    const logPath = temporaryLogPath("fake-npm.log");
+    writeNodeCommandShim(
+      binDir,
+      "npm",
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
+`,
+    );
+
+    withCommandOverrides({ npm: path.join(binDir, "npm.js") }, () =>
+      prepareTargetToolchain(cwd, {
+        ...validationOptions("example/npm", {
+          toolchain: {
+            packageManager: "npm",
+            baseValidationCommands: ["npm run check"],
+            changedGate: null,
+          },
+        }),
+        installTargetDeps: true,
+        installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+      }),
+    );
+
+    assert.equal(
+      fs.readFileSync(logPath, "utf8").trim(),
+      hasLockfile ? "ci --ignore-scripts" : "install --no-package-lock --ignore-scripts",
+    );
+  }
 });
 
 test("bun-based target toolchain installs deps and runs configured validation", () => {
@@ -967,19 +1192,38 @@ test("bun-based target toolchain installs deps and runs configured validation", 
 
   assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
     "--version",
-    "install --frozen-lockfile",
+    "install --frozen-lockfile --ignore-scripts",
     "run check",
   ]);
 });
 
-test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from preinstall hooks", () => {
-  // Regression guard for the `bunx only-allow bun` preinstall failure on
-  // openclaw/clawhub: ClawSweeper itself runs under pnpm so `process.env`
-  // carries `npm_config_user_agent=pnpm/...`. If that value leaked into the
-  // `bun install` child we'd shell out to, target preinstalls that gate on
-  // `only-allow bun` would refuse to run. prepareBunToolchain must scrub
-  // caller identity/lifecycle env and assert a bun user-agent instead, while
-  // preserving npm-compatible install configuration for private registries.
+test("bun lockfile fallback keeps lifecycle hooks disabled", () => {
+  const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  const { binDir, logPath } = fakeBunFixture(cwd, { failFrozenInstall: true });
+  withPathPrefix(binDir, () => {
+    prepareTargetToolchain(cwd, {
+      ...validationOptions("openclaw/clawhub", clawhubToolchain()),
+      installTargetDeps: true,
+      installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+      setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+    });
+  });
+
+  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
+    "--version",
+    "install --frozen-lockfile --ignore-scripts",
+    "install --no-frozen-lockfile --ignore-scripts",
+  ]);
+});
+
+test("bun-based target toolchain sanitizes caller package-manager metadata", () => {
+  // ClawSweeper itself runs under pnpm, so its caller identity must not leak
+  // into Bun. Lifecycle scripts are disabled independently; registry and cache
+  // configuration still needs to reach Bun for private target dependencies.
   const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
@@ -1208,7 +1452,7 @@ test("resolveTargetRepoToolchain stays total when the config file is malformed J
 test("changed validation retries one transient check:changed failure", () => {
   const cwd = gitPackageFixture({
     "check:changed":
-      "node -e \"const fs=require('fs'); const file='.attempt'; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); if (count===0) { console.error('transient changed gate failure'); process.exit(1); }\"",
+      "node -e \"const fs=require('fs'); const file='node_modules/.attempt'; fs.mkdirSync('node_modules',{recursive:true}); const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); if (count===0) { console.error('transient changed gate failure'); process.exit(1); }\"",
   });
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
@@ -1231,7 +1475,7 @@ test("changed validation retries one transient check:changed failure", () => {
   }
 });
 
-test("target validation strips Codex, model, and GitHub write credentials", () => {
+test("target validation strips credentials and GitHub Actions command channels", () => {
   const secretNames = [
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -1239,6 +1483,22 @@ test("target validation strips Codex, model, and GitHub write credentials", () =
     "CODEX_HOME",
     "GH_TOKEN",
     "GITHUB_TOKEN",
+    "GITHUB_ENV",
+    "GITHUB_OUTPUT",
+    "GITHUB_PATH",
+    "GITHUB_STEP_SUMMARY",
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "ACTIONS_RUNTIME_TOKEN",
+    "ACTIONS_RUNTIME_URL",
+    "ACTIONS_RESULTS_URL",
+    "CLAWSWEEPER_RULESET_GH_TOKEN",
+    "CLAWSWEEPER_CRABFLEET_AGENT_TOKEN",
+    "CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN",
+    "CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL",
+    "CLAWSWEEPER_CRABFLEET_WORK_STATE_URL",
+    "CLAWSWEEPER_CRABFLEET_BROWSER_URL",
+    "CLAWSWEEPER_CRABFLEET_SESSION_ID",
   ];
   const secretNameArray = `[${secretNames.map((name) => `'${name}'`).join(",")}]`;
   const cwd = gitPackageFixture({
@@ -1301,9 +1561,9 @@ function gitBunPackageFixture(scripts) {
   return cwd;
 }
 
-function fakeBunFixture(cwd, { failRun = false } = {}) {
+function fakeBunFixture(_cwd, { failRun = false, failFrozenInstall = false } = {}) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
-  const logPath = path.join(cwd, "fake-bun.log");
+  const logPath = temporaryLogPath("fake-bun.log");
   writeNodeCommandShim(
     binDir,
     "bun",
@@ -1311,6 +1571,7 @@ function fakeBunFixture(cwd, { failRun = false } = {}) {
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv[2] === "--version") console.log("1.3.10");
+if (${JSON.stringify(failFrozenInstall)} && process.argv[2] === "install" && process.argv.includes("--frozen-lockfile")) { console.error("lockfile is out of date"); process.exit(1); }
 if (process.argv[2] === "install") fs.mkdirSync("node_modules", { recursive: true });
 if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("src/base.ts:1: lint failed"); process.exit(1); }
 `,
@@ -1318,10 +1579,11 @@ if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("sr
   return { binDir, logPath };
 }
 
-function envLoggingBunFixture(cwd) {
+function envLoggingBunFixture(_cwd) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-env-bin-"));
-  const logPath = path.join(cwd, "fake-bun.log");
-  const envLogPath = path.join(cwd, "fake-bun-env.log");
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-env-log-"));
+  const logPath = path.join(logDir, "fake-bun.log");
+  const envLogPath = path.join(logDir, "fake-bun-env.log");
   writeNodeCommandShim(
     binDir,
     "bun",
@@ -1363,6 +1625,21 @@ function withPathPrefix(binDir, callback) {
   }
 }
 
+function withCommandOverrides(commands, callback) {
+  const previous = {};
+  for (const [command, commandPath] of Object.entries(commands)) {
+    for (const [key, value] of Object.entries(mockCommandBinEnv(command, commandPath))) {
+      previous[key] = process.env[key];
+      process.env[key] = value;
+    }
+  }
+  try {
+    callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) restoreEnv(key, value);
+  }
+}
+
 function envPathKey() {
   return Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
 }
@@ -1393,9 +1670,25 @@ function clawhubToolchain() {
 
 function gitPackageFixture(scripts) {
   const cwd = packageFixture(scripts);
+  fs.writeFileSync(path.join(cwd, ".gitignore"), "node_modules/\n");
+  fs.writeFileSync(
+    path.join(cwd, "pnpm-lock.yaml"),
+    "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n",
+  );
   git(cwd, "init", "-b", "main");
   git(cwd, "config", "user.email", "clawsweeper@example.invalid");
   git(cwd, "config", "user.name", "ClawSweeper Test");
+  return cwd;
+}
+
+function temporaryLogPath(name) {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-log-")), name);
+}
+
+function committedGitPackageFixture(scripts) {
+  const cwd = gitPackageFixture(scripts);
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
   return cwd;
 }
 

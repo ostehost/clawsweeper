@@ -11,6 +11,15 @@ export type CodexLoginMethod = "api" | "chatgpt";
 
 export const PUBLIC_CODEX_MODEL = "internal";
 
+const UNTRUSTED_RUNNER_CHANNELS = new Set([
+  "GITHUB_ENV",
+  "GITHUB_OUTPUT",
+  "GITHUB_PATH",
+  "GITHUB_STATE",
+  "GITHUB_STEP_SUMMARY",
+  "RUNNER_TRACKING_ID",
+]);
+
 export function codexLoginMethod(
   value = process.env.CLAWSWEEPER_CODEX_LOGIN_METHOD,
 ): CodexLoginMethod {
@@ -80,7 +89,17 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.LINEAR_API_KEY;
   delete env.LINEAR_TOKEN;
   for (const key of Object.keys(env)) {
-    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
+    if (
+      /^CLAWSWEEPER_.*GH_TOKEN$/.test(key) ||
+      /^CLAWSWEEPER_.*(?:API_KEY|PRIVATE_KEY|SECRET|TOKEN)$/.test(key) ||
+      key.startsWith("ACTIONS_") ||
+      key.startsWith("LD_") ||
+      key.startsWith("DYLD_") ||
+      key === "NODE_OPTIONS" ||
+      UNTRUSTED_RUNNER_CHANNELS.has(key)
+    ) {
+      delete env[key];
+    }
   }
   if (!options.preserveCodexAuth) {
     delete env.OPENAI_API_KEY;

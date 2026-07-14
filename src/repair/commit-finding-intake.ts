@@ -38,6 +38,7 @@ function prepare() {
     "report-path",
     stringArg("report_path", `records/${repoSlug(targetRepo)}/commits/${sha}.md`),
   );
+  assertCommitFindingSource({ targetRepo, reportRepo, reportPath, sha });
   const defaultReportUrl = `https://github.com/${reportRepo}/blob/main/${reportPath}`;
   const dispatchReportUrl = stringArg("report-url", stringArg("report_url", ""));
   const reportUrl = isGithubUrl(dispatchReportUrl) ? dispatchReportUrl : defaultReportUrl;
@@ -105,6 +106,33 @@ function prepare() {
   };
   writeStepOutputs(out);
   console.log(JSON.stringify(out, null, 2));
+}
+
+function assertCommitFindingSource({
+  targetRepo,
+  reportRepo,
+  reportPath,
+  sha,
+}: {
+  targetRepo: string;
+  reportRepo: string;
+  reportPath: string;
+  sha: string;
+}) {
+  const allowedOwner = String(process.env.CLAWSWEEPER_ALLOWED_OWNER ?? "openclaw").trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) {
+    die("target repository is invalid");
+  }
+  if (targetRepo.split("/")[0] !== allowedOwner) {
+    die(`target repository owner must be ${allowedOwner}`);
+  }
+  if (reportRepo !== "openclaw/clawsweeper") {
+    die("commit finding report repository must be openclaw/clawsweeper");
+  }
+  const expectedPath = `records/${repoSlug(targetRepo)}/commits/${sha}.md`;
+  if (reportPath !== expectedPath) {
+    die(`commit finding report path must be ${expectedPath}`);
+  }
 }
 
 function finalize() {

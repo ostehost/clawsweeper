@@ -12,17 +12,13 @@ export function reviewAfterFinalBaseSync<T>({
   syncChanged,
   currentReview,
   reviewSynchronizedTree,
-  checkpointSynchronizedTree,
 }: {
   syncChanged: boolean;
   currentReview: T;
   reviewSynchronizedTree: () => T;
-  checkpointSynchronizedTree: () => void;
 }): T {
   if (!syncChanged) return currentReview;
-  const review = reviewSynchronizedTree();
-  checkpointSynchronizedTree();
-  return review;
+  return reviewSynchronizedTree();
 }
 
 export function persistBeforePublication({

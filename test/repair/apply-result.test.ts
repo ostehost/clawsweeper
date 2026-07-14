@@ -1120,6 +1120,80 @@ test("repair apply leaves current-main fixed closeout outside coverage proof", (
   }
 });
 
+test("repair apply blocks post-merge closeout for an off-main merged candidate", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyFixture(tmp, {
+      action: "post_merge_close",
+      classification: "fixed_by_candidate",
+      candidate_fix: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({
+          number: 202,
+          title: "Rewrite config validation",
+          mergedAt: "2026-05-26T00:00:00Z",
+          base: "release",
+        }),
+      },
+      comments: { 101: [], 202: [] },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered", failIfProofRuns: true });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].reason, "pull request base is not main");
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply blocks post-merge closeout until both candidate views confirm merge", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyFixture(tmp, {
+      action: "post_merge_close",
+      classification: "fixed_by_candidate",
+      candidate_fix: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({
+          number: 202,
+          title: "Rewrite config validation",
+          mergedAt: "2026-05-26T00:00:00Z",
+        }),
+      },
+      prViewOverrides: { 202: { state: "OPEN", mergedAt: null } },
+      comments: { 101: [], 202: [] },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered", failIfProofRuns: true });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].reason, "candidate fix is not confirmed merged");
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1143,6 +1217,7 @@ type ApplyFixtureAction = {
 type FakeGhData = {
   issues: Record<number, Record<string, unknown>>;
   pulls: Record<number, Record<string, unknown>>;
+  prViewOverrides?: Record<number, Record<string, unknown>>;
   comments: Record<number, Record<string, unknown>[]>;
   omitIssueCommentCounts?: number[];
   prViewFailure?: { number: number; message: string };
@@ -1393,18 +1468,19 @@ if (args[0] === "pr" && args[1] === "view") {
   }
   const pull = data.pulls[number];
   write({
-    baseRefName: "main",
+    baseRefName: pull.base?.ref || "main",
     isDraft: false,
     mergeable: "MERGEABLE",
     mergeCommit: { oid: "abc123" },
     mergeStateStatus: "CLEAN",
     mergedAt: pull.merged_at || null,
     reviewDecision: null,
-    state: String(pull.state || "open").toUpperCase(),
+    state: pull.merged_at ? "MERGED" : String(pull.state || "open").toUpperCase(),
     statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
     title: pull.title,
     updatedAt: pull.updated_at,
     url: pull.html_url,
+    ...(data.prViewOverrides?.[number] || {}),
   });
   process.exit(0);
 }
@@ -1494,7 +1570,7 @@ function issue(options: {
   };
 }
 
-function pull(options: { number: number; title: string; mergedAt?: string }) {
+function pull(options: { number: number; title: string; mergedAt?: string; base?: string }) {
   return {
     number: options.number,
     title: options.title,
@@ -1502,6 +1578,7 @@ function pull(options: { number: number; title: string; mergedAt?: string }) {
     url: `https://github.com/openclaw/openclaw/pull/${options.number}`,
     state: options.mergedAt ? "closed" : "open",
     merged_at: options.mergedAt ?? null,
+    base: { ref: options.base ?? "main" },
     body: `${options.title} body.`,
     updated_at: "2026-05-25T00:00:00Z",
   };

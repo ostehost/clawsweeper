@@ -133,7 +133,7 @@ replacement PR. Direct mutation still happens outside Codex.
 
 Workflow: `.github/workflows/repair-cluster-worker.yml`
 
-The cluster worker has two jobs:
+The cluster worker has three jobs:
 
 1. `cluster`
    - checks out ClawSweeper
@@ -147,14 +147,23 @@ The cluster worker has two jobs:
 
 2. `execute`
    - runs only for `execute` or `autonomous`
-   - mints a write GitHub App token, including workflow-file write permission,
-     when configured
+   - mints only exact-repository read access
    - downloads worker artifacts
-   - runs `execute-fix-artifact`
-   - runs `apply-result`
-   - runs `post-flight`
-   - labels ClawSweeper targets
-   - uploads final artifacts
+   - runs `execute-fix-artifact --prepare-publication` under a dedicated,
+     capability-free UID
+   - kills and proves that UID empty, then stages only the exact bounded
+     manifest and bundle (or an atomic empty pair for no-publication)
+
+3. `publish`
+   - runs on a fixed trusted runner without Codex or target toolchains
+   - checks out the immutable state commit and validates the exact transferred
+     result, plan, base, tree, paths, lease, and bundle
+   - retains prepared code as a hash-bound deferred publication with no target
+     token or mutation
+   - permits only guarded no-publication comment/closeout work with a narrow
+     issues/pull-requests token
+   - leaves automated merge disabled because the API cannot atomically bind
+     the reviewed base branch
 
 The workflow concurrency group is based on job path and mode, so repeat
 dispatches of the same job queue instead of racing each other.
@@ -184,8 +193,10 @@ It can:
 - preserve contributor credit in co-author trailers, PR body, and closeout comments
 
 The executor prepares a temporary checkout of the target repo. Codex edits that
-checkout without GitHub credentials. The deterministic executor commits,
-pushes, opens PRs, and comments using the GitHub token.
+checkout without GitHub write credentials, and the deterministic executor
+commits and validates the reviewed tree locally. In the production Actions
+workflow, the fresh publisher retains that commit as a deferred bundle instead
+of pushing or opening a PR.
 
 For same-branch automerge repairs, the executor can stay alive after pushing a
 deterministic repair. It waits for the exact-head ClawSweeper verdict and GitHub

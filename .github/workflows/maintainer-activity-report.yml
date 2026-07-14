@@ -55,8 +55,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
+      artifact_attempt: ${{ steps.producer-attempt.outputs.value }}
       maintainers_sha: ${{ steps.maintainers-base.outputs.sha }}
     steps:
+      - name: Record producer attempt
+        id: producer-attempt
+        run: echo "value=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Create maintainer repo read token
         id: maintainers_read_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -114,12 +119,38 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.openclaw_read_token.outputs.token }}
           DISCRAWL_NO_AUTO_UPDATE: "1"
+          REPORT_PERIOD: ${{ github.event_name == 'workflow_dispatch' && inputs.period || 'day' }}
+          REPORT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}
+          REPORT_EVENT_NAME: ${{ github.event_name }}
+          REPORT_EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
+          REPORT_INCLUDE_COMMENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.comments && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          period="${{ github.event_name == 'workflow_dispatch' && inputs.period || 'day' }}"
-          report_date="${{ github.event_name == 'workflow_dispatch' && inputs.date || '' }}"
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            case "${{ github.event.schedule }}" in
+          period="$REPORT_PERIOD"
+          report_date="$REPORT_DATE"
+          case "$period" in
+            all | day | week | month) ;;
+            *)
+              echo "Invalid report period: $period" >&2
+              exit 1
+              ;;
+          esac
+          if [ -n "$report_date" ]; then
+            normalized_date="$(date -u -d "$report_date" +%F 2>/dev/null || true)"
+            if ! [[ "$report_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [ "$normalized_date" != "$report_date" ]; then
+              echo "Invalid report date: $report_date" >&2
+              exit 1
+            fi
+          fi
+          case "$REPORT_INCLUDE_COMMENTS" in
+            true | false) ;;
+            *)
+              echo "Invalid comments flag: $REPORT_INCLUDE_COMMENTS" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$REPORT_EVENT_NAME" = "schedule" ]; then
+            case "$REPORT_EVENT_SCHEDULE" in
               "47 8 * * 1") period="week" ;;
               "17 9 1 * *") period="month" ;;
               *) period="day" ;;
@@ -129,7 +160,7 @@ jobs:
           if [ -n "$report_date" ]; then
             args+=(--date "$report_date")
           fi
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.comments }}" != "true" ]; then
+          if [ "$REPORT_EVENT_NAME" != "workflow_dispatch" ] || [ "$REPORT_INCLUDE_COMMENTS" != "true" ]; then
             args+=(--no-comments)
           fi
           node .agents/skills/openclaw-maintainer-activity/scripts/generate-maintainer-activity-history.mjs "${args[@]}"
@@ -137,7 +168,7 @@ jobs:
       - name: Upload generated reports
         uses: actions/upload-artifact@v7
         with:
-          name: maintainer-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          name: maintainer-reports-${{ github.run_id }}-${{ steps.producer-attempt.outputs.value }}
           path: maintainers/reports
           if-no-files-found: error
           include-hidden-files: true
@@ -180,7 +211,7 @@ jobs:
       - name: Download generated reports
         uses: actions/download-artifact@v8
         with:
-          name: maintainer-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          name: maintainer-reports-${{ github.run_id }}-${{ needs.generate.outputs.artifact_attempt }}
           path: generated-reports
 
       - name: Prepare generated report publication

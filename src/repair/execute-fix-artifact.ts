@@ -3,6 +3,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
 import {
   spawn,
@@ -39,10 +40,10 @@ import {
   completeRebaseIfResolved,
   currentHead,
   ensureMergeBaseAvailable,
+  hasRebaseInProgress,
   isAncestor,
   rebaseOntoBase,
-  remoteBranchExists,
-  remoteBranchSha,
+  type RebaseOntoBaseResult,
   unmergedPaths,
 } from "./git-repo-utils.js";
 import {
@@ -94,6 +95,14 @@ import {
 } from "./execution-finalization.js";
 import { tryResolveMechanicalRebaseConflicts } from "./mechanical-rebase-conflicts.js";
 import { compactGeneratedBranchHistory } from "./compact-generated-branch.js";
+import { assertCommitTree, exactCommitRefspec } from "./reviewed-publication.js";
+import {
+  assertNoUnsafeGitMutationConfig,
+  fixedGitHubRepositoryUrl,
+  trustedGitArgs,
+  trustedGitContext,
+  trustedGitNetworkContext,
+} from "./trusted-git.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
 import {
   shouldCloseSupersededSourcePrs,
@@ -116,12 +125,15 @@ import {
 } from "./repair-branch-push-errors.js";
 import {
   canSkipInternalCodexReviewForRepairDelta,
+  assertTargetValidationReceipt,
+  captureTargetValidationReceipt,
   classifyExternalBaseValidationFailure,
   prepareTargetToolchain,
   preflightTargetValidationPlan,
   repairDeltaValidationPlan,
   reproduceValidationFailureAtPinnedBase,
-  runAllowedValidationCommands,
+  runAllowedValidationCommandsWithReceipt,
+  type TargetValidationReceipt,
   type TargetValidationOptions,
 } from "./target-validation.js";
 import { uniqueStrings } from "./validation-command-utils.js";
@@ -163,8 +175,30 @@ const jobPath = args._[0];
 const resultPathArg = args._[1];
 const latest = Boolean(args.latest);
 const dryRun = Boolean(args["dry-run"] || process.env.CLAWSWEEPER_FIX_DRY_RUN === "1");
-const deferPublication = Boolean(args["defer-publication"]);
+const preparePublication = Boolean(args["prepare-publication"]);
+const validatePreparedPublicationOnly = Boolean(args["validate-prepared-publication"]);
+const publishPreparedPublication = Boolean(args["publish-prepared-publication"]);
+const validateNoPublicationOnly = Boolean(args["validate-no-publication"]);
+const publishNoPublication = Boolean(args["publish-no-publication"]);
+const deferPublication = Boolean(
+  args["defer-publication"] ||
+  preparePublication ||
+  validatePreparedPublicationOnly ||
+  publishPreparedPublication,
+);
 const publishReportOnly = Boolean(args["publish-report-only"]);
+if (
+  [
+    preparePublication,
+    validatePreparedPublicationOnly,
+    publishPreparedPublication,
+    validateNoPublicationOnly,
+    publishNoPublication,
+  ].filter(Boolean).length > 1
+) {
+  throw new Error("prepare/validate/publish prepared publication modes are mutually exclusive");
+}
+if (preparePublication) scrubUntrustedProcessEnvironment(process.env);
 const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const executionModelArgs = codexModelArgs(model);
 const { codexTimeoutMs, fixStepTimeoutMs, lateWorkerReserveMs } = repairTimeoutBudgetFromEnv(
@@ -293,6 +327,7 @@ const targetValidationOptions: TargetValidationOptions = {
   installTargetDeps,
   strictTargetValidation: configuredStrictTargetValidation || automergeTargetValidation,
   targetRepo: result.repo,
+  gitFetch: fetchTargetRepository,
 };
 
 function currentTargetValidationOptions(): TargetValidationOptions {
@@ -321,10 +356,76 @@ function currentCheckoutCloneTimeoutMs() {
   );
 }
 
-function runGitNetwork(args: string[], cwd: string = targetDir) {
-  return run("git", args, {
+function runTrustedGitMutation(args: string[], cwd: string = targetDir) {
+  assertNoUnsafeGitMutationConfig({ targetDir: cwd, trustedRoot: workRoot });
+  const context = trustedGitContext(workRoot);
+  return run("git", trustedGitArgs(context, args), {
     cwd,
+    env: context.env,
     timeoutMs: currentNetworkCommandTimeoutMs(),
+  });
+}
+
+function runTrustedGitMutationResult(args: string[], cwd: string = targetDir) {
+  assertNoUnsafeGitMutationConfig({ targetDir: cwd, trustedRoot: workRoot });
+  const context = trustedGitContext(workRoot);
+  return runCommandResult("git", trustedGitArgs(context, args), {
+    cwd,
+    env: context.env,
+    timeoutMs: currentNetworkCommandTimeoutMs(),
+  });
+}
+
+function runTrustedGitNetwork(args: string[], cwd: string = targetDir) {
+  assertFixedGitHubNetworkArgs(args);
+  assertNoUnsafeGitMutationConfig({ targetDir: cwd, trustedRoot: workRoot });
+  const context = trustedGitNetworkContext(workRoot, currentGitHubToken());
+  return run("git", trustedGitArgs(context, args), {
+    cwd,
+    env: context.env,
+    timeoutMs: currentNetworkCommandTimeoutMs(),
+  });
+}
+
+function fetchTargetRepository(args: string[], cwd: string = targetDir) {
+  const remoteIndexes = args.flatMap((arg, index) => (arg === "origin" ? [index] : []));
+  if (remoteIndexes.length !== 1) {
+    throw new Error("trusted target fetch requires exactly one origin remote placeholder");
+  }
+  const networkArgs = [...args];
+  networkArgs[remoteIndexes[0]!] = fixedGitHubRepositoryUrl(String(result.repo));
+  return runTrustedGitNetwork(["fetch", ...networkArgs], cwd);
+}
+
+function currentGitHubToken(): string {
+  return String(process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? "").trim();
+}
+
+function validatedGitHubBranchRef(branch: string): string {
+  const targetRef = `refs/heads/${String(branch ?? "")}`;
+  exactCommitRefspec({ commit: "0".repeat(40), targetRef });
+  return targetRef;
+}
+
+function assertFixedGitHubNetworkArgs(args: readonly string[]): void {
+  if (!["fetch", "ls-remote", "push"].includes(args[0] ?? "")) {
+    throw new Error("trusted Git network operation is not allowlisted");
+  }
+  const urls = args.filter((arg) => arg.startsWith("https://"));
+  if (urls.length !== 1) {
+    throw new Error("trusted Git network operation requires one fixed GitHub URL");
+  }
+  const url = urls[0]!;
+  const match = /^https:\/\/github\.com\/([^/?#]+\/[^/?#]+)\.git$/.exec(url);
+  if (!match || fixedGitHubRepositoryUrl(match[1]!) !== url) {
+    throw new Error("trusted Git network operation requires a fixed github.com repository URL");
+  }
+}
+
+function completeTrustedRebase(targetDir: string) {
+  return completeRebaseIfResolved({
+    targetDir,
+    trustedRoot: workRoot,
   });
 }
 
@@ -428,6 +529,27 @@ const report: LooseRecord = {
   actions: [],
 };
 
+if (validateNoPublicationOnly || publishNoPublication) {
+  if (plannedFixActions.length !== 0) {
+    throw new Error(
+      "refusing no-publication path: the immutable cluster result still requires fix execution",
+    );
+  }
+  if (validateNoPublicationOnly) {
+    console.log("Validated immutable no-publication cluster result without mutation.");
+    process.exit(0);
+  }
+  report.status = "skipped";
+  report.reason = "immutable cluster result has no planned fix actions";
+  report.actions.push({
+    action: "execute_fix",
+    status: "skipped",
+    reason: report.reason,
+  });
+  writeReport(report, resultPath);
+  process.exit(0);
+}
+
 if (publishReportOnly) {
   publishPersistedReport(resultPath);
   process.exit(0);
@@ -517,6 +639,39 @@ if (scopeBlock) {
     evidence: scopeBlock.evidence,
   });
   writeReport(report, resultPath);
+  process.exit(0);
+}
+
+if (validatePreparedPublicationOnly || publishPreparedPublication) {
+  if (validatePreparedPublicationOnly) {
+    const prepared = validatePreparedPublicationArtifact({ fixArtifact, mutate: false });
+    writePreparedPublicationValidationReceipt(prepared);
+    console.log(
+      `Validated prepared publication ${prepared.commit} for ${prepared.repo} without mutation.`,
+    );
+    process.exit(0);
+  }
+  const prepared = readPreparedPublicationValidationReceipt();
+  const deferredOutcome = deferValidatedPreparedPublication(prepared);
+  const persistedReportPath = fixExecutionReportPath(resultPath);
+  const persistedReport: LooseRecord = {
+    repo: result.repo,
+    cluster_id: result.cluster_id,
+    dry_run: false,
+    result_path: path.relative(repoRoot(), resultPath),
+    executed_at: new Date().toISOString(),
+    status: "deferred",
+    reason: deferredOutcome.reason,
+    actions: [deferredOutcome],
+    publication_source: "independently validated immutable prepared bundle",
+  };
+  finalizeExecutionReport({
+    deferPublication: true,
+    reportPath: persistedReportPath,
+    serialize: () => `${JSON.stringify(persistedReport, null, 2)}\n`,
+    publish: () => {},
+  });
+  console.log("Persisted deferred prepared publication without target mutation.");
   process.exit(0);
 }
 
@@ -678,6 +833,13 @@ if (outcome.reason && !report.reason) report.reason = outcome.reason;
 if (Array.isArray(outcome.needs_human) && outcome.needs_human.length > 0) {
   report.needs_human = uniqueStrings([...(report.needs_human ?? []), ...outcome.needs_human]);
 }
+if (preparePublication && outcome.status === "prepared") {
+  report.prepared_publication = createPreparedPublicationArtifact({
+    outcome,
+    fixArtifact,
+    targetDir,
+  });
+}
 report.actions.push(outcome);
 writeReport(report, resultPath);
 if (outcome.requeue_required === true) process.exitCode = 1;
@@ -812,6 +974,18 @@ function preflightRepairSourceBranchWrite(fixArtifact: LooseRecord) {
     };
   }
   const branchBlock = sourceBranchWriteBlockReason(result.repo, pull);
+  if (preparePublication && pull.head?.repo?.full_name !== result.repo) {
+    return {
+      status: "replace_uneditable_branch",
+      source_pr: sourcePr.url,
+      head_repo: pull.head?.repo?.full_name ?? null,
+      head_ref: pull.head?.ref ?? null,
+      maintainer_can_modify: pull.maintainer_can_modify === true,
+      reason:
+        `source PR #${sourcePr.number} is hosted outside the exact target repository; ` +
+        "the isolated publisher cannot receive credentials for a contributor fork",
+    };
+  }
   if (!branchBlock) {
     return {
       status: "writable",
@@ -854,7 +1028,7 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
     `clawsweeper-repair/repair-${result.cluster_id}-${sourcePr.number}`,
   );
   logProgress("fetching latest base for contributor repair", { base_branch: baseBranch });
-  runGitNetwork(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], targetDir);
+  fetchTargetRepository(["origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], targetDir);
   logProgress("fetching contributor PR head", {
     source_pr: sourcePr.url,
     head_repo: pull.head.repo.full_name,
@@ -866,8 +1040,10 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
     branch,
     sourcePr,
     pull,
+    trustedRoot: workRoot,
+    token: currentGitHubToken(),
   });
-  ensureMergeBaseAvailable({ targetDir, baseBranch });
+  ensureMergeBaseAvailable({ targetDir, baseBranch, gitFetch: fetchTargetRepository });
   const sourceHead = currentHead(targetDir);
   logProgress("preparing target toolchain", { source_head: sourceHead });
   prepareTargetToolchain(targetDir, currentTargetValidationOptions());
@@ -888,7 +1064,12 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
     });
   } else {
     logProgress("rebasing source branch", { branch, base_branch: baseBranch });
-    rebaseResult = rebaseOntoBase({ targetDir, baseBranch });
+    rebaseResult = rebaseOntoBase({
+      targetDir,
+      baseBranch,
+      gitFetch: fetchTargetRepository,
+      trustedRoot: workRoot,
+    });
     logProgress("source branch rebase result", {
       status: rebaseResult.status,
       previous_head: rebaseResult.previous_head,
@@ -960,7 +1141,39 @@ function pushRepairBranchAndUpdateStatus({
   prep,
   fastRepair,
 }: LooseRecord) {
-  const branchUpdate = branchUpdateState({ targetDir, sourceHead });
+  const publicationCommit = String(prep.commit ?? "");
+  assertCommitTree({
+    targetDir,
+    commit: publicationCommit,
+    expectedTree: String(prep.reviewed_tree_sha ?? ""),
+  });
+  const branchUpdate = branchUpdateState({ targetDir, sourceHead, commit: publicationCommit });
+  if (preparePublication) {
+    if (!sameRepoBranch) {
+      throw new Error(
+        "isolated repair publication requires the source branch to be in the exact target repository",
+      );
+    }
+    return {
+      action: "repair_contributor_branch",
+      status: "prepared",
+      target: sourcePr.url,
+      commit: publicationCommit,
+      branch_rewritten: branchUpdate.rewritten,
+      merge_preflight: prep.merge_preflight,
+      publication: {
+        kind: "repair_contributor_branch",
+        base_branch: String(process.env.CLAWSWEEPER_FIX_BASE_BRANCH ?? DEFAULT_BASE_BRANCH),
+        source_pr: sourcePr.url,
+        source_pr_number: sourcePr.number,
+        source_head_repo: pull.head.repo.full_name,
+        source_head_ref: pull.head.ref,
+        source_head_sha: pull.head.sha,
+        commit: publicationCommit,
+        reviewed_tree_sha: String(prep.reviewed_tree_sha ?? ""),
+      },
+    };
+  }
   if (dryRun) {
     return {
       action: "repair_contributor_branch",
@@ -972,9 +1185,13 @@ function pushRepairBranchAndUpdateStatus({
     };
   }
 
-  ghAuthSetupGit(targetDir);
   if (!sameRepoBranch) {
-    assertRepairBranchWritable({ targetDir, pull, rewritten: branchUpdate.rewritten });
+    assertRepairBranchWritable({
+      targetDir,
+      pull,
+      rewritten: branchUpdate.rewritten,
+      commit: publicationCommit,
+    });
   }
   const settleSeconds = repairPushSettleSeconds();
   if (settleSeconds > 0) {
@@ -1002,9 +1219,23 @@ function pushRepairBranchAndUpdateStatus({
     branchUpdate,
   });
   if (liveHeadBlock) return liveHeadBlock;
-  const pushArgs = repairBranchPushArgs({ pull, rewritten: branchUpdate.rewritten });
+  const pushArgs = repairBranchPushArgs({
+    pull,
+    rewritten: branchUpdate.rewritten,
+    commit: publicationCommit,
+  });
   try {
-    runGitNetwork(pushArgs, targetDir);
+    runTrustedGitNetwork(pushArgs, targetDir);
+    const remoteCommit = fixedGitHubRemoteHead({
+      targetDir,
+      repository: pull.head.repo.full_name,
+      branch: pull.head.ref,
+    });
+    if (remoteCommit !== publicationCommit) {
+      throw new Error(
+        `repair branch publication mismatch: expected ${publicationCommit}, found ${remoteCommit || "missing"}`,
+      );
+    }
   } catch (error) {
     const blockedReason = repairBranchPushBlockedReason(error);
     if (blockedReason && !sameRepoBranch) {
@@ -1160,14 +1391,25 @@ function openReplacementPrFromPreparedRepairCheckout({
     };
   }
 
-  ghAuthSetupGit(targetDir);
-  run("git", ["checkout", "-B", branch], { cwd: targetDir });
+  assertCommitTree({
+    targetDir,
+    commit: String(prep.commit ?? ""),
+    expectedTree: String(prep.reviewed_tree_sha ?? ""),
+  });
+  if (
+    runTrustedGitMutation(["status", "--porcelain", "--ignore-submodules=none"], targetDir).trim()
+  ) {
+    throw new Error("cannot prepare a replacement branch after the reviewed tree became dirty");
+  }
+  runTrustedGitMutation(["checkout", "-B", branch, String(prep.commit)], targetDir);
   const historyCompaction = compactReplacementHistory({
     targetDir,
     baseBranch,
     fixArtifact,
     contributorCredits,
     checkpointCommits: prep.checkpoint_commits,
+    expectedHead: prep.commit,
+    expectedTree: prep.reviewed_tree_sha,
   });
   prep.commit = historyCompaction.commit;
   prep.history_compaction = historyCompaction;
@@ -1182,7 +1424,7 @@ function openReplacementPrFromPreparedRepairCheckout({
     contributorCredits,
   });
   if (mergedSourceSkip) return mergedSourceSkip;
-  if (!branchHasBaseDiff({ targetDir, baseBranch })) {
+  if (!branchHasBaseDiff({ targetDir, baseBranch, gitFetch: fetchTargetRepository })) {
     logProgress("prepared replacement branch has no changes versus base; skipping PR create", {
       branch,
       base_branch: baseBranch,
@@ -1205,7 +1447,7 @@ function openReplacementPrFromPreparedRepairCheckout({
     };
   }
 
-  pushRecoverableBranch({ targetDir, branch });
+  pushRecoverableBranch({ targetDir, branch, commit: prep.commit });
   const provenance = externalMessageProvenance({
     model,
     reasoning: codexReasoningEffort,
@@ -1366,8 +1608,14 @@ function tryAutomergeFastRebaseRepair({
   if (!commit || commit === sourceHead) {
     return { status: "fallback", reason: "deterministic rebase produced no branch change" };
   }
-  if (run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) {
+  if (
+    runTrustedGitMutation(["status", "--porcelain", "--ignore-submodules=none"], targetDir).trim()
+  ) {
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
+  }
+  const publicationReceipt = captureTargetValidationReceipt(targetDir);
+  if (publicationReceipt.headSha !== commit) {
+    throw new Error("deterministic rebase receipt does not match the prepared commit");
   }
 
   logProgress("automerge deterministic rebase ready; skipping Codex fix and local review pass", {
@@ -1382,6 +1630,8 @@ function tryAutomergeFastRebaseRepair({
     commit,
     prep: {
       commit,
+      publication_receipt: publicationReceipt,
+      reviewed_tree_sha: publicationReceipt.headTreeSha,
       checkpoint_commits: [],
       merge_preflight: {
         target: null,
@@ -1416,7 +1666,7 @@ function tryAutomergeFastRebaseRepair({
 function completeMechanicallyResolvedRebase({ targetDir }: { targetDir: string }) {
   for (let attempt = 1; attempt <= 6; attempt += 1) {
     try {
-      return completeRebaseIfResolved({ targetDir });
+      return completeTrustedRebase(targetDir);
     } catch (error) {
       const paths = unmergedPaths(targetDir);
       if (paths.length === 0) throw error;
@@ -1443,33 +1693,32 @@ function completeMechanicallyResolvedRebase({ targetDir }: { targetDir: string }
   throw new Error("mechanical rebase did not complete after resolving repeated conflicts");
 }
 
-function branchUpdateState({ targetDir, sourceHead }: LooseRecord) {
+function branchUpdateState({ targetDir, sourceHead, commit = "HEAD" }: LooseRecord) {
   const rewritten =
     /^[0-9a-f]{40}$/i.test(String(sourceHead ?? "")) &&
-    !isAncestor({ targetDir, ancestor: sourceHead, descendant: "HEAD" });
+    !isAncestor({ targetDir, ancestor: sourceHead, descendant: commit });
   return { rewritten };
 }
 
-function repairBranchPushArgs({ pull, rewritten }: LooseRecord) {
-  const remote = `https://github.com/${pull.head.repo.full_name}.git`;
-  if (!rewritten) return ["push", remote, `HEAD:${pull.head.ref}`];
+function repairBranchPushArgs({ pull, rewritten, commit }: LooseRecord) {
+  const remote = fixedGitHubRepositoryUrl(String(pull.head.repo.full_name ?? ""));
+  const refspec = exactCommitRefspec({
+    commit: String(commit ?? ""),
+    targetRef: `refs/heads/${pull.head.ref}`,
+  });
+  if (!rewritten) return ["push", remote, refspec];
   const headSha = String(pull.head?.sha ?? "");
   if (!/^[0-9a-f]{40}$/i.test(headSha)) {
     throw new Error(
       `cannot force-with-lease repair branch ${pull.head.ref}: source head sha is missing`,
     );
   }
-  return [
-    "push",
-    `--force-with-lease=refs/heads/${pull.head.ref}:${headSha}`,
-    remote,
-    `HEAD:${pull.head.ref}`,
-  ];
+  return ["push", `--force-with-lease=refs/heads/${pull.head.ref}:${headSha}`, remote, refspec];
 }
 
-function assertRepairBranchWritable({ targetDir, pull, rewritten }: LooseRecord) {
-  const args = repairBranchPushArgs({ pull, rewritten });
-  runGitNetwork(["push", "--dry-run", ...args.slice(1)], targetDir);
+function assertRepairBranchWritable({ targetDir, pull, rewritten, commit }: LooseRecord) {
+  const args = repairBranchPushArgs({ pull, rewritten, commit });
+  runTrustedGitNetwork(["push", "--dry-run", ...args.slice(1)], targetDir);
 }
 
 function prepareFallbackReplacementCheckout(sourceTargetDir: string) {
@@ -1512,7 +1761,7 @@ function executeReplacementBranch({
       ...areaCapacityBlock,
     };
   }
-  runGitNetwork(["fetch", "origin", baseBranch], targetDir);
+  fetchTargetRepository(["origin", baseBranch], targetDir);
   const branchState = checkoutRecoverableReplacementBranch({
     targetDir,
     branch,
@@ -1520,7 +1769,12 @@ function executeReplacementBranch({
     fixArtifact,
   });
   prepareTargetToolchain(targetDir, currentTargetValidationOptions());
-  const rebaseResult = rebaseOntoBase({ targetDir, baseBranch });
+  const rebaseResult = rebaseOntoBase({
+    targetDir,
+    baseBranch,
+    gitFetch: fetchTargetRepository,
+    trustedRoot: workRoot,
+  });
   const mechanicalConflictResolution = tryResolveMechanicalRebaseConflicts({
     targetDir,
     rebaseResult,
@@ -1529,7 +1783,6 @@ function executeReplacementBranch({
     logProgress("mechanically resolved replacement rebase conflicts", mechanicalConflictResolution);
   }
 
-  if (!dryRun) ghAuthSetupGit(targetDir);
   const prep = editValidatePrepareMerge({
     fixArtifact,
     targetDir,
@@ -1538,9 +1791,10 @@ function executeReplacementBranch({
     fallbackReason,
     baseBranch,
     contributorCredits,
-    allowExistingChanges: branchState.resumed && branchHasBaseDiff({ targetDir, baseBranch }),
+    allowExistingChanges:
+      branchState.resumed &&
+      branchHasBaseDiff({ targetDir, baseBranch, gitFetch: fetchTargetRepository }),
     reconcileWithBase: branchState.resumed,
-    pushCheckpoint: dryRun ? null : () => pushRecoverableBranch({ targetDir, branch }),
     rebaseResult,
   });
   const provenance = externalMessageProvenance({
@@ -1575,7 +1829,7 @@ function executeReplacementBranch({
     };
   }
 
-  if (!branchHasBaseDiff({ targetDir, baseBranch })) {
+  if (!branchHasBaseDiff({ targetDir, baseBranch, gitFetch: fetchTargetRepository })) {
     const mergedSourceSkip = skipMergedSourceReplacementWithoutDiff({
       mergedSource,
       targetDir,
@@ -1605,7 +1859,33 @@ function executeReplacementBranch({
     };
   }
 
-  pushRecoverableBranch({ targetDir, branch });
+  if (preparePublication) {
+    assertCommitTree({
+      targetDir,
+      commit: String(prep.commit ?? ""),
+      expectedTree: String(prep.reviewed_tree_sha ?? ""),
+    });
+    return {
+      action: "open_fix_pr",
+      status: "prepared",
+      branch,
+      resumed_branch: branchState.resumed,
+      commit: prep.commit,
+      checkpoint_commits: prep.checkpoint_commits,
+      merge_preflight: prep.merge_preflight,
+      supersede_sources: supersedeSources ? (fixArtifact.source_prs ?? []) : [],
+      contributor_credit: contributorCredits.map(publicContributorCredit),
+      publication: {
+        kind: "open_fix_pr",
+        base_branch: baseBranch,
+        branch,
+        commit: String(prep.commit ?? ""),
+        reviewed_tree_sha: String(prep.reviewed_tree_sha ?? ""),
+      },
+    };
+  }
+
+  pushRecoverableBranch({ targetDir, branch, commit: prep.commit });
   assertIssueImplementationNotPaused();
   const bodyPath = path.join(workRoot, "replacement-pr-body.md");
   fs.writeFileSync(bodyPath, body);
@@ -1722,7 +2002,7 @@ function skipMergedSourceReplacementWithoutDiff({
   resumedBranch = null,
 }: LooseRecord) {
   if (!mergedSource) return null;
-  if (branchHasBaseDiff({ targetDir, baseBranch })) return null;
+  if (branchHasBaseDiff({ targetDir, baseBranch, gitFetch: fetchTargetRepository })) return null;
   logProgress(
     "source PR already merged and replacement branch has no changes; skipping PR create",
     {
@@ -1982,15 +2262,12 @@ function editValidatePrepareMerge({
   contributorCredits = [],
   allowExistingChanges = false,
   reconcileWithBase = false,
-  pushCheckpoint = null,
   sourceHead = null,
   rebaseResult = null,
 }: LooseRecord) {
   let producedChanges = allowExistingChanges;
   let previousSummary = "";
   const checkpointCommits: JsonValue[] = [];
-  const hasRepairContract = repairContract(fixArtifact) !== null;
-  const pushIntermediateCheckpoint = hasRepairContract ? null : pushCheckpoint;
   if (
     !producedChanges &&
     canTreatRebaseAsCompleteRepair({
@@ -2177,7 +2454,10 @@ function editValidatePrepareMerge({
       });
 
       const hasWorkingTreeChanges = Boolean(
-        run("git", ["status", "--porcelain"], { cwd: targetDir }).trim(),
+        runTrustedGitMutation(
+          ["status", "--porcelain", "--ignore-submodules=none"],
+          targetDir,
+        ).trim(),
       );
       const hasHeadChanges = currentHead(targetDir) !== headBeforeAttempt;
       producedChanges = producedChanges || hasWorkingTreeChanges || hasHeadChanges;
@@ -2194,7 +2474,7 @@ function editValidatePrepareMerge({
     );
   }
 
-  const completedRebase = completeRebaseIfResolved({ targetDir });
+  const completedRebase = completeTrustedRebase(targetDir);
   if (completedRebase.status === "continued") {
     logProgress("completed resolved rebase", {
       previous_head: completedRebase.previous_head,
@@ -2209,7 +2489,6 @@ function editValidatePrepareMerge({
   });
   if (firstCheckpoint) {
     checkpointCommits.push(firstCheckpoint);
-    pushIntermediateCheckpoint?.();
   }
 
   logProgress("starting validation/review loop", { mode, attempt: 1 });
@@ -2220,7 +2499,7 @@ function editValidatePrepareMerge({
     details: mode,
     headSha: currentHead(targetDir),
   });
-  let codexReview = validateAndReviewLoop({
+  let reviewedTree = validateAndReviewLoop({
     fixArtifact,
     targetDir,
     mode,
@@ -2235,10 +2514,10 @@ function editValidatePrepareMerge({
       });
       if (checkpoint) {
         checkpointCommits.push(checkpoint);
-        pushIntermediateCheckpoint?.();
       }
     },
   });
+  let codexReview = reviewedTree.review;
   const finalSyncRepairDeltaPaths = run(
     "git",
     ["diff", "--name-only", `${repairDeltaBaseHead}..HEAD`],
@@ -2269,9 +2548,9 @@ function editValidatePrepareMerge({
     const synchronizedBaseSha = run("git", ["rev-parse", `origin/${baseBranch}`], {
       cwd: targetDir,
     }).trim();
-    codexReview = reviewAfterFinalBaseSync({
+    reviewedTree = reviewAfterFinalBaseSync({
       syncChanged: true,
-      currentReview: codexReview,
+      currentReview: reviewedTree,
       reviewSynchronizedTree: () =>
         validateAndReviewSynchronizedTree({
           fixArtifact,
@@ -2282,18 +2561,8 @@ function editValidatePrepareMerge({
           sourceHead: repairDeltaBaseHead,
           repairDeltaPaths: finalSyncRepairDeltaPaths,
         }),
-      checkpointSynchronizedTree: () => {
-        const checkpoint = commitCheckpointIfNeeded({
-          targetDir,
-          message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (1)`,
-          trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
-        });
-        if (checkpoint) {
-          checkpointCommits.push(checkpoint);
-          pushIntermediateCheckpoint?.();
-        }
-      },
     });
+    codexReview = reviewedTree.review;
     codexReview.final_base_sync = {
       status: "accepted_after_final_sync",
       reason:
@@ -2303,15 +2572,8 @@ function editValidatePrepareMerge({
       target_base_sha: synchronizedBaseSha,
     };
   }
-  const finalCheckpoint = commitCheckpointIfNeeded({
-    targetDir,
-    message: `fix(clawsweeper): finalize ${result.cluster_id}`,
-    trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
-  });
-  if (finalCheckpoint) {
-    checkpointCommits.push(finalCheckpoint);
-    pushIntermediateCheckpoint?.();
-  }
+  const reviewedCommit = reviewedTree.receipt.headSha;
+  const reviewedTreeSha = reviewedTree.receipt.headTreeSha;
   const historyCompaction =
     mode === "replacement"
       ? compactReplacementHistory({
@@ -2320,15 +2582,16 @@ function editValidatePrepareMerge({
           fixArtifact,
           contributorCredits,
           checkpointCommits,
+          expectedHead: reviewedCommit,
+          expectedTree: reviewedTreeSha,
         })
       : null;
-  enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch });
-  if (hasRepairContract || historyCompaction?.status === "compacted") {
-    pushCheckpoint?.();
-  }
-  const commit = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+  const commit = String(historyCompaction?.commit ?? reviewedCommit);
+  assertCommitTree({ targetDir, commit, expectedTree: reviewedTreeSha });
+  enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch, commit });
   return {
     commit,
+    reviewed_tree_sha: reviewedTreeSha,
     checkpoint_commits: checkpointCommits,
     history_compaction: historyCompaction,
     merge_preflight: buildMergePreflight({ fixArtifact, codexReview }),
@@ -2341,12 +2604,17 @@ function compactReplacementHistory({
   fixArtifact,
   contributorCredits,
   checkpointCommits,
+  expectedHead,
+  expectedTree,
 }: LooseRecord) {
   const compaction = compactGeneratedBranchHistory({
     targetDir,
     baseRef: `origin/${baseBranch}`,
+    expectedHead,
+    expectedTree,
     message: fixArtifact.pr_title,
     trailers: coAuthorTrailers(contributorCredits),
+    trustedRoot: workRoot,
   });
   if (compaction.status === "compacted") {
     checkpointCommits.splice(0, checkpointCommits.length, compaction.commit);
@@ -2371,7 +2639,14 @@ function updateAutomergeProgressStatus({
   details = null,
   headSha = null,
 }: LooseRecord) {
-  if (!isBranchRepairStatusJob() || dryRun) return false;
+  if (
+    preparePublication ||
+    validatePreparedPublicationOnly ||
+    publishPreparedPublication ||
+    !isBranchRepairStatusJob() ||
+    dryRun
+  )
+    return false;
   const target = automergeOutcomeTargetPrNumber();
   if (!target) return false;
   try {
@@ -2418,13 +2693,17 @@ function reconcileLatestBaseBeforePush({
   repositoryContext,
   sourceHead,
 }: LooseRecord) {
-  runGitNetwork(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], targetDir);
+  const baseBranchRef = validatedGitHubBranchRef(String(baseBranch));
+  runTrustedGitNetwork(
+    [
+      "fetch",
+      fixedGitHubRepositoryUrl(String(result.repo)),
+      `+${baseBranchRef}:refs/remotes/origin/${baseBranch}`,
+    ],
+    targetDir,
+  );
   const baseRef = `origin/${baseBranch}`;
-  if (isAncestor({ targetDir, ancestor: baseRef, descendant: "HEAD" })) {
-    return { status: "already-current" };
-  }
-
-  const rebaseResult = rebaseOntoBase({ targetDir, baseBranch });
+  const rebaseResult = rebaseOntoTrustedBase({ targetDir, baseRef });
   if (rebaseResult.status !== "conflicts") return rebaseResult;
 
   runCodexBaseReconcile({
@@ -2438,12 +2717,65 @@ function reconcileLatestBaseBeforePush({
     sourceHead,
     rebaseResult,
   });
-  const completed = completeRebaseIfResolved({ targetDir });
+  const completed = completeTrustedRebase(targetDir);
   return {
     status: "codex-reconciled",
     rebase_result: rebaseResult,
     completed_rebase: completed,
   };
+}
+
+function rebaseOntoTrustedBase({
+  targetDir,
+  baseRef,
+}: {
+  targetDir: string;
+  baseRef: string;
+}): RebaseOntoBaseResult {
+  const baseSha = runTrustedGitMutation(["rev-parse", `${baseRef}^{commit}`], targetDir).trim();
+  const previousHead = runTrustedGitMutation(["rev-parse", "HEAD"], targetDir).trim();
+  const ancestry = runTrustedGitMutationResult(
+    ["merge-base", "--is-ancestor", baseRef, previousHead],
+    targetDir,
+  );
+  if (ancestry.status === 0) {
+    return {
+      status: "already-current",
+      base_ref: baseRef,
+      base_sha: baseSha,
+      previous_head: previousHead,
+      current_head: previousHead,
+    };
+  }
+  if (ancestry.status !== 1) {
+    const detail = `${ancestry.stderr ?? ""}\n${ancestry.stdout ?? ""}`.trim();
+    throw new Error(detail || `failed to compare ${baseRef} with the reviewed commit`);
+  }
+
+  const child = runTrustedGitMutationResult(["rebase", baseRef], targetDir);
+  const detail = `${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
+  const currentHead = runTrustedGitMutation(["rev-parse", "HEAD"], targetDir).trim();
+  if (child.status === 0) {
+    return {
+      status: "rebased",
+      base_ref: baseRef,
+      base_sha: baseSha,
+      previous_head: previousHead,
+      current_head: currentHead,
+      detail,
+    };
+  }
+  if (hasRebaseInProgress(targetDir) || unmergedPaths(targetDir).length > 0) {
+    return {
+      status: "conflicts",
+      base_ref: baseRef,
+      base_sha: baseSha,
+      previous_head: previousHead,
+      current_head: currentHead,
+      detail,
+    };
+  }
+  throw new Error(detail || `git rebase ${baseRef} failed`);
 }
 
 function runCodexBaseReconcile({
@@ -2524,7 +2856,7 @@ function runCodexBaseReconcile({
       );
     }
     try {
-      completeRebaseIfResolved({ targetDir });
+      completeTrustedRebase(targetDir);
       return;
     } catch (error) {
       if (codexAttempt === maxEditAttempts) throw error;
@@ -2599,6 +2931,11 @@ function parseBooleanEnv(value: JsonValue, fallback: JsonValue) {
   return fallback;
 }
 
+type ReviewedTree = {
+  receipt: TargetValidationReceipt;
+  review: LooseRecord;
+};
+
 function validateAndReviewLoop({
   fixArtifact,
   targetDir,
@@ -2610,6 +2947,7 @@ function validateAndReviewLoop({
 }: LooseRecord) {
   let lastReview = null;
   let validationCommands: LooseRecord[] = [];
+  let validationReceipt: TargetValidationReceipt | null = null;
   for (let attempt = 1; attempt <= maxReviewAttempts; attempt += 1) {
     const validationOptions = {
       ...currentTargetValidationOptions(),
@@ -2620,26 +2958,32 @@ function validateAndReviewLoop({
       validationOptions,
     );
     try {
-      validationCommands = runAllowedValidationCommands(
+      const validation = runAllowedValidationCommandsWithReceipt(
         validationPlan.commands,
         targetDir,
         validationPlan.options,
         baseBranch,
       );
+      validationCommands = validation.commands;
+      validationReceipt = validation.receipt;
       runDiffCheck({ targetDir, baseRef: targetBaseSha });
       if (canSkipInternalCodexReviewForRepairDelta(validationPlan)) {
+        assertTargetValidationReceipt(targetDir, validationReceipt);
         return {
-          status: "passed_repair_delta_validation",
-          summary:
-            "Repair changed only docs/changelog files since the adopted PR source head; repair-delta validation passed, and exact-head ClawSweeper review plus GitHub checks still gate merge after push.",
-          findings: [],
-          findings_addressed: true,
-          evidence: [
-            "Repair-delta validation passed.",
-            "Internal Codex /review skipped for docs/changelog-only repair delta.",
-            "Exact-head ClawSweeper review is dispatched after the branch push before automerge.",
-          ],
-          validation_commands_run: validationCommands,
+          receipt: validationReceipt,
+          review: {
+            status: "passed_repair_delta_validation",
+            summary:
+              "Repair changed only docs/changelog files since the adopted PR source head; repair-delta validation passed, and exact-head ClawSweeper review plus GitHub checks still gate merge after push.",
+            findings: [],
+            findings_addressed: true,
+            evidence: [
+              "Repair-delta validation passed.",
+              "Internal Codex /review skipped for docs/changelog-only repair delta.",
+              "Exact-head ClawSweeper review is dispatched after the branch push before automerge.",
+            ],
+            validation_commands_run: validationCommands,
+          },
         };
       }
     } catch (error) {
@@ -2712,7 +3056,11 @@ function validateAndReviewLoop({
       throw error;
     }
     lastReview.validation_commands_run = validationCommands;
-    if (isCleanCodexReview(lastReview)) return lastReview;
+    if (!validationReceipt) throw new Error("validation receipt was not produced");
+    assertTargetValidationReceipt(targetDir, validationReceipt);
+    if (isCleanCodexReview(lastReview)) {
+      return { receipt: validationReceipt, review: lastReview } satisfies ReviewedTree;
+    }
     if (attempt === maxReviewAttempts) {
       const finalSummary = codexReviewFailureSummary(lastReview);
       runCodexReviewFix({
@@ -2728,30 +3076,37 @@ function validateAndReviewLoop({
         { fixArtifact, targetDir, sourceHead },
         validationOptions,
       );
-      validationCommands = runAllowedValidationCommands(
+      const finalValidation = runAllowedValidationCommandsWithReceipt(
         finalValidationPlan.commands,
         targetDir,
         finalValidationPlan.options,
         baseBranch,
       );
+      validationCommands = finalValidation.commands;
+      validationReceipt = finalValidation.receipt;
       runDiffCheck({ targetDir, baseRef: targetBaseSha });
-      return {
-        status: "passed_after_final_review_fix",
-        summary:
-          "Final Codex /review findings were sent through a last fix pass; changed-surface validation passed, and exact-head ClawSweeper review plus GitHub checks still gate merge after push.",
-        findings: [],
-        findings_addressed: true,
-        evidence: [
-          `Final review before fix: ${compactText(finalSummary, 700)}`,
-          "Changed-surface validation passed after the final review-fix pass.",
-          "Exact-head ClawSweeper review is dispatched after the branch push before automerge.",
-        ],
-        validation_commands_run: validationCommands,
-        final_review_fix: {
-          status: "validation_passed",
-          previous_summary: compactText(finalSummary, 1000),
-        },
+      const finalReview = runCodexReview({
+        fixArtifact,
+        targetDir,
+        mode,
+        attempt: `${attempt}-after-final-fix`,
+        baseBranch,
+        targetBaseSha,
+        validationCommands,
+        validationPlan: finalValidationPlan,
+      });
+      finalReview.validation_commands_run = validationCommands;
+      assertTargetValidationReceipt(targetDir, validationReceipt);
+      if (!isCleanCodexReview(finalReview)) {
+        throw new Error(
+          `Codex /review did not pass after the final review fix: ${codexReviewFailureSummary(finalReview)}`,
+        );
+      }
+      finalReview.final_review_fix = {
+        status: "validation_and_review_passed",
+        previous_summary: compactText(finalSummary, 1000),
       };
+      return { receipt: validationReceipt, review: finalReview } satisfies ReviewedTree;
     }
     runCodexReviewFix({
       fixArtifact,
@@ -2785,13 +3140,16 @@ function validateAndReviewSynchronizedTree({
     validationOptions,
   );
   let validationCommands;
+  let validationReceipt: TargetValidationReceipt;
   try {
-    validationCommands = runAllowedValidationCommands(
+    const validation = runAllowedValidationCommandsWithReceipt(
       validationPlan.commands,
       targetDir,
       validationPlan.options,
       baseBranch,
     );
+    validationCommands = validation.commands;
+    validationReceipt = validation.receipt;
   } catch (error) {
     const baseError = reproduceValidationFailureAtPinnedBase({
       commands: validationPlan.commands,
@@ -2832,7 +3190,8 @@ function validateAndReviewSynchronizedTree({
       `Codex /review did not pass after final base synchronization: ${codexReviewFailureSummary(review)}`,
     );
   }
-  return review;
+  assertTargetValidationReceipt(targetDir, validationReceipt!);
+  return { receipt: validationReceipt!, review } satisfies ReviewedTree;
 }
 
 function codexReviewFailureSummary(review: LooseRecord | null): string {
@@ -3228,22 +3587,25 @@ function ensureTargetCheckout(repo: string, targetDir: string) {
   if (!fs.existsSync(path.join(targetDir, ".git"))) {
     throw new Error(`target dir is not a git checkout: ${targetDir}`);
   }
-  const status = run("git", ["status", "--porcelain"], { cwd: targetDir }).trim();
+  const status = runTrustedGitMutation(["status", "--porcelain"], targetDir).trim();
   if (status) throw new Error(`target checkout has uncommitted changes: ${targetDir}`);
 }
 
 function cloneTargetCheckout(repo: string, targetDir: string) {
   fs.mkdirSync(path.dirname(targetDir), { recursive: true });
-  setupGitHubCredentialHelper();
   const timeoutMs = currentCheckoutCloneTimeoutMs();
   const attempts = Math.max(1, Number(process.env.CLAWSWEEPER_CHECKOUT_CLONE_ATTEMPTS ?? 3));
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     fs.rmSync(targetDir, { recursive: true, force: true });
     try {
-      run("git", bloblessCloneArgs(repo, targetDir), {
+      const token = currentGitHubToken();
+      const context = token
+        ? trustedGitNetworkContext(workRoot, token)
+        : trustedGitContext(workRoot);
+      run("git", trustedGitArgs(context, bloblessCloneArgs(repo, targetDir)), {
         cwd: repoRoot(),
-        env: ghEnv(),
+        env: context.env,
         timeoutMs,
       });
       return;
@@ -3263,37 +3625,15 @@ function cloneTargetCheckout(repo: string, targetDir: string) {
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function setupGitHubCredentialHelper() {
-  if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) return;
-  try {
-    run("gh", ["auth", "setup-git", "--hostname", "github.com"], {
-      cwd: repoRoot(),
-      env: ghEnv(),
-      timeoutMs: Math.min(30_000, currentNetworkCommandTimeoutMs()),
-    });
-  } catch (error) {
-    logProgress("GitHub git credential setup failed; continuing", {
-      error: compactText(String(error?.message ?? error), 500),
-    });
-  }
-}
-
 function bloblessCloneArgs(repo: string, targetDir: string) {
   return [
     "clone",
     "--filter=blob:none",
     "--depth=1",
     "--single-branch",
-    githubRepoCloneUrl(repo),
+    fixedGitHubRepositoryUrl(repo),
     targetDir,
   ];
-}
-
-function githubRepoCloneUrl(repo: string) {
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
-    throw new Error(`invalid GitHub repository: ${repo}`);
-  }
-  return `https://github.com/${repo}.git`;
 }
 
 function setupGitIdentity(cwd: JsonValue) {
@@ -3332,14 +3672,19 @@ function checkoutRecoverableReplacementBranch({
   const sourcePr = shouldSeedReplacementBranchFromSource(fixArtifact)
     ? firstTargetSourcePullRequest(fixArtifact.source_prs ?? [], result.repo)
     : null;
-  if (remoteBranchExists({ targetDir, branch })) {
-    runGitNetwork(
-      ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+  if (fixedGitHubRemoteHead({ targetDir, repository: result.repo, branch })) {
+    fetchTargetRepository(
+      ["origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
       targetDir,
     );
-    run("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: targetDir });
+    runTrustedGitMutation(["checkout", "-B", branch, `origin/${branch}`], targetDir);
     if (sourcePr) {
-      const sourceRef = fetchSourcePullRequestHead({ targetDir, sourcePr });
+      const sourceRef = fetchSourcePullRequestHead({
+        targetDir,
+        sourcePr,
+        trustedRoot: workRoot,
+        token: currentGitHubToken(),
+      });
       const sourceHeadSha = run("git", ["rev-parse", sourceRef], { cwd: targetDir }).trim();
       if (!isAncestor({ targetDir, ancestor: sourceHeadSha, descendant: "HEAD" })) {
         const pull = fetchPullRequest(result.repo, sourcePr.number);
@@ -3351,6 +3696,8 @@ function checkoutRecoverableReplacementBranch({
           branch,
           sourcePr,
           pull,
+          trustedRoot: workRoot,
+          token: currentGitHubToken(),
         });
         return {
           resumed: false,
@@ -3372,6 +3719,8 @@ function checkoutRecoverableReplacementBranch({
       branch,
       sourcePr,
       pull,
+      trustedRoot: workRoot,
+      token: currentGitHubToken(),
     });
     return {
       resumed: false,
@@ -3380,38 +3729,51 @@ function checkoutRecoverableReplacementBranch({
       source_head_sha: checkout.sourceHeadSha,
     };
   }
-  run("git", ["checkout", "-B", branch, `origin/${baseBranch}`], { cwd: targetDir });
+  runTrustedGitMutation(["checkout", "-B", branch, `origin/${baseBranch}`], targetDir);
   return { resumed: false, branch };
 }
 
 function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRecord) {
-  if (!run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) return "";
-  run("git", ["add", "--all"], { cwd: targetDir });
+  if (
+    !runTrustedGitMutation(["status", "--porcelain", "--ignore-submodules=none"], targetDir).trim()
+  )
+    return "";
+  runTrustedGitMutation(["add", "--all"], targetDir);
   const args = ["commit", "-m", message];
   for (const trailer of uniqueStrings(trailers)) args.push("-m", trailer);
-  runGitNetwork(args, targetDir);
-  return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+  runTrustedGitMutation(args, targetDir);
+  return runTrustedGitMutation(["rev-parse", "HEAD"], targetDir).trim();
 }
 
-function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch }: LooseRecord) {
+function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch, commit }: LooseRecord) {
   if (!repairContract(fixArtifact)) return;
   const baseRef = `origin/${baseBranch}`;
   const changedFiles = changedFilesFromNameOnlyZ(
-    run("git", ["diff", "--name-only", "-z", `${baseRef}..HEAD`], { cwd: targetDir }),
+    run("git", ["diff", "--name-only", "-z", `${baseRef}..${commit}`], {
+      cwd: targetDir,
+      env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+    }),
   );
   enforceRepairContract({ fixArtifact, changedFiles });
 }
 
-function pushRecoverableBranch({ targetDir, branch }: LooseRecord) {
+function pushRecoverableBranch({ targetDir, branch, commit }: LooseRecord) {
   assertIssueImplementationNotPaused();
-  const remoteSha = remoteBranchSha({ targetDir, branch });
-  const targetRef = `refs/heads/${branch}`;
+  const publicationCommit = String(commit ?? "");
+  const repository = String(result.repo ?? "");
+  const remote = fixedGitHubRepositoryUrl(repository);
+  const remoteSha = fixedGitHubRemoteHead({ targetDir, repository, branch });
+  const targetRef = validatedGitHubBranchRef(String(branch));
+  const refspec = exactCommitRefspec({ commit: publicationCommit, targetRef });
   const args = remoteSha
-    ? ["push", `--force-with-lease=${targetRef}:${remoteSha}`, "origin", `HEAD:${targetRef}`]
-    : ["push", "origin", `HEAD:${targetRef}`];
-  runGitNetwork(args, targetDir);
-  if (fetchRemoteRecoverableBranch({ targetDir, branch, required: false })) return;
-  throw new Error(`git push reported success, but refs/heads/${branch} was not visible on origin`);
+    ? ["push", `--force-with-lease=${targetRef}:${remoteSha}`, remote, refspec]
+    : ["push", remote, refspec];
+  runTrustedGitNetwork(args, targetDir);
+  const publishedCommit = fixedGitHubRemoteHead({ targetDir, repository, branch });
+  if (publishedCommit === publicationCommit) return;
+  throw new Error(
+    `git push publication mismatch for ${targetRef}: expected ${publicationCommit}, found ${publishedCommit || "missing"}`,
+  );
 }
 
 function assertIssueImplementationNotPaused() {
@@ -3440,21 +3802,21 @@ function assertIssueImplementationNotPaused() {
   }
 }
 
-function fetchRemoteRecoverableBranch({ targetDir, branch, required = true }: LooseRecord) {
-  const child = runCommandResult(
-    "git",
-    ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
-    {
-      cwd: targetDir,
-      env: process.env,
-      timeoutMs: currentNetworkCommandTimeoutMs(),
-    },
+function fixedGitHubRemoteHead({ targetDir, repository, branch }: LooseRecord): string {
+  const targetRef = validatedGitHubBranchRef(String(branch));
+  const output = runTrustedGitNetwork(
+    ["ls-remote", "--heads", fixedGitHubRepositoryUrl(String(repository)), targetRef],
+    targetDir,
   );
-  if (child.status === 0) return true;
-  const detail = `${child.stderr ?? ""}\n${child.stdout ?? ""}`.trim();
-  if (!required && /couldn't find remote ref|could not find remote ref|not found/i.test(detail))
-    return false;
-  throw new Error(detail || `failed to fetch remote branch ${branch}`);
+  const matches = output
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([sha, ref]) => /^[0-9a-f]{40,64}$/.test(sha ?? "") && ref === targetRef)
+    .map(([sha]) => sha);
+  if (matches.length > 1) {
+    throw new Error(`multiple remote values returned for ${targetRef}`);
+  }
+  return matches[0] ?? "";
 }
 
 function findOpenPullRequestForBranch(branch: string, cwd: JsonValue) {
@@ -3499,6 +3861,566 @@ function findLatestResultPath() {
   candidates.sort((left: JsonValue, right: JsonValue) => right.mtimeMs - left.mtimeMs);
   if (!candidates[0]) throw new Error("no result.json files found");
   return candidates[0].path;
+}
+
+function scrubUntrustedProcessEnvironment(env: NodeJS.ProcessEnv) {
+  for (const key of [
+    "GITHUB_ENV",
+    "GITHUB_PATH",
+    "GITHUB_OUTPUT",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_STATE",
+  ]) {
+    delete env[key];
+  }
+  for (const key of Object.keys(env)) {
+    if (/^ACTIONS_/i.test(key) || key.startsWith("CLAWSWEEPER_CRABFLEET_")) delete env[key];
+  }
+}
+
+function sha256File(file: string) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function sha256Lines(values: readonly string[]) {
+  return createHash("sha256")
+    .update(`${values.join("\n")}\n`)
+    .digest("hex");
+}
+
+function enforcePreparedChangedFileScope(
+  fixArtifact: LooseRecord,
+  changedFiles: readonly string[],
+) {
+  const likelyFiles = (fixArtifact.likely_files ?? []).map((value: JsonValue) =>
+    String(value ?? "").trim(),
+  );
+  const invalidPattern = likelyFiles.find(
+    (value: string) =>
+      !value ||
+      value === "unknown" ||
+      value.startsWith("/") ||
+      value.includes("\\") ||
+      value.includes("\0") ||
+      value.split("/").includes("..") ||
+      /[`$;&|<>()[\]{}~]/.test(value),
+  );
+  if (invalidPattern) {
+    throw new Error(`prepared publication has an unsafe likely_files entry: ${invalidPattern}`);
+  }
+  const unexpected = changedFiles.filter(
+    (file) => !likelyFiles.some((pattern: string) => preparedPathPatternMatches(pattern, file)),
+  );
+  if (unexpected.length > 0) {
+    throw new Error(
+      `prepared publication changed files outside immutable likely_files scope: ${unexpected.join(", ")}`,
+    );
+  }
+  const broadScopeAllowed =
+    allowBroadFixArtifacts || job.frontmatter.allow_broad_fix_artifacts === true;
+  if (!broadScopeAllowed && changedFiles.length > maxAutonomousFixFiles) {
+    throw new Error(
+      `prepared publication changes ${changedFiles.length} files; limit is ${maxAutonomousFixFiles}`,
+    );
+  }
+}
+
+function preparedPathPatternMatches(rawPattern: string, file: string) {
+  const pattern = rawPattern.replace(/^\.\//, "");
+  if (pattern.endsWith("/")) return file.startsWith(pattern);
+  let source = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]!;
+    if (character === "*" && pattern[index + 1] === "*") {
+      index += 1;
+      if (pattern[index + 1] === "/") {
+        index += 1;
+        source += "(?:.*/)?";
+      } else {
+        source += ".*";
+      }
+    } else if (character === "*") {
+      source += "[^/]*";
+    } else if (character === "?") {
+      source += "[^/]";
+    } else {
+      source += character.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`${source}$`).test(file);
+}
+
+function preparedPublicationArtifactFile(name: string) {
+  const configuredRoot = args["prepared-dir"];
+  if (typeof configuredRoot !== "string") return path.join(path.dirname(resultPath), name);
+  const root = path.resolve(configuredRoot);
+  const matches: string[] = [];
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new Error("prepared publication transfer must not contain symbolic links");
+      }
+      if (entry.isDirectory()) visit(candidate);
+      else if (entry.isFile() && entry.name === name) matches.push(candidate);
+    }
+  };
+  visit(root);
+  if (matches.length !== 1) {
+    throw new Error(`prepared publication transfer must contain exactly one ${name}`);
+  }
+  return matches[0]!;
+}
+
+function preparedPublicationValidationReceiptPath() {
+  const configuredRoot = args["prepared-dir"];
+  const root =
+    typeof configuredRoot === "string" ? path.resolve(configuredRoot) : path.dirname(resultPath);
+  return path.join(root, "prepared-publication-validation.json");
+}
+
+function writePreparedPublicationValidationReceipt(prepared: LooseRecord) {
+  const manifestPath = preparedPublicationArtifactFile("prepared-publication.json");
+  const bundlePath = preparedPublicationArtifactFile("prepared-publication.bundle");
+  const receipt = {
+    version: 1,
+    disposition: "publication_deferred",
+    repo: result.repo,
+    cluster_id: result.cluster_id,
+    job_sha256: sha256File(jobPath),
+    result_sha256: sha256File(resultPath),
+    manifest_sha256: sha256File(manifestPath),
+    bundle_sha256: sha256File(bundlePath),
+    base_sha: prepared.base_sha,
+    commit: prepared.commit,
+    tree_sha: prepared.tree_sha,
+    publication_kind: prepared.publication?.kind,
+    required_publisher: "fork-or-target-native-trusted-publisher",
+  };
+  fs.writeFileSync(
+    preparedPublicationValidationReceiptPath(),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+    { flag: "wx", mode: 0o600 },
+  );
+}
+
+function readPreparedPublicationValidationReceipt(): LooseRecord {
+  const receiptPath = preparedPublicationValidationReceiptPath();
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  const expectedKeys = [
+    "version",
+    "disposition",
+    "repo",
+    "cluster_id",
+    "job_sha256",
+    "result_sha256",
+    "manifest_sha256",
+    "bundle_sha256",
+    "base_sha",
+    "commit",
+    "tree_sha",
+    "publication_kind",
+    "required_publisher",
+  ];
+  if (
+    !receipt ||
+    typeof receipt !== "object" ||
+    Array.isArray(receipt) ||
+    Object.keys(receipt).sort().join("\0") !== [...expectedKeys].sort().join("\0")
+  ) {
+    throw new Error("prepared publication validation receipt shape is not exact");
+  }
+  const manifestPath = preparedPublicationArtifactFile("prepared-publication.json");
+  const bundlePath = preparedPublicationArtifactFile("prepared-publication.bundle");
+  if (
+    receipt.version !== 1 ||
+    receipt.disposition !== "publication_deferred" ||
+    receipt.repo !== result.repo ||
+    receipt.cluster_id !== result.cluster_id ||
+    receipt.job_sha256 !== sha256File(jobPath) ||
+    receipt.result_sha256 !== sha256File(resultPath) ||
+    receipt.manifest_sha256 !== sha256File(manifestPath) ||
+    receipt.bundle_sha256 !== sha256File(bundlePath) ||
+    receipt.required_publisher !== "fork-or-target-native-trusted-publisher" ||
+    !["repair_contributor_branch", "open_fix_pr"].includes(receipt.publication_kind)
+  ) {
+    throw new Error("prepared publication validation receipt is not bound to the exact transfer");
+  }
+  for (const value of [receipt.base_sha, receipt.commit, receipt.tree_sha]) {
+    if (!/^[0-9a-f]{40}$/i.test(String(value ?? ""))) {
+      throw new Error("prepared publication validation receipt contains a malformed SHA");
+    }
+  }
+  return receipt;
+}
+
+function createPreparedPublicationArtifact({ outcome, fixArtifact, targetDir }: LooseRecord) {
+  const publication = outcome.publication;
+  if (!publication || typeof publication !== "object" || Array.isArray(publication)) {
+    throw new Error("prepared fix outcome is missing publication metadata");
+  }
+  const commit = String(publication.commit ?? "");
+  const treeSha = String(publication.reviewed_tree_sha ?? "");
+  const baseBranch = String(publication.base_branch ?? "");
+  if (baseBranch !== DEFAULT_BASE_BRANCH) {
+    throw new Error("prepared publication must target the protected main branch");
+  }
+  assertCommitTree({ targetDir, commit, expectedTree: treeSha });
+  const baseSha = runTrustedGitMutation(
+    ["rev-parse", `refs/remotes/origin/${baseBranch}`],
+    targetDir,
+  ).trim();
+  if (!/^[0-9a-f]{40}$/i.test(baseSha)) {
+    throw new Error("prepared publication base did not resolve to a full commit SHA");
+  }
+  if (
+    runTrustedGitMutationResult(["merge-base", "--is-ancestor", baseSha, commit], targetDir)
+      .status !== 0
+  ) {
+    throw new Error("prepared publication commit is not based on the reviewed main commit");
+  }
+  if (
+    runTrustedGitMutation(["status", "--porcelain", "--ignore-submodules=none"], targetDir).trim()
+  ) {
+    throw new Error("prepared publication checkout became dirty after review");
+  }
+  const changedFiles = changedFilesFromNameOnlyZ(
+    runTrustedGitMutation(["diff", "--name-only", "-z", `${baseSha}..${commit}`], targetDir),
+  ).sort();
+  if (changedFiles.length === 0) {
+    throw new Error("prepared publication has no changes relative to its reviewed base");
+  }
+  enforcePreparedChangedFileScope(fixArtifact, changedFiles);
+  enforceRepairContract({ fixArtifact, changedFiles });
+
+  const runDir = path.dirname(resultPath);
+  const bundlePath = path.join(runDir, "prepared-publication.bundle");
+  const manifestPath = path.join(runDir, "prepared-publication.json");
+  const bundleRef = `refs/clawsweeper/prepared/${createHash("sha256")
+    .update(`${result.repo}\n${result.cluster_id}\n${commit}`)
+    .digest("hex")}`;
+  fs.rmSync(bundlePath, { force: true });
+  try {
+    runTrustedGitMutation(["update-ref", bundleRef, commit], targetDir);
+    runTrustedGitMutation(["bundle", "create", bundlePath, bundleRef], targetDir);
+  } finally {
+    runTrustedGitMutationResult(["update-ref", "-d", bundleRef], targetDir);
+  }
+  runTrustedGitMutation(["bundle", "verify", bundlePath], targetDir);
+
+  const manifest = {
+    version: 1,
+    repo: result.repo,
+    cluster_id: result.cluster_id,
+    job_sha256: sha256File(jobPath),
+    result_sha256: sha256File(resultPath),
+    base_branch: baseBranch,
+    base_sha: baseSha,
+    commit,
+    tree_sha: treeSha,
+    changed_files: changedFiles,
+    changed_files_sha256: sha256Lines(changedFiles),
+    bundle_file: path.basename(bundlePath),
+    bundle_ref: bundleRef,
+    bundle_sha256: sha256File(bundlePath),
+    publication,
+  };
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+  return {
+    version: manifest.version,
+    manifest_file: path.basename(manifestPath),
+    manifest_sha256: sha256File(manifestPath),
+    bundle_file: manifest.bundle_file,
+    bundle_sha256: manifest.bundle_sha256,
+    commit,
+    tree_sha: treeSha,
+    base_sha: baseSha,
+  };
+}
+
+function validatePreparedPublicationArtifact({
+  fixArtifact,
+}: {
+  fixArtifact: LooseRecord;
+  mutate: boolean;
+}): LooseRecord {
+  const manifestPath = preparedPublicationArtifactFile("prepared-publication.json");
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error("prepared publication manifest is missing");
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const requiredKeys = [
+    "version",
+    "repo",
+    "cluster_id",
+    "job_sha256",
+    "result_sha256",
+    "base_branch",
+    "base_sha",
+    "commit",
+    "tree_sha",
+    "changed_files",
+    "changed_files_sha256",
+    "bundle_file",
+    "bundle_ref",
+    "bundle_sha256",
+    "publication",
+  ];
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    Array.isArray(manifest) ||
+    Object.keys(manifest).sort().join("\0") !== [...requiredKeys].sort().join("\0")
+  ) {
+    throw new Error("prepared publication manifest shape is not exact");
+  }
+  if (
+    manifest.version !== 1 ||
+    manifest.repo !== result.repo ||
+    manifest.cluster_id !== result.cluster_id ||
+    manifest.job_sha256 !== sha256File(jobPath) ||
+    manifest.result_sha256 !== sha256File(resultPath)
+  ) {
+    throw new Error("prepared publication manifest is not bound to this exact job result");
+  }
+  if (manifest.base_branch !== DEFAULT_BASE_BRANCH) {
+    throw new Error("prepared publication base branch is not main");
+  }
+  for (const [label, value] of [
+    ["base", manifest.base_sha],
+    ["commit", manifest.commit],
+    ["tree", manifest.tree_sha],
+  ]) {
+    if (!/^[0-9a-f]{40}$/i.test(String(value ?? ""))) {
+      throw new Error(`prepared publication ${label} SHA is malformed`);
+    }
+  }
+  if (
+    !Array.isArray(manifest.changed_files) ||
+    manifest.changed_files.length === 0 ||
+    manifest.changed_files.some((value: JsonValue) => typeof value !== "string") ||
+    [...manifest.changed_files].sort().join("\0") !== manifest.changed_files.join("\0") ||
+    manifest.changed_files_sha256 !== sha256Lines(manifest.changed_files)
+  ) {
+    throw new Error("prepared publication changed-file receipt is malformed");
+  }
+  if (
+    manifest.bundle_file !== "prepared-publication.bundle" ||
+    !/^refs\/clawsweeper\/prepared\/[0-9a-f]{64}$/.test(String(manifest.bundle_ref ?? ""))
+  ) {
+    throw new Error("prepared publication bundle location or ref is invalid");
+  }
+  const bundlePath = preparedPublicationArtifactFile("prepared-publication.bundle");
+  if (!fs.existsSync(bundlePath) || manifest.bundle_sha256 !== sha256File(bundlePath)) {
+    throw new Error("prepared publication bundle hash does not match the manifest");
+  }
+
+  workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publication-control-"));
+  targetDir = path.join(workRoot, "target");
+  ensureTargetCheckout(result.repo, targetDir);
+  fetchTargetRepository(
+    ["origin", `+refs/heads/${DEFAULT_BASE_BRANCH}:refs/remotes/origin/${DEFAULT_BASE_BRANCH}`],
+    targetDir,
+  );
+  const liveBase = runTrustedGitMutation(
+    ["rev-parse", `refs/remotes/origin/${DEFAULT_BASE_BRANCH}`],
+    targetDir,
+  ).trim();
+  if (liveBase !== manifest.base_sha) {
+    throw new Error(
+      `prepared publication base moved from ${manifest.base_sha} to ${liveBase}; requeue required`,
+    );
+  }
+  runTrustedGitMutation(["bundle", "verify", bundlePath], targetDir);
+  const bundleHeads = runTrustedGitMutation(["bundle", "list-heads", bundlePath], targetDir)
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean);
+  if (bundleHeads.length !== 1 || bundleHeads[0] !== `${manifest.commit} ${manifest.bundle_ref}`) {
+    throw new Error("prepared publication bundle does not expose exactly the reviewed commit");
+  }
+  const importedRef = "refs/clawsweeper/validated-publication";
+  runTrustedGitMutation(
+    ["fetch", "--no-tags", bundlePath, `${manifest.bundle_ref}:${importedRef}`],
+    targetDir,
+  );
+  if (runTrustedGitMutation(["rev-parse", importedRef], targetDir).trim() !== manifest.commit) {
+    throw new Error("prepared publication imported commit does not match the manifest");
+  }
+  runTrustedGitMutation(["fsck", "--strict", "--no-dangling", manifest.commit], targetDir);
+  assertCommitTree({
+    targetDir,
+    commit: manifest.commit,
+    expectedTree: manifest.tree_sha,
+  });
+  if (
+    runTrustedGitMutationResult(
+      ["merge-base", "--is-ancestor", manifest.base_sha, manifest.commit],
+      targetDir,
+    ).status !== 0
+  ) {
+    throw new Error("prepared publication commit is not descended from the exact reviewed base");
+  }
+  runTrustedGitMutation(["checkout", "--detach", manifest.commit], targetDir);
+  const independentReceipt = captureTargetValidationReceipt(targetDir);
+  if (
+    independentReceipt.headSha !== manifest.commit ||
+    independentReceipt.headTreeSha !== manifest.tree_sha
+  ) {
+    throw new Error("independent target receipt does not match the prepared publication");
+  }
+  const changedFiles = changedFilesFromNameOnlyZ(
+    runTrustedGitMutation(
+      ["diff", "--name-only", "-z", `${manifest.base_sha}..${manifest.commit}`],
+      targetDir,
+    ),
+  ).sort();
+  if (
+    changedFiles.join("\0") !== manifest.changed_files.join("\0") ||
+    sha256Lines(changedFiles) !== manifest.changed_files_sha256
+  ) {
+    throw new Error("independently derived publication paths do not match the prepared receipt");
+  }
+  enforcePreparedChangedFileScope(fixArtifact, changedFiles);
+  enforceRepairContract({ fixArtifact, changedFiles });
+
+  const publication = manifest.publication;
+  if (!publication || typeof publication !== "object" || Array.isArray(publication)) {
+    throw new Error("prepared publication mutation parameters are malformed");
+  }
+  if (
+    publication.commit !== manifest.commit ||
+    publication.reviewed_tree_sha !== manifest.tree_sha ||
+    publication.base_branch !== DEFAULT_BASE_BRANCH
+  ) {
+    throw new Error("prepared publication mutation parameters are not commit/tree/base bound");
+  }
+  validatePreparedMutationParameters(publication);
+  return { ...manifest, target_dir: targetDir, bundle_path: bundlePath };
+}
+
+function validatePreparedMutationParameters(publication: LooseRecord) {
+  if (publication.kind === "repair_contributor_branch") {
+    assertExactPreparedPublicationKeys(publication, [
+      "kind",
+      "base_branch",
+      "source_pr",
+      "source_pr_number",
+      "source_head_repo",
+      "source_head_ref",
+      "source_head_sha",
+      "commit",
+      "reviewed_tree_sha",
+    ]);
+    if (fixArtifact.repair_strategy !== "repair_contributor_branch") {
+      throw new Error("prepared contributor repair kind conflicts with immutable fix strategy");
+    }
+    const sourcePr = firstSourcePullRequest(fixArtifact);
+    const expectedPull = fetchPullRequest(result.repo, sourcePr.number);
+    if (
+      publication.source_pr !== sourcePr.url ||
+      publication.source_pr_number !== sourcePr.number ||
+      publication.source_head_repo !== result.repo ||
+      expectedPull.state !== "open" ||
+      expectedPull.head?.repo?.full_name !== result.repo ||
+      expectedPull.head?.ref !== publication.source_head_ref ||
+      expectedPull.head?.sha !== publication.source_head_sha
+    ) {
+      throw new Error("prepared contributor repair source branch identity or lease changed");
+    }
+    const pauseBlock = liveRepairPauseBlock({
+      pull: expectedPull,
+      number: sourcePr.number,
+      target: sourcePr.url,
+    });
+    if (pauseBlock) throw new Error(pauseBlock.reason);
+    return;
+  }
+  if (publication.kind === "open_fix_pr") {
+    assertExactPreparedPublicationKeys(publication, [
+      "kind",
+      "base_branch",
+      "branch",
+      "commit",
+      "reviewed_tree_sha",
+    ]);
+    const expectedBranch = replacementBranchName(result.cluster_id);
+    if (publication.branch !== expectedBranch) {
+      throw new Error("prepared replacement branch is not the deterministic target branch");
+    }
+    if (fixArtifact.repair_strategy === "repair_contributor_branch") {
+      const sourcePr = firstSourcePullRequest(fixArtifact);
+      const sourcePull = fetchPullRequest(result.repo, sourcePr.number);
+      if (sourcePull.head?.repo?.full_name === result.repo) {
+        throw new Error(
+          "prepared replacement kind conflicts with the immutable same-repository repair strategy",
+        );
+      }
+    } else if (!["replace_uneditable_branch", "new_fix_pr"].includes(fixArtifact.repair_strategy)) {
+      throw new Error("prepared replacement kind conflicts with immutable fix strategy");
+    }
+    const liveRemoteSha = fixedGitHubRemoteHead({
+      targetDir,
+      repository: result.repo,
+      branch: expectedBranch,
+    });
+    if (liveRemoteSha) {
+      fetchTargetRepository(
+        ["origin", `+refs/heads/${expectedBranch}:refs/remotes/origin/${expectedBranch}`],
+        targetDir,
+      );
+    }
+    if (
+      liveRemoteSha &&
+      runTrustedGitMutationResult(
+        ["merge-base", "--is-ancestor", liveRemoteSha, String(publication.commit)],
+        targetDir,
+      ).status !== 0
+    ) {
+      throw new Error(
+        "prepared replacement branch is not descended from the live remote lease; requeue required",
+      );
+    }
+    const areaCapacityBlock = validateActivePrAreaCapacity({
+      fixArtifact,
+      targetDir,
+      branch: expectedBranch,
+      repo: result.repo,
+      maxActivePrsPerArea,
+    });
+    if (areaCapacityBlock) throw new Error(areaCapacityBlock.reason);
+    assertIssueImplementationNotPaused();
+    return;
+  }
+  throw new Error("prepared publication mutation kind is not allowlisted");
+}
+
+function assertExactPreparedPublicationKeys(
+  publication: LooseRecord,
+  expectedKeys: readonly string[],
+) {
+  if (Object.keys(publication).sort().join("\0") !== [...expectedKeys].sort().join("\0")) {
+    throw new Error("prepared publication mutation parameter shape is not exact");
+  }
+}
+
+function deferValidatedPreparedPublication(prepared: LooseRecord): LooseRecord {
+  return {
+    action: "publication_deferred",
+    status: "deferred",
+    reason:
+      "prepared code was not pushed because same-repository publication can trigger privileged target workflows before trusted review",
+    repo: prepared.repo,
+    commit: prepared.commit,
+    tree_sha: prepared.tree_sha,
+    base_sha: prepared.base_sha,
+    publication_kind: prepared.publication_kind,
+    manifest_sha256: prepared.manifest_sha256,
+    bundle_sha256: prepared.bundle_sha256,
+    required_publisher: prepared.required_publisher,
+    target_mutation: false,
+    merge_allowed: false,
+  };
 }
 
 function writeReport(report: LooseRecord, resultPath: string) {
@@ -4307,12 +5229,4 @@ function copyDebugFileWithTailCap(source: string, destination: string) {
     `[clawsweeper] debug file truncated from ${size} bytes to last ${readSize} bytes for final repair artifact; see dedicated Codex debug artifact when available.\n`,
   );
   fs.appendFileSync(destination, buffer);
-}
-
-function ghAuthSetupGit(cwd: JsonValue) {
-  run("gh", ["auth", "setup-git"], {
-    cwd,
-    env: ghEnv(),
-    timeoutMs: currentNetworkCommandTimeoutMs(),
-  });
 }

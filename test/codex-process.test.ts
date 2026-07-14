@@ -16,10 +16,72 @@ import {
   codexProcessCommand,
   codexProcessErrorCode,
   codexSpawnInvocation,
+  isolatedCodexEnvironment,
+  isolatedCodexPrincipal,
   runCodexProcess,
 } from "../dist/codex-process.js";
 
 const tmpPrefix = join(tmpdir(), "clawsweeper-codex-process-test-");
+
+test("Codex principal isolation requires a complete non-root numeric identity", () => {
+  assert.equal(isolatedCodexPrincipal({}), undefined);
+  assert.deepEqual(
+    isolatedCodexPrincipal({
+      CLAWSWEEPER_CODEX_PRINCIPAL_UID: "42001",
+      CLAWSWEEPER_CODEX_PRINCIPAL_GID: "42002",
+    }),
+    { uid: 42001, gid: 42002 },
+  );
+  for (const env of [
+    { CLAWSWEEPER_CODEX_PRINCIPAL_UID: "42001" },
+    { CLAWSWEEPER_CODEX_PRINCIPAL_GID: "42002" },
+    {
+      CLAWSWEEPER_CODEX_PRINCIPAL_UID: "root",
+      CLAWSWEEPER_CODEX_PRINCIPAL_GID: "42002",
+    },
+  ]) {
+    assert.throws(() => isolatedCodexPrincipal(env), /numeric UID and GID together/);
+  }
+  assert.throws(
+    () =>
+      isolatedCodexPrincipal({
+        CLAWSWEEPER_CODEX_PRINCIPAL_UID: "0",
+        CLAWSWEEPER_CODEX_PRINCIPAL_GID: "42002",
+      }),
+    /positive non-root Linux identifier/,
+  );
+});
+
+test("isolated Codex environment is a strict read-only allowlist", () => {
+  const env = isolatedCodexEnvironment({
+    CLAWSWEEPER_CODEX_PRINCIPAL_HOME: "/tmp/codex-home",
+    CLAWSWEEPER_CODEX_PRINCIPAL_TMPDIR: "/tmp/codex-home/tmp",
+    CLAWSWEEPER_CODEX_PRINCIPAL_CODEX_HOME: "/tmp/codex-home/config",
+    CLAWSWEEPER_PROOF_SCRATCH_DIR: "/tmp/proof",
+    GH_CONFIG_DIR: "/tmp/empty-gh",
+    GH_TOKEN: "read-only",
+    HTTPS_PROXY: "http://127.0.0.1:9999",
+    ACTIONS_RUNTIME_TOKEN: "forbidden",
+    GITHUB_OUTPUT: "/tmp/forbidden-output",
+    CLAWSWEEPER_APP_PRIVATE_KEY: "forbidden",
+    LD_PRELOAD: "/tmp/forbidden.so",
+    NODE_OPTIONS: "--require=/tmp/forbidden.js",
+  });
+  assert.equal(env.GH_TOKEN, "read-only");
+  assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:9999");
+  assert.equal(env.CLAWSWEEPER_PROOF_SCRATCH_DIR, "/tmp/proof");
+  assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
+  assert.equal(env.GITHUB_OUTPUT, undefined);
+  assert.equal(env.CLAWSWEEPER_APP_PRIVATE_KEY, undefined);
+  assert.equal(env.LD_PRELOAD, undefined);
+  assert.equal(env.NODE_OPTIONS, undefined);
+  assert.deepEqual(
+    Object.keys(env)
+      .filter((key) => key.includes("TOKEN"))
+      .sort(),
+    ["GH_TOKEN"],
+  );
+});
 
 test("Codex process resolves command overrides and escaped Windows launchers", () => {
   assert.equal(codexProcessCommand({}), "codex");

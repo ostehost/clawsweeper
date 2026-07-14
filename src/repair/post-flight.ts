@@ -31,6 +31,13 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import {
+  graphqlPullRequestMergeConfirmed,
+  pullRequestMainBaseBlock,
+  restPullRequestMergeConfirmed,
+} from "./merge-confirmation.js";
+import { postFlightExitCode } from "./post-flight-outcome.js";
+import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -97,6 +104,10 @@ const report: LooseRecord = {
   repo: result.repo,
   cluster_id: result.cluster_id,
   dry_run: dryRun,
+  job_intent: job.frontmatter.job_intent ?? null,
+  source: job.frontmatter.source ?? null,
+  commit_sha: job.frontmatter.commit_sha ?? null,
+  allow_no_pr: result.fix_artifact?.allow_no_pr === true,
   result_path: path.relative(repoRoot(), resultPath),
   post_flight_at: new Date().toISOString(),
   actions: [],
@@ -109,7 +120,7 @@ if (!fixReport) {
     reason: "no fix-execution-report.json",
   });
   writeReport(report, resultPath);
-  process.exit(0);
+  process.exit(postFlightExitCode(report));
 }
 
 for (const action of fixReport.actions ?? []) {
@@ -130,12 +141,14 @@ if (report.actions.length === 0) {
 }
 
 writeReport(report, resultPath);
+process.exitCode = postFlightExitCode(report);
 
 function finalizeFixPr(action: LooseRecord) {
   const base = {
     action: "finalize_fix_pr",
     source_action: action.action,
     source_status: action.status,
+    ...(typeof action.reason === "string" ? { source_reason: action.reason } : {}),
     target: action.pr_url ?? action.target ?? null,
   };
 
@@ -152,8 +165,14 @@ function finalizeFixPr(action: LooseRecord) {
     return { ...base, status: "blocked", reason: "fix PR URL is missing or outside target repo" };
   }
 
-  if (isIssueImplementationJob()) {
-    return finalizeIssueImplementationPr({ base, parsed });
+  const nonMergeReadyReason = nonMergeFixPrReadyReason();
+  if (nonMergeReadyReason) {
+    return finalizeNonMergeFixPr({
+      base,
+      parsed,
+      expectedCommit: action.commit,
+      readyReason: nonMergeReadyReason,
+    });
   }
 
   const deadline = Date.now() + POST_FLIGHT_WAIT_MS;
@@ -166,17 +185,56 @@ function finalizeFixPr(action: LooseRecord) {
     pull = fetchPullRequest(result.repo, parsed.number);
     view = fetchPullRequestView(result.repo, parsed.number);
     prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    const headBlock = validatedRepairHeadBlock({
+      expectedCommit: action.commit,
+      pull,
+      view,
+    });
+    if (headBlock) {
+      return { ...prBase, status: "blocked", reason: headBlock, waited_ms: waitedMs };
+    }
     const policyBlock = validateMergePolicy(action, pull);
     if (policyBlock) return { ...prBase, status: "blocked", reason: policyBlock };
 
+    const baseBlock = pullRequestMainBaseBlock(pull, view);
+    if (baseBlock) return { ...prBase, status: "blocked", reason: baseBlock };
+
+    const restMergeConfirmed = restPullRequestMergeConfirmed(pull);
+    const graphqlMergeConfirmed = graphqlPullRequestMergeConfirmed(view);
     const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
-    if (mergedAt) {
+    if (restMergeConfirmed && graphqlMergeConfirmed) {
       return {
         ...prBase,
         status: "executed",
         reason: "already merged",
         merged_at: mergedAt,
         merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+        waited_ms: waitedMs,
+      };
+    }
+    if (
+      restMergeConfirmed ||
+      graphqlMergeConfirmed ||
+      Boolean(mergedAt) ||
+      pull.merged === true ||
+      String(view.state ?? "").toUpperCase() === "MERGED"
+    ) {
+      if (!dryRun && Date.now() < deadline) {
+        const sleepFor = Math.min(POST_FLIGHT_POLL_MS, Math.max(0, deadline - Date.now()));
+        sleepMs(sleepFor);
+        waitedMs += sleepFor;
+        continue;
+      }
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "merge state is not yet confirmed by both GitHub pull request views",
+        live_state: pull.state ?? null,
+        live_view_state: view.state ?? null,
+        merged_at: mergedAt,
+        merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+        retry_recommended: true,
+        requeue_required: true,
         waited_ms: waitedMs,
       };
     }
@@ -220,14 +278,30 @@ function finalizeFixPr(action: LooseRecord) {
     };
   }
 
+  const validatedBaseBranch = String(view.baseRefName ?? pull.base?.ref ?? "");
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: validatedBaseBranch,
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) {
+    return {
+      ...prBase,
+      status: "blocked",
+      reason: strictBaseBindingBlock,
+      merge_method: "squash",
+      waited_ms: waitedMs,
+    };
+  }
+
   const mergeMessage = buildRepairSquashMergeMessage({
     target: parsed.number,
     title: view.title ?? pull.title,
-    headSha: pull.head?.sha,
+    headSha: action.commit,
     preflight: action.merge_preflight,
     reason: "merged by ClawSweeper Repair post-flight",
   });
-  const bodyFile = writeRepairSquashMergeBody(parsed.number, pull.head?.sha, mergeMessage.body);
+  const bodyFile = writeRepairSquashMergeBody(parsed.number, action.commit, mergeMessage.body);
   const mergeArgs = [
     "pr",
     "merge",
@@ -239,9 +313,35 @@ function finalizeFixPr(action: LooseRecord) {
     String(mergeMessage.subject),
     "--body-file",
     bodyFile,
+    "--match-head-commit",
+    String(action.commit),
   ];
-  if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
   try {
+    const finalView = fetchPullRequestView(result.repo, parsed.number);
+    const finalBaseBranch = String(finalView.baseRefName ?? "");
+    if (finalBaseBranch !== validatedBaseBranch) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "pull request base changed since merge validation",
+        merge_method: "squash",
+        waited_ms: waitedMs,
+      };
+    }
+    const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+      repo: result.repo,
+      baseBranch: finalBaseBranch,
+      policyReadJson: rulesetPolicyReader(),
+    });
+    if (finalStrictBaseBindingBlock) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: finalStrictBaseBindingBlock,
+        merge_method: "squash",
+        waited_ms: waitedMs,
+      };
+    }
     ghWithRetry(mergeArgs);
   } catch (error) {
     const detail = ghErrorText(error);
@@ -255,18 +355,58 @@ function finalizeFixPr(action: LooseRecord) {
         merge_state_status: latestView.mergeStateStatus ?? null,
         review_decision: latestView.reviewDecision ?? null,
         retry_recommended: true,
+        requeue_required: true,
         waited_ms: waitedMs,
       };
     }
     throw error;
   }
   const merged = fetchPullRequest(result.repo, parsed.number);
+  const mergedView = fetchPullRequestView(result.repo, parsed.number);
+  const mergedHeadBlock = validatedRepairHeadBlock({
+    expectedCommit: action.commit,
+    pull: merged,
+    view: mergedView,
+  });
+  if (mergedHeadBlock) {
+    return { ...prBase, status: "blocked", reason: mergedHeadBlock, waited_ms: waitedMs };
+  }
+  const mergedBaseBlock = pullRequestMainBaseBlock(merged, mergedView);
+  if (mergedBaseBlock) {
+    return {
+      ...prBase,
+      status: "blocked",
+      reason: mergedBaseBlock,
+      live_state: merged.state ?? null,
+      live_view_state: mergedView.state ?? null,
+      merged_at: merged.merged_at ?? mergedView.mergedAt ?? null,
+      merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
+      merge_method: "squash",
+      waited_ms: waitedMs,
+    };
+  }
+  const mergedAt = merged.merged_at ?? mergedView.mergedAt ?? null;
+  if (!restPullRequestMergeConfirmed(merged) || !graphqlPullRequestMergeConfirmed(mergedView)) {
+    return {
+      ...prBase,
+      status: "blocked",
+      reason: "merge command completed without a confirmed merged pull request",
+      live_state: merged.state ?? null,
+      live_view_state: mergedView.state ?? null,
+      merged_at: mergedAt,
+      merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
+      merge_method: "squash",
+      retry_recommended: true,
+      requeue_required: true,
+      waited_ms: waitedMs,
+    };
+  }
   return {
     ...prBase,
     status: "executed",
     reason: "merged by ClawSweeper Repair post-flight",
-    merged_at: merged.merged_at ?? null,
-    merge_commit_sha: merged.merge_commit_sha ?? null,
+    merged_at: mergedAt,
+    merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,
@@ -275,13 +415,26 @@ function finalizeFixPr(action: LooseRecord) {
   };
 }
 
-function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
+function rulesetPolicyReader() {
+  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+  if (!token) return undefined;
+  return (ghArgs: string[]) =>
+    ghJson(ghArgs, {
+      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+    });
+}
+
+function finalizeNonMergeFixPr({ base, parsed, expectedCommit, readyReason }: LooseRecord) {
   const deadline = Date.now() + POST_FLIGHT_WAIT_MS;
   let waitedMs = 0;
   for (;;) {
     const pull = fetchPullRequest(result.repo, parsed.number);
     const view = fetchPullRequestView(result.repo, parsed.number);
     const prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    const headBlock = validatedRepairHeadBlock({ expectedCommit, pull, view });
+    if (headBlock) {
+      return { ...prBase, status: "blocked", reason: headBlock, waited_ms: waitedMs };
+    }
 
     if (pull.state !== "open") {
       return {
@@ -297,8 +450,7 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
       return {
         ...prBase,
         status: "ready",
-        reason:
-          "issue implementation PR checks are green; merge intentionally blocked for this lane",
+        reason: readyReason,
         mergeable: view.mergeable ?? null,
         merge_state_status: view.mergeStateStatus ?? null,
         review_decision: view.reviewDecision ?? null,
@@ -455,8 +607,17 @@ function isAutomergeReplacementMerge(action: LooseRecord, pull: LooseRecord) {
   );
 }
 
-function isIssueImplementationJob() {
-  return job.frontmatter.source === "issue_implementation";
+function nonMergeFixPrReadyReason() {
+  if (job.frontmatter.source === "issue_implementation") {
+    return "issue implementation PR checks are green; merge intentionally blocked for this lane";
+  }
+  if (
+    job.frontmatter.source === "clawsweeper_commit" ||
+    job.frontmatter.job_intent === "commit_finding"
+  ) {
+    return "commit finding repair PR checks are green; merge intentionally blocked for this lane";
+  }
+  return "";
 }
 
 function hasLabel(labels: LooseRecord[], wanted: string) {
@@ -496,8 +657,8 @@ function hasLiveSecuritySignal(number: JsonValue, labels: LooseRecord[]) {
 function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
   if (pull.state !== "open") return `pull request is ${pull.state}`;
   if (pull.draft || view.isDraft) return "pull request is draft";
-  if (String(view.baseRefName ?? pull.base?.ref ?? "") !== "main")
-    return "pull request base is not main";
+  const baseBlock = pullRequestMainBaseBlock(pull, view);
+  if (baseBlock) return baseBlock;
   if (hasLiveSecuritySignal(pull.number, pull.labels ?? [])) {
     return "security-sensitive PR requires central security triage";
   }
@@ -521,6 +682,25 @@ function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
   if (checkBlock) return checkBlock;
 
   return "";
+}
+
+function validatedRepairHeadBlock({ expectedCommit, pull, view }: LooseRecord) {
+  if (!isFullCommitSha(expectedCommit)) return "fix action commit is missing or malformed";
+
+  const liveHeads = [pull.head?.sha, view.headRefOid].filter(
+    (value: JsonValue) => value !== undefined && value !== null && value !== "",
+  );
+  if (liveHeads.length === 0 || liveHeads.some((value: JsonValue) => !isFullCommitSha(value))) {
+    return "live pull request head is missing or malformed";
+  }
+  if (liveHeads.some((value: JsonValue) => value !== expectedCommit)) {
+    return "pull request head does not match worker-validated repair commit";
+  }
+  return "";
+}
+
+function isFullCommitSha(value: JsonValue): value is string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 }
 
 function validateMergePreflight(preflight: LooseRecord) {
@@ -735,6 +915,7 @@ function fetchPullRequestView(repo: string, number: JsonValue) {
     "--json",
     [
       "baseRefName",
+      "headRefOid",
       "isDraft",
       "mergeable",
       "mergeCommit",

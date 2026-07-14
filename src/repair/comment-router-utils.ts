@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import {
+  COMMENT_ROUTER_LEDGER_COMMAND_LIMIT,
+  isProtectedCommentRouterLedgerCommand,
+} from "./comment-router-ledger-policy.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const DEFAULT_IGNORED_CHECKS = [
@@ -15,6 +19,8 @@ const DEFAULT_IGNORED_CHECKS = [
 ];
 const TRANSIENT_CANCELLED_CHECKS = new Set(["real behavior proof"]);
 const LEDGER_COMMAND_STATUSES = new Set(["claimed", "executed", "skipped", "waiting"]);
+const MERGE_MUTATION_RECEIPT_STATUSES = new Set(["attempted", "accepted", "unknown", "rejected"]);
+const REPLAYABLE_MERGE_MUTATION_RECEIPT_STATUSES = new Set(["attempted", "accepted", "unknown"]);
 const LEDGER_COMMAND_STRING_FIELDS = [
   "idempotency_key",
   "comment_id",
@@ -61,6 +67,76 @@ export function routerDispatchReceiptKey(entry: LooseRecord, claim: LooseRecord 
     .update(dispatchReceiptKeyMaterial(entry, claim))
     .digest("hex")
     .slice(0, 16)}`;
+}
+
+export function hasAcceptedMergeMutationReceipt(command: LooseRecord): boolean {
+  return mergeMutationReceiptStatus(command) === "accepted";
+}
+
+export function mergeMutationReceiptStatus(command: LooseRecord): string | null {
+  const status = (Array.isArray(command.actions) ? command.actions : [])
+    .filter((action: JsonValue) => action?.action === "merge")
+    .map((action: JsonValue) => String(action?.merge_mutation_status ?? ""))
+    .find((candidate: string) => MERGE_MUTATION_RECEIPT_STATUSES.has(candidate));
+  return status ?? null;
+}
+
+export function mergeMutationReceiptStatusForOutcome({
+  outcome,
+  repairReason,
+  status,
+  signal,
+  error,
+}: {
+  outcome: "accepted" | "rejected" | "unknown";
+  repairReason: string | null;
+  status: number | null;
+  signal: string | null;
+  error?: unknown;
+}): "accepted" | "rejected" | "unknown" {
+  if (outcome === "accepted") return "accepted";
+  const completedNonzeroFailure =
+    !signal && !error && Number.isInteger(status) && Number(status) !== 0;
+  return outcome === "rejected" || (completedNonzeroFailure && repairReason)
+    ? "rejected"
+    : "unknown";
+}
+
+export function waitingMergeReplay(ledger: LooseRecord, command: LooseRecord): LooseRecord | null {
+  const idempotencyKey = String(command.idempotency_key ?? "").trim();
+  const commentVersionKey = String(command.comment_version_key ?? "").trim();
+  const commandHeadSha = String(command.expected_head_sha ?? "")
+    .trim()
+    .toLowerCase();
+  if (!idempotencyKey || !commentVersionKey) return null;
+
+  const replay = (Array.isArray(ledger.commands) ? ledger.commands : []).find(
+    (entry: JsonValue) => {
+      if (String(entry?.status ?? "") !== "waiting") return false;
+      if (String(entry?.idempotency_key ?? "") !== idempotencyKey) return false;
+      if (String(entry?.comment_version_key ?? "") !== commentVersionKey) return false;
+      if (String(entry?.repo ?? "") !== String(command.repo ?? "")) return false;
+      if (Number(entry?.issue_number ?? 0) !== Number(command.issue_number ?? 0)) return false;
+      if (String(entry?.intent ?? "") !== String(command.intent ?? "")) return false;
+      const entryHeadSha = String(entry?.expected_head_sha ?? "")
+        .trim()
+        .toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(entryHeadSha)) return false;
+      if (commandHeadSha && commandHeadSha !== entryHeadSha) return false;
+      if (String(entry?.attempt_id ?? "") !== String(command.attempt_id ?? "")) return false;
+      return (
+        (Array.isArray(entry?.actions) ? entry.actions : []).some(
+          (action: JsonValue) => action?.action === "merge" && action?.status === "waiting",
+        ) &&
+        REPLAYABLE_MERGE_MUTATION_RECEIPT_STATUSES.has(
+          mergeMutationReceiptStatus(entry as LooseRecord) ?? "",
+        )
+      );
+    },
+  );
+  return replay && typeof replay === "object" && !Array.isArray(replay)
+    ? (replay as LooseRecord)
+    : null;
 }
 
 function forcedReplayAttemptId(entry: LooseRecord): string | null {
@@ -553,9 +629,40 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     changed = true;
   }
   if (!changed) return false;
+  const boundedCommands = boundedLedgerCommands([...byCommentVersion.values()]);
+  const retainedKeys = new Set(boundedCommands.map((entry) => ledgerEntryKey(entry)));
+  for (const entry of compact.filter(isProtectedCommentRouterLedgerCommand)) {
+    const key = ledgerEntryKey(entry);
+    if (!retainedKeys.has(key)) {
+      throw new Error(`comment router ledger would evict protected mutation receipt ${key}`);
+    }
+  }
   current.updated_at = new Date().toISOString();
-  current.commands = [...byCommentVersion.values()].slice(-1000);
+  current.commands = boundedCommands;
   return true;
+}
+
+function boundedLedgerCommands(entries: LooseRecord[]): LooseRecord[] {
+  const protectedKeys = new Set(
+    entries.filter(isProtectedCommentRouterLedgerCommand).map((entry) => ledgerEntryKey(entry)),
+  );
+  if (protectedKeys.size > COMMENT_ROUTER_LEDGER_COMMAND_LIMIT) {
+    throw new Error(
+      `comment router ledger has more than ${COMMENT_ROUTER_LEDGER_COMMAND_LIMIT} protected mutation receipts`,
+    );
+  }
+  const ordinaryBudget = Math.max(0, COMMENT_ROUTER_LEDGER_COMMAND_LIMIT - protectedKeys.size);
+  const ordinary = entries.filter((entry) => !protectedKeys.has(ledgerEntryKey(entry)));
+  const ordinaryTail = ordinaryBudget > 0 ? ordinary.slice(-ordinaryBudget) : [];
+  const retainedKeys = new Set([
+    ...protectedKeys,
+    ...ordinaryTail.map((entry) => ledgerEntryKey(entry)),
+  ]);
+
+  // At-most-once merge safety is stronger than ordinary entry retention. The
+  // protected-count guard above fails before the ledger is mutated rather than
+  // evicting a receipt or allowing unbounded durable state.
+  return entries.filter((entry) => retainedKeys.has(ledgerEntryKey(entry)));
 }
 
 function validatedLedgerCommand(entry: JsonValue): LooseRecord {
@@ -671,8 +778,56 @@ function compactLedgerActions(actions: JsonValue) {
       status: action?.status ?? null,
       label: action?.label ?? null,
       job_path: action?.job_path ?? null,
+      ...(actionNeedsDurableDispatchClaim(action)
+        ? {
+            dispatch_repo: action?.dispatch_repo ?? null,
+            dispatch_workflow: action?.dispatch_workflow ?? null,
+            dispatch_event: action?.dispatch_event ?? null,
+            dispatch_title: action?.dispatch_title ?? null,
+            dispatch_mode: action?.dispatch_mode ?? null,
+            dispatch_runner: action?.dispatch_runner ?? null,
+            dispatch_execution_runner: action?.dispatch_execution_runner ?? null,
+            dispatch_model: action?.dispatch_model ?? null,
+          }
+        : {}),
+      ...(action?.action === "merge" &&
+      MERGE_MUTATION_RECEIPT_STATUSES.has(String(action?.merge_mutation_status ?? ""))
+        ? {
+            merge_mutation_status: action?.merge_mutation_status,
+            ...(action?.merged_at ? { merged_at: action.merged_at } : {}),
+            ...(action?.merge_commit_sha ? { merge_commit_sha: action.merge_commit_sha } : {}),
+            ...(action?.prepared_head_sha ? { prepared_head_sha: action.prepared_head_sha } : {}),
+            ...(action?.confirmation_status
+              ? { confirmation_status: action.confirmation_status }
+              : {}),
+            ...(action?.live_rest_state ? { live_rest_state: action.live_rest_state } : {}),
+            ...(action?.live_graphql_state
+              ? { live_graphql_state: action.live_graphql_state }
+              : {}),
+          }
+        : {}),
     }))
     .filter((action: LooseRecord) => action.action || action.status);
+}
+
+function actionNeedsDurableDispatchClaim(action: JsonValue): boolean {
+  if (
+    !["dispatch_clawsweeper", "dispatch_repair", "dispatch_assist"].includes(
+      String(action?.action ?? ""),
+    )
+  ) {
+    return false;
+  }
+  return [
+    "dispatch_repo",
+    "dispatch_workflow",
+    "dispatch_event",
+    "dispatch_title",
+    "dispatch_mode",
+    "dispatch_runner",
+    "dispatch_execution_runner",
+    "dispatch_model",
+  ].some((field) => action !== null && typeof action === "object" && Object.hasOwn(action, field));
 }
 
 export function writeLedger(file: JsonValue, current: LooseRecord) {

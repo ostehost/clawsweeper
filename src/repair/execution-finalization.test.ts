@@ -46,10 +46,9 @@ test("changed final base sync runs exactly one review against the synchronized t
       events.push("review");
       return { status: "passed", base: "synchronized" };
     },
-    checkpointSynchronizedTree: () => events.push("checkpoint"),
   });
 
-  assert.deepEqual(events, ["review", "checkpoint"]);
+  assert.deepEqual(events, ["review"]);
   assert.deepEqual(review, { status: "passed", base: "synchronized" });
 });
 
@@ -60,9 +59,6 @@ test("unchanged final base sync keeps the existing review", () => {
     currentReview,
     reviewSynchronizedTree: () => {
       throw new Error("unexpected synchronized-tree review");
-    },
-    checkpointSynchronizedTree: () => {
-      throw new Error("unexpected synchronized-tree checkpoint");
     },
   });
 

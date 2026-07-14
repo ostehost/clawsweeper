@@ -41,7 +41,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 env:
@@ -84,29 +84,75 @@ jobs:
 
   intake:
     if: ${{ !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
-    runs-on: ${{ vars.CLAWSWEEPER_COMMIT_FINDING_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
-    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
           build-script: build:repair
 
-      - name: Create GitHub App token
+      - name: Validate bounded commit finding source
+        id: source
+        env:
+          ALLOWED_OWNER: ${{ env.CLAWSWEEPER_ALLOWED_OWNER }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
+          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper' }}
+          REPORT_PATH: ${{ github.event.inputs.report_path || github.event.client_payload.report_path }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const targetRepo = String(process.env.TARGET_REPO || "").trim();
+          const reportRepo = String(process.env.REPORT_REPO || "").trim();
+          const sha = String(process.env.COMMIT_SHA || "").trim().toLowerCase();
+          const allowedOwner = String(process.env.ALLOWED_OWNER || "").trim();
+          const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+          if (!repoPattern.test(targetRepo) || targetRepo.split("/")[0] !== allowedOwner) {
+            throw new Error("target repository is outside the allowed owner");
+          }
+          if (reportRepo !== process.env.GITHUB_REPOSITORY) {
+            throw new Error("commit finding reports must come from the current ClawSweeper repository");
+          }
+          if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("commit SHA must be 40 hexadecimal characters");
+          const targetSlug = targetRepo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+          const expectedPath = `records/${targetSlug}/commits/${sha}.md`;
+          const reportPath = String(process.env.REPORT_PATH || expectedPath).trim();
+          if (reportPath !== expectedPath) {
+            throw new Error("commit finding report path does not match the canonical target/commit path");
+          }
+          const [, targetName] = targetRepo.split("/");
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            [
+              `target_repo=${targetRepo}`,
+              `target_repo_name=${targetName}`,
+              `commit_sha=${sha}`,
+              `report_repo=${reportRepo}`,
+              `report_path=${reportPath}`,
+            ].join("\n") + "\n",
+          );
+          NODE
+
+      - name: Create read-only target token
         id: app_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          permission-workflows: write
+          owner: ${{ env.CLAWSWEEPER_ALLOWED_OWNER }}
+          repositories: |
+            ${{ steps.source.outputs.target_repo_name }}
+            clawsweeper
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
           permission-actions: read
 
       - name: Create state token
@@ -126,10 +172,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_ENABLED || 'true' }}
-          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
-          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
-          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper' }}
-          REPORT_PATH: ${{ github.event.inputs.report_path || github.event.client_payload.report_path }}
+          TARGET_REPO: ${{ steps.source.outputs.target_repo }}
+          COMMIT_SHA: ${{ steps.source.outputs.commit_sha }}
+          REPORT_REPO: ${{ steps.source.outputs.report_repo }}
+          REPORT_PATH: ${{ steps.source.outputs.report_path }}
           REPORT_URL: ${{ github.event.inputs.report_url || github.event.client_payload.report_url }}
         run: |
           set -euo pipefail
@@ -148,32 +194,9 @@ jobs:
           fi
           pnpm run repair:commit-finding-intake -- "${args[@]}"
 
-      - uses: ./.github/actions/setup-codex
-        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
-        with:
-          cache-suffix: target-pnpm
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
-
       - name: Review synthetic result
         if: ${{ steps.prepare.outputs.should_repair == 'true' }}
         run: pnpm run repair:review-results -- "${{ steps.prepare.outputs.result_path }}"
-
-      - name: Execute credited fix artifact
-        id: execute
-        if: ${{ steps.prepare.outputs.should_repair == 'true' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
-        continue-on-error: true
-        timeout-minutes: 40
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-        run: pnpm run repair:execute-fix -- "${{ steps.prepare.outputs.job_path }}" "${{ steps.prepare.outputs.result_path }}"
-
-      - name: Post-flight finalize fix PRs
-        if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.execute.outcome == 'success' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-        run: pnpm run repair:post-flight -- "${{ steps.prepare.outputs.job_path }}" "${{ steps.prepare.outputs.result_path }}"
 
       - name: Publish local result ledger
         if: ${{ always() && steps.prepare.outputs.should_repair == 'true' }}
@@ -186,7 +209,7 @@ jobs:
             --run-id "${{ github.run_id }}" \
             --run-url "$RUN_URL" \
             --head-sha "${{ github.sha }}" \
-            --conclusion "${{ steps.execute.outcome == 'success' && 'success' || steps.execute.outcome == 'failure' && 'failure' || 'skipped' }}"
+            --conclusion "success"
 
       - name: Finalize commit finding audit
         if: always()
@@ -195,7 +218,7 @@ jobs:
             pnpm run repair:commit-finding-intake -- finalize \
               --audit-path "${{ steps.prepare.outputs.audit_path }}" \
               --run-dir "${{ steps.prepare.outputs.run_dir }}" \
-              --status "${{ steps.prepare.outputs.should_repair == 'true' && (steps.execute.outcome || 'skipped') || steps.prepare.outputs.status }}"
+              --status "${{ steps.prepare.outputs.should_repair == 'true' && 'queued' || steps.prepare.outputs.status }}"
           fi
 
       - name: Commit intake ledger
@@ -210,6 +233,29 @@ jobs:
             --max-attempts 12 \
             --push-attempts 4
 
-      - name: Fail on repair failure
-        if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.execute.outcome == 'failure' }}
-        run: exit 1
+      - name: Create central worker dispatch token
+        id: dispatch-token
+        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: openclaw
+          repositories: clawsweeper
+          permission-actions: write
+          permission-contents: read
+
+      - name: Dispatch isolated repair worker
+        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          JOB_PATH: ${{ steps.prepare.outputs.job_path }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:dispatch -- "$JOB_PATH" \
+            --mode autonomous \
+            --wait-for-capacity \
+            --runner blacksmith-4vcpu-ubuntu-2404 \
+            --execution-runner blacksmith-16vcpu-ubuntu-2404 \
+            --model internal \
+            --ref main

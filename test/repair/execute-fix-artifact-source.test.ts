@@ -25,7 +25,10 @@ test("repair workflow and executor share coherent production timeout defaults", 
     workflow,
     /CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS \|\| '1800000' \}\}/,
   );
-  assert.match(workflow, /name: Execute credited fix artifact[\s\S]*timeout-minutes: 70/);
+  assert.match(
+    workflow,
+    /name: Execute isolated fix preparation and stage exact publication[\s\S]*timeout-minutes: 72[\s\S]*--timeout-ms 4200000/,
+  );
 });
 
 test("no-op automerge repair updates outcome and re-enters router before exit", () => {
@@ -90,7 +93,8 @@ test("repair branch pushes settle and re-check the exact source head", () => {
     "the live head must be fetched after the settle window",
   );
   assert.ok(
-    push.indexOf("repairPushSettleBlock") < push.indexOf("runGitNetwork(pushArgs, targetDir)"),
+    push.indexOf("repairPushSettleBlock") <
+      push.indexOf("runTrustedGitNetwork(pushArgs, targetDir)"),
     "the exact-head guard must run before the branch push",
   );
 
@@ -119,7 +123,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
 
   const preparedSkipIndex = preparedReplacement.indexOf("skipMergedSourceReplacementWithoutDiff({");
   const preparedPushIndex = preparedReplacement.indexOf(
-    "pushRecoverableBranch({ targetDir, branch });",
+    "pushRecoverableBranch({ targetDir, branch, commit: prep.commit });",
   );
   const preparedCreateIndex = preparedReplacement.indexOf('"pr",\n        "create"');
   assert.notEqual(preparedSkipIndex, -1);
@@ -136,7 +140,10 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   assert.notEqual(helperEnd, -1);
   const helper = source.slice(helperStart, helperEnd);
   assert.match(helper, /if \(!mergedSource\) return null;/);
-  assert.match(helper, /if \(branchHasBaseDiff\(\{ targetDir, baseBranch \}\)\) return null;/);
+  assert.match(
+    helper,
+    /if \(branchHasBaseDiff\(\{ targetDir, baseBranch, gitFetch: fetchTargetRepository \}\)\) return null;/,
+  );
   assert.match(
     helper,
     /reason: "source PR already merged and replacement branch has no changes versus base"/,
@@ -190,14 +197,12 @@ test("repair Codex heartbeat wrapper uses bounded process capture", () => {
 test("issue implementation rechecks opt-out labels immediately before branch pushes", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   const pushStart = source.indexOf("function pushRecoverableBranch(");
-  const pushEnd = source.indexOf("function fetchRemoteRecoverableBranch(", pushStart);
   const helperStart = source.indexOf("function assertIssueImplementationNotPaused(");
-  const helperEnd = source.indexOf("function fetchRemoteRecoverableBranch(", helperStart);
+  const helperEnd = source.indexOf("function fixedGitHubRemoteHead(", helperStart);
 
   assert.notEqual(pushStart, -1);
-  assert.notEqual(pushEnd, -1);
-  assert.match(source.slice(pushStart, pushEnd), /assertIssueImplementationNotPaused\(\)/);
   assert.notEqual(helperStart, -1);
+  assert.match(source.slice(pushStart, helperStart), /assertIssueImplementationNotPaused\(\)/);
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
@@ -206,23 +211,23 @@ test("repair contract gates the final cumulative tree, not individual checkpoint
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   assert.equal(
     [...source.matchAll(/commitCheckpointIfNeeded\(/g)].length,
-    5,
-    "four checkpoint call sites plus the ordinary commit helper should remain",
+    3,
+    "only the initial and review-fix checkpoint call sites plus the helper should remain",
   );
   assert.doesNotMatch(source, /commitRepairCheckpointIfNeeded|checkpointBaseHead/);
-  assert.match(source, /enforceFinalRepairContract\(\{ fixArtifact, targetDir, baseBranch \}\)/);
-  assert.equal(
-    [...source.matchAll(/pushIntermediateCheckpoint\?\.\(\)/g)].length,
-    4,
-    "contract jobs must defer all four recovery pushes until final validation",
+  assert.match(
+    source,
+    /enforceFinalRepairContract\(\{ fixArtifact, targetDir, baseBranch, commit \}\)/,
   );
-  assert.match(source, /if \(hasRepairContract \|\| historyCompaction\?\.status === "compacted"\)/);
+  assert.doesNotMatch(source, /pushIntermediateCheckpoint|pushCheckpoint/);
 
   const compact = source.indexOf("const historyCompaction =");
-  const enforce = source.indexOf("enforceFinalRepairContract(", compact);
-  const publish = source.indexOf("if (hasRepairContract", enforce);
-  const commit = source.indexOf('const commit = run("git", ["rev-parse", "HEAD"]', publish);
-  assert.ok(compact < enforce && enforce < publish && publish < commit);
+  const commit = source.indexOf(
+    "const commit = String(historyCompaction?.commit ?? reviewedCommit)",
+  );
+  const bindTree = source.indexOf("assertCommitTree({ targetDir, commit", commit);
+  const enforce = source.indexOf("enforceFinalRepairContract(", bindTree);
+  assert.ok(compact < commit && commit < bindTree && bindTree < enforce);
 });
 
 test("final repair contract compares the repaired tree with the latest base", () => {
@@ -232,7 +237,7 @@ test("final repair contract compares the repaired tree with the latest base", ()
   const helper = source.slice(start, end);
   assert.match(source, /\.\/repair-contract\.js/);
   assert.match(helper, /const baseRef = `origin\/\$\{baseBranch\}`/);
-  assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseRef\}\.\.HEAD`/);
+  assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseRef\}\.\.\$\{commit\}`/);
   assert.match(helper, /enforceRepairContract\(\{ fixArtifact, changedFiles \}\)/);
   assert.doesNotMatch(helper, /--porcelain=v1|phase|checkpoint/);
 });
@@ -270,22 +275,52 @@ test("final synchronized tree is reviewed and reports persist before publication
   assert.match(source, /finalizeExecutionReport\(\{/);
 });
 
-test("repair workflow renews target credentials before deferred outcome publication", () => {
+test("repair workflow isolates untrusted preparation and defers prepared publication", () => {
   const workflow = readText(
     path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
   );
-  const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
-  const renewIndex = workflow.indexOf("- name: Renew target write token for post-flight");
-  const publishIndex = workflow.indexOf("- name: Publish deferred fix outcome");
+  const executeJobIndex = workflow.indexOf("\n  execute:\n");
+  const publishJobIndex = workflow.indexOf("\n  publish:\n");
+  const executeIndex = workflow.indexOf(
+    "- name: Execute isolated fix preparation and stage exact publication",
+  );
+  const validateIndex = workflow.indexOf("- name: Independently validate publication authority");
+  const writeTokenIndex = workflow.indexOf(
+    "- name: Create narrow no-publication mutation token after validation",
+  );
+  const publishIndex = workflow.indexOf("- name: Publish independently validated outcome");
   const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
 
   assert.ok(
-    executeIndex < renewIndex && renewIndex < publishIndex && publishIndex < postFlightIndex,
+    executeJobIndex < executeIndex &&
+      executeIndex < publishJobIndex &&
+      publishJobIndex < validateIndex &&
+      validateIndex < writeTokenIndex &&
+      writeTokenIndex < publishIndex &&
+      publishIndex < postFlightIndex,
   );
-  assert.match(workflow.slice(executeIndex, renewIndex), /--latest --defer-publication/);
+  const executeJob = workflow.slice(executeJobIndex, publishJobIndex);
+  const publisher = workflow.slice(publishJobIndex);
+  assert.match(executeJob, /"\$JOB_PATH" "\$RESULT_PATH" --prepare-publication/);
+  assert.doesNotMatch(executeJob, /--latest/);
+  assert.match(executeJob, /name: Create exact-repository read token/);
+  assert.match(executeJob, /trusted-principal-main\.js/);
+  assert.doesNotMatch(
+    executeJob,
+    /permission-(?:actions|contents|issues|pull-requests|workflows): write/,
+  );
+  assert.match(publisher, /runs-on: ubuntu-latest/);
+  assert.match(publisher, /artifact-ids: \${{ needs\.execute\.outputs\.prepared_artifact_id }}/);
+  assert.match(publisher, /--prepared-dir \.clawsweeper-prepared/);
+  assert.match(publisher, /--validate-prepared-publication/);
+  assert.match(publisher, /--publish-prepared-publication/);
   assert.match(
-    workflow.slice(publishIndex, postFlightIndex),
-    /GH_TOKEN: \${{ steps\.target_post_flight_token\.outputs\.token }}/,
+    publisher,
+    /Create narrow no-publication mutation token[\s\S]*?mode == 'no-publication'/,
   );
-  assert.match(workflow.slice(publishIndex, postFlightIndex), /--latest --publish-report-only/);
+  assert.match(
+    publisher,
+    /env -u GH_TOKEN -u GITHUB_TOKEN -u TARGET_MUTATION_TOKEN[\s\S]*?--publish-prepared-publication/,
+  );
+  assert.doesNotMatch(publisher, /permission-(?:actions|contents|workflows): write/);
 });

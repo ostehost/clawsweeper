@@ -3,7 +3,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { parseArgs } from "./lib.js";
+import { parseArgs, parseJob, validateJob } from "./lib.js";
 import { isJsonObject } from "./json-types.js";
 import { AUTOMATION_LIMITS, WORKER_CONFIG, workerLimit, type WorkerLane } from "./limits.js";
 
@@ -255,9 +255,20 @@ function runCli(): void {
         ),
       );
       break;
-    case "count-requeue-required":
-      console.log(countRequeueRequired(requiredString("dir")));
+    case "count-requeue-required": {
+      const job = parseJob(requiredString("job"));
+      const errors = validateJob(job);
+      if (errors.length > 0) throw new Error(`invalid requeue job: ${errors.join("; ")}`);
+      console.log(
+        countRequeueRequired(requiredString("dir"), {
+          repo: String(job.frontmatter.repo),
+          clusterId: String(job.frontmatter.cluster_id),
+          mode: String(job.frontmatter.mode),
+          sourceJob: job.relativePath,
+        }),
+      );
       break;
+    }
     case "limit":
       process.stdout.write(String(automationLimit(optionalString("path") || positionalString(1))));
       break;
@@ -1111,10 +1122,37 @@ export function countCommandActions(reportPath: string, action: string, status =
     .length;
 }
 
-export function countRequeueRequired(reportDir: string): number {
-  return resultFiles(reportDir)
-    .flatMap((file) => resultActions(file))
-    .filter((action) => action.requeue_required === true).length;
+export function countRequeueRequired(
+  reportDir: string,
+  expected: {
+    repo: string;
+    clusterId: string;
+    mode: string;
+    sourceJob: string;
+  },
+): number {
+  if (!fs.existsSync(reportDir)) return 0;
+  const workspaceRoot = requeueWorkspaceRoot(reportDir);
+  for (const resultPath of requeueResultFiles(reportDir)) {
+    const runDir = path.dirname(resultPath);
+    const planPath = path.join(runDir, "cluster-plan.json");
+    if (!fs.existsSync(planPath)) continue;
+    const result = readJsonObject(resultPath);
+    const plan = readJsonObject(planPath);
+    if (!matchesRequeueJobIdentity(result, plan, expected)) continue;
+
+    if (resultActions(result).some((action) => action.requeue_required === true)) return 1;
+    for (const reportName of ["apply-report.json", "post-flight-report.json"]) {
+      const reportPath = path.join(runDir, reportName);
+      if (!fs.existsSync(reportPath)) continue;
+      const report = readJsonObject(reportPath);
+      if (!matchesRequeueReportIdentity(report, expected, resultPath, workspaceRoot)) continue;
+      if (resultActions(report).some((action) => isRequeueReportAction(reportName, action))) {
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 export function mergeApplyReports(reportDir: string, outputPath: string): void {
@@ -2211,19 +2249,65 @@ function reportsReviewCommentSync(entry: ApplyAction): boolean {
   );
 }
 
-function resultFiles(reportDir: string): string[] {
-  if (!fs.existsSync(reportDir)) return [];
+function requeueResultFiles(reportDir: string): string[] {
   return fs
     .readdirSync(reportDir, { recursive: true })
     .map((entry) => path.join(reportDir, String(entry)))
-    .filter((candidate) => ["apply-report.json", "result.json"].includes(path.basename(candidate)))
+    .filter((candidate) => path.basename(candidate) === "result.json")
     .filter((candidate) => fs.statSync(candidate).isFile());
 }
 
-function resultActions(reportPath: string): LooseRecord[] {
-  const parsed = readJsonObject(reportPath);
+function resultActions(parsed: LooseRecord): LooseRecord[] {
   const actions: JsonValue[] = Array.isArray(parsed.actions) ? parsed.actions : [];
   return actions.filter((action): action is LooseRecord => isJsonObject(action));
+}
+
+function requeueWorkspaceRoot(reportDir: string): string {
+  const absolute = path.resolve(reportDir);
+  if (
+    path.basename(absolute) !== "runs" ||
+    path.basename(path.dirname(absolute)) !== ".clawsweeper-repair"
+  ) {
+    throw new Error("requeue report directory must be .clawsweeper-repair/runs");
+  }
+  return path.dirname(path.dirname(absolute));
+}
+
+function matchesRequeueJobIdentity(
+  result: LooseRecord,
+  plan: LooseRecord,
+  expected: { repo: string; clusterId: string; mode: string; sourceJob: string },
+): boolean {
+  return (
+    result.repo === expected.repo &&
+    result.cluster_id === expected.clusterId &&
+    result.mode === expected.mode &&
+    plan.repo === expected.repo &&
+    plan.cluster_id === expected.clusterId &&
+    plan.mode === expected.mode &&
+    plan.source_job === expected.sourceJob
+  );
+}
+
+function matchesRequeueReportIdentity(
+  report: LooseRecord,
+  expected: { repo: string; clusterId: string },
+  resultPath: string,
+  workspaceRoot: string,
+): boolean {
+  const expectedResultPath = path.relative(workspaceRoot, resultPath).split(path.sep).join("/");
+  return (
+    report.repo === expected.repo &&
+    report.cluster_id === expected.clusterId &&
+    report.dry_run !== true &&
+    report.result_path === expectedResultPath
+  );
+}
+
+function isRequeueReportAction(reportName: string, action: LooseRecord): boolean {
+  if (action.requeue_required !== true) return false;
+  if (reportName !== "post-flight-report.json") return true;
+  return action.status === "blocked" && action.retry_recommended === true;
 }
 
 function readJsonObject(filePath: string): LooseRecord {

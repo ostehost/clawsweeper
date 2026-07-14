@@ -208,6 +208,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CLAWSWEEPER_APP_SLUG: clawsweeper
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
   CLAWSWEEPER_MODEL: internal
 
@@ -519,9 +520,23 @@ jobs:
           repositories: ${{ steps.target.outputs.target_repo_name }}
           permission-checks: read
           permission-contents: read
-          permission-issues: read
+          permission-issues: write
           permission-pull-requests: read
           permission-statuses: read
+
+      - name: Create target Codex inspection token
+        if: ${{ steps.target.outputs.target_enabled == 'true' }}
+        id: codex-inspection-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.target_repo_owner }}
+          repositories: ${{ steps.target.outputs.target_repo_name }}
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
 
       - name: Check live target item state
         if: ${{ steps.target.outputs.target_enabled == 'true' }}
@@ -589,56 +604,11 @@ jobs:
               ;;
           esac
 
-      - name: Create target write token
-        if: ${{ steps.live-item.outcome == 'success' }}
-        id: target-write-token
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ steps.target.outputs.target_repo_owner }}
-          repositories: ${{ steps.target.outputs.target_repo_name }}
-          permission-checks: read
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          permission-statuses: read
-
       - uses: ./.github/actions/setup-pnpm
         id: setup-pnpm
         if: ${{ steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true') }}
         with:
           build-script: ${{ steps.live-item.outputs.proceed == 'true' && 'build:all' || 'build:repair' }}
-
-      - name: React to target item review start
-        if: ${{ steps.live-item.outputs.proceed == 'true' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
-          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
-          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
-        run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN"
-          react() {
-            local content="$1"
-            local err
-            err="$(mktemp)"
-            if gh api -X POST \
-              -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions" \
-              -f content="$content" 2>"$err" >/dev/null; then
-              echo "Added $content reaction to $TARGET_REPO#$ITEM_NUMBER."
-            elif grep -qi "HTTP 422\\|already exists" "$err"; then
-              echo "$content reaction already exists on $TARGET_REPO#$ITEM_NUMBER."
-            else
-              cat "$err" >&2
-              return 1
-            fi
-            rm -f "$err"
-          }
-          react "eyes"
 
       - uses: actions/cache@v6
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
@@ -682,27 +652,6 @@ jobs:
           fi
           git -C "$checkout_dir" rev-parse --short HEAD
 
-      - name: Mark re-review command in progress
-        if: ${{ steps.live-item.outputs.proceed == 'true' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
-          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
-          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
-          COMMAND_STATUS_MARKER: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).commandStatusMarker || '' }}
-          STATUS_COMMENT_ID: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).statusCommentId || '' }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          pnpm run repair:update-command-status -- \
-            --repo "$TARGET_REPO" \
-            --item-number "$ITEM_NUMBER" \
-            --marker "$COMMAND_STATUS_MARKER" \
-            --status-comment-id "$STATUS_COMMENT_ID" \
-            --state "Review in progress" \
-            --detail "The exact-review queue leased this run; Codex is reviewing the item." \
-            --run-url "$RUN_URL" \
-            --wait-ms 120000
-
       - uses: ./.github/actions/setup-codex
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
         env:
@@ -711,18 +660,52 @@ jobs:
         with:
           login-status: "true"
 
+      - name: Prepare isolated Codex principal
+        id: codex-principal
+        if: ${{ steps.live-item.outputs.proceed == 'true' }}
+        run: |
+          set -euo pipefail
+          principal="cswe${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+          sudo --non-interactive useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$principal"
+          principal_uid="$(id -u "$principal")"
+          principal_gid="$(id -g "$principal")"
+          principal_home="$RUNNER_TEMP/clawsweeper-event-codex-home"
+          principal_tmp="$principal_home/tmp"
+          principal_codex_home="$principal_home/codex"
+          sudo --non-interactive install -d -m 0700 -o "$principal_uid" -g "$principal_gid" \
+            "$principal_home" "$principal_tmp" "$principal_codex_home"
+          sudo --non-interactive cp -a "$CODEX_HOME/." "$principal_codex_home/"
+          sudo --non-interactive chown -R --no-dereference "$principal_uid:$principal_gid" \
+            "$principal_home"
+          sudo --non-interactive chmod -R u+rwX,go-rwx "$principal_home"
+          sudo --non-interactive chmod o+x "$HOME" "$HOME/.clawsweeper-repair"
+          sudo --non-interactive chmod -R a+rX,go-w "$HOME/.clawsweeper-repair/codex"
+          {
+            echo "uid=$principal_uid"
+            echo "gid=$principal_gid"
+            echo "home=$principal_home"
+            echo "tmp=$principal_tmp"
+            echo "codex_home=$principal_codex_home"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Review exact event item
         id: review-exact-event-item
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
-          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.target-read-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
+          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.codex-inspection-token.outputs.token }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_UID: ${{ steps.codex-principal.outputs.uid }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_GID: ${{ steps.codex-principal.outputs.gid }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_HOME: ${{ steps.codex-principal.outputs.home }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_TMPDIR: ${{ steps.codex-principal.outputs.tmp }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_CODEX_HOME: ${{ steps.codex-principal.outputs.codex_home }}
           ADDITIONAL_PROMPT: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).additionalPrompt || '' }}
           CLAWSWEEPER_RELATED_GITHUB_SEARCH: ${{ vars.CLAWSWEEPER_RELATED_GITHUB_SEARCH || '1' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          test -n "$CLAWSWEEPER_PROOF_INSPECTION_TOKEN"
           codex_timeout_ms="${{ steps.target.outputs.codex_timeout_ms }}"
           if ! [[ "$codex_timeout_ms" =~ ^[0-9]+$ ]] || [ "$codex_timeout_ms" -lt 1 ]; then
             echo "Invalid Codex timeout: $codex_timeout_ms" >&2
@@ -738,8 +721,11 @@ jobs:
           media_preprocessing_reserve_seconds=480
           review_timeout_seconds=$((codex_timeout_seconds + media_preprocessing_reserve_seconds + 180))
           echo "::notice::Exact event review timeout is ${review_timeout_seconds}s for per-item Codex timeout ${codex_timeout_seconds}s, reserved media preprocessing ${media_preprocessing_reserve_seconds}s, and detected media allowance ${media_proof_timeout_seconds}s."
+          mkdir -p artifacts/event
+          node_real="$(realpath "$(command -v node)")"
           set +e
-          timeout --kill-after=30s "${review_timeout_seconds}s" pnpm run review -- \
+          /usr/bin/timeout --kill-after=30s "${review_timeout_seconds}s" \
+            "$node_real" dist/clawsweeper.js review \
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --target-dir "${{ steps.target.outputs.target_checkout_dir }}" \
             --artifact-dir artifacts/event \
@@ -756,6 +742,9 @@ jobs:
             "${additional_prompt_arg[@]}"
           review_exit_code=$?
           set -e
+          sudo --non-interactive "$node_real" dist/trusted-principal-drain.js \
+            "$CLAWSWEEPER_CODEX_PRINCIPAL_UID" "$CLAWSWEEPER_CODEX_PRINCIPAL_GID"
+          echo "principal_drained=true" >> "$GITHUB_OUTPUT"
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
           if [ "$review_exit_code" -ne 0 ]; then
             exit "$review_exit_code"
@@ -801,9 +790,25 @@ jobs:
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
+      - name: Create target write token
+        if: ${{ always() && steps.live-item.outcome == 'success' && (steps.live-item.outputs.proceed != 'true' || steps.review-exact-event-item.outputs.principal_drained == 'true') }}
+        id: target-write-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.target_repo_owner }}
+          repositories: ${{ steps.target.outputs.target_repo_name }}
+          permission-checks: read
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-statuses: read
+
       - name: Create state token
         id: state-token
-        if: ${{ always() && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}
+        if: ${{ always() && (steps.live-item.outputs.proceed != 'true' || steps.review-exact-event-item.outputs.principal_drained == 'true') && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}
         uses: ./.github/actions/create-state-token
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -811,7 +816,7 @@ jobs:
 
       - uses: ./.github/actions/setup-state
         id: setup-state
-        if: ${{ always() && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}
+        if: ${{ always() && (steps.live-item.outputs.proceed != 'true' || steps.review-exact-event-item.outputs.principal_drained == 'true') && (steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true')) }}
         with:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
@@ -882,12 +887,45 @@ jobs:
             echo "Released unsuccessful review lease comment $lease_id owned by $LEASE_OWNER."
           done <<< "$lease_ids"
 
+      - name: Renew exact-repository mutation token for direct routing
+        id: router-mutation-token
+        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'false' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.target_repo_owner }}
+          repositories: ${{ steps.target.outputs.target_repo_name }}
+          permission-actions: write
+          permission-checks: read
+          permission-contents: write
+          permission-issues: read
+          permission-pull-requests: write
+          permission-statuses: read
+
+      - name: Bind direct-routing mutation App identity
+        id: router-mutation-app
+        if: ${{ steps.router-mutation-token.outcome == 'success' && vars.CLAWSWEEPER_ALLOW_MERGE == '1' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.router-mutation-token.outputs.token }}
+          APP_SLUG: ${{ steps.router-mutation-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_SLUG"
+          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
+          test "$app_id" -gt 0
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+
       - name: Route synced ClawSweeper verdict
         id: route-synced-verdict
         if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'false' }}
         timeout-minutes: 4
         env:
-          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          GH_TOKEN: ${{ steps.router-mutation-token.outputs.token }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.router-mutation-app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.router-mutation-token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.router-mutation-token.outputs.installation-id }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
@@ -1863,7 +1901,7 @@ jobs:
   review:
     name: Review shard ${{ matrix.shard }} · ${{ needs.plan.outputs.target_repo }}#${{ matrix.item_numbers }}
     needs: plan
-    runs-on: ${{ vars.CLAWSWEEPER_REVIEW_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 75
     continue-on-error: true
     permissions:
@@ -1944,6 +1982,34 @@ jobs:
         with:
           login-status: "true"
 
+      - name: Prepare isolated Codex principal
+        id: codex-principal
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          principal="cswr${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}${{ matrix.shard }}"
+          sudo --non-interactive useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$principal"
+          principal_uid="$(id -u "$principal")"
+          principal_gid="$(id -g "$principal")"
+          principal_home="$RUNNER_TEMP/clawsweeper-review-codex-home"
+          principal_tmp="$principal_home/tmp"
+          principal_codex_home="$principal_home/codex"
+          sudo --non-interactive install -d -m 0700 -o "$principal_uid" -g "$principal_gid" \
+            "$principal_home" "$principal_tmp" "$principal_codex_home"
+          sudo --non-interactive cp -a "$CODEX_HOME/." "$principal_codex_home/"
+          sudo --non-interactive chown -R --no-dereference "$principal_uid:$principal_gid" \
+            "$principal_home"
+          sudo --non-interactive chmod -R u+rwX,go-rwx "$principal_home"
+          sudo --non-interactive chmod o+x "$HOME" "$HOME/.clawsweeper-repair"
+          sudo --non-interactive chmod -R a+rX,go-w "$HOME/.clawsweeper-repair/codex"
+          {
+            echo "uid=$principal_uid"
+            echo "gid=$principal_gid"
+            echo "home=$principal_home"
+            echo "tmp=$principal_tmp"
+            echo "codex_home=$principal_codex_home"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: actions/cache@v6
         with:
           path: ${{ needs.plan.outputs.target_checkout_dir }}-cache.git
@@ -1992,8 +2058,13 @@ jobs:
         continue-on-error: true
         working-directory: clawsweeper
         env:
-          GH_TOKEN: ${{ steps.target-read-token.outputs.token || github.token }}
-          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.codex-inspection-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
+          CLAWSWEEPER_PROOF_INSPECTION_TOKEN: ${{ steps.codex-inspection-token.outputs.token }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_UID: ${{ steps.codex-principal.outputs.uid }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_GID: ${{ steps.codex-principal.outputs.gid }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_HOME: ${{ steps.codex-principal.outputs.home }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_TMPDIR: ${{ steps.codex-principal.outputs.tmp }}
+          CLAWSWEEPER_CODEX_PRINCIPAL_CODEX_HOME: ${{ steps.codex-principal.outputs.codex_home }}
           ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.review_options.additional_prompt || github.event.client_payload.additional_prompt || '' }}
           EXACT_ITEM: ${{ github.event.client_payload.item_number || github.event.inputs.item_number || github.event.inputs.item_numbers || '' }}
           EXPECTED_SOURCE_REVISION: ${{ github.event.client_payload.expected_source_revision || '' }}
@@ -2023,8 +2094,10 @@ jobs:
             review_timeout_seconds=4200
           fi
           echo "::notice::Review shard timeout is ${review_timeout_seconds}s for batch size ${{ needs.plan.outputs.batch_size }} and per-item Codex timeout ${codex_timeout_seconds}s."
+          mkdir -p ../review-artifacts/shard-${{ matrix.shard }}
+          node_real="$(realpath "$(command -v node)")"
           set +e
-          timeout --kill-after=30s "${review_timeout_seconds}s" node dist/clawsweeper.js review \
+          /usr/bin/timeout --kill-after=30s "${review_timeout_seconds}s" "$node_real" dist/clawsweeper.js review \
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --target-dir "../${{ needs.plan.outputs.target_checkout_dir }}" \
             --artifact-dir ../review-artifacts/shard-${{ matrix.shard }} \
@@ -2044,11 +2117,14 @@ jobs:
             "${expected_source_revision_arg[@]}"
           review_exit_code=$?
           set -e
+          sudo --non-interactive "$node_real" dist/trusted-principal-drain.js \
+            "$CLAWSWEEPER_CODEX_PRINCIPAL_UID" "$CLAWSWEEPER_CODEX_PRINCIPAL_GID"
+          echo "principal_drained=true" >> "$GITHUB_OUTPUT"
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
           exit "$review_exit_code"
 
       - name: Finalize review action ledger
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         continue-on-error: true
         working-directory: clawsweeper
         env:
@@ -2066,7 +2142,7 @@ jobs:
           node dist/clawsweeper.js finalize-action-events "${args[@]}"
 
       - name: Record shard metrics
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         env:
           ITEM_NUMBERS: ${{ matrix.item_numbers }}
           REVIEW_OUTCOME: ${{ steps.review-shard.outcome || 'not_started' }}
@@ -2092,7 +2168,7 @@ jobs:
             }' > review-artifacts/metrics/shard-${{ matrix.shard }}.json
 
       - name: Record failed review shard
-        if: ${{ failure() || steps.review-shard.outcome == 'failure' }}
+        if: ${{ steps.review-shard.outputs.principal_drained == 'true' && (failure() || steps.review-shard.outcome == 'failure') }}
         run: |
           mkdir -p review-artifacts/failed-shards
           cat > review-artifacts/failed-shards/shard-${{ matrix.shard }}.json <<JSON
@@ -2103,7 +2179,7 @@ jobs:
           JSON
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         with:
           name: review-shard-${{ matrix.shard }}
           path: |
@@ -2112,7 +2188,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         with:
           name: action-ledger-review-${{ matrix.shard }}
           path: ${{ runner.temp }}/clawsweeper-action-ledger/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}/**
@@ -2120,21 +2196,21 @@ jobs:
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         with:
           name: review-failed-shard-${{ matrix.shard }}
           path: review-artifacts/failed-shards/shard-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' }}
         with:
           name: review-metrics-${{ matrix.shard }}
           path: review-artifacts/metrics/shard-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
-        if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.client_payload.expected_source_revision != '' }}
+        if: ${{ always() && steps.review-shard.outputs.principal_drained == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.expected_source_revision != '' }}
         with:
           name: review-source-revision-mismatch-${{ matrix.shard }}
           path: review-artifacts/shard-${{ matrix.shard }}/source-revision-mismatch.json

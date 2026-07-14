@@ -9,7 +9,9 @@ import { compactGeneratedBranchHistory } from "./compact-generated-branch.js";
 
 test("generated branch compaction keeps the reviewed tree and removes checkpoint noise", () => {
   const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-compact-"));
+  const trustedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-compact-trusted-"));
   test.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+  test.after(() => fs.rmSync(trustedRoot, { recursive: true, force: true }));
 
   git(targetDir, "init", "-b", "main");
   git(targetDir, "config", "user.name", "ClawSweeper");
@@ -31,11 +33,15 @@ test("generated branch compaction keeps the reviewed tree and removes checkpoint
   git(targetDir, "add", "--all");
   git(targetDir, "commit", "-m", "fix(clawsweeper): address review");
 
+  const reviewedHead = git(targetDir, "rev-parse", "HEAD").trim();
   const reviewedTree = git(targetDir, "rev-parse", "HEAD^{tree}").trim();
   const result = compactGeneratedBranchHistory({
     targetDir,
     baseRef: "origin/main",
+    expectedHead: reviewedHead,
+    expectedTree: reviewedTree,
     message: "fix: update runtime",
+    trustedRoot,
     trailers: ["Co-authored-by: Contributor <contributor@example.com>"],
   });
 
@@ -56,7 +62,10 @@ test("generated branch compaction keeps the reviewed tree and removes checkpoint
   const unchanged = compactGeneratedBranchHistory({
     targetDir,
     baseRef: "origin/main",
+    expectedHead: git(targetDir, "rev-parse", "HEAD").trim(),
+    expectedTree: reviewedTree,
     message: "fix: update runtime",
+    trustedRoot,
   });
   assert.equal(unchanged.status, "unchanged");
   assert.equal(unchanged.previous_commit_count, 1);

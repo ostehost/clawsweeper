@@ -1,8 +1,14 @@
-import { currentHead } from "./git-repo-utils.js";
 import type { GitHubRef } from "./github-ref.js";
 import { parsePullRequestUrl } from "./github-ref.js";
 import type { JsonValue } from "./json-types.js";
 import { runCommand as run } from "./command-runner.js";
+import {
+  assertNoUnsafeGitMutationConfig,
+  fixedGitHubRepositoryUrl,
+  trustedGitArgs,
+  trustedGitContext,
+  trustedGitNetworkContext,
+} from "./trusted-git.js";
 
 const gitNetworkTimeoutMs = Math.max(
   30_000,
@@ -42,21 +48,33 @@ export function checkoutSourcePullRequestHead({
   branch,
   sourcePr,
   pull,
+  trustedRoot,
+  token,
 }: {
   targetDir: string;
   repo: string;
   branch: string;
   sourcePr: GitHubRef;
   pull: JsonValue;
+  trustedRoot: string;
+  token: string;
 }): SourcePullRequestCheckout {
   if (sourcePr.repo !== repo) {
     throw new Error(`source PR ${sourcePr.url} is not in target repo ${repo}`);
   }
 
-  const sourceRef = fetchSourcePullRequestHead({ targetDir, sourcePr });
-  run("git", ["checkout", "-B", branch, sourceRef], { cwd: targetDir });
+  const sourceRef = fetchSourcePullRequestHead({ targetDir, sourcePr, trustedRoot, token });
+  runTrustedSourceGit({
+    targetDir,
+    trustedRoot,
+    args: ["checkout", "-B", branch, sourceRef],
+  });
 
-  const sourceHeadSha = currentHead(targetDir);
+  const sourceHeadSha = runTrustedSourceGit({
+    targetDir,
+    trustedRoot,
+    args: ["rev-parse", "HEAD"],
+  }).trim();
   const expectedHeadSha = pullRequestHeadSha(pull);
   if (expectedHeadSha && sourceHeadSha !== expectedHeadSha) {
     throw new Error(
@@ -83,14 +101,50 @@ export function sourcePullRequestRemoteRef(number: number): string {
 export function fetchSourcePullRequestHead({
   targetDir,
   sourcePr,
+  trustedRoot,
+  token,
 }: {
   targetDir: string;
   sourcePr: GitHubRef;
+  trustedRoot: string;
+  token: string;
 }): string {
   const sourceRef = sourcePullRequestRemoteRef(sourcePr.number);
-  run("git", ["fetch", "origin", sourcePullRequestFetchSpec(sourcePr.number, sourceRef)], {
-    cwd: targetDir,
-    timeoutMs: gitNetworkTimeoutMs,
+  runTrustedSourceGit({
+    targetDir,
+    trustedRoot,
+    token,
+    network: true,
+    args: [
+      "fetch",
+      fixedGitHubRepositoryUrl(sourcePr.repo),
+      sourcePullRequestFetchSpec(sourcePr.number, sourceRef),
+    ],
   });
   return sourceRef;
+}
+
+function runTrustedSourceGit({
+  targetDir,
+  trustedRoot,
+  args,
+  network = false,
+  token = "",
+}: {
+  targetDir: string;
+  trustedRoot: string;
+  args: string[];
+  network?: boolean;
+  token?: string;
+}): string {
+  assertNoUnsafeGitMutationConfig({ targetDir, trustedRoot });
+  const context =
+    network && token
+      ? trustedGitNetworkContext(trustedRoot, token)
+      : trustedGitContext(trustedRoot);
+  return run("git", trustedGitArgs(context, args), {
+    cwd: targetDir,
+    env: context.env,
+    timeoutMs: gitNetworkTimeoutMs,
+  });
 }

@@ -33,6 +33,12 @@ import {
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import {
+  graphqlPullRequestMergeConfirmed,
+  pullRequestMainBaseBlock,
+  restPullRequestMergeConfirmed,
+} from "./merge-confirmation.js";
+import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
+import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
   prCloseCoverageProofCandidateCanClose,
@@ -590,6 +596,29 @@ function applyMergeAction({
   const view = fetchPullRequestView(result.repo, target);
   const mergedAt = pullRequest.merged_at ?? view.mergedAt ?? null;
   if (mergedAt) {
+    const baseBlock = pullRequestMainBaseBlock(pullRequest, view);
+    if (baseBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: baseBlock,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+      };
+    }
+    if (!restPullRequestMergeConfirmed(pullRequest) || !graphqlPullRequestMergeConfirmed(view)) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: "merge state is not yet confirmed by both GitHub pull request views",
+        live_state: pullRequest.state ?? null,
+        live_view_state: view.state ?? null,
+        live_updated_at: live.updated_at,
+        merged_at: mergedAt,
+        requeue_required: true,
+        retry_recommended: true,
+      };
+    }
     return {
       ...base,
       status: "executed",
@@ -637,6 +666,23 @@ function applyMergeAction({
     };
   }
 
+  const validatedBaseBranch = String(view.baseRefName ?? pullRequest.base?.ref ?? "");
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: validatedBaseBranch,
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: strictBaseBindingBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      merge_method: "squash",
+    };
+  }
+
   if (dryRun) {
     return {
       ...base,
@@ -670,6 +716,33 @@ function applyMergeAction({
   ];
   if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
   try {
+    const finalView = fetchPullRequestView(result.repo, target);
+    const finalBaseBranch = String(finalView.baseRefName ?? "");
+    if (finalBaseBranch !== validatedBaseBranch) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: "pull request base changed since merge validation",
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        merge_method: "squash",
+      };
+    }
+    const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+      repo: result.repo,
+      baseBranch: finalBaseBranch,
+      policyReadJson: rulesetPolicyReader(),
+    });
+    if (finalStrictBaseBindingBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: finalStrictBaseBindingBlock,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        merge_method: "squash",
+      };
+    }
     ghWithRetry(mergeArgs);
   } catch (error) {
     if (isLockedConversationCommentError(error)) {
@@ -681,19 +754,59 @@ function applyMergeAction({
     throw error;
   }
   const merged = fetchPullRequest(result.repo, target);
+  const mergedView = fetchPullRequestView(result.repo, target);
+  const confirmedMergedAt = merged.merged_at ?? mergedView.mergedAt ?? null;
+  const mergedBaseBlock = pullRequestMainBaseBlock(merged, mergedView);
+  if (mergedBaseBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: mergedBaseBlock,
+      live_state: merged.state ?? null,
+      live_view_state: mergedView.state ?? null,
+      live_updated_at: live.updated_at,
+      merged_at: confirmedMergedAt,
+      merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
+      merge_method: "squash",
+    };
+  }
+  if (!restPullRequestMergeConfirmed(merged) || !graphqlPullRequestMergeConfirmed(mergedView)) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "merge command completed without a confirmed merged pull request",
+      live_state: merged.state ?? null,
+      live_view_state: mergedView.state ?? null,
+      live_updated_at: live.updated_at,
+      merged_at: confirmedMergedAt,
+      merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
+      merge_method: "squash",
+      requeue_required: true,
+      retry_recommended: true,
+    };
+  }
   return {
     ...base,
     status: "executed",
     reason: "merged by clawsweeper-repair",
     live_state: "merged",
     live_updated_at: live.updated_at,
-    merged_at: merged.merged_at ?? null,
-    merge_commit_sha: merged.merge_commit_sha ?? null,
+    merged_at: confirmedMergedAt,
+    merge_commit_sha: merged.merge_commit_sha ?? mergedView.mergeCommit?.oid ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
   };
+}
+
+function rulesetPolicyReader() {
+  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+  if (!token) return undefined;
+  return (ghArgs: string[]) =>
+    ghJson(ghArgs, {
+      env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+    });
 }
 
 function validateClosePolicy({ job, actionName }: LooseRecord) {
@@ -839,7 +952,15 @@ function findMergePreflight(result: LooseRecord, target: LooseRecord) {
 function validateMergedCandidateFix(repo: string, candidateFix: LooseRecord) {
   if (!candidateFix) return "post-merge close requires candidate_fix";
   const candidate = fetchPullRequest(repo, candidateFix);
-  if (!candidate.merged_at) return "candidate fix is not merged";
+  const candidateView = fetchPullRequestView(repo, candidateFix);
+  const baseBlock = pullRequestMainBaseBlock(candidate, candidateView);
+  if (baseBlock) return baseBlock;
+  if (
+    !restPullRequestMergeConfirmed(candidate) ||
+    !graphqlPullRequestMergeConfirmed(candidateView)
+  ) {
+    return "candidate fix is not confirmed merged";
+  }
   return "";
 }
 

@@ -2257,11 +2257,25 @@ export function renderResponse(command: LooseRecord, dispatched: LooseRecord) {
         "I will update this PR branch, or open a safe credited replacement, if the repair worker finds a narrow CI fix.",
       ].join("\n");
     }
+    const alreadyMergedWithoutReceipt =
+      dispatched?.merge?.status === "skipped" &&
+      (String(dispatched.merge.reason ?? "").includes(
+        "already merged without a recorded accepted ClawSweeper merge request",
+      ) ||
+        String(dispatched.merge.reason ?? "").includes("merge actor is not attributed"));
     return [
       marker,
       dispatched?.merge?.status === "executed"
-        ? botFeedbackLead(command, "ClawSweeper merged this PR after the passing review.")
-        : botFeedbackLead(command, "ClawSweeper saw the passing review, but did not merge yet."),
+        ? botFeedbackLead(
+            command,
+            "This PR is confirmed merged after ClawSweeper submitted the exact-head merge request.",
+          )
+        : alreadyMergedWithoutReceipt
+          ? botFeedbackLead(
+              command,
+              "This PR was already merged; ClawSweeper has no accepted exact-head merge request receipt to attribute.",
+            )
+          : botFeedbackLead(command, "ClawSweeper saw the passing review, but did not merge yet."),
       "",
       `Source: \`${commandSource(command)}\``,
       `Feedback: ${command.repair_reason ?? "ClawSweeper reported a passing review."}`,
@@ -2283,15 +2297,25 @@ export function renderResponse(command: LooseRecord, dispatched: LooseRecord) {
       "",
       dispatched?.merge?.status === "executed"
         ? "The automerge loop is complete."
-        : "I left the PR open for the remaining gate instead of bypassing it.",
+        : alreadyMergedWithoutReceipt
+          ? "No merge completion was attributed to ClawSweeper."
+          : "I left the PR open for the remaining gate instead of bypassing it.",
     ].join("\n");
   }
   if (command.intent === "maintainer_approve_automerge") {
+    const alreadyMergedWithoutReceipt =
+      dispatched?.merge?.status === "skipped" &&
+      (String(dispatched.merge.reason ?? "").includes(
+        "already merged without a recorded accepted ClawSweeper merge request",
+      ) ||
+        String(dispatched.merge.reason ?? "").includes("merge actor is not attributed"));
     return [
       marker,
       dispatched?.merge?.status === "executed"
-        ? "Maintainer-approved ClawSweeper automerge is complete."
-        : "Maintainer-approved ClawSweeper automerge is not merged yet.",
+        ? "The maintainer-approved PR is confirmed merged after ClawSweeper submitted the exact-head merge request."
+        : alreadyMergedWithoutReceipt
+          ? "The maintainer-approved PR was already merged; ClawSweeper has no accepted exact-head merge request receipt to attribute."
+          : "Maintainer-approved ClawSweeper automerge is not merged yet.",
       "",
       `Approver: \`${command.author ?? "maintainer"}\``,
       `Head: ${markdownCommitLink(command.repo, command.expected_head_sha ?? command.target?.head_sha) || "`unknown`"}`,
@@ -2313,7 +2337,9 @@ export function renderResponse(command: LooseRecord, dispatched: LooseRecord) {
       "",
       dispatched?.merge?.status === "executed"
         ? "The automerge loop is complete."
-        : "I left the PR open for the remaining gate instead of bypassing it.",
+        : alreadyMergedWithoutReceipt
+          ? "No merge completion was attributed to ClawSweeper."
+          : "I left the PR open for the remaining gate instead of bypassing it.",
     ].join("\n");
   }
   if (command.intent === "clawsweeper_needs_human") {
