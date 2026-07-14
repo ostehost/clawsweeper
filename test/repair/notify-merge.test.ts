@@ -13,6 +13,7 @@ import {
   resolveHookAgentUrl,
   runMergeNotifier,
 } from "../../dist/repair/notify-merge.js";
+import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
 
 test("buildMergeNotification accepts executed ClawSweeper merge actions", () => {
   const notification = buildMergeNotification({
@@ -258,38 +259,135 @@ test("runMergeNotifier posts hook payloads and records sent ledger", async () =>
   assert.equal(requests.length, 1);
 });
 
-test("runMergeNotifier returns a strict failure when the hook rejects", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-notify-fail-"));
-  fs.writeFileSync(
-    path.join(root, "repair-apply-report.json"),
-    `${JSON.stringify([
-      {
-        repo: "openclaw/openclaw",
-        target: "#123",
-        action: "merge_candidate",
-        status: "executed",
-        reason: "merged by clawsweeper-repair",
-        merge_commit_sha: "abc123",
-        run_id: "987",
-      },
-    ])}\n`,
-  );
-
-  const summary = await runMergeNotifier(["--run-id", "987", "--strict"], {
-    root,
-    fetch: (async () => new Response("bad", { status: 500 })) as typeof fetch,
-    log: () => undefined,
-    env: {
-      CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks/agent",
-      CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
-      CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+for (const scenario of [
+  {
+    name: "permanent 422 rejection",
+    fetch: async () => new Response("invalid request", { status: 422 }),
+    requestState: "mutation_rejected",
+    completionReason: "mutation_rejected",
+    mutation: false,
+    retryable: false,
+  },
+  {
+    name: "ambiguous 500 response",
+    fetch: async () => new Response("bad gateway", { status: 500 }),
+    requestState: "mutation_unknown",
+    completionReason: "mutation_outcome_unknown",
+    mutation: true,
+    retryable: true,
+  },
+  {
+    name: "ambiguous transport failure",
+    fetch: async () => {
+      throw new Error("read ECONNRESET");
     },
-  });
+    requestState: "mutation_unknown",
+    completionReason: "mutation_outcome_unknown",
+    mutation: true,
+    retryable: true,
+  },
+] as const) {
+  test(`runMergeNotifier classifies ${scenario.name}`, async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-notify-fail-")),
+    );
+    const outputRoot = path.join(root, "action-events");
+    fs.mkdirSync(outputRoot);
+    fs.writeFileSync(
+      path.join(root, "repair-apply-report.json"),
+      `${JSON.stringify([
+        {
+          repo: "openclaw/openclaw",
+          target: "#123",
+          action: "merge_candidate",
+          status: "executed",
+          reason: "merged by clawsweeper-repair",
+          merge_commit_sha: "abc123",
+          run_id: "987",
+        },
+      ])}\n`,
+    );
+    const previous = { ...process.env };
+    Object.assign(process.env, actionLedgerEnv(root, outputRoot));
 
-  assert.equal(summary.failed, 1);
-  assert.equal(summary.exitCode, 1);
-  assert.equal(
-    fs.existsSync(path.join(root, "notifications/clawsweeper-merge-ledger.json")),
-    false,
-  );
-});
+    try {
+      const summary = await runMergeNotifier(["--run-id", "987", "--strict"], {
+        root,
+        fetch: scenario.fetch as typeof fetch,
+        log: () => undefined,
+        env: {
+          CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks/agent",
+          CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+          CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+        },
+      });
+      await flushRepairActionEvents();
+
+      assert.equal(summary.failed, 1);
+      assert.equal(summary.exitCode, 1);
+      assert.equal(
+        fs.existsSync(path.join(root, "notifications/clawsweeper-merge-ledger.json")),
+        false,
+      );
+      const events = readActionEvents(outputRoot);
+      assert.deepEqual(
+        events.map((event) => event.attributes?.state),
+        ["planned", "mutation_attempted", scenario.requestState, "failed"],
+      );
+      const terminal = events.at(-1);
+      assert.equal(terminal?.attributes?.completion_reason, scenario.completionReason);
+      assert.equal(terminal?.action.mutation, scenario.mutation);
+      assert.equal(terminal?.action.retryable, scenario.retryable);
+    } finally {
+      restoreEnv(previous);
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  });
+}
+
+function actionLedgerEnv(root: string, outputRoot: string): NodeJS.ProcessEnv {
+  return {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "notify-merge-test",
+    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+    GITHUB_ACTION: "notify-merge",
+    GITHUB_JOB: "notification",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "987",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_WORKFLOW: "notification",
+    GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/repair-notify.yml@refs/heads/main",
+  };
+}
+
+function readActionEvents(root: string): Record<string, any>[] {
+  return walk(root)
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) =>
+      fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+    );
+}
+
+function walk(root: string): string[] {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(root, entry.name);
+    return entry.isDirectory() ? walk(target) : [target];
+  });
+}
+
+function restoreEnv(previous: NodeJS.ProcessEnv) {
+  for (const key of Object.keys(process.env)) {
+    if (!(key in previous)) delete process.env[key];
+  }
+  Object.assign(process.env, previous);
+}

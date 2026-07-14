@@ -150,6 +150,7 @@ The cluster worker has three jobs:
    - hydrates the cluster
    - runs Codex in read-only mode
    - reviews the structured result
+   - finalizes and uploads the exact current-attempt cluster action ledger
    - uploads transfer artifacts
 
 2. `execute`
@@ -160,6 +161,7 @@ The cluster worker has three jobs:
      capability-free UID
    - kills and proves that UID empty, then stages only the exact bounded
      manifest and bundle (or an atomic empty pair for no-publication)
+   - finalizes and uploads the exact current-attempt execute action ledger
 
 3. `publish`
    - runs on a fixed trusted runner without Codex or target toolchains
@@ -171,9 +173,12 @@ The cluster worker has three jobs:
      issues/pull-requests token
    - leaves automated merge disabled because the API cannot atomically bind
      the reviewed base branch
+   - uploads final artifacts
 
 The workflow concurrency group is based on job path and mode, so repeat
 dispatches of the same job queue instead of racing each other.
+
+Neither worker job receives state-repository write credentials solely for ledger publication. The trusted `repair-publish-results` workflow capability-detects the exact worker SHA, verifies every current run, attempt, job, and manifest, then imports the cluster and execute lanes with its own publication lane before durable result mutation. Legacy in-flight workers that did not advertise this topology remain compatible without synthetic receipts.
 
 ## Preparing Implementation Bundles
 
@@ -252,18 +257,18 @@ ClawSweeper can dispatch `clawsweeper_commit_finding` when a main-branch commit
 review report has `result: findings`. ClawSweeper treats that report as a source
 finding, not as an order to open a PR.
 
-The intake step fetches the report from latest `openclaw/clawsweeper@main`,
-writes one audit file, and then decides whether automatic repair-bundle
-preparation is allowed:
+The intake step fetches one report from `openclaw/clawsweeper-state` at an exact state commit, verifies its SHA-256 and embedded repository/commit identity, writes one audit file, and then decides whether automatic repair-bundle preparation is allowed:
 
 - audit path: `results/commit-findings/<repo-slug>/<sha>.md`
 - job path: `jobs/<owner>/inbox/clawsweeper-commit-<repo-slug>-<shortsha>.md`
 - branch: `clawsweeper/clawsweeper-commit-<repo-slug>-<shortsha>`
 
 Non-finding, disabled, security/privacy/supply-chain, and broad findings stop
-at the audit record. Eligible ordinary bug/regression/reliability findings get a
-deterministic synthetic ClawSweeper result and fix artifact. That skips the normal
-cluster-planning Codex pass and sends the report straight to
+at the audit record. Eligible ordinary bug/regression/reliability findings get
+a deterministic synthetic ClawSweeper result and fix artifact. The worker
+handoff binds the published state commit and exact job digest so a later state
+update cannot replace queued work. That skips the normal cluster-planning Codex
+pass and sends the report straight to
 `execute-fix-artifact`, where Codex is used for the repair loop against latest
 target `main`. The executor handles trivial branch-refresh work before asking
 Codex to edit: a clean rebase that changes only commit ancestry skips the edit
@@ -279,6 +284,14 @@ skipped no-PR outcome instead of failing the workflow.
 The generated job uses `source: clawsweeper_commit` and may have no issue/PR
 `candidates`. The fix artifact uses `repair_strategy: new_fix_pr`; merge and
 close actions remain blocked.
+
+The immutable worker handoff applies to every repair source, not only commit
+findings. Cluster and issue intake, report-only requeues, failed-run self-heal,
+open-PR finalization, and conflict self-heal resolve the exact state commit and
+job SHA-256 before dispatch. The worker checks those bytes during planning and
+again during execution authorization, then includes a sealed copy and identity
+record with each result artifact. Result publication never reopens the mutable
+job path to reconstruct provenance.
 
 ## Issue Implementation Commands
 

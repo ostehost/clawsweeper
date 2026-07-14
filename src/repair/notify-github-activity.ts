@@ -14,6 +14,10 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
+import {
+  deliverRetriedNotification,
+  recordNotificationPhase,
+} from "./notification-action-ledger.js";
 
 export type GithubActivity = {
   type: string;
@@ -309,6 +313,7 @@ export async function runGithubActivityNotifier(
   }
   const routineReason = routineGithubActivityReason(activity);
   if (routineReason) {
+    recordNotificationPhase(activityNotificationLedgerInput(activity), "skipped", "routine");
     if (args["write-report"]) {
       writeJsonFile(reportPath, {
         version: 1,
@@ -330,6 +335,7 @@ export async function runGithubActivityNotifier(
 
   const config = resolveOpenClawHookConfig(env);
   if (!config) {
+    recordNotificationPhase(activityNotificationLedgerInput(activity), "skipped", "not_configured");
     const summary = summaryRow("skipped", 0, 0, "OpenClaw hook notification is not configured");
     log(JSON.stringify(summary));
     return summary;
@@ -340,21 +346,28 @@ export async function runGithubActivityNotifier(
   let reason: string | null = null;
   if (!dryRun) {
     try {
-      const result = await postOpenClawAgentHook({
-        config,
-        fetcher,
-        post: {
-          name: `GitHub ${activity.type} ${activity.repo}`,
-          message: renderGithubActivityMessage(activity, config.discordTarget),
-          idempotencyKey: activity.idempotencyKey,
-          deliver,
-        },
-      });
+      const result = await deliverRetriedNotification(
+        activityNotificationLedgerInput(activity),
+        (attemptRunner) =>
+          postOpenClawAgentHook({
+            config,
+            fetcher,
+            post: {
+              name: `GitHub ${activity.type} ${activity.repo}`,
+              message: renderGithubActivityMessage(activity, config.discordTarget),
+              idempotencyKey: activity.idempotencyKey,
+              deliver,
+            },
+            attemptRunner,
+          }),
+      );
       hookRunId = result.runId;
     } catch (error) {
       failed = 1;
       reason = errorText(error);
     }
+  } else {
+    recordNotificationPhase(activityNotificationLedgerInput(activity), "planned", "dry_run");
   }
 
   if (args["write-report"]) {
@@ -376,6 +389,14 @@ export async function runGithubActivityNotifier(
   summary.exitCode = failed > 0 && strict ? 1 : 0;
   log(JSON.stringify(summary, null, 2));
   return summary;
+}
+
+function activityNotificationLedgerInput(activity: GithubActivity) {
+  return {
+    repository: activity.repo,
+    key: activity.idempotencyKey,
+    ...(activity.subject.number ? { number: activity.subject.number } : {}),
+  };
 }
 
 export function routineGithubActivityReason(activity: GithubActivity): string | null {

@@ -446,6 +446,7 @@ export function promotionGhMock(options: {
   commentsAfterFirstRead?: unknown[];
   commentsAfterCommentWrite?: unknown[];
   reviews?: unknown[];
+  reviewsAfterFirstRead?: unknown[];
   pullReviewComments?: unknown[];
   timeline?: unknown[];
   mergeable?: boolean | null;
@@ -490,8 +491,9 @@ export function promotionGhMock(options: {
 	const comments = ${JSON.stringify(comments)};
 	const commentsAfterFirstRead = ${JSON.stringify(options.commentsAfterFirstRead ?? null)};
 	const commentsAfterCommentWrite = ${JSON.stringify(options.commentsAfterCommentWrite ?? null)};
-	const reviews = ${JSON.stringify(options.reviews ?? [])};
-	const pullReviewComments = ${JSON.stringify(options.pullReviewComments ?? [])};
+		const reviews = ${JSON.stringify(options.reviews ?? [])};
+		const reviewsAfterFirstRead = ${JSON.stringify(options.reviewsAfterFirstRead ?? null)};
+		const pullReviewComments = ${JSON.stringify(options.pullReviewComments ?? [])};
 	const timeline = ${JSON.stringify(timeline)};
 	const linkedPulls = ${JSON.stringify(linkedPulls)};
 	const linkedPullsAfterProof = ${JSON.stringify(options.linkedPullsAfterProof ?? {})};
@@ -504,7 +506,8 @@ export function promotionGhMock(options: {
 	const closeCommandDelayMs = ${JSON.stringify(options.closeCommandDelayMs ?? 0)};
 	const number = ${options.number};
 	const commentStatePath = join(__dirname, "..", "comment-state-" + number + ".json");
-	const commentReadStatePath = join(__dirname, "..", "comment-read-" + number);
+		const commentReadStatePath = join(__dirname, "..", "comment-read-" + number);
+		const reviewReadStatePath = join(__dirname, "..", "review-read-" + number);
 	const mutationComment = (id, body) => ({
 	  id,
 	  html_url: "https://github.com/openclaw/openclaw/pull/" + number + "#issuecomment-" + id,
@@ -609,7 +612,11 @@ export function promotionGhMock(options: {
 } else if (args[0] === "api" && new RegExp("/issues/" + number + "/timeline(?:\\\\?|$)").test(path)) {
   console.log(JSON.stringify(slurp ? [timeline] : timeline));
 } else if (args[0] === "api" && new RegExp("/pulls/" + number + "/reviews(?:\\\\?|$)").test(path)) {
-  console.log(JSON.stringify(slurp ? [reviews] : reviews));
+  const currentReviews = reviewsAfterFirstRead && existsSync(reviewReadStatePath)
+    ? reviewsAfterFirstRead
+    : reviews;
+  if (!existsSync(reviewReadStatePath)) writeFileSync(reviewReadStatePath, "read", "utf8");
+  console.log(JSON.stringify(slurp ? [currentReviews] : currentReviews));
 } else if (args[0] === "api" && new RegExp("/issues/" + number + "$").test(path)) {
   console.log(JSON.stringify({
     number,

@@ -37,38 +37,54 @@ test("repair requeue receipts remain stable but the isolated worker never recurs
   assert.match(source, /`job=\$\{jobPath\}`/);
   assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
   assert.match(source, /operationKey: `repair-requeue:/);
-  assert.match(source, /sourceRevision: authorizationSha256/);
+  assert.match(source, /sourceRevision: immutableJob\.stateRevision/);
+  assert.match(source, /immutableJob\.identityKey/);
+  assert.match(source, /sourceJobSha256: authorizationSha256/);
   assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
+  assert.match(workflow, /- name: Create read-only state token/);
+  assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
   assert.match(workflow, /JOB_PATH: \$\{\{ inputs\.job \}\}/);
+  assert.doesNotMatch(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
   assert.doesNotMatch(workflow, /^\s+REQUEUE_(?:MODE|DEPTH|RUNNER|EXECUTION_RUNNER|MODEL):/m);
   assert.doesNotMatch(workflow, /repair:requeue|requeue-job\.js/);
-  assert.doesNotMatch(workflow, /setup-action-ledger|repair-requeue action ledger/);
+  assert.doesNotMatch(workflow, /repair-requeue action ledger/);
   assert.doesNotMatch(workflow, /count-requeue-required|--source-job-path/);
 });
 
-test("exact review publishes status receipts created after its first ledger publication", () => {
+test("exact review publishes post-ack status receipts in a second ledger", () => {
   const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
   const source = readText("src/repair/update-command-status.ts");
   const workflow = readText(".github/workflows/sweep.yml");
+  const exactEventFinalize = workflow.indexOf("- name: Finalize exact event action ledger");
+  const exactEventPublish = workflow.indexOf("- name: Publish exact event action ledger");
+  const completeLease = workflow.indexOf("- name: Complete exact-review queue lease");
   const sourceDriftStatus = workflow.indexOf("- name: Mark source-drift re-review queued");
   const lateFinalize = workflow.indexOf("- name: Finalize late command status action ledger");
   const latePublish = workflow.indexOf("- name: Publish late command status action ledger");
+  const exactReviewQueuePublisher = workflow.indexOf(
+    "\n  publish-exact-review-action-ledger:",
+    latePublish,
+  );
   const targetFanout = workflow.indexOf("\n  target-fanout:", latePublish);
   const finalizeStep = workflow.slice(lateFinalize, latePublish);
-  const publishStep = workflow.slice(latePublish, targetFanout);
+  const publishStep = workflow.slice(latePublish, exactReviewQueuePublisher);
 
-  assert.ok(sourceDriftStatus >= 0);
+  assert.ok(exactEventFinalize >= 0);
+  assert.ok(exactEventPublish > exactEventFinalize);
+  assert.ok(completeLease > exactEventPublish);
+  assert.ok(sourceDriftStatus > completeLease);
   assert.ok(lateFinalize > sourceDriftStatus);
   assert.ok(latePublish > lateFinalize);
+  assert.ok(exactReviewQueuePublisher > latePublish);
   assert.ok(targetFanout > latePublish);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' && steps\.finalize-late-command-status-action-ledger\.outcome == 'success' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);

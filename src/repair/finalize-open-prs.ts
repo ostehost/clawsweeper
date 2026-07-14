@@ -8,7 +8,6 @@ import {
   currentProjectRepo,
   hasDeterministicSecuritySignal,
   parseArgs,
-  parseJob,
   readMaxLiveWorkers,
   repoRoot,
   waitForLiveWorkerCapacity,
@@ -18,6 +17,11 @@ import { sleepMs } from "./timing.js";
 import { DEFAULT_TARGET_REPO, REPAIR_CLUSTER_WORKFLOW, REVIEW_BOTS } from "./constants.js";
 import { numberEnv } from "./env-utils.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
+import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
+import {
+  immutableJobDispatchArgs,
+  resolveCurrentStateJobIdentity,
+} from "./immutable-job-handoff.js";
 
 const DEFAULT_HEAD_PREFIX = "clawsweeper/";
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -54,6 +58,7 @@ const maxLiveWorkers = readMaxLiveWorkers(args);
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const allowRepeat = Boolean(args["allow-repeat"]);
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
+const skippedDispatchCandidates: LooseRecord[] = [];
 
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
   throw new Error(`repo must be owner/repo, got ${repo}`);
@@ -84,6 +89,7 @@ const report: LooseRecord = {
     model,
     max_prs: maxPrs,
     candidates: dispatchCandidates.map(summarizeDispatchCandidate),
+    skipped_candidates: skippedDispatchCandidates,
   },
   prs,
 };
@@ -494,13 +500,13 @@ function loadPublishedRecords() {
 }
 
 function existingJobPath(clusterId: string) {
+  const owner = repo.split("/")[0] || "openclaw";
   for (const relative of [
-    path.join("jobs", "openclaw", "inbox", `${clusterId}.md`),
-    path.join("jobs", "openclaw", "outbox", "finalized", `${clusterId}.md`),
-    path.join("jobs", "openclaw", "outbox", "stuck", `${clusterId}.md`),
+    path.join("jobs", owner, "inbox", `${clusterId}.md`),
+    path.join("jobs", owner, "outbox", "finalized", `${clusterId}.md`),
+    path.join("jobs", owner, "outbox", "stuck", `${clusterId}.md`),
   ]) {
-    const resolved = path.resolve(relative);
-    if (fs.existsSync(resolved)) return path.relative(repoRoot(), resolved);
+    if (fs.existsSync(path.join(repoRoot(), relative))) return relative.split(path.sep).join("/");
   }
   return null;
 }
@@ -514,10 +520,23 @@ function selectDispatchCandidates(openPrs: JsonValue) {
           .map((attempt: JsonValue) => attempt.idempotency_key)
           .filter(Boolean) ?? []),
   );
-  return openPrs
-    .filter((pr: JsonValue) => isDispatchableFinalizerPr(pr))
-    .map((pr: JsonValue) => dispatchCandidateFromPr(pr))
-    .filter((candidate: JsonValue) => allowRepeat || !attempted.has(candidate.idempotency_key));
+  const selected: LooseRecord[] = [];
+  for (const pr of openPrs.filter((candidate: JsonValue) => isDispatchableFinalizerPr(candidate))) {
+    try {
+      const candidate = dispatchCandidateFromPr(pr);
+      if (allowRepeat || !attempted.has(candidate.idempotency_key)) selected.push(candidate);
+    } catch (error) {
+      skippedDispatchCandidates.push({
+        pr: pr.number,
+        url: pr.url,
+        cluster_id: pr.cluster_id,
+        job_path: pr.job_path,
+        reason: "immutable_job_unavailable",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return selected;
 }
 
 function isDispatchableFinalizerPr(pr: JsonValue) {
@@ -537,7 +556,15 @@ function isDispatchableFinalizerPr(pr: JsonValue) {
 }
 
 function dispatchCandidateFromPr(pr: JsonValue) {
-  const mode = resolveDispatchMode(pr.job_path);
+  const jobPath = normalizedFinalizerDispatchJobPath(pr.job_path);
+  const immutableJob = resolveCurrentStateJobIdentity(jobPath);
+  const mode = resolveDispatchMode(immutableJob);
+  const idempotencyKey = finalizerDispatchIdempotencyKey({
+    pr: pr.number,
+    headSha: pr.head_sha,
+    jobPath: immutableJob.jobPath,
+    jobSha256: immutableJob.jobSha256,
+  });
   return {
     pr: pr.number,
     url: pr.url,
@@ -545,18 +572,58 @@ function dispatchCandidateFromPr(pr: JsonValue) {
     branch: pr.branch,
     head_sha: pr.head_sha,
     cluster_id: pr.cluster_id,
-    job_path: pr.job_path,
+    job_path: immutableJob.jobPath,
+    state_revision: immutableJob.stateRevision,
+    job_sha256: immutableJob.jobSha256,
+    immutable_job_key: immutableJob.identityKey,
     mode,
     blockers: pr.blockers,
     recommended_next_action: pr.recommended_next_action,
-    idempotency_key: `finalize-open-prs:${repo}#${pr.number}:${pr.head_sha || pr.branch || "unknown"}`,
+    idempotency_key: idempotencyKey,
   };
 }
 
-function resolveDispatchMode(jobPath: string) {
+function finalizerDispatchIdempotencyKey({
+  pr,
+  headSha,
+  jobPath,
+  jobSha256,
+}: {
+  pr: unknown;
+  headSha: unknown;
+  jobPath: unknown;
+  jobSha256: unknown;
+}): string {
+  const normalizedHeadSha = String(headSha ?? "")
+    .trim()
+    .toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(normalizedHeadSha)) {
+    throw new Error("finalizer dispatch requires a valid PR head SHA");
+  }
+  return `finalize-open-prs:${repo}#${pr}:${normalizedHeadSha}:${jobPath}:${jobSha256}`;
+}
+
+function normalizedFinalizerDispatchJobPath(value: unknown): string {
+  const normalized = String(value ?? "")
+    .trim()
+    .replaceAll("\\", "/");
+  if (path.posix.normalize(normalized) !== normalized) {
+    throw new Error("finalizer job path must be normalized without traversal");
+  }
+  const match = normalized.match(
+    /^jobs\/([A-Za-z0-9_.-]+)\/(?:inbox|outbox\/(?:finalized|stuck))\/([A-Za-z0-9_.-]+\.md)$/,
+  );
+  if (!match) {
+    throw new Error(
+      "finalizer job path must match jobs/<owner>/(inbox|outbox/finalized|outbox/stuck)/<job>.md",
+    );
+  }
+  return `jobs/${match[1]}/inbox/${match[2]}`;
+}
+
+function resolveDispatchMode(immutableJob: ReturnType<typeof resolveCurrentStateJobIdentity>) {
   if (requestedMode) return requestedMode;
-  const job = parseJob(jobPath);
-  const mode = String(job.frontmatter.mode ?? "");
+  const mode = String(immutableJob.job.frontmatter.mode ?? "");
   return ["execute", "autonomous"].includes(mode) ? mode : "autonomous";
 }
 
@@ -566,6 +633,8 @@ function summarizeDispatchCandidate(candidate: LooseRecord) {
     url: candidate.url,
     cluster_id: candidate.cluster_id,
     job_path: candidate.job_path,
+    state_revision: candidate.state_revision,
+    job_sha256: candidate.job_sha256,
     branch: candidate.branch,
     head_sha: candidate.head_sha,
     mode: candidate.mode,
@@ -595,6 +664,7 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
       repo: repairRepo,
       workflow,
       jobPath: candidate.job_path,
+      jobSha256: candidate.job_sha256,
       activeRunsByPrefix: activeRepairRunsByPrefix,
     });
     if (activeRun) activeRunsByJobPath.set(String(candidate.job_path), activeRun);
@@ -629,6 +699,9 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
       url: candidate.url,
       cluster_id: candidate.cluster_id,
       job_path: candidate.job_path,
+      state_revision: candidate.state_revision,
+      job_sha256: candidate.job_sha256,
+      immutable_job_key: candidate.immutable_job_key,
       branch: candidate.branch,
       head_sha: candidate.head_sha,
       mode: candidate.mode,
@@ -660,7 +733,7 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
 }
 
 function dispatchRepair(candidate: LooseRecord) {
-  ghText([
+  const commandArgs = [
     "workflow",
     "run",
     workflow,
@@ -668,6 +741,10 @@ function dispatchRepair(candidate: LooseRecord) {
     repairRepo,
     "-f",
     `job=${candidate.job_path}`,
+    ...immutableJobDispatchArgs({
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
+    }),
     "-f",
     `mode=${candidate.mode}`,
     "-f",
@@ -676,7 +753,38 @@ function dispatchRepair(candidate: LooseRecord) {
     `execution_runner=${executionRunner}`,
     "-f",
     `model=${model}`,
-  ]);
+  ];
+  runRepairMutation(finalizerDispatchLifecycle(candidate), {
+    kind: "repair_dispatch",
+    operationName: "open_pr_finalizer",
+    component: "open_pr_finalizer",
+    identity: {
+      repository: repairRepo,
+      workflow,
+      jobPath: candidate.job_path,
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
+      mode: candidate.mode,
+      runner,
+      executionRunner,
+      model,
+      headSha: candidate.head_sha,
+    },
+    operation: () => ghText(commandArgs),
+  });
+}
+
+function finalizerDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
+  const pr = Number(candidate.pr);
+  return {
+    repository: repo,
+    workKey: String(candidate.idempotency_key),
+    number: pr,
+    sourceRevision: String(candidate.state_revision),
+    recordPath: String(candidate.job_path),
+    subjectKind: "pull_request",
+    subjectId: `pull-request-${pr}`,
+  };
 }
 
 function readDispatchLedger() {

@@ -45,6 +45,7 @@ on:
     - cron: "0 10 * * *"
 
 permissions:
+  actions: read
   contents: read
   issues: write
   pull-requests: read
@@ -68,6 +69,7 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve target repository
         id: target
@@ -107,10 +109,15 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-state
+        id: setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:all
 
@@ -199,9 +206,53 @@ jobs:
           if [ ${#cursor_publish_args[@]} -gt 0 ]; then
             pnpm run repair:publish-main -- \
               --message "chore: update proof handling cursors" \
+              --receipt-kind proof_cursor_publication \
               --rebase-strategy theirs \
               "${cursor_publish_args[@]}"
           fi
+
+      - name: Finalize proof handling action ledger
+        id: finalize-action-ledger
+        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/proof-action-ledger-finalize.json
+
+      - name: Import immutable proof handling action ledger
+        id: import-action-ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.finalize-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/proof-action-ledger-import.json"
+          paths_file=".artifacts/proof-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job proof-nudges \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+
+      - name: Publish immutable proof handling action ledger
+        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          paths_file=".artifacts/proof-action-ledger-paths.txt"
+          if [ ! -s "$paths_file" ]; then
+            echo "No immutable proof handling action events to publish."
+            exit 0
+          fi
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append proof handling action ledger"
 
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}

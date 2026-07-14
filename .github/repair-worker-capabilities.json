@@ -1,0 +1,6 @@
+{
+  "action_ledger": true,
+  "schema": "clawsweeper.repair-worker-capabilities",
+  "schema_version": 1,
+  "sealed_source": true
+}

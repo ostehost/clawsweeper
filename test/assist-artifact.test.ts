@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import test from "node:test";
+import { readValidatedActionEventShardBatch } from "../dist/action-ledger-runtime.js";
 import {
   ASSIST_ANSWER_MAX_BYTES,
   assertAssistArtifactLiveRevision,
@@ -130,6 +134,96 @@ test("assist artifact validation rejects stale or redirected publication", () =>
   );
 });
 
+test("assist validation records rejected artifacts in the action ledger", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "assist-validation-ledger-")));
+  const outputRoot = realpathSync(mkdtempSync(join(root, "output-")));
+  const artifactPath = join(root, "assist-result.json");
+  const runId = `${process.pid}${Date.now()}`;
+  try {
+    writeFileSync(
+      artifactPath,
+      JSON.stringify({ ...artifact(), executable: "./payload.sh" }),
+      "utf8",
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        "dist/clawsweeper.js",
+        "assist-validate",
+        "--artifact",
+        artifactPath,
+        "--target-repo",
+        request.targetRepo,
+        "--item-number",
+        String(request.itemNumber),
+        "--question",
+        request.question,
+        "--mode",
+        request.mode,
+        "--lens",
+        request.lens,
+        "--comment-id",
+        request.sourceCommentId,
+        "--comment-url",
+        request.sourceCommentUrl,
+        "--author",
+        request.author,
+        "--codex-reasoning-effort",
+        request.reasoningEffort,
+        "--run-id",
+        runId,
+        "--run-attempt",
+        "2",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION: basename(root).replaceAll(".", "-"),
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+          GITHUB_ACTION: "assist-validate",
+          GITHUB_JOB: "publish",
+          GITHUB_REPOSITORY: "openclaw/clawsweeper",
+          GITHUB_RUN_ATTEMPT: "2",
+          GITHUB_RUN_ID: runId,
+          GITHUB_RUN_STARTED_AT: "2026-07-13T20:00:00Z",
+          GITHUB_SHA: "a".repeat(40),
+          GITHUB_WORKFLOW: "ClawSweeper Assist",
+          GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/assist.yml@refs/heads/main",
+        },
+      },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unexpected assist artifact fields/);
+
+    const events = readValidatedActionEventShardBatch(outputRoot).events.filter(
+      (event) => event.producer.run_id === runId,
+    );
+    assert.deepEqual(
+      events.map((event) => [
+        event.event_type,
+        event.action.status,
+        event.action.reason_code,
+        event.action.retryable,
+      ]),
+      [
+        ["proof.binding", "started", "selected", false],
+        ["proof.binding", "failed", "validation_failed", false],
+      ],
+    );
+    assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+    assert.equal(events[1]?.attributes?.completion_reason, "validation_failed");
+    assert.equal(
+      events[1]?.evidence.some((entry) => entry.kind === "assist_review_artifact"),
+      true,
+    );
+    assert.doesNotMatch(JSON.stringify(events), new RegExp(root.replaceAll("\\", "\\\\")));
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("assist retry identity stays stable across live context revisions", () => {
   const first = artifact();
   const later = createAssistArtifact({
@@ -241,8 +335,13 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4);
   assert.equal(workflow.match(/REASONING_EFFORT: high/g)?.length, 3);
   assert.doesNotMatch(workflow, /inputs\.reasoning_effort|client_payload\.reasoning_effort/);
+  assert.match(
+    workflow,
+    /dispatch-receipt-owner\.sh \\\n\s+assist\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Publish trusted assist comment" "Revalidate and publish assist comment"/,
+  );
 
   assert.match(generation, /Create read-only GitHub App token/);
+  assert.match(generation, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.ok(
     generation.indexOf("Resolve validated target repository") <
       generation.indexOf("Create read-only GitHub App token"),
@@ -260,6 +359,10 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(generation, /generation_attempt=\$GITHUB_RUN_ATTEMPT/);
   assert.match(generation, /actions\/upload-artifact@v7/);
   assert.match(generation, /include-hidden-files: true/);
+  assert.match(
+    generation,
+    /action-ledger-assist-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
   assert.doesNotMatch(generation, /permission-issues: write/);
   assert.doesNotMatch(generation, /write_token|Create narrow GitHub App write token/);
 
@@ -269,6 +372,8 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.ok(validateIndex >= 0 && validateIndex < tokenIndex && tokenIndex < mutateIndex);
   assert.match(publish, /runs-on: ubuntu-latest/);
   assert.match(publish, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(publish, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(publish, /uses: \.\/\.github\/actions\/setup-state/);
   assert.match(publish, /Verify exact workflow source/);
   assert.ok(
     publish.indexOf("Resolve validated target repository") <
@@ -279,6 +384,15 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
     publish,
     /clawsweeper-assist-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
   );
+  assert.match(
+    publish,
+    /action-ledger-assist-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
+  );
+  assert.match(
+    publish,
+    /GENERATION_ATTEMPT: \$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
+  );
+  assert.match(publish, /--expected-run-attempt "\$GENERATION_ATTEMPT"/);
   assert.equal(publish.match(/--run-attempt "\$GENERATION_ATTEMPT"/g)?.length, 2);
   assert.match(publish, /permission-issues: write/);
   assert.match(publish, /permission-pull-requests: write/);
@@ -286,6 +400,10 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(publish, /GH_TOKEN: \$\{\{ steps\.write_token\.outputs\.token \}\}/);
   assert.match(publish, /assist-validate/);
   assert.match(publish, /assist-publish/);
+  assert.equal(publish.match(/publish-action-events/g)?.length, 2);
+  assert.match(publish, /--expected-producer-job assist/);
+  assert.match(publish, /--expected-producer-job "\$GITHUB_JOB"/);
+  assert.match(publish, /publish-action-event-paths/);
   assert.doesNotMatch(publish, /setup-codex|OPENAI_API_KEY|CLAWSWEEPER_INTERNAL_MODEL/);
   assert.ok(publish.indexOf("GH_TOKEN:") > tokenIndex);
   assert.match(
@@ -296,5 +414,9 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.match(source, /readBoundedUtf8File\([\s\S]*ASSIST_ARTIFACT_MAX_BYTES/);
   assert.match(source, /findOwnedCommentByMarker[\s\S]*canPatchReviewComment/);
   assert.match(source, /live\.sourceComment\?\.htmlUrl \?\? request\.sourceCommentUrl/);
+  assert.match(source, /ACTION_EVENT_TYPES\.reviewLogPublication/);
+  assert.match(source, /ACTION_EVENT_TYPES\.reviewCommentPublication/);
+  assert.match(source, /assistCommentMutationRunner/);
+  assert.match(source, /ghObservedMutationCommand\(\{[\s\S]*assist_comment/);
   assert.doesNotMatch(source, /idempotency marker is owned by a non-ClawSweeper comment/);
 });

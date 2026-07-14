@@ -22,6 +22,10 @@ export type OpenClawHookPostResult = {
   runId: string | null;
 };
 
+export type OpenClawHookAttemptRunner = (
+  operation: () => Promise<OpenClawHookPostResult>,
+) => Promise<OpenClawHookPostResult>;
+
 const DEFAULT_AGENT_ID = "clawsweeper";
 const DEFAULT_CHANNEL = "discord";
 const DEFAULT_THINKING = "low";
@@ -67,12 +71,14 @@ export async function postOpenClawAgentHook({
   config,
   fetcher,
   post,
+  attemptRunner = runAttempt,
   retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
   sleep = delay,
 }: {
   config: OpenClawHookConfig;
   fetcher: typeof fetch;
   post: OpenClawHookPost;
+  attemptRunner?: OpenClawHookAttemptRunner;
   retryDelaysMs?: number[];
   sleep?: (ms: number) => Promise<void>;
 }): Promise<OpenClawHookPostResult> {
@@ -80,7 +86,7 @@ export async function postOpenClawAgentHook({
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await postOpenClawAgentHookOnce({ config, fetcher, post });
+      return await attemptRunner(() => postOpenClawAgentHookOnce({ config, fetcher, post }));
     } catch (error) {
       lastError = error;
       if (attempt >= attempts || !isTransientOpenClawHookError(error)) {
@@ -154,6 +160,15 @@ export function isTransientOpenClawHookError(error: unknown): boolean {
   );
 }
 
+export function isRejectedOpenClawHookError(error: unknown): boolean {
+  return (
+    error instanceof OpenClawHookHttpError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    !isTransientOpenClawHookError(error)
+  );
+}
+
 export function readHookRunId(body: string): string | null {
   try {
     const parsed = JSON.parse(body);
@@ -198,4 +213,10 @@ function delay(ms: number): Promise<void> {
     const timeout = setTimeout(resolve, ms);
     timeout.unref?.();
   });
+}
+
+function runAttempt(
+  operation: () => Promise<OpenClawHookPostResult>,
+): Promise<OpenClawHookPostResult> {
+  return operation();
 }

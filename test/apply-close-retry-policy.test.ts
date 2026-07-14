@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   implementedCloseReport,
   reportWithSyncedReviewComment,
@@ -10,6 +11,12 @@ import {
   tmpPrefix,
   withMockGh,
 } from "./helpers.ts";
+
+const emptyReviewActivityCursor = createReviewedPrActivityCursor({
+  reviews: [],
+  inlineComments: [],
+});
+assert.ok(emptyReviewActivityCursor);
 
 test("apply-decisions retries legacy fixed close skips", () => {
   for (const actionTaken of ["skipped_maintainer_authored", "skipped_invalid_decision"]) {
@@ -27,6 +34,7 @@ test("apply-decisions retries legacy fixed close skips", () => {
         action_taken: actionTaken,
         author_association: "MEMBER",
         labels: JSON.stringify(["maintainer"]),
+        review_activity_cursor: emptyReviewActivityCursor,
       }).replace(
         "## Close Comment\n\nClosing this because the requested behavior is already on main.\n",
         "## Close Comment\n\n_No close comment posted._\n",
@@ -90,7 +98,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "maintainer" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -140,6 +148,7 @@ test("apply-decisions retries legacy kept-open close reports", () => {
     const closeReport = implementedCloseReport({
       type: "pull_request",
       action_taken: "kept_open",
+      review_activity_cursor: emptyReviewActivityCursor,
     });
     const synced = reportWithSyncedReviewComment(closeReport, 321, "implemented_on_main");
     writeFileSync(join(itemsDir, "321.md"), synced.report, "utf8");
@@ -193,7 +202,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -257,6 +266,7 @@ test("apply-decisions pair-closes issues blocked by closeable linked PRs", () =>
         type: "pull_request",
         title: "Obsolete linked PR",
         action_taken: "kept_open",
+        review_activity_cursor: emptyReviewActivityCursor,
       }),
       321,
       "implemented_on_main",
@@ -338,7 +348,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");

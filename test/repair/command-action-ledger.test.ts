@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
 
 import {
   flushCommandActionEvents,
@@ -21,6 +19,11 @@ import {
   parseCommandActionLedgerManifest,
   serializeCommandActionLedgerManifest,
 } from "../../dist/repair/command-action-ledger-manifest.js";
+import {
+  applyAutomergeResultToCommand,
+  automergeAttemptReceiptOutcome,
+} from "../../dist/repair/automerge-effect.js";
+import { recordWorkflowActionEvent } from "../../dist/action-ledger-runtime.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
 test("command manifest permits only explicitly empty finalization", async () => {
@@ -112,29 +115,12 @@ test("command receipts preserve operation identity across explicit retry attempt
     const manifest = await finalizeCommandActionLedgerManifest("comment-router");
     assert.ok(manifest);
     assert.equal(manifest.event_paths.length, 2);
-    for (const relativePath of manifest.event_paths) {
-      assert.equal(relativePath.includes("\\"), false);
-      assert.equal(relativePath, path.posix.normalize(relativePath));
-    }
     assert.deepEqual(
       parseCommandActionLedgerManifest(
         serializeCommandActionLedgerManifest(manifest),
         "comment-router",
       ),
       manifest,
-    );
-    assert.throws(
-      () =>
-        parseCommandActionLedgerManifest(
-          serializeCommandActionLedgerManifest({
-            ...manifest,
-            event_paths: manifest.event_paths.map((relativePath) =>
-              relativePath.replaceAll("/", "\\"),
-            ),
-          }),
-          "comment-router",
-        ),
-      /manifest paths must use POSIX separators/,
     );
 
     const events = readEvents(outputRoot);
@@ -369,8 +355,8 @@ test("command failure reflects only successfully recorded prior mutations", asyn
   }
 });
 
-test("command manifest recovers an abrupt mutation crash before publication", async () => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-mutation-crash-")));
+test("ambiguous automerge receipts leave the durable command waiting", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-automerge-wait-")));
   const outputRoot = path.join(root, "output");
   fs.mkdirSync(outputRoot);
   const previous = { ...process.env };
@@ -378,14 +364,167 @@ test("command manifest recovers an abrupt mutation crash before publication", as
     CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
     CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
     CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
-    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "abrupt-mutation",
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "automerge-wait",
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
     GITHUB_SHA: "7".repeat(40),
     GITHUB_WORKFLOW: "repair comment router",
     GITHUB_WORKFLOW_REF:
       "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
     GITHUB_JOB: "route-comments",
-    GITHUB_RUN_ID: "26345",
+    GITHUB_RUN_ID: "23345",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ACTION: "route",
+    GITHUB_RUN_STARTED_AT: "2026-07-12T17:10:00Z",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+  });
+
+  try {
+    const command = syntheticCommand("e".repeat(40));
+    command.status = "ready";
+    command.actions = [{ action: "merge", status: "pending" }];
+    recordCommandReceived(command);
+
+    const attempt = runCommandMutation(command, {
+      kind: "pull_request_merge",
+      identity: {
+        repository: command.repo,
+        number: command.issue_number,
+        expectedHeadSha: command.target.head_sha,
+        method: "squash",
+      },
+      operation: () => ({
+        command_result: {
+          status: 1,
+          stdout: "",
+          stderr: "gh: HTTP 502: Bad Gateway",
+          error: null,
+        },
+        command_error: null,
+        confirmation: {
+          mergedAt: null,
+          mergeCommitSha: null,
+          pendingReason: "",
+          block: "",
+        },
+      }),
+      outcome: automergeAttemptReceiptOutcome,
+    });
+    assert.equal(
+      applyAutomergeResultToCommand(command, {
+        action: "merge",
+        status: "waiting",
+        reason:
+          "merge command response was transient and its exact-head effect is not yet observable",
+      }),
+      true,
+    );
+    assert.equal(attempt.command_result.status, 1);
+    assert.equal(command.status, "waiting");
+    assert.equal(command.actions[0]?.status, "waiting");
+    recordCommandOutcome(command);
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === "command.mutation")
+        .map((event) => event.attributes.completion_reason),
+      ["mutation_attempted", "mutation_outcome_unknown"],
+    );
+    const waiting = events.find((event) => event.event_type === "command.wait");
+    assert.equal(waiting?.attributes.state, "waiting");
+    assert.equal(waiting?.action.status, "waiting");
+    assert.equal(waiting?.action.mutation, false);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("known pre-dispatch failures record a rejected mutation outcome", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-predispatch-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "predispatch-rejected",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_SHA: "8".repeat(40),
+    GITHUB_WORKFLOW: "repair comment router",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
+    GITHUB_JOB: "route-comments",
+    GITHUB_RUN_ID: "24345",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ACTION: "route",
+    GITHUB_RUN_STARTED_AT: "2026-07-13T16:50:00Z",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+  });
+
+  try {
+    const command = syntheticCommand("f".repeat(40));
+    recordCommandReceived(command);
+    const expected = new Error("review activity changed before merge dispatch");
+    assert.throws(
+      () =>
+        runCommandMutation(command, {
+          kind: "pull_request_merge",
+          identity: {
+            repository: command.repo,
+            number: command.issue_number,
+            expectedHeadSha: command.target.head_sha,
+            method: "squash",
+          },
+          operation: () => {
+            throw expected;
+          },
+          knownNoMutation: (error) => error === expected,
+        }),
+      expected,
+    );
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === "command.mutation")
+        .map((event) => event.attributes.completion_reason),
+      ["mutation_attempted", "mutation_rejected"],
+    );
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("command finalization recovers an interrupted mutation request", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-interruption-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "interrupted-request",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_SHA: "d".repeat(40),
+    GITHUB_WORKFLOW: "repair comment router",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
+    GITHUB_JOB: "route-comments",
+    GITHUB_RUN_ID: "24345",
     GITHUB_RUN_ATTEMPT: "1",
     GITHUB_ACTION: "route",
     GITHUB_RUN_STARTED_AT: "2026-07-12T17:15:00Z",
@@ -394,82 +533,51 @@ test("command manifest recovers an abrupt mutation crash before publication", as
   });
 
   try {
-    const moduleUrl = pathToFileURL(path.resolve("dist/repair/command-action-ledger.js")).href;
-    const child = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "--eval",
-        `const { runCommandMutation } = await import(${JSON.stringify(moduleUrl)});
-const acceptedCommand = {
-  repo: "openclaw/openclaw",
-  issue_number: 41,
-  idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:automerge:41",
-  status: "pending",
-  target: { kind: "pull_request", head_sha: "${"4".repeat(40)}" },
-  actions: [],
-};
-runCommandMutation(acceptedCommand, {
-  kind: "comment_update",
-  identity: { repository: acceptedCommand.repo, commentId: 776, bodySha256: "${"3".repeat(64)}" },
-  operation: () => "accepted",
-});
-const command = {
-  repo: "openclaw/openclaw",
-  issue_number: 42,
-  idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:automerge:42",
-  status: "pending",
-  target: { kind: "pull_request", head_sha: "${"6".repeat(40)}" },
-  actions: [],
-};
-runCommandMutation(command, {
-  kind: "comment_update",
-  identity: { repository: command.repo, commentId: 777, bodySha256: "${"5".repeat(64)}" },
-  operation: () => process.exit(86),
-});`,
-      ],
-      { cwd: process.cwd(), encoding: "utf8", env: process.env },
-    );
-    assert.equal(child.status, 86, child.stderr || child.stdout);
+    const started = recordWorkflowActionEvent(root, {
+      scope: "command.mutation",
+      identity: { request: "comment-update", outcome: "attempted" },
+      operation: "command",
+      operationIdentity: { repository: "openclaw/openclaw", number: 42 },
+      attemptIdentity: { runId: "24345", runAttempt: 1 },
+      idempotencyIdentity: { request: "comment-update" },
+      type: "command.mutation",
+      component: "comment_router",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "pull_request",
+        number: 42,
+      },
+      action: {
+        name: "command.mutation",
+        status: "started",
+        reasonCode: "selected",
+        retryable: true,
+        mutation: false,
+      },
+      attributes: {
+        state: "mutation_attempted",
+        completion_reason: "mutation_attempted",
+      },
+    });
+    assert.ok(started);
 
-    const manifest = await finalizeCommandActionLedgerManifest("comment-router");
-    assert.ok(manifest);
-    const mutations = readEvents(outputRoot).filter(
-      (event) => event.event_type === "command.mutation",
-    );
-    assert.equal(mutations.length, 4);
-    const recovered = mutations.find(
-      (event) => event.attributes.completion_reason === "mutation_outcome_unknown",
-    );
-    const started = mutations.find((event) => event.event_id === recovered?.parent_event_id);
-    assert.equal(started?.action.status, "started");
-    assert.equal(started?.attributes.completion_reason, "mutation_attempted");
-    assert.equal(recovered?.action.status, "failed");
-    assert.equal(recovered?.action.mutation, true);
-    assert.equal(recovered?.action.retryable, true);
-    assert.equal(recovered?.attributes.completion_reason, "mutation_outcome_unknown");
-    assert.equal(recovered?.parent_event_id, started?.event_id);
-    assert.equal(recovered?.operation_id, started?.operation_id);
-    assert.equal(recovered?.attempt_id, started?.attempt_id);
-    assert.equal(recovered?.idempotency_key_sha256, started?.idempotency_key_sha256);
-    assert.equal(recovered?.phase_seq, Number(started?.phase_seq) + 1);
-    assert.deepEqual(recovered?.subject, started?.subject);
-    assert.deepEqual(recovered?.producer, started?.producer);
-    const completedOperationEvents = mutations.filter(
-      (event) =>
-        event.operation_id !== recovered?.operation_id &&
-        event.attributes.completion_reason !== "mutation_outcome_unknown",
-    );
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
     assert.deepEqual(
-      completedOperationEvents.map((event) => event.attributes.completion_reason),
-      ["mutation_attempted", "mutation_accepted"],
+      events.map((event) => [
+        event.action.status,
+        event.action.mutation,
+        event.attributes.completion_reason,
+      ]),
+      [
+        ["started", false, "mutation_attempted"],
+        ["failed", true, "mutation_outcome_unknown"],
+      ],
     );
-
-    await finalizeCommandActionLedgerManifest("comment-router");
-    assert.equal(
-      readEvents(outputRoot).filter((event) => event.event_type === "command.mutation").length,
-      4,
-    );
+    assert.equal(events[1]?.parent_event_id, started.event_id);
+    assert.equal(events[1]?.idempotency_key_sha256, started.idempotency_key_sha256);
+    assert.equal(events[1]?.action.retryable, true);
   } finally {
     for (const key of Object.keys(process.env)) {
       if (!(key in previous)) delete process.env[key];

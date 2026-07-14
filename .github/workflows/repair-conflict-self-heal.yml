@@ -47,7 +47,7 @@ concurrency:
 
 jobs:
   self-heal:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - name: Create GitHub App token
@@ -67,6 +67,7 @@ jobs:
           filter: blob:none
           fetch-depth: 0
           token: ${{ steps.app_token.outputs.token }}
+          persist-credentials: false
 
       - name: Create state token
         id: state-token
@@ -83,23 +84,31 @@ jobs:
         with:
           build-script: build:repair
 
+      - name: Setup conflict self-heal action ledger
+        id: self-heal-action-ledger
+        uses: ./.github/actions/setup-action-ledger
+
       - name: Plan conflict self-heal
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOW_EXECUTE: ${{ vars.CLAWSWEEPER_ALLOW_EXECUTE || '0' }}
           CLAWSWEEPER_ALLOW_FIX_PR: ${{ vars.CLAWSWEEPER_ALLOW_FIX_PR || '0' }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXECUTE_REQUESTED: ${{ inputs.execute || false }}
+          SCHEDULE_EXECUTE: ${{ vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_EXECUTE || '0' }}
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+          MAX_PRS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_prs || vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_MAX_PRS || '5' }}
+          RUNNER: blacksmith-4vcpu-ubuntu-2404
+          EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
         run: |
+          set -euo pipefail
           execute="false"
-          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
-          max_prs="${{ github.event_name == 'workflow_dispatch' && inputs.max_prs || vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_MAX_PRS || '5' }}"
-          runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
-          execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
-          if { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.execute }}" = "true" ]; } ||
-             { [ "${{ github.event_name }}" = "schedule" ] && [ "${{ vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_EXECUTE || '0' }}" = "1" ]; }; then
+          if { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$EXECUTE_REQUESTED" = "true" ]; } ||
+             { [ "$EVENT_NAME" = "schedule" ] && [ "$SCHEDULE_EXECUTE" = "1" ]; }; then
             execute="true"
           fi
 
-          args=(--repo "$target_repo" --max-prs "$max_prs" --runner "$runner" --execution-runner "$execution_runner" --wait-for-capacity)
+          args=(--repo "$TARGET_REPO" --max-prs "$MAX_PRS" --runner "$RUNNER" --execution-runner "$EXECUTION_RUNNER" --wait-for-capacity)
           if [ "$execute" = "true" ]; then
             args+=(--execute)
           fi
@@ -117,4 +126,52 @@ jobs:
             --path results/conflict-self-heal-dispatch.json \
             --path results/conflict-self-heal.json \
             --path results/conflict-self-heal.md \
+            --receipt-kind conflict_self_heal_state \
             --rebase-strategy theirs
+
+      - name: Finalize conflict self-heal action ledger
+        if: ${{ always() && steps.self-heal-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane conflict-self-heal \
+            --allow-empty \
+            > .artifacts/conflict-self-heal-action-ledger-manifest.json
+
+      - name: Publish immutable conflict self-heal action ledger
+        if: ${{ always() && steps.self-heal-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/conflict-self-heal-action-ledger-manifest.json"
+          event_paths_file=".artifacts/conflict-self-heal-action-ledger-paths.txt"
+          import_result_file=".artifacts/conflict-self-heal-action-ledger-import.json"
+          test -s "$manifest_file"
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane conflict-self-heal \
+            --manifest "$manifest_file" \
+            --allow-empty \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            exit 0
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append conflict self-heal action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

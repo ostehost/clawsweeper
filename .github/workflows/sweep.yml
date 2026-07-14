@@ -235,61 +235,57 @@ jobs:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep' && github.event.client_payload.queue_lease_id == '' && !(github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: exact-review-action-ledger
+
+      - uses: ./.github/actions/setup-pnpm
+        id: exact-review-pnpm
+        with:
+          build-script: build:repair
+
       - name: Enqueue legacy event through the durable control plane
+        if: ${{ steps.exact-review-action-ledger.outcome == 'success' && steps.exact-review-pnpm.outcome == 'success' }}
         env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: node dist/repair/exact-review-action-ledger-cli.js enqueue
+
+      - name: Finalize exact-review enqueue action ledger
+        id: finalize-exact-review-action-ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.exact-review-pnpm.outcome == 'success' }}
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
         run: |
           set -euo pipefail
-          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
-          queue_url="${QUEUE_URL%/}"
-          payload="$(node <<'NODE'
-          const payload = JSON.parse(process.env.CLIENT_PAYLOAD || "{}");
-          const itemKind = payload.item_kind === "pull_request" ? "pull_request" : "issue";
-          const sourceEvent = payload.source_event === "pull_request" ? "pull_request" : "issues";
-          const dispatchKey = String(payload.dispatch_key || "").trim();
-          process.stdout.write(
-            JSON.stringify({
-              delivery_id: dispatchKey
-                ? `router:${dispatchKey}`
-                : `legacy:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
-              decision: {
-                targetRepo: payload.target_repo || "openclaw/openclaw",
-                targetBranch: payload.target_branch || "main",
-                itemNumber: Number(payload.item_number),
-                itemKind,
-                sourceEvent,
-                sourceAction: payload.source_action || "legacy_dispatch",
-                supersedesInProgress: payload.supersedes_in_progress === true,
-                ...(Number.isFinite(Number(payload.codex_timeout_ms))
-                  ? { codexTimeoutMs: Number(payload.codex_timeout_ms) }
-                  : {}),
-                ...(Number.isFinite(Number(payload.media_proof_timeout_ms))
-                  ? { mediaProofTimeoutMs: Number(payload.media_proof_timeout_ms) }
-                  : {}),
-                ...(Object.hasOwn(payload, "command_status_marker")
-                  ? { commandStatusMarker: payload.command_status_marker }
-                  : {}),
-                ...(Object.hasOwn(payload, "status_comment_id")
-                  ? { statusCommentId: payload.status_comment_id }
-                  : {}),
-                ...(Object.hasOwn(payload, "additional_prompt")
-                  ? { additionalPrompt: payload.additional_prompt }
-                  : {}),
-              },
-            }),
-          );
-          NODE
-          )"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/enqueue" >/dev/null
+          manifest="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/exact-review-action-ledger-manifest.json"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane exact-review-queue \
+            --allow-empty > "$manifest"
+
+      - name: Upload exact-review enqueue action ledger
+        if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: exact-review-action-ledger-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
 
   event-review-apply:
     name: Review, comment, and apply event item
@@ -306,10 +302,29 @@ jobs:
       issues: write
       pull-requests: write
       statuses: read
+    outputs:
+      action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: exact-review-action-ledger
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        with:
+          build-script: build:repair
+
       - name: Claim exact-review queue lease
         id: claim-exact-review-queue
+        if: ${{ steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
           ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key }}
           QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
@@ -318,140 +333,11 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          test -n "$QUEUE_LEASE_ID"
           if ! [[ "$QUEUE_LEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
-            echo "Invalid exact-review queue lease ID." >&2
+            echo "Invalid exact-review queue lease identity." >&2
             exit 1
           fi
-          queue_url="${QUEUE_URL%/}"
-          payload="$(node -e '
-            const runAttempt = Number(process.env.RUN_ATTEMPT);
-            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
-            const itemKey = String(process.env.ITEM_KEY || "").trim();
-            const rawLeaseRevision = String(process.env.QUEUE_LEASE_REVISION || "").trim();
-            const hasTuple = Boolean(itemKey || rawLeaseRevision);
-            const leaseRevision = Number(rawLeaseRevision);
-            if (hasTuple && (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1)) {
-              process.exit(1);
-            }
-            process.stdout.write(JSON.stringify({
-              lease_id: process.env.QUEUE_LEASE_ID,
-              ...(hasTuple ? { item_key: itemKey, lease_revision: leaseRevision } : {}),
-              run_id: process.env.GITHUB_RUN_ID,
-              run_attempt: runAttempt,
-            }));
-          ')"
-          for attempt in 1 2 3; do
-            if response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --data "$payload" \
-              "$queue_url/internal/exact-review/claim")" &&
-              RESPONSE="$response" node <<'NODE'
-                const fs = require("node:fs");
-                const response = JSON.parse(process.env.RESPONSE || "{}");
-                const dispatch = JSON.parse(process.env.DISPATCH_PAYLOAD || "{}");
-                const requestedItemKey = String(process.env.ITEM_KEY || "").trim();
-                const requestedLeaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
-                const responseProtocol = Number(response.protocol_version || 1);
-                if (responseProtocol !== 1 && responseProtocol !== 2) process.exit(1);
-                if (response.claimed !== true) process.exit(1);
-
-                const reviewOptions =
-                  dispatch.review_options && typeof dispatch.review_options === "object"
-                    ? dispatch.review_options
-                    : {};
-                const legacyDecision = {
-                  targetRepo: String(dispatch.target_repo || ""),
-                  targetBranch: String(dispatch.target_branch || "main"),
-                  itemNumber: Number(dispatch.item_number),
-                  itemKind: String(dispatch.item_kind || ""),
-                  sourceEvent: String(dispatch.source_event || ""),
-                  sourceAction: String(dispatch.source_action || "legacy_dispatch"),
-                  supersedesInProgress: dispatch.supersedes_in_progress === true,
-                  ...(Number.isFinite(Number(reviewOptions.codex_timeout_ms))
-                    ? { codexTimeoutMs: Number(reviewOptions.codex_timeout_ms) }
-                    : {}),
-                  ...(Number.isFinite(Number(reviewOptions.media_proof_timeout_ms))
-                    ? { mediaProofTimeoutMs: Number(reviewOptions.media_proof_timeout_ms) }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "command_status_marker")
-                    ? { commandStatusMarker: reviewOptions.command_status_marker }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "status_comment_id")
-                    ? { statusCommentId: reviewOptions.status_comment_id }
-                    : {}),
-                  ...(Object.hasOwn(reviewOptions, "additional_prompt")
-                    ? { additionalPrompt: reviewOptions.additional_prompt }
-                    : {}),
-                };
-                const decision =
-                  response.decision && typeof response.decision === "object"
-                    ? response.decision
-                    : legacyDecision;
-                const targetRepo = String(decision?.targetRepo || "");
-                const itemNumber = Number(decision?.itemNumber);
-                const itemKey = `${targetRepo}#${itemNumber}`;
-                const leaseRevision =
-                  responseProtocol === 2
-                    ? Number(response.lease_revision)
-                    : Number(
-                        response.revision ||
-                          response.lease_revision ||
-                          process.env.QUEUE_LEASE_REVISION,
-                      );
-                const claimGeneration = Number(response.claim_generation);
-                if (
-                  !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
-                  !Number.isInteger(itemNumber) ||
-                  itemNumber < 1 ||
-                  (decision.itemKind !== "issue" && decision.itemKind !== "pull_request") ||
-                  (decision.sourceEvent !== "issues" && decision.sourceEvent !== "pull_request") ||
-                  typeof decision.sourceAction !== "string" ||
-                  !decision.sourceAction
-                ) {
-                  process.exit(1);
-                }
-                if (response.item_key && response.item_key !== itemKey) process.exit(1);
-                if (requestedItemKey && requestedItemKey !== itemKey) process.exit(1);
-                if (
-                  responseProtocol === 2 &&
-                  (!response.decision ||
-                    typeof response.decision !== "object" ||
-                    response.item_key !== requestedItemKey ||
-                    response.lease_revision !== requestedLeaseRevision ||
-                    !Number.isInteger(claimGeneration) ||
-                    claimGeneration < 1)
-                ) {
-                  process.exit(1);
-                }
-                const output = [
-                  `lease_id=${process.env.QUEUE_LEASE_ID}`,
-                  `item_key=${itemKey}`,
-                  `lease_revision=${Number.isInteger(leaseRevision) ? leaseRevision : ""}`,
-                  `claim_generation=${responseProtocol === 2 ? claimGeneration : ""}`,
-                  `protocol_version=${responseProtocol}`,
-                  `decision=${JSON.stringify(decision)}`,
-                ];
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `${output.join("\n")}\n`);
-          NODE
-            then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
-          exit 1
-
-      - uses: actions/checkout@v7
-        with:
-          filter: blob:none
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: ./.github/actions/setup-action-ledger
-        continue-on-error: true
+          node dist/repair/exact-review-action-ledger-cli.js claim
 
       - name: Resolve event payload
         id: target
@@ -520,7 +406,7 @@ jobs:
           repositories: ${{ steps.target.outputs.target_repo_name }}
           permission-checks: read
           permission-contents: read
-          permission-issues: write
+          permission-issues: read
           permission-pull-requests: read
           permission-statuses: read
 
@@ -608,11 +494,9 @@ jobs:
               ;;
           esac
 
-      - uses: ./.github/actions/setup-pnpm
-        id: setup-pnpm
-        if: ${{ steps.live-item.outputs.proceed == 'true' || ((steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') && steps.target.outputs.has_command_context == 'true') }}
-        with:
-          build-script: ${{ steps.live-item.outputs.proceed == 'true' && 'build:all' || 'build:repair' }}
+      - name: Build full exact-review runtime
+        if: ${{ steps.live-item.outputs.proceed == 'true' }}
+        run: pnpm run build:all
 
       - uses: actions/cache@v6
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
@@ -797,23 +681,6 @@ jobs:
             "$CLAWSWEEPER_CODEX_PRINCIPAL_UID" "$CLAWSWEEPER_CODEX_PRINCIPAL_GID"
           echo "principal_drained=true" >> "$GITHUB_OUTPUT"
 
-      - name: Finalize exact event action ledger
-        if: ${{ always() && steps.live-item.outputs.proceed == 'true' }}
-        continue-on-error: true
-        env:
-          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
-          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
-            args=(--interrupt-open-attempts --reason timeout)
-          elif [ "$REVIEW_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
       - name: Create target write token
         if: ${{ always() && steps.live-item.outcome == 'success' && (steps.live-item.outputs.proceed != 'true' || steps.drain-codex-principal.outputs.principal_drained == 'true') }}
         id: target-write-token
@@ -908,7 +775,10 @@ jobs:
           )"
           while IFS= read -r lease_id; do
             [ -n "$lease_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/comments/$lease_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js comment delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --comment-id "$lease_id"
             echo "Released unsuccessful review lease comment $lease_id owned by $LEASE_OWNER."
           done <<< "$lease_ids"
           reaction_ids="$(
@@ -918,7 +788,10 @@ jobs:
           )"
           while IFS= read -r reaction_id; do
             [ -n "$reaction_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js reaction delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --reaction-id "$reaction_id"
             echo "Removed unsuccessful eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
           done <<< "$reaction_ids"
 
@@ -945,12 +818,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.router-mutation-token.outputs.token }}
           APP_SLUG: ${{ steps.router-mutation-token.outputs.app-slug }}
+          EXPECTED_APP_SLUG: ${{ env.CLAWSWEEPER_APP_SLUG }}
         run: |
           set -euo pipefail
-          test -n "$APP_SLUG"
+          if [ -z "$APP_SLUG" ] || [ "$APP_SLUG" != "$EXPECTED_APP_SLUG" ]; then
+            echo "Authenticated mutation App slug is missing or unexpected: ${APP_SLUG:-<empty>}." >&2
+            exit 1
+          fi
           app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
-          test "$app_id" -gt 0
+          if ! printf '%s' "$app_id" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "Authenticated mutation App ID is invalid: ${app_id:-<empty>}." >&2
+            exit 1
+          fi
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "app_slug=$APP_SLUG" >> "$GITHUB_OUTPUT"
 
       - name: Route synced ClawSweeper verdict
         id: route-synced-verdict
@@ -959,7 +840,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.router-mutation-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.router-mutation-app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.router-mutation-token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.router-mutation-app.outputs.app_slug }}
           CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.router-mutation-token.outputs.installation-id }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -990,14 +871,18 @@ jobs:
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
-          gh workflow run repair-comment-router.yml \
+          node dist/repair/sweep-mutation-cli.js workflow dispatch \
             --repo "$GITHUB_REPOSITORY" \
+            --workflow repair-comment-router.yml \
             --ref main \
-            -f execute=true \
-            -f target_repo="$TARGET_REPO" \
-            -f target_branch="$TARGET_BRANCH" \
-            -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
-            -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+            --business-key "exact-verdict-router:$GITHUB_RUN_ID:$ITEM_NUMBER" \
+            --target-repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --field execute=true \
+            --field target_repo="$TARGET_REPO" \
+            --field target_branch="$TARGET_BRANCH" \
+            --field lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
+            --field max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
 
       - name: Release terminal review leases
         id: release-terminal-review-leases
@@ -1022,12 +907,18 @@ jobs:
           test "$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state)" = "closed"
           while IFS= read -r lease_id; do
             [ -n "$lease_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/comments/$lease_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js comment delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --comment-id "$lease_id"
             echo "Released terminal review lease comment $lease_id for $TARGET_REPO#$ITEM_NUMBER."
           done <<< "$lease_ids"
           while IFS= read -r reaction_id; do
             [ -n "$reaction_id" ] || continue
-            gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" --method DELETE
+            node dist/repair/sweep-mutation-cli.js reaction delete \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --reaction-id "$reaction_id"
             echo "Removed terminal eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
           done <<< "$reaction_ids"
 
@@ -1133,6 +1024,7 @@ jobs:
         run: |
           pnpm run repair:publish-main -- \
             --message "chore: record ClawSweeper event comment routing" \
+            --receipt-kind event_comment_router_state_publication \
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \
@@ -1151,21 +1043,10 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           add_completion_reaction() {
-            local err
-            err="$(mktemp)"
-            if gh api -X POST \
-              -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions" \
-              -f content="+1" 2>"$err" >/dev/null; then
-              echo "Added +1 reaction to $TARGET_REPO#$ITEM_NUMBER."
-            elif grep -qi "HTTP 422\\|already exists" "$err"; then
-              echo "+1 reaction already exists on $TARGET_REPO#$ITEM_NUMBER."
-            else
-              cat "$err" >&2
-              rm -f "$err"
-              exit 1
-            fi
-            rm -f "$err"
+            node dist/repair/sweep-mutation-cli.js reaction add \
+              --repo "$TARGET_REPO" \
+              --item-number "$ITEM_NUMBER" \
+              --content +1
           }
           remove_own_eyes_reactions() {
             local ids
@@ -1185,15 +1066,12 @@ jobs:
             rm -f "$err"
             while IFS= read -r reaction_id; do
               [ -n "$reaction_id" ] || continue
-              err="$(mktemp)"
-              if gh api -X DELETE \
-                -H "Accept: application/vnd.github+json" \
-                "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" 2>"$err" >/dev/null; then
+              if node dist/repair/sweep-mutation-cli.js reaction delete \
+                --repo "$TARGET_REPO" \
+                --item-number "$ITEM_NUMBER" \
+                --reaction-id "$reaction_id"; then
                 echo "Removed eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
-              else
-                cat "$err" >&2
               fi
-              rm -f "$err"
             done <<< "$ids"
           }
           if [ "$POLICY_NOOP" != "true" ] && [ "$REVIEW_ONLY" != "true" ]; then
@@ -1248,82 +1126,27 @@ jobs:
           fi
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
 
-      - name: Complete exact-review queue lease
-        id: complete-exact-review-queue
-        if: ${{ always() }}
+      - name: Finalize exact event action ledger
+        id: finalize-exact-event-action-ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         continue-on-error: true
         env:
-          PRIMARY_OUTCOME: ${{ steps.exact-review-primary-result.outputs.outcome || 'failure' }}
-          CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
-          ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
-          PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
-          QUEUE_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
-          QUEUE_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
-          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
-          RETRY_AT: ${{ steps.review-exact-event-item.outputs.retry_at }}
-          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
+          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
         run: |
-          set -euo pipefail
-          test -n "$QUEUE_LEASE_ID"
-          queue_url="${QUEUE_URL%/}"
-          payload="$(node -e '
-            const runAttempt = Number(process.env.RUN_ATTEMPT);
-            const protocolVersion = Number(process.env.PROTOCOL_VERSION);
-            const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
-            const claimGeneration = Number(process.env.CLAIM_GENERATION);
-            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
-            if (protocolVersion !== 1 && protocolVersion !== 2) process.exit(1);
-            if (
-              protocolVersion === 2 &&
-              (!process.env.ITEM_KEY ||
-                !Number.isInteger(leaseRevision) ||
-                leaseRevision < 1 ||
-                !Number.isInteger(claimGeneration) ||
-                claimGeneration < 1)
-            ) process.exit(1);
-            const primaryOutcome = String(process.env.PRIMARY_OUTCOME || "");
-            const outcome = ["success", "cancelled", "failure"].includes(primaryOutcome)
-              ? primaryOutcome
-              : "failure";
-            const retryAt = String(process.env.RETRY_AT || "").trim();
-            const requeueLatest = process.env.REQUEUE_LATEST === "true";
-            process.stdout.write(JSON.stringify({
-              lease_id: process.env.QUEUE_LEASE_ID,
-              ...(protocolVersion === 2
-                ? {
-                    item_key: process.env.ITEM_KEY,
-                    lease_revision: leaseRevision,
-                    claim_generation: claimGeneration,
-                  }
-                : {}),
-              run_id: process.env.GITHUB_RUN_ID,
-              run_attempt: runAttempt,
-              outcome,
-              ...(retryAt ? { retry_at: retryAt } : {}),
-              ...(requeueLatest ? { requeue_latest: true } : {}),
-            }));
-          ')"
-          for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --data "$payload" \
-              "$queue_url/internal/exact-review/complete" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
-          exit 1
-
-      - name: Fail unsuccessful exact review
-        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
-        run: exit 1
+          args=()
+          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
+            args=(--interrupt-open-attempts --reason timeout)
+          elif [ "$REVIEW_OUTCOME" != "success" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
 
       - name: Publish exact event action ledger
-        if: ${{ always() && steps.setup-state.outcome == 'success' }}
+        id: publish-exact-event-action-ledger
+        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -1353,6 +1176,52 @@ jobs:
             --paths-file "$event_paths_file" \
             --message "chore: append exact event action ledger"
 
+      - name: Complete exact-review queue lease
+        id: complete-exact-review-queue
+        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && (steps.publish-exact-event-action-ledger.outcome == 'success' || steps.target.outputs.target_enabled == 'false' || steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') }}
+        continue-on-error: true
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
+          PRIMARY_OUTCOME: ${{ steps.exact-review-primary-result.outputs.outcome || 'failure' }}
+          CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+          PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
+          QUEUE_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
+          QUEUE_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RETRY_AT: ${{ steps.review-exact-event-item.outputs.retry_at }}
+          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: node dist/repair/exact-review-action-ledger-cli.js complete
+
+      - name: Finalize exact-review queue action ledger
+        id: finalize-exact-review-action-ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
+        run: |
+          set -euo pipefail
+          manifest="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/exact-review-action-ledger-manifest.json"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane exact-review-queue \
+            --allow-empty > "$manifest"
+
+      - name: Upload exact-review queue action ledger
+        if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: exact-review-action-ledger-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Fail unsuccessful exact review
+        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
+        run: exit 1
+
       - name: Mark source-drift re-review queued
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' }}
         continue-on-error: true
@@ -1378,6 +1247,7 @@ jobs:
         run: exit 1
 
       - name: Finalize late command status action ledger
+        id: finalize-late-command-status-action-ledger
         if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -1388,7 +1258,7 @@ jobs:
             > .artifacts/late-command-status-action-ledger-manifest.json
 
       - name: Publish late command status action ledger
-        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' }}
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' && steps.finalize-late-command-status-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -1427,6 +1297,107 @@ jobs:
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
 
+  publish-exact-review-action-ledger:
+    name: Publish immutable exact-review queue action ledger
+    needs: [legacy-event-queue-intake, event-review-apply]
+    if: ${{ always() && (needs.legacy-event-queue-intake.outputs.action_ledger_ready == 'true' || needs.event-review-apply.outputs.action_ledger_ready == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Create exact-review ledger state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        with:
+          build-script: build:all
+
+      - name: Resolve exact-review ledger producer
+        id: producer
+        env:
+          EVENT_READY: ${{ needs.event-review-apply.outputs.action_ledger_ready }}
+          LEGACY_READY: ${{ needs.legacy-event-queue-intake.outputs.action_ledger_ready }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_READY" = "$LEGACY_READY" ]; then
+            echo "Expected exactly one exact-review action ledger producer." >&2
+            exit 1
+          fi
+          if [ "$EVENT_READY" = "true" ]; then
+            producer_job="event-review-apply"
+          else
+            producer_job="legacy-event-queue-intake"
+          fi
+          echo "job=$producer_job" >> "$GITHUB_OUTPUT"
+          echo "artifact=exact-review-action-ledger-$producer_job-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact-review queue action ledger
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.producer.outputs.artifact }}
+          path: .clawsweeper-repair/exact-review-action-ledger
+
+      - name: Publish exact producer action ledger
+        env:
+          PRODUCER_JOB: ${{ steps.producer.outputs.job }}
+        run: |
+          set -euo pipefail
+          source_root=".clawsweeper-repair/exact-review-action-ledger"
+          manifest="$source_root/exact-review-action-ledger-manifest.json"
+          import_result=".artifacts/exact-review-action-ledger-import.json"
+          paths_file=".artifacts/exact-review-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane exact-review-queue \
+            --allow-empty \
+            --manifest "$manifest" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-workflow sweep.yml \
+            --expected-job "$PRODUCER_JOB" \
+            --expected-run-id "$GITHUB_RUN_ID" \
+            --expected-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result"
+          if ! jq -e --slurpfile manifest "$manifest" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result" >/dev/null; then
+            echo "Imported exact-review paths do not match the producer manifest." >&2
+            exit 1
+          fi
+          jq -r '.paths[]?' "$import_result" | sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "No immutable exact-review queue action events to publish."
+            exit 0
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append exact-review queue action ledger"
+
   target-fanout:
     name: Fan out target repository sweeps
     if: ${{ github.event_name == 'schedule' && (github.event.schedule == '4/15 * * * *' || github.event.schedule == '41 * * * *' || github.event.schedule == '37 */6 * * *') }}
@@ -1449,10 +1420,15 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-state
+        id: setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -1491,11 +1467,60 @@ jobs:
             --ref main
 
       - name: Publish fanout cursor
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         run: |
+          set -euo pipefail
+          if [ ! -d results/target-fanout-cursors ]; then
+            echo "No target fanout cursor to publish."
+            exit 0
+          fi
           pnpm run repair:publish-main -- \
             --message "chore: update target fanout cursor" \
             --path results/target-fanout-cursors \
+            --receipt-kind target_fanout_cursor_publication \
             --rebase-strategy theirs
+
+      - name: Finalize target fanout action ledger
+        id: finalize-action-ledger
+        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/target-fanout-action-ledger-finalize.json
+
+      - name: Import immutable target fanout action ledger
+        id: import-action-ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.finalize-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/target-fanout-action-ledger-import.json"
+          event_paths_file=".artifacts/target-fanout-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job target-fanout \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Target fanout action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+
+      - name: Publish immutable target fanout action ledger
+        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/target-fanout-action-ledger-paths.txt \
+            --message "chore: append target fanout action ledger"
 
   plan:
     name: Plan review candidates
@@ -1533,6 +1558,11 @@ jobs:
           path: clawsweeper
           filter: blob:none
           fetch-depth: 0
+
+      - uses: ./clawsweeper/.github/actions/setup-action-ledger
+        id: plan-action-ledger
+        with:
+          worktree-path: clawsweeper
 
       - name: Resolve target repository
         id: target
@@ -1596,12 +1626,14 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./clawsweeper/.github/actions/setup-state
+        id: plan-setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
           worktree-path: clawsweeper
           fetch-depth: 1
 
       - uses: ./clawsweeper/.github/actions/setup-pnpm
+        id: plan-setup-pnpm
         with:
           working-directory: clawsweeper
           build-script: build:all
@@ -1620,6 +1652,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           timeout 20s pnpm run repair:publish-main -- \
             --message "chore: mark sweep planning started" \
+            --receipt-kind sweep_planning_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs || echo "::warning::Skipped slow planning-started dashboard publish so candidate selection can start."
 
@@ -1942,8 +1975,54 @@ jobs:
             --capacity-reason "${{ steps.select.outputs.capacity_reason }}"
           timeout 20s pnpm run repair:publish-main -- \
             --message "chore: mark sweep review in progress" \
+            --receipt-kind sweep_planning_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs || echo "::warning::Skipped slow in-progress dashboard publish so review shards can start."
+
+      - name: Finalize planning state publication action ledger
+        id: finalize-planning-state-action-ledger
+        if: ${{ always() && steps.plan-action-ledger.outcome == 'success' && steps.plan-setup-pnpm.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/planning-state-action-ledger-finalize.json
+
+      - name: Import immutable planning state action ledger
+        id: import-planning-state-action-ledger
+        if: ${{ always() && steps.plan-setup-state.outcome == 'success' && steps.finalize-planning-state-action-ledger.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/planning-state-action-ledger-import.json"
+          event_paths_file=".artifacts/planning-state-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job plan \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Planning state action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+
+      - name: Publish immutable planning state action ledger
+        if: ${{ always() && steps.import-planning-state-action-ledger.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/planning-state-action-ledger-paths.txt \
+            --message "chore: append planning state action ledger"
 
   review:
     name: Review shard ${{ matrix.shard }} · ${{ needs.plan.outputs.target_repo }}#${{ matrix.item_numbers }}
@@ -2302,6 +2381,31 @@ jobs:
       actions: read
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: source-drift-action-ledger
+
+      - name: Create source-drift state token
+        id: source-drift-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: source-drift-setup-state
+        with:
+          token: ${{ steps.source-drift-state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        id: source-drift-setup-pnpm
+        with:
+          build-script: build:repair
+
       - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
@@ -2336,6 +2440,8 @@ jobs:
             echo "::warning::Ignoring invalid source-revision mismatch marker."
             exit 0
           fi
+          payload_file="$(mktemp)"
+          trap 'rm -f "$payload_file"' EXIT
           jq -n \
             --arg target_repo "$TARGET_REPO" \
             --arg target_branch "$TARGET_BRANCH" \
@@ -2355,8 +2461,51 @@ jobs:
                 expected_source_revision: $expected_source_revision,
                 source_revision_requeue_count: "1"
               }
-            }' | gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input -
+            }' > "$payload_file"
+          node dist/repair/sweep-mutation-cli.js repository dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --event-type clawsweeper_target_sweep \
+            --payload-file "$payload_file" \
+            --business-key "source-drift-requeue:$GITHUB_RUN_ID:$item_number" \
+            --target-repo "$TARGET_REPO" \
+            --item-number "$item_number"
           echo "::notice::Requeued $TARGET_REPO#$item_number at source revision $actual_revision."
+
+      - name: Finalize source-drift dispatch action ledger
+        id: finalize-source-drift-dispatch-action-ledger
+        if: ${{ always() && steps.source-drift-action-ledger.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish source-drift dispatch action ledger
+        if: ${{ always() && steps.source-drift-setup-state.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' && steps.finalize-source-drift-dispatch-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No source-drift dispatch action shards were finalized."
+            exit 0
+          fi
+          paths_file=".artifacts/source-drift-dispatch-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job requeue-source-revision-drift \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "Source-drift dispatch action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append source-drift dispatch action ledger"
 
   publish:
     name: Publish review artifacts
@@ -2376,6 +2525,7 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-action-ledger
+        id: publish-action-ledger
         continue-on-error: true
 
       - name: Create target write token
@@ -2571,11 +2721,13 @@ jobs:
           fi
           pnpm run repair:publish-main -- \
             --message "chore: update sweep records" \
+            --receipt-kind sweep_review_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           echo "records_published=true" >> "$GITHUB_OUTPUT"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep status" \
+            --receipt-kind sweep_review_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
 
@@ -2625,14 +2777,19 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching reproducible bug implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=strict_bug \
-              -f report_path="$report_path" \
-              -f report_url="$report_url"
+              --business-key "strict-bug-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=strict_bug \
+              --field report_path="$report_path" \
+              --field report_url="$report_url"
           done < /tmp/issue-implementation-candidates.tsv
 
       - name: Dispatch vision-fit implementation candidates
@@ -2681,14 +2838,19 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching vision-fit implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=vision_fit \
-              -f report_path="$report_path" \
-              -f report_url="$report_url"
+              --business-key "vision-fit-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=vision_fit \
+              --field report_path="$report_path" \
+              --field report_url="$report_url"
           done < /tmp/vision-fit-implementation-candidates.tsv
 
       - name: Backfill viable open issue implementation candidates
@@ -2724,16 +2886,21 @@ jobs:
           fi
           while IFS=$'\t' read -r item_number report_path report_url; do
             echo "Dispatching viable issue implementation intake for $TARGET_REPO#$item_number"
-            gh workflow run repair-issue-implementation-intake.yml \
+            node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow repair-issue-implementation-intake.yml \
               --ref main \
-              -f enabled=true \
-              -f target_repo="$TARGET_REPO" \
-              -f item_number="$item_number" \
-              -f candidate_kind=viable \
-              -f report_repo=openclaw/clawsweeper-state \
-              -f report_path="$report_path" \
-              -f report_url="$report_url" \
-              -f model=internal
+              --business-key "viable-intake:$GITHUB_RUN_ID:$item_number" \
+              --target-repo "$TARGET_REPO" \
+              --item-number "$item_number" \
+              --field enabled=true \
+              --field target_repo="$TARGET_REPO" \
+              --field item_number="$item_number" \
+              --field candidate_kind=viable \
+              --field report_repo=openclaw/clawsweeper-state \
+              --field report_path="$report_path" \
+              --field report_url="$report_url" \
+              --field model=internal
           done < /tmp/viable-implementation-candidates.tsv
 
       - name: Dispatch background review comment sync
@@ -2748,21 +2915,22 @@ jobs:
             echo "No review artifacts to sync comments for."
             exit 0
           fi
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f target_repo="$TARGET_REPO" \
-              -f apply_existing=true \
-              -f apply_sync_comments_only=true \
-              -f apply_item_numbers="$item_numbers" \
-              -f apply_limit=0 \
-              -f apply_comment_sync_min_age_days=7; then
-              echo "Dispatched background comment sync for item numbers: $item_numbers"
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "::warning::Unable to dispatch background comment sync after three attempts; apply/comment-sync backstops can pick it up later."
+          if node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "background-comment-sync:$GITHUB_RUN_ID" \
+            --target-repo "$TARGET_REPO" \
+            --field target_repo="$TARGET_REPO" \
+            --field apply_existing=true \
+            --field apply_sync_comments_only=true \
+            --field apply_item_numbers="$item_numbers" \
+            --field apply_limit=0 \
+            --field apply_comment_sync_min_age_days=7; then
+            echo "Dispatched background comment sync for item numbers: $item_numbers"
+          else
+            echo "::warning::Unable to dispatch background comment sync; apply/comment-sync backstops can pick it up later."
+          fi
 
       - name: Sync selected review comments
         id: sync-selected-review-comments
@@ -2816,61 +2984,15 @@ jobs:
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
           pnpm run repair:publish-main -- \
             --message "chore: sync selected review comments" \
+            --receipt-kind selected_review_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           pnpm run repair:publish-main -- \
             --message "chore: publish selected review comment status" \
+            --receipt-kind selected_review_status_publication \
             --path apply-report.json \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
-
-      - name: Finalize selected review comment action ledger
-        id: finalize-selected-review-comment-action-ledger
-        if: ${{ always() && steps.sync-selected-review-comments.outcome != 'skipped' }}
-        env:
-          SELECTED_COMMENT_EXIT_CODE: ${{ steps.sync-selected-review-comments.outputs.exit_code || '' }}
-          SELECTED_COMMENT_OUTCOME: ${{ steps.sync-selected-review-comments.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$SELECTED_COMMENT_OUTCOME" = "cancelled" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "130" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "143" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$SELECTED_COMMENT_EXIT_CODE" = "124" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "137" ]; then
-            args=(--interrupt-open-attempts --reason timeout)
-          elif [ "$SELECTED_COMMENT_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
-      - name: Publish selected review comment action ledger
-        if: ${{ always() && steps.sync-selected-review-comments.outcome != 'skipped' && steps.finalize-selected-review-comment-action-ledger.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
-            echo "No selected review comment action shards were finalized."
-            exit 0
-          fi
-          event_paths_file=".artifacts/selected-comment-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent publish-action-events -- \
-            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" \
-            --expected-producer-job "$GITHUB_JOB" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            echo "Selected review comment action shards existed but no paths were imported." >&2
-            exit 1
-          fi
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$event_paths_file"
-          node dist/clawsweeper.js publish-action-event-paths \
-            --paths-file "$event_paths_file" \
-            --message "chore: append selected review comment action ledger"
 
       - name: Dispatch selected safe close proposals to isolated apply
         if: ${{ always() && !cancelled() && steps.sync-selected-review-comments.outputs.sync_succeeded == 'true' && steps.target-write-token.outputs.token != '' && github.event.inputs.apply_after_review == 'true' }}
@@ -2898,26 +3020,23 @@ jobs:
             echo "Invalid apply-after-review minimum age." >&2
             exit 1
           fi
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f target_repo="$TARGET_REPO" \
-              -f apply_existing=true \
-              -f apply_item_numbers="$item_numbers" \
-              -f apply_limit="$item_count" \
-              -f apply_min_age_minutes="$min_age_minutes" \
-              -f apply_kind=all \
-              -f apply_close_reasons="$close_reasons" \
-              -f apply_stale_min_age_days=30 \
-              -f apply_close_delay_ms=1000 \
-              -f apply_comment_sync_min_age_days=0; then
-              echo "Dispatched isolated apply for item numbers: $item_numbers"
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "Unable to dispatch isolated apply after three attempts." >&2
-          exit 1
+          node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "isolated-apply:$GITHUB_RUN_ID" \
+            --target-repo "$TARGET_REPO" \
+            --field target_repo="$TARGET_REPO" \
+            --field apply_existing=true \
+            --field apply_item_numbers="$item_numbers" \
+            --field apply_limit="$item_count" \
+            --field apply_min_age_minutes="$min_age_minutes" \
+            --field apply_kind=all \
+            --field apply_close_reasons="$close_reasons" \
+            --field apply_stale_min_age_days=30 \
+            --field apply_close_delay_ms=1000 \
+            --field apply_comment_sync_min_age_days=0
+          echo "Dispatched isolated apply for item numbers: $item_numbers"
 
       - name: Continue sweep
         if: ${{ always() && !cancelled() && steps.apply-review-artifacts.outputs.review_batch_succeeded == 'true' && steps.commit-review-records.outputs.records_published == 'true' && needs.plan.outputs.planned_count == needs.plan.outputs.planned_capacity && github.event_name != 'repository_dispatch' && (github.event_name != 'workflow_dispatch' || (github.event.inputs.item_number == '' && github.event.inputs.item_numbers == '')) }}
@@ -2931,21 +3050,73 @@ jobs:
           CODEX_TIMEOUT_MS: ${{ needs.plan.outputs.codex_timeout_ms }}
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
-            if gh workflow run sweep.yml \
-              --ref main \
-              -f apply_existing=false \
-              -f hot_intake="$HOT_INTAKE" \
-              -f target_repo="$TARGET_REPO" \
-              -f target_branch="$TARGET_BRANCH" \
-              -f batch_size="$BATCH_SIZE" \
-              -f shard_count="$SHARD_COUNT" \
-              -f codex_timeout_ms="$CODEX_TIMEOUT_MS"; then
-              exit 0
-            fi
-            sleep "$((attempt * 10))"
-          done
-          echo "::warning::Unable to dispatch the next sweep after three attempts; the scheduled backstop will pick it up."
+          # A hard runner loss after acceptance can redeliver this broad batch. The target
+          # concurrency and per-item review leases keep the continuation at-least-once safe.
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
+            --ref main \
+            --business-key "sweep-continuation:$GITHUB_RUN_ID" \
+            --target-repo "$TARGET_REPO" \
+            --field apply_existing=false \
+            --field hot_intake="$HOT_INTAKE" \
+            --field target_repo="$TARGET_REPO" \
+            --field target_branch="$TARGET_BRANCH" \
+            --field batch_size="$BATCH_SIZE" \
+            --field shard_count="$SHARD_COUNT" \
+            --field codex_timeout_ms="$CODEX_TIMEOUT_MS"; then
+            echo "::warning::Unable to dispatch the next sweep; the scheduled backstop will pick it up."
+          fi
+
+      - name: Finalize sweep caller action ledger
+        id: finalize-sweep-caller-action-ledger
+        if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.setup-publish-pnpm.outcome == 'success' }}
+        env:
+          SELECTED_COMMENT_EXIT_CODE: ${{ steps.sync-selected-review-comments.outputs.exit_code || '' }}
+          SELECTED_COMMENT_OUTCOME: ${{ steps.sync-selected-review-comments.outcome || 'not_started' }}
+        run: |
+          args=()
+          if [ "$SELECTED_COMMENT_OUTCOME" = "cancelled" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "130" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "143" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$SELECTED_COMMENT_EXIT_CODE" = "124" ] || [ "$SELECTED_COMMENT_EXIT_CODE" = "137" ]; then
+            args=(--interrupt-open-attempts --reason timeout)
+          elif [ "$SELECTED_COMMENT_OUTCOME" != "success" ] &&
+             [ "$SELECTED_COMMENT_OUTCOME" != "skipped" ] &&
+             [ "$SELECTED_COMMENT_OUTCOME" != "not_started" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Publish sweep caller action ledger
+        if: ${{ always() && steps.finalize-sweep-caller-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
+            echo "No sweep caller action shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/sweep-caller-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent publish-action-events -- \
+            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" \
+            --expected-producer-job "$GITHUB_JOB" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Sweep caller action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append sweep caller action ledger"
 
   recover-review-failures:
     name: Recover failed review shards
@@ -2957,6 +3128,31 @@ jobs:
       actions: read
       contents: read
     steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: recovery-action-ledger
+
+      - name: Create recovery state token
+        id: recovery-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: recovery-setup-state
+        with:
+          token: ${{ steps.recovery-state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        id: recovery-setup-pnpm
+        with:
+          build-script: build:repair
+
       - uses: actions/download-artifact@v8
         id: failed-shards
         continue-on-error: true
@@ -2990,7 +3186,6 @@ jobs:
             echo "Invalid failed-review recovery Codex timeout." >&2
             exit 1
           fi
-          queue_url="${QUEUE_URL%/}"
           recovery_marker="[clawsweeper-recovery-attempt=1]"
           max_additional_prompt_bytes=$((5000 - ${#recovery_marker} - 2))
           additional_prompt_bytes="$(printf '%s' "$ADDITIONAL_PROMPT" | LC_ALL=C wc -c | tr -d '[:space:]')"
@@ -3055,7 +3250,7 @@ jobs:
           recovery_result_dir="$(mktemp -d "$RUNNER_TEMP/clawsweeper-recovery.XXXXXX")"
           enqueue_recovery_item() {
             local item_number="$1"
-            local dispatch_key item_kind payload signature response queued attempt source_event
+            local client_payload dispatch_key item_kind source_event
             dispatch_key="failed-review-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${item_number}"
             item_kind="$(
               jq -r --arg item_number "$item_number" \
@@ -3069,7 +3264,7 @@ jobs:
                 return 1
                 ;;
             esac
-            payload="$(jq -n \
+            client_payload="$(jq -c -n \
               --arg target_repo "$TARGET_REPO" \
               --arg target_branch "$TARGET_BRANCH" \
               --arg item_number "$item_number" \
@@ -3079,42 +3274,19 @@ jobs:
               --arg codex_timeout_ms "$CODEX_TIMEOUT_MS" \
               --arg additional_prompt "$recovery_prompt" \
               '{
-                delivery_id: ("router:" + $dispatch_key),
-                decision: {
-                  targetRepo: $target_repo,
-                  targetBranch: $target_branch,
-                  itemNumber: ($item_number | tonumber),
-                  itemKind: $item_kind,
-                  sourceEvent: $source_event,
-                  sourceAction: "failed_review_shard_recovery",
-                  supersedesInProgress: false,
-                  codexTimeoutMs: ($codex_timeout_ms | tonumber),
-                  additionalPrompt: $additional_prompt
-                }
+                target_repo: $target_repo,
+                target_branch: $target_branch,
+                item_number: ($item_number | tonumber),
+                item_kind: $item_kind,
+                source_event: $source_event,
+                source_action: "failed_review_shard_recovery",
+                supersedes_in_progress: false,
+                dispatch_key: $dispatch_key,
+                codex_timeout_ms: ($codex_timeout_ms | tonumber),
+                additional_prompt: $additional_prompt
               }')"
-            queued=false
-            for attempt in 1 2 3; do
-              # shellcheck disable=SC2016 # The Node source must retain its literal template expression.
-              signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-              response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST \
-                --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/enqueue")" || response=""
-              if jq -e '.ok == true and (.queued == true or .deduped == true or .accepted == false)' <<<"$response" >/dev/null; then
-                if jq -e '.accepted == false' <<<"$response" >/dev/null; then
-                  echo "Recovery skipped because the target is disabled: $item_number"
-                fi
-                queued=true
-                break
-              fi
-              echo "Recovery queue acknowledgement was not accepted for $item_number on attempt $attempt." >&2
-              if [ "$attempt" -lt 3 ]; then
-                sleep "$((attempt * 5))"
-              fi
-            done
-            if [ "$queued" != "true" ]; then
+            if ! CLIENT_PAYLOAD="$client_payload" \
+              node dist/repair/exact-review-action-ledger-cli.js enqueue; then
               printf '%s\n' "$item_number" > "$recovery_result_dir/$item_number"
             fi
           }
@@ -3155,6 +3327,42 @@ jobs:
           fi
           echo "Queued failed review shards $failed_shards through the exact-review control plane: $item_numbers"
 
+      - name: Finalize review recovery action ledger
+        id: finalize-review-recovery-action-ledger
+        if: ${{ always() && steps.recovery-action-ledger.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish review recovery action ledger
+        if: ${{ always() && steps.recovery-setup-state.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' && steps.finalize-review-recovery-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No review recovery action shards were finalized."
+            exit 0
+          fi
+          paths_file=".artifacts/review-recovery-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job recover-review-failures \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "Review recovery action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append review recovery action ledger"
+
   retry-failed-reviews:
     name: Retry failed Codex reviews
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '13 * * * *' }}
@@ -3172,6 +3380,7 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-action-ledger
+        id: failed-review-action-ledger
         continue-on-error: true
 
       - name: Create state token
@@ -3191,6 +3400,7 @@ jobs:
 
       - name: Plan or dispatch failed-review retries
         id: retry-failed-reviews-run
+        if: ${{ vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED != '1' || steps.failed-review-action-ledger.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3227,8 +3437,18 @@ jobs:
           echo "exit_code=$retry_exit_code" >> "$GITHUB_OUTPUT"
           exit "$retry_exit_code"
 
+      - name: Publish failed-review retry state
+        if: ${{ always() && steps.failed-review-action-ledger.outcome == 'success' && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
+        run: |
+          pnpm run repair:publish-main -- \
+            --message "chore: update failed review retry state" \
+            --receipt-kind failed_review_retry_state_publication \
+            --path results/failed-review-retries/openclaw-openclaw \
+            --rebase-strategy theirs
+
       - name: Finalize failed-review retry action ledger
-        if: ${{ always() }}
+        id: finalize-failed-review-retry-action-ledger
+        if: ${{ always() && steps.failed-review-action-ledger.outcome == 'success' }}
         env:
           RETRY_EXIT_CODE: ${{ steps.retry-failed-reviews-run.outputs.exit_code || '' }}
           RETRY_OUTCOME: ${{ steps.retry-failed-reviews-run.outcome || 'not_started' }}
@@ -3243,16 +3463,8 @@ jobs:
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
-      - name: Publish failed-review retry state
-        if: ${{ always() && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
-        run: |
-          pnpm run repair:publish-main -- \
-            --message "chore: update failed review retry state" \
-            --path results/failed-review-retries/openclaw-openclaw \
-            --rebase-strategy theirs
-
       - name: Publish failed-review retry action ledger
-        if: ${{ always() }}
+        if: ${{ always() && steps.finalize-failed-review-retry-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -3313,6 +3525,9 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: audit-action-ledger
 
       - name: Resolve target repository
         id: target
@@ -3381,10 +3596,12 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-state
+        id: audit-setup-state
         with:
           token: ${{ steps.state-token.outputs.token }}
 
       - uses: ./.github/actions/setup-pnpm
+        id: audit-setup-pnpm
         with:
           build-script: build:all
 
@@ -3415,10 +3632,12 @@ jobs:
           target_slug="${target_slug//\//-}"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep audit state" \
+            --receipt-kind sweep_audit_records_publication \
             --path "records/${target_slug}" \
             --rebase-strategy reconcile-records
           pnpm run repair:publish-main -- \
             --message "chore: publish sweep audit status" \
+            --receipt-kind sweep_audit_status_publication \
             --path README.md \
             --path "results/audit/${target_slug}.json" \
             --path "results/sweep-status/${target_slug}.json" \
@@ -3428,9 +3647,56 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.state-token.outputs.token }}
         run: |
-          gh workflow run dashboard.yml \
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
             --repo openclaw/clawsweeper-state \
-            --ref main || echo "Best-effort dashboard refresh dispatch failed; scheduled state dashboard will retry."
+            --workflow dashboard.yml \
+            --ref main \
+            --business-key "dashboard-refresh:$GITHUB_RUN_ID" \
+            --target-repo openclaw/clawsweeper-state; then
+            echo "Best-effort dashboard refresh dispatch failed; scheduled state dashboard will retry."
+          fi
+
+      - name: Finalize sweep audit state action ledger
+        id: finalize-audit-state-action-ledger
+        if: ${{ always() && steps.audit-action-ledger.outcome == 'success' && steps.audit-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/sweep-audit-state-action-ledger-finalize.json
+
+      - name: Import immutable sweep audit state action ledger
+        id: import-audit-state-action-ledger
+        if: ${{ always() && steps.audit-setup-state.outcome == 'success' && steps.finalize-audit-state-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/sweep-audit-state-action-ledger-import.json"
+          event_paths_file=".artifacts/sweep-audit-state-action-ledger-paths.txt"
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job audit-dashboard \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Sweep audit state action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+
+      - name: Publish immutable sweep audit state action ledger
+        if: ${{ always() && steps.import-audit-state-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/sweep-audit-state-action-ledger-paths.txt \
+            --message "chore: append sweep audit state action ledger"
 
   apply-proof:
     name: Prove close coverage without write credentials
@@ -3894,6 +4160,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_PUBLISH_THROTTLE_STATUS: "true"
           CLAWSWEEPER_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CLAWSWEEPER_THROTTLE_STATUS_MIN_WAIT_MS: "60000"
@@ -4311,19 +4578,6 @@ jobs:
         if: ${{ always() && !cancelled() && steps.apply-existing-run.outcome == 'success' }}
         run: echo "succeeded=true" >> "$GITHUB_OUTPUT"
 
-      - name: Finalize apply action ledger
-        if: ${{ always() }}
-        env:
-          APPLY_OUTCOME: ${{ steps.apply-existing-run.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$APPLY_OUTCOME" = "cancelled" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$APPLY_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
       - name: Retry final apply status publication
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
         run: |
@@ -4335,40 +4589,9 @@ jobs:
           target_slug="${target_slug//\//-}"
           pnpm run repair:publish-main -- \
             --message "chore: mark sweep apply finished" \
+            --receipt-kind sweep_apply_status_publication \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy apply-records
-
-      - name: Publish apply action events
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"
-          if [ ! -d "$source_root/ledger" ]; then
-            echo "No apply action event shards were finalized."
-            exit 0
-          fi
-          event_paths_file=".artifacts/apply-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent publish-action-events -- \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" \
-            --expected-producer-job "$GITHUB_JOB" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            echo "Apply action event shards existed but no paths were imported." >&2
-            exit 1
-          fi
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$event_paths_file"
-          node dist/clawsweeper.js publish-action-event-paths \
-            --paths-file "$event_paths_file" \
-            --message "chore: append apply action ledger"
 
       - name: Continue apply sweep
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
@@ -4430,36 +4653,30 @@ jobs:
             fi
           fi
 
-          run_workflow_with_retry() {
-            local label="$1"
-            shift
-            for attempt in 1 2 3; do
-              if gh workflow run sweep.yml "$@"; then
-                return 0
-              fi
-              echo "::warning::Failed to queue ${label} on attempt ${attempt}; retrying."
-              sleep "$((attempt * 10))"
-            done
-            echo "::warning::Unable to queue ${label} after three attempts; scheduled runs will backstop it."
-            return 0
-          }
-
           echo "Apply reached requested limit; queueing another apply run."
-          run_workflow_with_retry "apply continuation" \
+          # Durable receipts cover normal reruns. After a hard runner loss, apply concurrency
+          # and per-item apply leases keep a possible duplicate continuation at-least-once safe.
+          if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow sweep.yml \
             --ref main \
-            -f apply_existing=true \
-            -f target_repo="$APPLY_TARGET_REPO" \
-            -f apply_limit="$APPLY_LIMIT" \
-            -f apply_min_age_days="$APPLY_MIN_AGE_DAYS" \
-            -f apply_min_age_minutes="$APPLY_MIN_AGE_MINUTES" \
-            -f apply_kind="$APPLY_KIND" \
-            -f apply_close_reasons="$APPLY_CLOSE_REASONS" \
-            -f apply_stale_min_age_days="$APPLY_STALE_MIN_AGE_DAYS" \
-            -f apply_item_numbers="$APPLY_ITEM_NUMBERS" \
-            -f apply_sync_comments_only="$APPLY_SYNC_COMMENTS_ONLY" \
-            -f apply_comment_sync_min_age_days="$APPLY_COMMENT_SYNC_MIN_AGE_DAYS" \
-            -f apply_close_delay_ms="$APPLY_CLOSE_DELAY_MS" \
-            -f apply_checkpoint_size="$APPLY_CHECKPOINT_SIZE"
+            --business-key "apply-continuation:$GITHUB_RUN_ID" \
+            --target-repo "$APPLY_TARGET_REPO" \
+            --field apply_existing=true \
+            --field target_repo="$APPLY_TARGET_REPO" \
+            --field apply_limit="$APPLY_LIMIT" \
+            --field apply_min_age_days="$APPLY_MIN_AGE_DAYS" \
+            --field apply_min_age_minutes="$APPLY_MIN_AGE_MINUTES" \
+            --field apply_kind="$APPLY_KIND" \
+            --field apply_close_reasons="$APPLY_CLOSE_REASONS" \
+            --field apply_stale_min_age_days="$APPLY_STALE_MIN_AGE_DAYS" \
+            --field apply_item_numbers="$APPLY_ITEM_NUMBERS" \
+            --field apply_sync_comments_only="$APPLY_SYNC_COMMENTS_ONLY" \
+            --field apply_comment_sync_min_age_days="$APPLY_COMMENT_SYNC_MIN_AGE_DAYS" \
+            --field apply_close_delay_ms="$APPLY_CLOSE_DELAY_MS" \
+            --field apply_checkpoint_size="$APPLY_CHECKPOINT_SIZE"; then
+            echo "::warning::Unable to queue apply continuation; scheduled runs will backstop it."
+          fi
 
       - name: Queue review backstops
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' && steps.target.outputs.target_repo == 'openclaw/openclaw' }}
@@ -4501,40 +4718,86 @@ jobs:
           NODE
           )"
 
-          run_workflow_with_retry() {
-            local label="$1"
-            shift
-            for attempt in 1 2 3; do
-              if gh workflow run sweep.yml "$@"; then
-                return 0
-              fi
-              echo "::warning::Failed to queue ${label} on attempt ${attempt}; retrying."
-              sleep "$((attempt * 10))"
-            done
-            echo "::warning::Unable to queue ${label} after three attempts; scheduled runs will backstop it."
-            return 0
-          }
-
           if [ "$HOT_RECENT" != "true" ]; then
             echo "No recent hot-intake run found; queueing backstop."
-            run_workflow_with_retry "hot review backstop" \
+            # Broad review backstops are at-least-once after hard runner loss; target
+            # concurrency and per-item review leases absorb a possible duplicate batch.
+            if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow sweep.yml \
               --ref main \
-              -f apply_existing=false \
-              -f hot_intake=true \
-              -f target_repo=openclaw/openclaw \
-              -f batch_size=1 \
-              -f shard_count="$hot_intake_shards" \
-              -f codex_timeout_ms=1200000
+              --business-key "hot-review-backstop:$GITHUB_RUN_ID" \
+              --target-repo openclaw/openclaw \
+              --field apply_existing=false \
+              --field hot_intake=true \
+              --field target_repo=openclaw/openclaw \
+              --field batch_size=1 \
+              --field shard_count="$hot_intake_shards" \
+              --field codex_timeout_ms=1200000; then
+              echo "::warning::Unable to queue hot review backstop; scheduled runs will retry."
+            fi
           fi
 
           if [ "$REVIEW_RECENT" != "true" ]; then
             echo "No recent normal review run found; queueing backstop."
-            run_workflow_with_retry "normal review backstop" \
+            if ! node dist/repair/sweep-mutation-cli.js workflow dispatch \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow sweep.yml \
               --ref main \
-              -f apply_existing=false \
-              -f hot_intake=false \
-              -f target_repo=openclaw/openclaw \
-              -f batch_size=3 \
-              -f shard_count="$normal_shards" \
-              -f codex_timeout_ms=1200000
+              --business-key "normal-review-backstop:$GITHUB_RUN_ID" \
+              --target-repo openclaw/openclaw \
+              --field apply_existing=false \
+              --field hot_intake=false \
+              --field target_repo=openclaw/openclaw \
+              --field batch_size=3 \
+              --field shard_count="$normal_shards" \
+              --field codex_timeout_ms=1200000; then
+              echo "::warning::Unable to queue normal review backstop; scheduled runs will retry."
+            fi
           fi
+
+      - name: Finalize apply action ledger
+        id: finalize-apply-action-ledger
+        if: ${{ always() }}
+        env:
+          APPLY_OUTCOME: ${{ steps.apply-existing-run.outcome || 'not_started' }}
+        run: |
+          args=()
+          if [ "$APPLY_OUTCOME" = "cancelled" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$APPLY_OUTCOME" != "success" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Publish apply action events
+        if: ${{ always() && steps.finalize-apply-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No apply action event shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/apply-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent publish-action-events -- \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" \
+            --expected-producer-job "$GITHUB_JOB" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Apply action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append apply action ledger"

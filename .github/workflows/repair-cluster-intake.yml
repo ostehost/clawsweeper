@@ -63,7 +63,7 @@ concurrency:
 jobs:
   intake:
     if: ${{ github.event_name != 'schedule' || vars.CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED == '1' }}
-    runs-on: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_CLUSTER_REPAIR_INTAKE_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Create central GitHub App token
@@ -75,7 +75,7 @@ jobs:
           owner: openclaw
           repositories: clawsweeper
           permission-actions: write
-          permission-contents: write
+          permission-contents: read
 
       - name: Create gitcrawl-store token
         id: store-token
@@ -92,10 +92,16 @@ jobs:
           token: ${{ steps.central-token.outputs.token }}
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
+        id: intake-setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Setup cluster intake action ledger
+        id: intake-action-ledger
+        uses: ./.github/actions/setup-action-ledger
 
       - name: Create state token
         id: state-token
@@ -255,6 +261,7 @@ jobs:
           NODE
 
       - name: Publish intake jobs and ledger
+        id: publish-intake
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
         run: |
           set -euo pipefail
@@ -262,23 +269,118 @@ jobs:
             --message "chore: record cluster repair intake" \
             --path jobs \
             --path results/cluster-repair-intake \
+            --receipt-kind cluster_intake_state \
             --max-attempts 12 \
             --push-attempts 4
+
+      - name: Bind immutable published jobs
+        id: published-jobs
+        if: ${{ steps.import.outputs.should_dispatch == 'true' && steps.publish-intake.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          while IFS= read -r job; do
+            [ -n "$job" ] || continue
+            if ! printf '%s' "$job" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+              echo "Invalid imported cluster job path: $job" >&2
+              exit 1
+            fi
+            git -C "$CLAWSWEEPER_STATE_DIR" cat-file -e "${state_revision}:${job}"
+          done < .artifacts/cluster-repair-intake/generated-paths.txt
+          echo "state_revision=$state_revision" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch imported cluster repair
         if: ${{ steps.import.outputs.should_dispatch == 'true' }}
         env:
           GH_TOKEN: ${{ steps.central-token.outputs.token }}
-          RUNNER: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
-          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+          RUNNER: blacksmith-4vcpu-ubuntu-2404
+          EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
           MODEL: internal
+          STATE_REVISION: ${{ steps.published-jobs.outputs.state_revision }}
         run: |
           set -euo pipefail
           mapfile -t jobs < .artifacts/cluster-repair-intake/generated-paths.txt
-          pnpm run repair:dispatch -- "${jobs[@]}" \
-            --mode autonomous \
-            --wait-for-capacity \
-            --runner "$RUNNER" \
-            --execution-runner "$EXECUTION_RUNNER" \
-            --model "$MODEL" \
-            --ref main
+          state_revision="$STATE_REVISION"
+          for job in "${jobs[@]}"; do
+            [ -n "$job" ] || continue
+            immutable_job="$RUNNER_TEMP/cluster-job-$(printf '%s' "$job" | sha256sum | cut -d' ' -f1).md"
+            git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" > "$immutable_job"
+            job_sha256="$(sha256sum "$immutable_job" | cut -d' ' -f1)"
+            cp "$immutable_job" "$job"
+            pnpm run repair:dispatch -- "$job" \
+              --mode autonomous \
+              --wait-for-capacity \
+              --runner "$RUNNER" \
+              --execution-runner "$EXECUTION_RUNNER" \
+              --state-revision "$state_revision" \
+              --job-sha256 "$job_sha256" \
+              --model "$MODEL" \
+              --ref main
+          done
+
+      - name: Finalize cluster intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane cluster-intake \
+            "${allow_empty_args[@]}" \
+            > .artifacts/cluster-intake-action-ledger-manifest.json
+
+      - name: Publish immutable cluster intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/cluster-intake-action-ledger-manifest.json"
+          event_paths_file=".artifacts/cluster-intake-action-ledger-paths.txt"
+          import_result_file=".artifacts/cluster-intake-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane cluster-intake \
+            --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+               [ "${{ steps.import.outputs.should_dispatch }}" != "true" ]; then
+              exit 0
+            fi
+            echo "Cluster intake action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append cluster intake action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

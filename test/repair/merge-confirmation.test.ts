@@ -239,70 +239,83 @@ test("already-merged confirmation rejects off-main and disagreeing live bases", 
   );
 });
 
-test("comment router replays only a durable waiting merge before open-state readiness", () => {
+test("comment router replays a durable dispatched claim before closed-state exit", () => {
   const routerSource = readFileSync("src/repair/comment-router.ts", "utf8");
   const classifier = routerSource.slice(
     routerSource.indexOf("function classifyAutomergePass("),
     routerSource.indexOf("function classifyPassedAutomergeRepair("),
   );
-  assert.match(
-    classifier,
-    /classifyWaitingMergeReplay\(command, pull\)[\s\S]*reason: "PR is not open"/,
-  );
+  assert.match(classifier, /reason: "PR is not open"/);
   assert.ok(
-    classifier.indexOf("classifyWaitingMergeReplay(command, pull)") <
+    classifier.indexOf("classifyDispatchedMergeClaimReplay(command, pull)") <
       classifier.indexOf('reason: "PR is not open"'),
   );
   const replayClassifier = routerSource.slice(
-    routerSource.indexOf("function classifyWaitingMergeReplay("),
+    routerSource.indexOf("function classifyDispatchedMergeClaimReplay("),
     routerSource.indexOf("function classifyNeedsHuman("),
   );
   assert.match(
     replayClassifier,
-    /if \(!pull\) return null;[\s\S]*waitingMergeReplay\(ledger, command\)[\s\S]*mergeMutationReceiptStatus\(prior\)[\s\S]*expected_head_sha: prior\.expected_head_sha[\s\S]*status: "ready"[\s\S]*action: "merge"[\s\S]*merge_mutation_status: mergeMutationStatus/,
+    /if \(!pull\) return null;[\s\S]*inspectAutomergeMergeClaim\(command\)[\s\S]*claim\.status !== "existing" \|\| claim\.dispatched !== true[\s\S]*status: "ready"[\s\S]*action: "merge"/,
   );
-  assert.doesNotMatch(replayClassifier, /issue\.state/);
+  assert.match(replayClassifier, /status: claim\.status === "unknown" \? "waiting" : "blocked"/);
   const maintainerClassifier = routerSource.slice(
     routerSource.indexOf("function classifyMaintainerApprovedAutomerge("),
-    routerSource.indexOf("function classifyWaitingMergeReplay("),
+    routerSource.indexOf("function classifyDispatchedMergeClaimReplay("),
   );
   assert.match(
     maintainerClassifier,
-    /classifyWaitingMergeReplay\(command, pull\)[\s\S]*reason: "PR is not open"/,
+    /classifyDispatchedMergeClaimReplay\(command, pull\)[\s\S]*reason: "PR is not open"/,
   );
 
   const executor = routerSource.slice(
     routerSource.indexOf("function executeAutomerge("),
     routerSource.indexOf("function rulesetPolicyReader()"),
   );
-  assert.match(
-    executor,
-    /fetchPullRequestView\(command\.issue_number\)[\s\S]*fetchPullRequest\(command\.issue_number\)[\s\S]*confirmAlreadyMergedPullRequest/,
-  );
   assert.ok(
-    executor.indexOf("confirmAlreadyMergedPullRequest") <
-      executor.indexOf("validateAutomergeReadiness"),
-  );
-  assert.match(
-    executor,
-    /alreadyMerged\.status === "executed" && !acceptedMergeMutationReceipt[\s\S]*status: "skipped"[\s\S]*already merged without a recorded accepted ClawSweeper merge request/,
-  );
-  const acceptedReplayWait = executor.slice(
-    executor.indexOf("if (acceptedMergeMutationReceipt || uncertainMergeMutationReceipt)"),
-    executor.indexOf("let latestTarget ="),
-  );
-  assert.match(
-    acceptedReplayWait,
-    /status: "waiting"[\s\S]*waiting for GitHub to confirm the recorded accepted merge request[\s\S]*waiting for GitHub to resolve the recorded merge attempt with an unknown outcome[\s\S]*merge_mutation_status: mergeMutationStatus/,
-  );
-  assert.ok(
-    executor.indexOf("if (acceptedMergeMutationReceipt || uncertainMergeMutationReceipt)") <
+    executor.indexOf("observeExistingAutomergeEffect(command, view)") <
       executor.indexOf("validateAutomergeReadiness"),
   );
   assert.ok(
-    executor.indexOf("if (acceptedMergeMutationReceipt || uncertainMergeMutationReceipt)") <
+    executor.indexOf("priorClaim = inspectAutomergeMergeClaim(command)") <
+      executor.indexOf("const stoppedReason = repairLoopStoppedReason(command)"),
+    "a dispatched exact-head claim must reconcile even when a later stop signal is present",
+  );
+  assert.match(
+    executor,
+    /priorClaim\.status === "existing" && priorClaim\.dispatched === true[\s\S]*return reconcileClaimedAutomergeRequest\(/,
+  );
+  assert.ok(
+    executor.indexOf("claimAutomergeMergeRequest(command)") <
+      executor.indexOf("result = runGitHubSpawnMutation("),
+  );
+  assert.ok(
+    executor.indexOf("reconcileClaimedAutomergeRequest(") <
       executor.indexOf("runGitHubSpawnMutation("),
-    "an accepted or uncertain replay must reconcile instead of submitting the merge again",
+    "an existing durable claim must reconcile instead of submitting the merge again",
+  );
+  const dualConfirmation = routerSource.slice(
+    routerSource.indexOf("function confirmDualViewAutomergeEffectSnapshot("),
+    routerSource.indexOf("function fetchAutomergeSquashCommitProof("),
+  );
+  assert.match(
+    dualConfirmation,
+    /confirmAutomergeEffectSnapshot\(snapshot, expectedHeadSha, proof\)[\s\S]*confirmAlreadyMergedPullRequest\([\s\S]*pull,[\s\S]*view/,
+  );
+  assert.match(
+    dualConfirmation,
+    /confirmation\.status === "waiting"[\s\S]*pendingReason: confirmation\.reason/,
+  );
+  const effectSnapshot = routerSource.slice(
+    routerSource.indexOf("function fetchAutomergeEffectSnapshot("),
+    routerSource.indexOf("function confirmDualViewAutomergeEffectSnapshot("),
+  );
+  assert.match(effectSnapshot, /"baseRefName"[\s\S]*"mergeCommit"[\s\S]*"mergedAt"/);
+  assert.doesNotMatch(effectSnapshot, /if \(pull\.merged_at\) return/);
+  assert.equal(
+    routerSource.match(/confirmDualViewAutomergeEffectSnapshot\(/g)?.length,
+    4,
+    "the helper definition and all three automerge confirmation paths must use dual views",
   );
 });
 
@@ -312,16 +325,32 @@ test("merge owners gate terminal success on the focused confirmation helpers", (
     applySource.indexOf("function applyMergeAction("),
     applySource.indexOf("function rulesetPolicyReader()"),
   );
-  const applyPostMerge = applyOwner.slice(applyOwner.indexOf("ghWithRetry(mergeArgs);"));
-  assert.match(
-    applyPostMerge,
-    /const merged = fetchPullRequest[\s\S]*const mergedView = fetchPullRequestView/,
+  const applyConfirmation = applySource.slice(
+    applySource.indexOf("function confirmExactMergeSnapshot("),
+    applySource.indexOf("function claimApplyMergeRequest("),
   );
   assert.match(
-    applyPostMerge,
-    /!restPullRequestMergeConfirmed\(merged\)[\s\S]*!graphqlPullRequestMergeConfirmed\(mergedView\)[\s\S]*status: "blocked"/,
+    applyConfirmation,
+    /confirmAlreadyMergedPullRequest\(\{[\s\S]*expectedHeadSha: authorizedHeadSha,[\s\S]*pull: pullRequest,[\s\S]*view/,
   );
-  assert.match(applyPostMerge, /requeue_required: true/);
+  assert.match(
+    applyConfirmation,
+    /confirmation\.status === "waiting"[\s\S]*pendingReason: confirmation\.reason[\s\S]*confirmation\.status !== "executed"[\s\S]*block: confirmation\.reason/,
+  );
+  assert.equal(
+    applyOwner.match(/confirmExactMergeSnapshot\(/g)?.length,
+    5,
+    "every apply merge observation boundary must require the dual-view helper",
+  );
+  assert.match(
+    applyOwner,
+    /runRepairMutation\([\s\S]*return ghText\(mergeArgs\)[\s\S]*merged = fetchPullRequestOnce\(result\.repo, target\)[\s\S]*mergedView = fetchPullRequestViewOnce\(result\.repo, target\)[\s\S]*confirmExactMergeSnapshot\(merged, mergedView, authorizedHeadSha/,
+  );
+  assert.match(
+    applyOwner,
+    /if \(confirmation\.pendingReason\)[\s\S]*status: "blocked"[\s\S]*requeue_required: true/,
+  );
+  assert.match(applyOwner, /merge_commit_sha: confirmation\.mergeCommitSha/);
 
   const candidateCloseout = applySource.slice(
     applySource.indexOf("function validateMergedCandidateFix("),
@@ -332,82 +361,23 @@ test("merge owners gate terminal success on the focused confirmation helpers", (
     /fetchPullRequest[\s\S]*fetchPullRequestView[\s\S]*pullRequestMainBaseBlock[\s\S]*restPullRequestMergeConfirmed[\s\S]*graphqlPullRequestMergeConfirmed/,
   );
 
-  const alreadyMerged = applyOwner.slice(
-    applyOwner.indexOf("const mergedAt = pullRequest.merged_at"),
-    applyOwner.indexOf("const lockedSkip ="),
-  );
-  assert.match(
-    alreadyMerged,
-    /pullRequestMainBaseBlock\(pullRequest, view\)[\s\S]*reason: "already merged"/,
-  );
-
   const routerSource = readFileSync("src/repair/comment-router.ts", "utf8");
-  const routerOwner = routerSource.slice(
-    routerSource.indexOf("function executeAutomerge("),
-    routerSource.indexOf(
-      "function rulesetPolicyReader()",
-      routerSource.indexOf("function executeAutomerge("),
-    ),
-  );
-  const routerMutation = routerOwner.slice(
-    routerOwner.indexOf('persistMergeMutationReceipt(command, "attempted")'),
+  const routerConfirmation = routerSource.slice(
+    routerSource.indexOf("function confirmDualViewAutomergeEffectSnapshot("),
+    routerSource.indexOf("function fetchAutomergeSquashCommitProof("),
   );
   assert.match(
-    routerMutation,
-    /persistMergeMutationReceipt\(command, "attempted"\)[\s\S]*runGitHubSpawnMutation\([\s\S]*ghSpawnMutationOutcome\(result\)[\s\S]*persistMergeMutationReceipt\(command, mutationReceiptStatus\)[\s\S]*const mergedPull = fetchPullRequest[\s\S]*const mergedView = fetchPullRequestView[\s\S]*confirmAlreadyMergedPullRequest\([\s\S]*expectedHeadSha: command\.expected_head_sha/,
-  );
-  assert.match(routerMutation, /merge_mutation_status: mutationReceiptStatus/);
-  assert.match(routerMutation, /retry_recommended: true/);
-  assert.doesNotMatch(routerMutation, /mergedAt \?\? new Date\(\)\.toISOString\(\)/);
-  assert.ok(
-    routerMutation.indexOf('persistMergeMutationReceipt(command, "attempted")') <
-      routerMutation.indexOf("runGitHubSpawnMutation("),
-    "the attempted receipt must be durable before the merge subprocess starts",
-  );
-  assert.ok(
-    routerMutation.indexOf("persistMergeMutationReceipt(command, mutationReceiptStatus)") <
-      routerMutation.indexOf('if (mutationReceiptStatus === "rejected")'),
-    "the observed outcome must be durable before failure handling",
-  );
-  assert.ok(
-    routerMutation.indexOf("persistMergeMutationReceipt(command, mutationReceiptStatus)") <
-      routerMutation.indexOf("const mergedPull = fetchPullRequest"),
-    "the observed outcome must be durable before post-mutation GitHub lookups",
-  );
-  const receiptWriter = routerOwner.slice(
-    routerOwner.indexOf("function persistMergeMutationReceipt("),
-    routerOwner.indexOf("function rulesetPolicyReader()"),
-  );
-  assert.match(
-    receiptWriter,
-    /"attempted" \| "accepted" \| "unknown" \| "rejected"[\s\S]*status: "waiting"[\s\S]*merge_mutation_status: mergeMutationStatus[\s\S]*appendLedger\(ledger, \[receipt\]\)[\s\S]*writeLedger\(ledgerPath\(\), ledger\)[\s\S]*publishDurableMergeMutationReceipt\(command, mergeMutationStatus\)/,
-  );
-  const durableReceiptWriter = receiptWriter.slice(
-    receiptWriter.indexOf("function publishDurableMergeMutationReceipt("),
-  );
-  assert.match(
-    durableReceiptWriter,
-    /CLAWSWEEPER_STATE_DIR[\s\S]*writeReportFile\(repoRoot\(\)[\s\S]*publishMainCommit\(\{[\s\S]*paths: \["results\/comment-router\.json", "results\/comment-router-latest\.json", "jobs"\][\s\S]*rebaseStrategy: "comment-router-ledger"/,
-  );
-  assert.match(
-    durableReceiptWriter,
-    /publishMainCommit\([\s\S]*readLedger\([\s\S]*stateDir[\s\S]*entry\.repo[\s\S]*entry\.idempotency_key[\s\S]*entry\.comment_version_key[\s\S]*entry\.attempt_id[\s\S]*entry\.expected_head_sha[\s\S]*mergeMutationReceiptStatus\(entry as LooseRecord\) === mergeMutationStatus/,
+    routerConfirmation,
+    /confirmAlreadyMergedPullRequest\(\{[\s\S]*expectedHeadSha,[\s\S]*pull,[\s\S]*view/,
   );
 
   const postFlightSource = readFileSync("src/repair/post-flight.ts", "utf8");
-  const postFlightOwner = postFlightSource.slice(
-    postFlightSource.indexOf("function finalizeFixPr("),
-    postFlightSource.indexOf("function rulesetPolicyReader()"),
-  );
-  const postFlightPostMerge = postFlightOwner.slice(
-    postFlightOwner.indexOf("ghWithRetry(mergeArgs);"),
+  const postFlightConfirmation = postFlightSource.slice(
+    postFlightSource.indexOf("function confirmPostFlightMergeSnapshot("),
+    postFlightSource.indexOf("function confirmMergedPullSnapshot("),
   );
   assert.match(
-    postFlightPostMerge,
-    /const merged = fetchPullRequest[\s\S]*const mergedView = fetchPullRequestView/,
-  );
-  assert.match(
-    postFlightPostMerge,
-    /pullRequestMainBaseBlock\(merged, mergedView\)[\s\S]*!restPullRequestMergeConfirmed\(merged\)[\s\S]*!graphqlPullRequestMergeConfirmed\(mergedView\)[\s\S]*status: "blocked"/,
+    postFlightConfirmation,
+    /confirmAlreadyMergedPullRequest\(\{[\s\S]*expectedHeadSha,[\s\S]*pull,[\s\S]*view/,
   );
 });

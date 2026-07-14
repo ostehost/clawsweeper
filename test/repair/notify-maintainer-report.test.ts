@@ -9,6 +9,7 @@ import {
   resolveDailyReportPointer,
   runMaintainerReportNotifier,
 } from "../../dist/repair/notify-maintainer-report.js";
+import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
 
 const report = {
   period: { period: "day", key: "2026-05-22", title: "Daily Report 2026-05-22" },
@@ -183,3 +184,163 @@ test("runMaintainerReportNotifier supports dry-run and strict missing config", a
   assert.equal(missingConfig.status, "skipped");
   assert.equal(missingConfig.exitCode, 1);
 });
+
+test("missing reports still emit a durable skipped notification receipt", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-maintainer-missing-")),
+  );
+  const outputRoot = path.join(root, "ledger-output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-12",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+    GITHUB_ACTION: "notify",
+    GITHUB_JOB: "maintainer-notification",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "6262",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_WORKFLOW: "maintainer report notification",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/maintainer-report-discord.yml@refs/heads/main",
+  });
+
+  try {
+    const summary = await runMaintainerReportNotifier(["--strict", "--date", "2026-07-11"], {
+      root,
+      fetch: async () => Response.json({ latest: {}, entries: [] }),
+      log: () => undefined,
+      env: process.env,
+    });
+    assert.equal(summary.exitCode, 1);
+    assert.equal(summary.reason, "daily report not found");
+
+    await flushRepairActionEvents();
+    const events = fs
+      .readdirSync(outputRoot, { recursive: true, encoding: "utf8" })
+      .filter((entry) => entry.endsWith(".jsonl"))
+      .flatMap((entry) =>
+        fs
+          .readFileSync(path.join(outputRoot, entry), "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line)),
+      );
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event_type, "notification.skipped");
+    assert.equal(events[0]?.action.status, "skipped");
+    assert.equal(events[0]?.subject.kind, "notification");
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+for (const scenario of [
+  {
+    name: "index fetch",
+    fetch: async () => {
+      throw new Error("report index unavailable");
+    },
+  },
+  {
+    name: "report parse",
+    fetch: async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/index.json")) {
+        return Response.json({
+          latest: {
+            day: {
+              period: "day",
+              key: "2026-07-11",
+              href: "day/2026-07-11/",
+              data: "day/2026-07-11/data.json",
+            },
+          },
+          entries: [
+            {
+              period: "day",
+              key: "2026-07-11",
+              href: "day/2026-07-11/",
+              data: "day/2026-07-11/data.json",
+            },
+          ],
+        });
+      }
+      return new Response("<html>not json</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    },
+  },
+] as const) {
+  test(`${scenario.name} failures emit durable non-mutation receipts`, async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-maintainer-preflight-")),
+    );
+    const outputRoot = path.join(root, "ledger-output");
+    fs.mkdirSync(outputRoot);
+    const previous = { ...process.env };
+    Object.assign(process.env, {
+      CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+      CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+      CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+      CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-12",
+      CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+      CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+      GITHUB_ACTION: "notify",
+      GITHUB_JOB: "maintainer-notification",
+      GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_RUN_ID: "6363",
+      GITHUB_SHA: "a".repeat(40),
+      GITHUB_WORKFLOW: "maintainer report notification",
+      GITHUB_WORKFLOW_REF:
+        "openclaw/clawsweeper/.github/workflows/maintainer-report-discord.yml@refs/heads/main",
+    });
+
+    try {
+      await assert.rejects(
+        runMaintainerReportNotifier(["--strict", "--date", "2026-07-11"], {
+          root,
+          fetch: scenario.fetch as typeof fetch,
+          log: () => undefined,
+          env: process.env,
+        }),
+      );
+
+      await flushRepairActionEvents();
+      const events = fs
+        .readdirSync(outputRoot, { recursive: true, encoding: "utf8" })
+        .filter((entry) => entry.endsWith(".jsonl"))
+        .flatMap((entry) =>
+          fs
+            .readFileSync(path.join(outputRoot, entry), "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line)),
+        );
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.event_type, "notification.failed");
+      assert.equal(events[0]?.action.status, "failed");
+      assert.equal(events[0]?.action.mutation, false);
+      assert.equal(events[0]?.action.retryable, true);
+      assert.equal(events[0]?.attributes?.completion_reason, "preflight_failed");
+    } finally {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key];
+      }
+      Object.assign(process.env, previous);
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  });
+}

@@ -2,11 +2,18 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
 import { currentProjectRepo, parseArgs, parseSimpleYaml, repoRoot } from "./lib.js";
-import { ghJsonWithRetry, ghTextWithRetry } from "./github-cli.js";
+import { ghErrorText, ghJsonWithRetry, ghText } from "./github-cli.js";
 import { parseIssueOrPullRef } from "./github-ref.js";
 import { CLAWSWEEPER_LABEL_DESCRIPTION, DEFAULT_LABEL } from "./constants.js";
 import { readJsonFileIfExists as readJson } from "./json-file.js";
+import {
+  runRepairMutation,
+  type RepairLifecycleInput,
+  type RepairMutationOptions,
+} from "./repair-action-ledger.js";
+import { sleepMs } from "./timing.js";
 
 const FIX_PR_STATUSES = new Set(["opened", "pushed", "executed", "blocked", "planned"]);
 const APPLY_STATUSES = new Set(["executed"]);
@@ -335,15 +342,19 @@ function labelTarget(target: LooseRecord) {
   }
 
   try {
-    ghTextWithRetry([
-      "issue",
-      "edit",
-      String(target.number),
-      "--repo",
-      target.repo,
-      "--add-label",
-      labelName,
-    ]);
+    runLabelMutationWithRetry(
+      labelTargetLifecycle(target, kind, item.updated_at),
+      {
+        kind: "target_label_add",
+        identity: {
+          repository: target.repo,
+          number: target.number,
+          label: labelName,
+        },
+        component: "tag_clawsweeper_targets",
+      },
+      ["issue", "edit", String(target.number), "--repo", target.repo, "--add-label", labelName],
+    );
     return { ...verified, status: "labeled", reason: `added ${labelName}` };
   } catch (error) {
     return { ...verified, status: "failed", reason: ghErrorMessage(error) };
@@ -378,17 +389,34 @@ function githubLabelExists() {
 
 function createGithubLabel() {
   const repo = process.env.CLAWSWEEPER_TARGET_REPO ?? "openclaw/openclaw";
-  ghTextWithRetry([
-    "label",
-    "create",
-    labelName,
-    "--repo",
-    repo,
-    "--color",
-    "F97316",
-    "--description",
-    CLAWSWEEPER_LABEL_DESCRIPTION,
-  ]);
+  runLabelMutationWithRetry(
+    {
+      repository: repo,
+      workKey: `label-housekeeping:repository-label:${labelName}`,
+      subjectKind: "workflow",
+    },
+    {
+      kind: "repository_label_create",
+      identity: {
+        repository: repo,
+        label: labelName,
+        color: "F97316",
+        description: CLAWSWEEPER_LABEL_DESCRIPTION,
+      },
+      component: "tag_clawsweeper_targets",
+    },
+    [
+      "label",
+      "create",
+      labelName,
+      "--repo",
+      repo,
+      "--color",
+      "F97316",
+      "--description",
+      CLAWSWEEPER_LABEL_DESCRIPTION,
+    ],
+  );
 }
 
 function fetchIssue(repo: string, number: JsonValue) {
@@ -406,9 +434,8 @@ function readSiblingJson(runDir: string, filename: string) {
   return null;
 }
 
-function ghErrorMessage(error: JsonValue) {
-  const stderr = String(error?.stderr ?? "").trim();
-  return stderr || error?.message || String(error);
+function ghErrorMessage(error: unknown) {
+  return ghErrorText(error) || String(error);
 }
 
 function noteSource(filePath: string) {
@@ -422,6 +449,93 @@ function relative(filePath: string) {
 
 function sortTarget(left: JsonValue, right: JsonValue) {
   return left.repo.localeCompare(right.repo) || left.number - right.number;
+}
+
+function labelTargetLifecycle(
+  target: LooseRecord,
+  kind: string,
+  targetUpdatedAt: JsonValue,
+): RepairLifecycleInput {
+  const source = preferredTargetSource(target.sources);
+  const recordPath = sourceRecordPath(source);
+  const sourceRevision = String(targetUpdatedAt ?? "").trim();
+  return {
+    repository: String(target.repo),
+    workKey: `label-housekeeping:target:${target.repo}#${target.number}:${labelName}`,
+    number: Number(target.number),
+    subjectKind: kind === "pull_request" ? "pull_request" : "issue",
+    ...(/^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$/.test(sourceRevision) ? { sourceRevision } : {}),
+    ...(recordPath ? { recordPath } : {}),
+  };
+}
+
+function preferredTargetSource(value: unknown): LooseRecord | null {
+  if (!Array.isArray(value)) return null;
+  const sources = value.filter((source): source is LooseRecord =>
+    Boolean(source && typeof source === "object" && !Array.isArray(source)),
+  );
+  return (
+    sources.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))[0] ??
+    null
+  );
+}
+
+function sourceRecordPath(source: LooseRecord | null): string | null {
+  const normalized = String(source?.source ?? "")
+    .trim()
+    .split(path.sep)
+    .join("/");
+  if (
+    !/^(?:\.artifacts|artifacts|jobs|ledger|logs|notifications|records|results)\//.test(
+      normalized,
+    ) ||
+    normalized.split("/").includes("..")
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function runLabelMutationWithRetry(
+  lifecycle: RepairLifecycleInput,
+  options: Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">,
+  ghArgs: string[],
+): string {
+  const attempts = githubMutationRetryAttempts();
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return runRepairMutation(lifecycle, {
+        ...options,
+        knownNoMutation: githubMutationRejectedBeforeWrite,
+        operation: () => ghText(ghArgs),
+      });
+    } catch (error) {
+      lastError = error;
+      const retryKind = ghRetryKind(error);
+      if (attempt >= attempts || retryKind === "none") throw error;
+      sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function githubMutationRetryAttempts(): number {
+  const configured = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  if (configured == null || configured.trim() === "") return 6;
+  const attempts = Number(configured);
+  return Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 6;
+}
+
+function githubMutationRejectedBeforeWrite(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as NodeJS.ErrnoException).code ?? "")
+      : "";
+  if (code === "ENOENT" || code === "EACCES") return true;
+  return /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
+    ghErrorText(error),
+  );
 }
 
 function writeMarkdownReport(summary: LooseRecord, filePath: string) {

@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -57,9 +58,23 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Create notification ledger state token
+        id: notification-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.notification-state-token.outputs.token }}
 
       - name: Post report summary
         env:
@@ -75,3 +90,48 @@ jobs:
           CLAWSWEEPER_MAINTAINER_REPORT_STRICT: "1"
           CLAWSWEEPER_MAINTAINER_REPORT_DELIVER: "1"
         run: pnpm run repair:notify-maintainer-report -- --write-report
+
+      - name: Finalize maintainer notification action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane maintainer-notification \
+            > .artifacts/maintainer-notification-action-ledger-manifest.json
+
+      - name: Publish immutable maintainer notification action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/maintainer-notification-action-ledger-manifest.json"
+          paths_file=".artifacts/maintainer-notification-action-ledger-paths.txt"
+          import_result_file=".artifacts/maintainer-notification-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane maintainer-notification \
+            --manifest "$manifest_file" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          test -s "$paths_file"
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$paths_file"
+          if [ "${#action_ledger_args[@]}" -gt 0 ]; then
+            pnpm run repair:publish-main -- \
+              --message "chore: append maintainer notification action ledger" \
+              "${action_ledger_args[@]}"
+          fi

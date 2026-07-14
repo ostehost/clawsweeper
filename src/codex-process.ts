@@ -103,6 +103,7 @@ export function runCodexProcess(options: {
   stdoutPath?: string;
   stderrPath?: string;
   appServer?: CodexAppServerProcessOptions;
+  redactValues?: readonly string[];
 }): CodexProcessResult {
   const workDir = mkdtempSync(join(tmpdir(), "clawsweeper-codex-process-"));
   const optionsPath = join(workDir, "options.json");
@@ -157,7 +158,10 @@ export function runCodexProcess(options: {
     const worker = spawnSync(workerCommand, workerArgs, {
       cwd: options.cwd,
       env: isolatedPrincipal ? trustedLauncherEnvironment() : workerEnv,
-      input: options.input,
+      input: JSON.stringify({
+        input: options.input,
+        redactValues: [...(options.redactValues ?? [])],
+      }),
       stdio: ["pipe", "ignore", "ignore"],
       timeout: options.timeoutMs + 10_000,
     });

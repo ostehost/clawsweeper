@@ -5,10 +5,15 @@ inputs:
     description: ClawSweeper checkout path relative to the workspace.
     required: false
     default: "."
+outputs:
+  output-root:
+    description: Canonical action ledger shard output root.
+    value: ${{ steps.context.outputs.output-root }}
 runs:
   using: composite
   steps:
     - name: Export immutable action ledger context
+      id: context
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -30,3 +35,4 @@ runs:
           echo "CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=$output_root"
           echo "GITHUB_RUN_STARTED_AT=$run_started_at"
         } >> "$GITHUB_ENV"
+        echo "output-root=$output_root" >> "$GITHUB_OUTPUT"

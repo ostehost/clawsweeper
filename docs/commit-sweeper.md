@@ -151,6 +151,13 @@ Codex reviews the provided commit range and is expected to read beyond the diff:
 - general web sources when current external facts matter
 - focused live tests or smoke checks when feasible
 
+Before Codex starts, the workflow uses its read-only target token to build a
+bounded context bundle for the commit. The bundle contains associated or
+explicitly linked issues and pull requests, check runs, commit statuses, and
+workflow runs. The reviewer validates and embeds that bundle as untrusted
+evidence, then launches Codex without GitHub or Actions credentials. Codex must
+use the bundle rather than calling `gh` itself.
+
 The time budget is 30 minutes per commit.
 
 Codex returns markdown only. The front matter is small and stable so tooling can
@@ -194,10 +201,11 @@ App-permission changes, but the workflow uses `workflow_dispatch` so the
 ClawSweeper App only needs Actions write access on `openclaw/clawsweeper`.
 
 The dispatch is intentionally report-based. ClawSweeper sends the target repo,
-commit SHA, report repo, report path, report URL, severity, check conclusion,
-and source run URL. The repair intake fetches the report from latest
-`openclaw/clawsweeper@main`, writes an audit record, and decides whether an
-automatic PR makes sense on latest target `main`.
+commit SHA, canonical state repository/path, exact state revision, report
+SHA-256, immutable report URL, severity, check conclusion, and source run URL.
+The repair intake fetches and verifies those exact report bytes and embedded
+source identity, writes an audit record, and decides whether an automatic PR
+makes sense on latest target `main`.
 
 Disable this without code changes by setting:
 

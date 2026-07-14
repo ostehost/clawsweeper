@@ -619,6 +619,8 @@ test("issue implementation intake checks generated branches through REST", () =>
   assert.match(source, /open PR already covers a related issue in this work cluster/);
   assert.match(source, /review report references an open or unverifiable pull request/);
   assert.match(source, /issue implementation job already queued/);
+  assert.match(source, /source_revision: sourceRevision/);
+  assert.match(source, /sourceIssueRevision: context\.sourceRevision/);
   assert.match(source, /repos\/\$\{owner\}\/\$\{name\}\/issues\/\$\{number\}/);
   assert.match(source, /"search\/issues",\s+"--method",\s+"GET"/);
   assert.doesNotMatch(source, /"pr", "list"/);

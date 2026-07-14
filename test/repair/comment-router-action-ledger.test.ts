@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { automergeEffectDefinitelyAbsent } from "../../dist/repair/automerge-effect.js";
 import { readText } from "../helpers.ts";
 
 test("comment router records receipts after durable command boundaries", () => {
@@ -9,11 +10,11 @@ test("comment router records receipts after durable command boundaries", () => {
   assert.match(source, /rawCommands\.push\(command\);\s+recordCommandReceived\(command\);/);
   assert.match(
     source,
-    /writeLedger\(ledgerPath\(\), ledger\);\s+publishDurableDispatchClaims\(claimedCommands, "initial"\);\s+for \(const command of claimedCommands\) recordCommandClaimed\(command\);/,
+    /writeLedger\(ledgerPath\(\), ledger\);\s+for \(const command of claimedCommands\) recordCommandClaimed\(command\);/,
   );
   assert.match(
     source,
-    /writeLedger\(ledgerPath\(\), ledger\);\s+publishDurableDispatchClaims\(\[claim\], "refresh"\);\s+for \(const key of dispatchClaimLookupKeys\(claim\)\) priorDispatchClaims\.set\(key, claim\);[\s\S]*recordCommandClaimRefreshed\(claim\);/,
+    /writeLedger\(ledgerPath\(\), ledger\);\s+for \(const key of dispatchClaimLookupKeys\(claim\)\) priorDispatchClaims\.set\(key, claim\);\s+recordCommandClaimRefreshed\(claim\);/,
   );
   assert.match(
     source,
@@ -26,7 +27,7 @@ test("comment router wraps every GitHub mutation at the request boundary", () =>
   const source = readText("src/repair/comment-router.ts");
 
   assert.equal(source.match(/\bghText\(/g)?.length, 2);
-  assert.equal(source.match(/\bghSpawn\(/g)?.length, 1);
+  assert.equal(source.match(/\bresult = ghSpawn\(/g)?.length, 1);
   assert.doesNotMatch(source, /\bghBestEffort\b/);
   assert.doesNotMatch(source, /ghTextWithRetry as ghText/);
   assert.match(source, /function runGitHubTextMutation[\s\S]*runCommandMutationWithRetry/);
@@ -75,6 +76,27 @@ test("forced replay attempt identity flows through the production workflow", () 
   assert.equal(workflow.match(/args\+=\(--attempt-id "\$attempt_id"\)/g)?.length, 2);
 });
 
+test("production comment router binds authenticated App provenance", () => {
+  const workflow = readText(".github/workflows/repair-comment-router.yml");
+
+  assert.match(
+    workflow,
+    /name: Bind authenticated mutation App identity[\s\S]*id: mutation_app[\s\S]*APP_SLUG: \$\{\{ steps\.app_token\.outputs\.app-slug \}\}[\s\S]*gh api "apps\/\$APP_SLUG" --jq '\.id'/,
+  );
+  assert.equal(
+    workflow.match(
+      /CLAWSWEEPER_AUTHENTICATED_APP_ID: \$\{\{ steps\.mutation_app\.outputs\.app_id \}\}/g,
+    )?.length,
+    2,
+  );
+  assert.equal(
+    workflow.match(
+      /CLAWSWEEPER_AUTHENTICATED_APP_SLUG: \$\{\{ steps\.mutation_app\.outputs\.app_slug \}\}/g,
+    )?.length,
+    2,
+  );
+});
+
 test("command receipt identity excludes list position and binds command attempts", () => {
   const source = readText("src/repair/command-action-ledger.ts");
 
@@ -87,130 +109,391 @@ test("command receipt identity excludes list position and binds command attempts
   assert.doesNotMatch(source, /\bindex\b/);
 });
 
-test("durable dispatch recovery is scoped to the routed repository", () => {
+test("automerge reconciles command responses inside the merge receipt without certifying ambiguous methods", () => {
   const source = readText("src/repair/comment-router.ts");
-  const claimIndex = source.indexOf("const priorDispatchClaims = new Map");
-  const claimOwner = source.slice(
-    claimIndex,
-    source.indexOf("const processedCommentVersions", claimIndex),
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
   );
-  const recoveryIndex = source.indexOf("function resolveProtectedLedgerSources(");
-  const recoveryOwner = source.slice(
-    recoveryIndex,
-    source.indexOf("function listCandidateComments()", recoveryIndex),
+  const fetchEffectSnapshot = source.slice(
+    source.indexOf("function fetchAutomergeEffectSnapshot("),
+    source.indexOf("function fetchAutomergeSquashCommitProof("),
+  );
+  const claimMergeRequest = source.slice(
+    source.indexOf("function claimAutomergeMergeRequest("),
+    source.indexOf("function inspectAutomergeMergeClaim("),
   );
 
-  assert.ok(claimIndex >= 0);
   assert.match(
-    claimOwner,
-    /for \(const entry of ledger\.commands \?\? \[\]\) \{\s+if \(String\(entry\.repo \?\? ""\) !== targetRepo\) continue;\s+if \(!hasDurableDispatchBarrier\(entry\)\) continue;/,
+    executeAutomerge,
+    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile:/,
+  );
+  assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
+  assert.match(
+    executeAutomerge,
+    /reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*fetchAutomergeSquashCommitProof\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)/,
   );
   assert.match(
-    recoveryOwner,
-    /\(ledger\.commands \?\? \[\]\)\s+\.filter\(\(candidate: JsonValue\) => String\(candidate\.repo \?\? ""\) === targetRepo\)\s+\.filter\(isProtectedCommentRouterLedgerCommand\)/,
+    executeAutomerge,
+    /confirmDualViewAutomergeEffectSnapshot\([\s\S]*command\.expected_head_sha,[\s\S]*squashCommitProof \? \{ squashCommit: squashCommitProof \} : \{\}[\s\S]*outcome: automergeAttemptReceiptOutcome/,
+  );
+  assert.doesNotMatch(executeAutomerge, /"merge confirmed after ambiguous response"/);
+  assert.match(
+    fetchEffectSnapshot,
+    /repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1[\s\S]*"pr",[\s\S]*"view"[\s\S]*"autoMergeRequest"[\s\S]*"baseRefName"[\s\S]*"headRefOid"[\s\S]*"isInMergeQueue"[\s\S]*"mergeCommit"[\s\S]*"mergedAt"[\s\S]*"state"[\s\S]*attempts: 1/,
+  );
+  assert.doesNotMatch(fetchEffectSnapshot, /if \(pull\.merged_at\) return/);
+  assert.match(
+    source,
+    /function confirmDualViewAutomergeEffectSnapshot[\s\S]*confirmAutomergeEffectSnapshot[\s\S]*confirmAlreadyMergedPullRequest/,
+  );
+  assert.match(
+    source,
+    /function fetchAutomergeSquashCommitProof[\s\S]*repos\/\$\{targetRepo\}\/commits\/\$\{mergeCommitSha\}/,
+  );
+  assert.match(
+    claimMergeRequest,
+    /dispatchedClaimEffectAbsent: \(\) =>[\s\S]*automergeEffectDefinitelyAbsent\([\s\S]*fetchAutomergeEffectSnapshot\(request\.number\),[\s\S]*request\.headSha/,
+  );
+  assert.doesNotMatch(claimMergeRequest, /confirmAutomergeEffectSnapshot/);
+  assert.match(executeAutomerge, /outcome: automergeAttemptReceiptOutcome/);
+  assert.match(
+    executeAutomerge,
+    /automergeUnconfirmedFailureDisposition\(result\) === "waiting"[\s\S]*status: "waiting"/,
+  );
+  assert.match(
+    executeAutomerge,
+    /rejectAutomergeMergeClaim\(command, mergeClaim\.claimId\)[\s\S]*status !== "rejected"[\s\S]*ensureMergeReadyLabel\(command\)/,
+  );
+  assert.match(
+    source,
+    /function rejectAutomergeMergeClaim[\s\S]*rejectExactHeadMergeClaim[\s\S]*isTrustedExactHeadMergeClaimRejectionComment/,
+  );
+  assert.match(
+    source,
+    /const merge = executeAutomerge\(command\);[\s\S]*if \(applyAutomergeResultToCommand\(command, merge\)\) return;/,
   );
 });
 
-test("a stale dispatch claim refreshes once and redispatches through the refreshed binding", () => {
-  const source = readText("src/repair/comment-router.ts");
-  const refreshIndex = source.indexOf("function refreshDispatchClaim(");
-  const refreshOwner = source.slice(
-    refreshIndex,
-    source.indexOf("function publishDurableDispatchClaims(", refreshIndex),
-  );
-  const stateIndex = source.indexOf("function claimedDispatchState(");
-  const stateOwner = source.slice(
-    stateIndex,
-    source.indexOf("function durableDispatchRetryBlockReason(", stateIndex),
-  );
-  const reconcileIndex = source.indexOf("function reconcilePriorDispatchClaimBeforeMutations(");
-  const reconcileOwner = source.slice(
-    reconcileIndex,
-    source.indexOf("function boundDispatchClaimAction(", reconcileIndex),
-  );
+test("automerge claim recovery preserves a GraphQL-observed merge after a stale REST read", () => {
+  const headSha = "a".repeat(40);
 
-  assert.match(
-    refreshOwner,
-    /publishDurableDispatchClaims\(\[claim\], "refresh"\)[\s\S]*command\.dispatch_retry_binding = \(Array\.isArray\(claim\.actions\)/,
+  assert.equal(
+    automergeEffectDefinitelyAbsent(
+      {
+        pull: {
+          head: { sha: headSha },
+          merged_at: null,
+          merge_commit_sha: null,
+          auto_merge: null,
+        },
+        view: {
+          headRefOid: headSha,
+          mergedAt: "2026-07-13T21:00:00Z",
+          state: "MERGED",
+          isInMergeQueue: false,
+          autoMergeRequest: null,
+        },
+      },
+      headSha,
+    ),
+    false,
   );
-  assert.match(
-    stateOwner,
-    /if \(decision\.action === "dispatch"\)[\s\S]*refreshDispatchClaim\(command\);\s+return null;/,
-  );
-  assert.match(
-    reconcileOwner,
-    /if \(!receipt\) \{\s+command\.dispatch_retry_authorized = true;\s+command\.dispatch_retry_binding \?\?= boundAction;\s+return false;/,
-  );
-
-  for (const [name, nextName, action, claimGuard] of [
-    [
-      "dispatchClawSweeperReview",
-      "dispatchClawSweeperAssist",
-      "dispatch_clawsweeper",
-      /if \(!retryBinding\) \{\s+const claimed = claimedDispatchState/,
-    ],
-    [
-      "dispatchClawSweeperAssist",
-      "freeformReviewPrompt",
-      "dispatch_assist",
-      /if \(!retryBinding\) \{\s+const claimed = claimedDispatchState/,
-    ],
-    [
-      "dispatchRepair",
-      "dispatchRepairActionStatus",
-      "dispatch_repair",
-      /const claimed = retryBinding\s+\? null\s+: claimedDispatchState/,
-    ],
-  ]) {
-    const index = source.indexOf(`function ${name}(`);
-    const owner = source.slice(index, source.indexOf(`function ${nextName}(`, index));
-    assert.match(
-      owner,
-      new RegExp(`authorizedDispatchRetryBinding\\(command, "${action}"\\)`),
-      name,
-    );
-    assert.match(owner, claimGuard, name);
-  }
 });
 
-test("dispatch claims bind immutable destinations and retry searches cross the claim boundary", () => {
-  const source = readText("src/repair/comment-router.ts");
-  const bindIndex = source.indexOf("function bindDispatchClaimAction(");
-  const bindOwner = source.slice(
-    bindIndex,
-    source.indexOf("function refreshDispatchClaim(", bindIndex),
+test("automerge blocks a merged REST snapshot from the wrong head", () => {
+  const confirmation = readText("src/repair/automerge-effect.ts");
+
+  assert.match(confirmation, /pull\.merged_at/);
+  assert.match(confirmation, /pull\.head\?\.sha/);
+  assert.match(
+    confirmation,
+    /observed !== expected[\s\S]*merged pull request head does not match the authorized automerge head/,
   );
-  const stateIndex = source.indexOf("function claimedDispatchState(");
-  const stateOwner = source.slice(
-    stateIndex,
-    source.indexOf("function durableDispatchRetryBlockReason(", stateIndex),
+  assert.match(
+    confirmation,
+    /if \(mergedAt\)[\s\S]*squashMergedMethodBlock[\s\S]*block: methodBlock/,
+  );
+});
+
+test("automerge observes exact-head queue state before issuing another merge", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const hardCheck = executeAutomerge.indexOf("validateAutomergeHardReadiness({");
+  const pendingCheck = executeAutomerge.indexOf("exactHeadAutomergePendingReason(command, view)");
+  const readinessCheck = executeAutomerge.indexOf("validateAutomergeReadiness({");
+  const gateAction = executeAutomerge.indexOf("if (gateBlock) {");
+  const mergeCall = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
+
+  assert.ok(hardCheck >= 0);
+  assert.ok(pendingCheck > hardCheck);
+  assert.ok(readinessCheck > pendingCheck);
+  assert.ok(gateAction > readinessCheck);
+  assert.ok(mergeCall > pendingCheck);
+  const finalHardCheck = executeAutomerge.indexOf("const finalHardBlock");
+  const finalPendingCheck = executeAutomerge.indexOf("const finalPendingReason");
+  const finalReadinessCheck = executeAutomerge.indexOf("const finalReadinessBlock");
+  assert.ok(finalPendingCheck > finalHardCheck);
+  assert.ok(finalReadinessCheck > finalPendingCheck);
+  assert.match(
+    source,
+    /function exactHeadAutomergePendingReason[\s\S]*view\.headRefOid[\s\S]*currentHeadSha !== expectedHeadSha[\s\S]*view\.isInMergeQueue[\s\S]*view\.autoMergeRequest/,
+  );
+  assert.equal(source.match(/"isInMergeQueue"/g)?.length, 3);
+  assert.equal(source.match(/"autoMergeRequest"/g)?.length, 3);
+});
+
+test("automerge replays prior claims and reconciles fresh claims before merge", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const claim = executeAutomerge.indexOf("claimAutomergeMergeRequest(command)");
+  const priorReconciliation = executeAutomerge.indexOf("reconcileClaimedAutomergeRequest(");
+  const claimedReconciliation = executeAutomerge.indexOf(
+    "reconcileClaimedAutomergeRequest(",
+    claim,
+  );
+  const merge = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
+
+  assert.ok(claim >= 0);
+  assert.ok(priorReconciliation >= 0 && priorReconciliation < claim);
+  assert.ok(claimedReconciliation > claim);
+  assert.ok(merge > claimedReconciliation);
+  assert.match(
+    source,
+    /function claimAutomergeMergeRequest[\s\S]*ensureExactHeadMergeClaim[\s\S]*"pull_request_merge_claim"/,
+  );
+  assert.match(
+    source,
+    /function reconcileClaimedAutomergeRequest[\s\S]*fetchAutomergeEffectSnapshot[\s\S]*status: "waiting"/,
+  );
+  assert.match(
+    source,
+    /function observeExistingAutomergeEffect[\s\S]*inspectAutomergeMergeClaim[\s\S]*claim\.expectedSquashMessage[\s\S]*fetchAutomergeSquashCommitProof/,
+  );
+  assert.match(
+    source,
+    /function reconcileClaimedAutomergeRequest[\s\S]*claim\.expectedSquashMessage[\s\S]*fetchAutomergeSquashCommitProof/,
+  );
+  assert.match(
+    source,
+    /markAutomergeMergeClaimDispatched\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)/,
+  );
+});
+
+test("trusted verdict automerge rechecks reviewed PR activity around the merge claim", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const first = executeAutomerge.indexOf(
+    "const reviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const final = executeAutomerge.indexOf(
+    "const finalReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const claim = executeAutomerge.indexOf("claimAutomergeMergeRequest(command)");
+  const claimed = executeAutomerge.indexOf(
+    "const claimedReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const merge = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
+
+  assert.ok(first >= 0);
+  assert.ok(final > first);
+  assert.ok(claim > final);
+  assert.ok(claimed > claim);
+  assert.ok(merge > claimed);
+  assert.match(
+    source,
+    /function trustedAutomergeReviewActivityBlockReason[\s\S]*expected_review_activity_cursor[\s\S]*pulls\/\$\{command\.issue_number\}\/reviews[\s\S]*pulls\/\$\{command\.issue_number\}\/comments/,
+  );
+  assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
+});
+
+test("post-claim external merge and pending state release ownership before returning", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const observeExisting = source.slice(
+    source.indexOf("function observeExistingAutomergeEffect("),
+    source.indexOf("function exactHeadAutomergePendingReason("),
   );
 
-  for (const field of [
-    "dispatch_repo",
-    "dispatch_workflow",
-    "dispatch_event",
-    "dispatch_title",
-    "dispatch_mode",
-    "dispatch_runner",
-    "dispatch_execution_runner",
-    "dispatch_model",
-  ]) {
-    assert.match(bindOwner, new RegExp(`\\b${field}:`), field);
-  }
-  assert.match(source, /const MAX_DISPATCH_RUN_PAGES = 100;/);
   assert.match(
-    stateOwner,
-    /const claimBoundaryMs = Date\.parse\(String\(claim\.processed_at \?\? ""\)\) - 5_000;/,
-  );
-  assert.match(stateOwner, /for \(let page = 1; page <= MAX_DISPATCH_RUN_PAGES; page \+= 1\)/);
-  assert.match(stateOwner, /runs\?per_page=100&page=\$\{page\}/);
-  assert.match(
-    stateOwner,
-    /if \(pageRuns\.length < 100\)[\s\S]*if \(runOrderingVerified && priorRunCreatedAtMs < claimBoundaryMs\)/,
+    executeAutomerge,
+    /const claimedExistingMerge = observeExistingAutomergeEffect\(command, claimedView\);\s+if \(claimedExistingMerge\) return releaseBeforeDispatch\(claimedExistingMerge\);/,
   );
   assert.match(
-    stateOwner,
-    /if \(decision\.action === "dispatch"\)[\s\S]*if \(!searchComplete\)[\s\S]*refreshDispatchClaim\(command\)/,
+    executeAutomerge,
+    /const claimedPendingReason = exactHeadAutomergePendingReason\(command, claimedView\);\s+if \(claimedPendingReason\) \{\s+return releaseBeforeDispatch\(\s+automergePendingAction\(/,
   );
+  assert.match(
+    observeExisting,
+    /const mergeOwned = claim\.status === "existing" && claim\.dispatched === true;/,
+  );
+  assert.match(observeExisting, /status: mergeOwned \? "executed" : "skipped"/);
+  assert.match(observeExisting, /"already merged without a dispatched ClawSweeper claim"/);
+});
+
+test("activity and live state are checked after durable dispatch marking", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const dispatchBoundary = executeAutomerge.slice(
+    executeAutomerge.indexOf("beforeDispatch: () => {"),
+    executeAutomerge.indexOf("onDispatchStart: () => {"),
+  );
+  const liveDispatchState = executeAutomerge.slice(
+    executeAutomerge.indexOf("const liveDispatchStateBlock ="),
+    executeAutomerge.indexOf(
+      "let result;",
+      executeAutomerge.indexOf("const liveDispatchStateBlock ="),
+    ),
+  );
+  const mergeAttempt = executeAutomerge.indexOf("const dispatchBoundaryState");
+  const preDispatchCatch = executeAutomerge.indexOf("} catch (error) {", mergeAttempt);
+  const preDispatchFailure = executeAutomerge.slice(
+    preDispatchCatch,
+    executeAutomerge.indexOf("return reconcileClaimedAutomergeRequest(", preDispatchCatch),
+  );
+  const preMarkerActivityCheck = dispatchBoundary.indexOf(
+    "trustedAutomergeAuthorizationBlockReason(command)",
+  );
+  const guard = dispatchBoundary.indexOf("guardAutomergeMergeDispatch({");
+  const claimDispatch = dispatchBoundary.indexOf("markDispatched: () =>");
+  const postMarkerActivityCheck = dispatchBoundary.indexOf(
+    "reviewActivityBlock: () => trustedAutomergeAuthorizationBlockReason(command)",
+  );
+  const postMarkerStateCheck = dispatchBoundary.indexOf(
+    "dispatchStateBlock: liveDispatchStateBlock",
+  );
+  const finalSafetyCheck = dispatchBoundary.indexOf("finalSafetyBlock: finalDispatchSafetyBlock");
+  const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
+
+  assert.ok(preMarkerActivityCheck >= 0);
+  assert.ok(guard > preMarkerActivityCheck);
+  assert.ok(claimDispatch > guard);
+  assert.ok(postMarkerActivityCheck > claimDispatch);
+  assert.ok(postMarkerStateCheck > postMarkerActivityCheck);
+  assert.ok(finalSafetyCheck > postMarkerStateCheck);
+  assert.ok(reject > finalSafetyCheck);
+  assert.match(
+    executeAutomerge,
+    /const readDispatchState[\s\S]*fetchPullRequestView\(command\.issue_number\)[\s\S]*latestAutomergeTarget\(/,
+  );
+  assert.match(
+    executeAutomerge,
+    /const dispatchStateBlock[\s\S]*validateAutomergeHardReadiness\([\s\S]*validateAutomergeReadiness\(/,
+  );
+  assert.match(
+    liveDispatchState,
+    /readDispatchState\(\)[\s\S]*dispatchStateBlock\(state\)[\s\S]*verifiedBaseBranch/,
+  );
+  assert.match(
+    liveDispatchState,
+    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*verifiedBaseBranch/,
+  );
+  assert.match(
+    liveDispatchState,
+    /firstState = readDispatchState\(\)[\s\S]*middleState = readDispatchState\(\)[\s\S]*verifiedBaseBranch = middleBaseBranch[\s\S]*finalState = readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
+  );
+  assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
+  assert.match(
+    executeAutomerge,
+    /const dispatchBoundaryState: \{[\s\S]*preMarkerAuthorizationBlock:[\s\S]*dispatchedAbortAction: LooseRecord \| null;[\s\S]*\}/,
+  );
+  assert.match(
+    preDispatchFailure,
+    /if \(dispatchBoundaryState\.dispatchedAbortAction\) \{[\s\S]*return dispatchBoundaryState\.dispatchedAbortAction;[\s\S]*const dispatchAuthorizationBlock = dispatchBoundaryState\.preMarkerAuthorizationBlock;[\s\S]*releaseBeforeDispatch/,
+  );
+  assert.match(
+    source,
+    /function trustedAutomergeAuthorizationBlockReason[\s\S]*trustedAutomationReviewLeaseBlockReason\(command\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)/,
+  );
+  assert.match(
+    source,
+    /function trustedAutomergeReviewActivityBlockReason[\s\S]*command\.intent !== "clawsweeper_auto_merge"\) return null;/,
+  );
+});
+
+test("all exact-head merge owners release unused claims and require squash auto-merge", () => {
+  const apply = readText("src/repair/apply-result.ts");
+  const router = readText("src/repair/comment-router.ts");
+  const postFlight = readText("src/repair/post-flight.ts");
+  const effect = readText("src/repair/automerge-effect.ts");
+  const applyExecution = apply.slice(
+    apply.indexOf("function applyMergeAction("),
+    apply.indexOf("function validateMergeHeadBinding("),
+  );
+  const routerExecution = router.slice(
+    router.indexOf("function executeAutomerge("),
+    router.indexOf("function automergeReadinessAction("),
+  );
+  const postFlightExecution = postFlight.slice(
+    postFlight.indexOf("function finalizeFixPr("),
+    postFlight.indexOf("function reconcileMergeState("),
+  );
+
+  assert.match(
+    apply,
+    /function releaseApplyMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"apply_result_merge_claim_release"/,
+  );
+  assert.match(
+    router,
+    /function releaseAutomergeMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"pull_request_merge_claim_release"/,
+  );
+  assert.match(
+    postFlight,
+    /function releasePostFlightMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"post_flight_merge_claim_release"/,
+  );
+  assert.match(applyExecution, /markApplyMergeClaimDispatched\(/);
+  assert.match(applyExecution, /kind: "apply_result_merge"/);
+  assert.ok(
+    applyExecution.indexOf("markApplyMergeClaimDispatched(") <
+      applyExecution.indexOf('kind: "apply_result_merge"'),
+  );
+  assert.match(routerExecution, /markAutomergeMergeClaimDispatched\(/);
+  assert.match(routerExecution, /result = runGitHubSpawnMutation\(/);
+  assert.ok(
+    routerExecution.indexOf("result = runGitHubSpawnMutation(") <
+      routerExecution.indexOf("markAutomergeMergeClaimDispatched("),
+  );
+  assert.match(postFlightExecution, /markPostFlightMergeClaimDispatched\(/);
+  assert.match(postFlightExecution, /kind: "post_flight_merge"/);
+  assert.ok(
+    postFlightExecution.indexOf('kind: "post_flight_merge"') <
+      postFlightExecution.indexOf("markPostFlightMergeClaimDispatched("),
+  );
+  assert.match(applyExecution, /let mergeRequestStarted = false/);
+  assert.match(routerExecution, /let mergeRequestStarted = false/);
+  assert.match(postFlightExecution, /let mergeRequestStarted = false/);
+  assert.match(apply, /validateMergeablePullRequestHard[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(router, /validateAutomergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(postFlight, /validateFixPrMergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(
+    effect,
+    /function squashAutomergeMethodBlock[\s\S]*method === "SQUASH"[\s\S]*instead of SQUASH/,
+  );
+});
+
+test("automerge execution never invents a merge timestamp", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+
+  assert.match(executeAutomerge, /merged_at: result\.confirmation\.mergedAt/);
+  assert.doesNotMatch(executeAutomerge, /merged_at:[^\n]*new Date/);
+  assert.doesNotMatch(executeAutomerge, /mergedAt \?\? new Date/);
 });

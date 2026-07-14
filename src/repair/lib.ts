@@ -32,6 +32,7 @@ export {
   activeRepairWorkflowRunForJobAfterDispatchRecheck,
   listActiveWorkflowRuns,
   liveWorkerCapacity,
+  parseRepairRunTitle,
   readMaxLiveWorkers,
   repairRunNameForJob,
   repairRunNamePrefixForJob,
@@ -290,6 +291,7 @@ export function renderPrompt(
   parts.push(
     "## Required final output",
     "Return JSON matching `schema/repair/codex-result.schema.json` and nothing else.",
+    "For every action, copy target_timeline_cursor from the matching cluster preflight item. Merge actions are invalid when that cursor is missing or changed.",
     "If the fix has explicit files that must differ from the latest base in the final repaired tree, set `fix_artifact.repair_contract` to an object with `must_touch` and `match` (`any` or `all`). The executor checks this once against the final branch delta after review fixes and base sync. Set `repair_contract` to null when the expected edit surface is uncertain, only represented by incomplete `likely_files`, or the work is a pure deterministic rebase.",
   );
 

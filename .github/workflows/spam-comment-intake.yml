@@ -5,6 +5,7 @@ on:
     types: [clawsweeper_spam_comment_intake]
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -25,6 +26,8 @@ jobs:
       }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
+    outputs:
+      action_ledger_ready: ${{ steps.finalize-action-ledger.outcome == 'success' }}
     steps:
       - name: Check core API budget
         id: core-budget
@@ -55,6 +58,10 @@ jobs:
             config/automation-limits.json
             prompts/pr-close-coverage-proof.md
             schema/clawsweeper-pr-close-coverage-proof.schema.json
+            scripts/hydrate-state.ts
+            src/action-ledger-files.ts
+            src/action-ledger-runtime.ts
+            src/action-ledger.ts
             src/clawsweeper-text.ts
             src/command.ts
             src/codex-env.ts
@@ -84,8 +91,13 @@ jobs:
           owner: ${{ github.repository_owner }}
           permission-contents: write
 
+      - uses: ./.github/actions/setup-action-ledger
+        if: steps.core-budget.outputs.skip != 'true'
+        id: action-ledger
+
       - uses: ./.github/actions/setup-pnpm
         if: steps.core-budget.outputs.skip != 'true'
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -94,3 +106,96 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: pnpm run repair:spam-comment-intake -- --write-report
+
+      - name: Finalize spam comment intake action ledger
+        id: finalize-action-ledger
+        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/spam-comment-intake-action-ledger-finalize.json
+
+      - name: Upload spam comment intake action ledger
+        if: ${{ always() && steps.finalize-action-ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: spam-comment-intake-action-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-ledger:
+    name: Publish immutable spam comment intake action ledger
+    needs: intake
+    if: ${{ always() && needs.intake.outputs.action_ledger_ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          hydrate-paths: ledger
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        with:
+          build-script: build:all
+
+      - name: Download spam comment intake action ledger
+        uses: actions/download-artifact@v8
+        with:
+          name: spam-comment-intake-action-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/spam-comment-intake-action-ledger
+
+      - name: Import immutable spam comment intake action ledger
+        id: import-action-ledger
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root=".clawsweeper-repair/spam-comment-intake-action-ledger"
+          import_result_file=".artifacts/spam-comment-intake-action-ledger-import.json"
+          paths_file=".artifacts/spam-comment-intake-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job intake \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+
+      - name: Publish immutable spam comment intake action ledger
+        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          paths_file=".artifacts/spam-comment-intake-action-ledger-paths.txt"
+          if [ ! -s "$paths_file" ]; then
+            echo "No immutable spam comment intake action events to publish."
+            exit 0
+          fi
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append spam comment intake action ledger"

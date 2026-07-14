@@ -304,38 +304,66 @@ test("strict base binding fails closed when mutation identity or policy access i
   );
 });
 
-test("all repair merge owners repeat the shared strict base guard immediately before merge", () => {
-  for (const [file, functionName, mergeCall] of [
-    ["src/repair/apply-result.ts", "function applyMergeAction(", "ghWithRetry(mergeArgs)"],
-    [
-      "src/repair/comment-router.ts",
-      "function executeAutomerge(",
-      "const result = runGitHubSpawnMutation(",
-    ],
-    ["src/repair/post-flight.ts", "function finalizeFixPr(", "ghWithRetry(mergeArgs)"],
-  ] as const) {
-    const source = fs.readFileSync(file, "utf8");
-    const start = source.indexOf(functionName);
-    const end = source.indexOf("\nfunction ", start + functionName.length);
-    const owner = source.slice(start, end < 0 ? undefined : end);
-    const guards = [...owner.matchAll(/runtimeStrictBaseBindingBlock\(\{/g)].map(
-      (match) => match.index,
-    );
-    const merge = owner.indexOf(mergeCall);
-    assert.equal(guards.length, 2, `${file} must check strict base binding twice`);
-    assert.ok(merge > guards[1]!, `${file} does not guard the final merge call`);
-    const finalRead = owner.lastIndexOf("fetchPullRequestView", guards[1]!);
-    assert.ok(finalRead >= 0, `${file} must refresh the pull request before its final guard`);
-    const finalBaseGate = owner.slice(finalRead, guards[1]!);
-    assert.match(finalBaseGate, /const finalBaseBranch = String\(finalView\.baseRefName \?\? ""\)/);
-    assert.match(finalBaseGate, /finalBaseBranch !== validatedBaseBranch/);
-    assert.match(finalBaseGate, /pull request base changed since merge validation/);
-    const finalGuard = owner.slice(guards[1]!, merge);
-    assert.match(finalGuard, /baseBranch: finalBaseBranch/);
-    assert.match(finalGuard, /policyReadJson: rulesetPolicyReader\(\)/);
-    assert.doesNotMatch(finalGuard, /gh(?:Json|Text|Spawn|WithRetry)\(/);
-  }
+test("all repair merge owners keep strict base binding on the ledger dispatch boundary", () => {
+  const applyOwner = functionSource("src/repair/apply-result.ts", "function applyMergeAction(");
+  const applyGuards = [...applyOwner.matchAll(/runtimeStrictBaseBindingBlock\(\{/g)].map(
+    (match) => match.index!,
+  );
+  const applyMutation = applyOwner.indexOf("runRepairMutation(", applyGuards.at(-1));
+  const applyMerge = applyOwner.indexOf("return ghText(mergeArgs)", applyMutation);
+  assert.equal(applyGuards.length, 2);
+  assert.ok(applyMutation > applyGuards.at(-1)!);
+  assert.ok(applyMerge > applyMutation);
+  assert.match(
+    applyOwner.slice(applyGuards.at(-1), applyMutation),
+    /baseBranch: absoluteFinalBaseBranch[\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+  );
+  assert.match(
+    applyOwner.slice(applyMutation, applyMerge),
+    /kind: "apply_result_merge"[\s\S]*operation: \(\) => \{/,
+  );
+
+  const routerOwner = functionSource("src/repair/comment-router.ts", "function executeAutomerge(");
+  const routerGuard = routerOwner.indexOf("runtimeStrictBaseBindingBlock({");
+  const routerMutation = routerOwner.indexOf("runGitHubSpawnMutation(", routerGuard);
+  assert.ok(routerGuard >= 0);
+  assert.ok(routerMutation > routerGuard);
+  assert.match(
+    routerOwner.slice(routerGuard, routerMutation),
+    /baseBranch: finalBaseBranch[\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+  );
+  assert.match(
+    routerOwner.slice(routerMutation),
+    /beforeDispatch: \(\) => \{[\s\S]*finalSafetyBlock: finalDispatchSafetyBlock/,
+  );
+
+  const postFlightOwner = functionSource("src/repair/post-flight.ts", "function finalizeFixPr(");
+  const postFlightHelper = functionSource(
+    "src/repair/post-flight.ts",
+    "function postFlightMergeRetryBlock(",
+  );
+  const postFlightMutation = postFlightOwner.indexOf("runRepairMutation(");
+  const postFlightMerge = postFlightOwner.indexOf("ghText(mergeArgs)", postFlightMutation);
+  const finalRetryGuard = postFlightOwner.lastIndexOf(
+    "postFlightMergeRetryBlock({",
+    postFlightMerge,
+  );
+  assert.match(
+    postFlightHelper,
+    /runtimeStrictBaseBindingBlock\(\{[\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+  );
+  assert.ok(postFlightMutation >= 0);
+  assert.ok(finalRetryGuard > postFlightMutation);
+  assert.ok(postFlightMerge > finalRetryGuard);
 });
+
+function functionSource(file: string, functionName: string): string {
+  const source = fs.readFileSync(file, "utf8");
+  const start = source.indexOf(functionName);
+  assert.ok(start >= 0, `${file} is missing ${functionName}`);
+  const end = source.indexOf("\nfunction ", start + functionName.length);
+  return source.slice(start, end < 0 ? undefined : end);
+}
 
 function strictRulesetRule(
   rulesetId = 18588237,

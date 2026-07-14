@@ -5,7 +5,10 @@ import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
   codexOutputTail,
+  createCodexTextRedactor,
   openCodexOutputCapture,
+  redactCodexText,
+  redactCodexTextChunk,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree, waitForCodexProcessExit } from "./codex-spawn.js";
 
@@ -61,15 +64,19 @@ interface RpcMessage {
 
 const options = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as WorkerOptions;
 const execOptions = parseExecOptions(options.args, process.cwd());
-const prompt = await readStdin();
+const input = readWorkerInput(await readStdin());
+const prompt = input.prompt;
 const stdout = openCodexOutputCapture(options.stdoutPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
 const stderr = openCodexOutputCapture(options.stderrPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
+const terminalRedactor = createCodexTextRedactor(input.redactValues);
 process.env.CODEX_BIN = options.command;
 const child = spawnCodex(
   [
@@ -241,7 +248,8 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   if (message.method === "item/completed") {
     const item = recordAt(message.params, ["item"]);
     if (item?.type === "agentMessage" && typeof item.text === "string") {
-      finalMessage = item.text;
+      const finalRedactor = createCodexTextRedactor(input.redactValues);
+      finalMessage = redactCodexTextChunk(finalRedactor, item.text, true);
     }
     return;
   }
@@ -257,6 +265,7 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   terminalWrite(
     `\r\n\r\n[ClawSweeper] Codex turn ${turnStatus || "finished"}. Deterministic repair gates continue in GitHub Actions.\r\n`,
   );
+  flushTerminalOutput();
   clearTimeout(timeout);
   await updateWorkState(
     failed ? "blocked" : "running",
@@ -378,7 +387,16 @@ async function updateWorkState(state: string, phase: string, summary: string): P
 }
 
 function terminalWrite(value: string): void {
-  if (terminal?.readyState === WebSocket.OPEN) terminal.send(value);
+  if (terminal?.readyState === WebSocket.OPEN) {
+    const output = redactCodexTextChunk(terminalRedactor, value);
+    if (output) terminal.send(output);
+  }
+}
+
+function flushTerminalOutput(): void {
+  if (terminal?.readyState !== WebSocket.OPEN) return;
+  const output = redactCodexTextChunk(terminalRedactor, "", true);
+  if (output) terminal.send(output);
 }
 
 async function finish(status: number, signal: NodeJS.Signals | null, error?: Error): Promise<void> {
@@ -395,6 +413,7 @@ async function finish(status: number, signal: NodeJS.Signals | null, error?: Err
     forceKillTimer = terminateCodexProcessTree(child);
     await waitForCodexProcessExit(child);
   }
+  flushTerminalOutput();
   terminal?.close(1000, "turn complete");
   closeCodexOutputCapture(stdout);
   closeCodexOutputCapture(stderr);
@@ -403,7 +422,7 @@ async function finish(status: number, signal: NodeJS.Signals | null, error?: Err
     JSON.stringify({
       status,
       signal,
-      ...(error ? { error: serializedError(error) } : {}),
+      ...(error ? { error: serializedError(error, input.redactValues) } : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
     }),
@@ -550,14 +569,30 @@ function readStdin(): Promise<string> {
   });
 }
 
+function readWorkerInput(raw: string): { prompt: string; redactValues: string[] } {
+  const value = JSON.parse(raw) as { input?: unknown; redactValues?: unknown };
+  return {
+    prompt: typeof value.input === "string" ? value.input : "",
+    redactValues: Array.isArray(value.redactValues)
+      ? value.redactValues.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function serializedError(error: Error): { message: string; code?: string } {
+function serializedError(
+  error: Error,
+  redactValues: readonly string[],
+): {
+  message: string;
+  code?: string;
+} {
   const code = "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
-    message: error.message,
+    message: redactCodexText(error.message, redactValues),
     ...(typeof code === "string" ? { code } : {}),
   };
 }

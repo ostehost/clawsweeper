@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "../action-ledger.js";
 import { githubActionsRunUrl, parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile as readJson } from "./json-file.js";
 import { escapeRegExp, slug } from "./text-utils.js";
@@ -9,7 +16,6 @@ import { renderClusterReport, writeClosedRecord } from "./publish-cluster-report
 import {
   findResultPaths,
   inferRunId,
-  latestClusterRecords,
   readArchivedClusters,
   readExistingRunRecord,
   readRunMetadata,
@@ -30,6 +36,19 @@ import {
   hydrateClosureRows,
   sortNewestClosureRowFirst,
 } from "./publish-tracked-rows.js";
+import {
+  canonicalResultPublicationDecision,
+  compareResultPublicationGeneration,
+  latestResultPublicationRecords,
+  reviewedResultRevision,
+} from "./publish-result-source.js";
+import {
+  flushRepairActionEvents,
+  recordRepairLifecycleEvent,
+  recordRepairLifecycleFailureSafely,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
+import { resolveStateJobIdentity } from "./immutable-job-handoff.js";
 
 const DASHBOARD_START = "<!-- clawsweeper-repair-dashboard:start -->";
 const DASHBOARD_END = "<!-- clawsweeper-repair-dashboard:end -->";
@@ -44,25 +63,68 @@ const CLOSE_APPLICATOR_ACTIONS = new Set([
 const MERGE_APPLICATOR_ACTIONS = new Set(["merge_candidate", "merge_canonical"]);
 const APPLICATOR_ACTIONS = new Set([...CLOSE_APPLICATOR_ACTIONS, ...MERGE_APPLICATOR_ACTIONS]);
 const POST_FLIGHT_APPLY_ACTIONS = new Set(["finalize_fix_pr", "post_merge_closeout"]);
+const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.md$/;
 const root = repoRoot();
 const archivedClusters = readArchivedClusters(root);
 
 const args = parseArgs(process.argv.slice(2));
 const inputs = args._.length > 0 ? args._ : [path.join(root, ".clawsweeper-repair", "runs")];
 const metadataByRunId = readRunMetadata(args["runs-json"]);
+const trustedLegacyWorkerHeadArg = args["trusted-legacy-worker-head"];
+const trustedLegacyWorkerHead =
+  trustedLegacyWorkerHeadArg === undefined ? null : exactHex(trustedLegacyWorkerHeadArg, 40);
+if (trustedLegacyWorkerHeadArg !== undefined && !trustedLegacyWorkerHead) {
+  throw new Error("--trusted-legacy-worker-head must be an exact lowercase 40-hex commit");
+}
 const published: LooseRecord[] = [];
 
-for (const input of inputs) {
-  for (const resultPath of findResultPaths(path.resolve(input))) {
-    const record = publishResult(resultPath);
-    published.push(record);
-  }
+if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  await runPublishResult();
 }
 
-writeAggregateApplyReport();
-if (args["write-dashboard"]) updateDashboard();
+async function runPublishResult() {
+  let commandError: unknown = null;
+  try {
+    for (const input of inputs) {
+      for (const resultPath of findResultPaths(path.resolve(input))) {
+        const record = publishResult(resultPath);
+        published.push(record);
+      }
+    }
 
-console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
+    writeAggregateApplyReport();
+    recordAggregatePreparation("apply_report");
+    if (args["write-dashboard"]) {
+      updateDashboard();
+      recordAggregatePreparation("repair_dashboard");
+    }
+
+    console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
+  } catch (error) {
+    commandError = error;
+    recordRepairLifecycleFailureSafely(aggregateLifecycle("publish_result"), {
+      component: "publish_result",
+      operation: "publication",
+      phase: "publish",
+      error,
+    });
+  }
+
+  try {
+    await flushRepairActionEvents();
+  } catch (error) {
+    if (commandError) {
+      console.error(
+        `[action-ledger] failed to finalize result publication receipts: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } else {
+      commandError = error;
+    }
+  }
+  if (commandError) throw commandError;
+}
 
 function publishResult(resultPath: string) {
   const runDir = path.dirname(resultPath);
@@ -71,6 +133,20 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
+  const sealedSource = readSealedPublishedSource(
+    runDir,
+    result,
+    clusterPlan,
+    resultPath,
+    trustedLegacyWorkerHead,
+  );
+  const sourceContext = sealedSource?.frontmatter ?? null;
+  const reviewedTargetRevision = resultPublicationSourceRevision(
+    result,
+    clusterPlan,
+    sourceContext,
+    resultPath,
+  );
   const runId = String(args["run-id"] ?? inferRunId(resultPath) ?? "");
   const metadata = runId ? metadataByRunId.get(runId) : undefined;
   const previousRecord = runId ? readExistingRunRecord(root, runId) : null;
@@ -85,6 +161,20 @@ function publishResult(resultPath: string) {
     args.conclusion ?? metadata?.conclusion ?? previousRecord?.workflow_conclusion ?? "",
   );
   const workflowStatus = String(metadata?.status ?? previousRecord?.workflow_status ?? "");
+  const workflowCreatedAt = publicationTimestamp(
+    args["workflow-created-at"] ??
+      metadata?.createdAt ??
+      metadata?.created_at ??
+      previousRecord?.workflow_created_at,
+    "--workflow-created-at",
+  );
+  const producerAttempt = publicationPositiveInteger(
+    args["producer-attempt"] ??
+      metadata?.runAttempt ??
+      metadata?.run_attempt ??
+      previousRecord?.producer_attempt,
+    "--producer-attempt",
+  );
   const repo = String(result.repo ?? "unknown/unknown");
   const owner = repo.split("/")[0] || "unknown";
   const clusterId = String(result.cluster_id ?? path.basename(runDir));
@@ -106,12 +196,18 @@ function publishResult(resultPath: string) {
     head_sha: headSha || null,
     workflow_conclusion: workflowConclusion || null,
     workflow_status: workflowStatus || null,
-    workflow_created_at:
-      metadata?.createdAt ?? metadata?.created_at ?? previousRecord?.workflow_created_at ?? null,
+    post_flight_outcome: postFlightReport.outcome ?? null,
+    post_flight_detail: postFlightReport.detail ?? null,
+    workflow_created_at: workflowCreatedAt,
     workflow_updated_at:
       metadata?.updatedAt ?? metadata?.updated_at ?? previousRecord?.workflow_updated_at ?? null,
+    producer_attempt: producerAttempt,
     result_status: result.status ?? null,
-    source_job: clusterPlan?.source_job ?? null,
+    source_job: sealedSource?.sourceJob ?? null,
+    source_state_revision: sealedSource?.stateRevision ?? null,
+    source_job_sha256: sealedSource?.jobSha256 ?? null,
+    source_provenance: sealedSource?.provenance ?? null,
+    source_worker_revision: sealedSource?.workerHeadSha ?? null,
     published_at: new Date().toISOString(),
     canonical: result.canonical ?? null,
     canonical_issue: result.canonical_issue ?? null,
@@ -133,15 +229,27 @@ function publishResult(resultPath: string) {
 
   const reportDir = path.join(root, "results", owner);
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(reportDir, `${slug(clusterId)}.md`),
-    renderClusterReport(report),
-    "utf8",
-  );
+  const existingRecords = readRunRecords(root);
+  const canonicalDecision = canonicalResultPublicationDecision(report, existingRecords);
+  const canonicalPublicationStatus = canonicalDecision.publish ? "published" : "stale_noop";
+  Object.assign(report, {
+    canonical_publication_status: canonicalPublicationStatus,
+    canonical_publication_reason: canonicalDecision.reason,
+    canonical_superseded_by_run_id: canonicalDecision.supersededByRunId,
+  });
+  if (canonicalDecision.publish) {
+    fs.writeFileSync(
+      path.join(reportDir, `${slug(clusterId)}.md`),
+      renderClusterReport(report),
+      "utf8",
+    );
+  }
 
   const runDirOut = path.join(root, "results", "runs");
   fs.mkdirSync(runDirOut, { recursive: true });
-  if (runId) {
+  const replaceRunRecord =
+    !previousRecord || compareResultPublicationGeneration(report, previousRecord) >= 0;
+  if (runId && replaceRunRecord) {
     fs.writeFileSync(
       path.join(runDirOut, `${runId}.json`),
       `${JSON.stringify(report, null, 2)}\n`,
@@ -149,20 +257,211 @@ function publishResult(resultPath: string) {
     );
   }
 
-  for (const action of report.apply_actions.filter(
-    (action: JsonValue) => action.status === "executed",
-  )) {
-    writeClosedRecord({ report, action, owner, root });
+  if (canonicalDecision.publish) {
+    for (const action of report.apply_actions.filter(
+      (action: JsonValue) => action.status === "executed",
+    )) {
+      writeClosedRecord({ report, action, owner, root });
+    }
   }
+
+  recordRepairLifecycleEvent(
+    {
+      repository: repo,
+      workKey: `${repo}:${clusterId}`,
+      clusterId,
+      sourceRevision: reviewedTargetRevision,
+      recordPath: path.posix.join("results", owner, `${slug(clusterId)}.md`),
+    },
+    {
+      type: ACTION_EVENT_TYPES.publicationLifecycle,
+      status: canonicalDecision.publish
+        ? ACTION_EVENT_STATUSES.completed
+        : ACTION_EVENT_STATUSES.skipped,
+      reasonCode: canonicalDecision.publish
+        ? ACTION_EVENT_REASON_CODES.completed
+        : ACTION_EVENT_REASON_CODES.stale,
+      mutation: false,
+      component: "publish_result",
+      operation: "publication",
+      state: canonicalDecision.publish ? "prepared" : "stale_noop",
+      publicationKind: "cluster_result",
+      eventIdentity: {
+        publicationKind: "cluster_result",
+        runId: runId || clusterId,
+        state: canonicalDecision.publish ? "prepared" : "stale_noop",
+      },
+    },
+  );
 
   return {
     cluster_id: report.cluster_id,
     run_id: report.run_id,
     result_status: report.result_status,
     workflow_conclusion: report.workflow_conclusion,
+    canonical_publication_status: canonicalPublicationStatus,
+    canonical_superseded_by_run_id: canonicalDecision.supersededByRunId,
+    run_record_status: replaceRunRecord ? "published" : "stale_noop",
     fix_counts: report.fix_counts,
     apply_counts: report.apply_counts,
   };
+}
+
+function publicationTimestamp(value: unknown, label: string): string | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!Number.isFinite(Date.parse(text))) {
+    throw new Error(`${label} must be a valid timestamp`);
+  }
+  return text;
+}
+
+function publicationPositiveInteger(value: unknown, label: string): number | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!/^[1-9][0-9]*$/.test(text)) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${label} must be a safe positive integer`);
+  }
+  return parsed;
+}
+
+export function resultPublicationSourceRevision(
+  result: LooseRecord,
+  clusterPlan: LooseRecord | null,
+  sourceContext: LooseRecord | null,
+  resultPath = "result.json",
+): string | null {
+  const revision = reviewedResultRevision(result, clusterPlan, sourceContext);
+  if (revision || !resultPublicationRequiresExactRevision(result, sourceContext)) {
+    return revision;
+  }
+  throw new Error(`repair result is missing one exact reviewed target revision: ${resultPath}`);
+}
+
+function resultPublicationRequiresExactRevision(
+  result: LooseRecord,
+  sourceContext: LooseRecord | null,
+): boolean {
+  if (String(result.canonical_pr ?? "").trim()) return true;
+
+  const source = String(sourceContext?.source ?? "").trim();
+  if (
+    ["clawsweeper_commit", "issue_implementation", "pr-repair-intake", "pr_automerge"].includes(
+      source,
+    )
+  ) {
+    return true;
+  }
+  return [
+    "source_issue_revision_sha256",
+    "expected_head_sha",
+    "commit_sha",
+    "expected_source_revision",
+    "reviewed_sha",
+  ].some((key) => sourceContext?.[key] !== undefined);
+}
+
+export function readSealedPublishedSource(
+  runDir: string,
+  result: LooseRecord,
+  clusterPlan: LooseRecord | null,
+  resultPath = "result.json",
+  trustedLegacyWorkerHead: string | null = null,
+  stateRoot?: string,
+): {
+  sourceJob: string;
+  stateRevision: string | null;
+  jobSha256: string | null;
+  frontmatter: LooseRecord | null;
+  provenance: "sealed_immutable_job" | "trusted_legacy_worker";
+  workerHeadSha: string | null;
+} | null {
+  const plannedSourceJob = String(clusterPlan?.source_job ?? "").trim();
+  const identityPath = path.join(runDir, "source-job.json");
+  const sourceJobPath = path.join(runDir, "source-job.md");
+  const hasIdentity = fs.existsSync(identityPath);
+  const hasJob = fs.existsSync(sourceJobPath);
+  if (!hasIdentity && !hasJob && !plannedSourceJob) {
+    throw new Error(`repair result is missing sealed source job provenance: ${resultPath}`);
+  }
+  if (!hasIdentity && !hasJob && trustedLegacyWorkerHead) {
+    if (!SOURCE_JOB_PATH.test(plannedSourceJob)) {
+      throw new Error(`trusted legacy source job path is invalid: ${resultPath}`);
+    }
+    return {
+      sourceJob: plannedSourceJob,
+      stateRevision: null,
+      jobSha256: null,
+      frontmatter: null,
+      provenance: "trusted_legacy_worker",
+      workerHeadSha: trustedLegacyWorkerHead,
+    };
+  }
+  if (!hasIdentity || !hasJob) {
+    throw new Error(`repair result is missing sealed source job provenance: ${resultPath}`);
+  }
+
+  const identity = readJson(identityPath);
+  const identityKeys = Object.keys(identity).sort();
+  const expectedKeys = ["job_sha256", "schema_version", "source_job", "state_revision"];
+  if (JSON.stringify(identityKeys) !== JSON.stringify(expectedKeys)) {
+    throw new Error(`sealed source job identity has unexpected fields: ${resultPath}`);
+  }
+  const sourceJob = String(identity.source_job ?? "").trim();
+  const stateRevision = exactHex(identity.state_revision, 40);
+  const jobSha256 = exactHex(identity.job_sha256, 64);
+  if (
+    identity.schema_version !== 1 ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
+    (plannedSourceJob && plannedSourceJob !== sourceJob) ||
+    !stateRevision ||
+    !jobSha256
+  ) {
+    throw new Error(`sealed source job identity is invalid: ${resultPath}`);
+  }
+  const immutableJob = resolveStateJobIdentity({
+    jobPath: sourceJob,
+    stateRevision,
+    jobSha256,
+    ...(stateRoot === undefined ? {} : { stateRoot }),
+  });
+  const sealedJobBytes = fs.readFileSync(sourceJobPath);
+  const actualJobSha256 = createHash("sha256").update(sealedJobBytes).digest("hex");
+  if (
+    actualJobSha256 !== immutableJob.jobSha256 ||
+    !sealedJobBytes.equals(Buffer.from(immutableJob.job.raw, "utf8"))
+  ) {
+    throw new Error(`sealed source job SHA-256 mismatch: ${resultPath}`);
+  }
+
+  const frontmatter = immutableJob.job.frontmatter;
+  const expectedRepo = String(result.repo ?? clusterPlan?.repo ?? "");
+  const expectedClusterId = String(result.cluster_id ?? clusterPlan?.cluster_id ?? "");
+  if (
+    String(frontmatter.repo ?? "") !== expectedRepo ||
+    String(frontmatter.cluster_id ?? "") !== expectedClusterId ||
+    (clusterPlan?.repo !== undefined && String(clusterPlan.repo) !== expectedRepo) ||
+    (clusterPlan?.cluster_id !== undefined && String(clusterPlan.cluster_id) !== expectedClusterId)
+  ) {
+    throw new Error(`sealed source job does not match the repair result target: ${resultPath}`);
+  }
+  return {
+    sourceJob,
+    stateRevision,
+    jobSha256,
+    frontmatter,
+    provenance: "sealed_immutable_job",
+    workerHeadSha: null,
+  };
+}
+
+function exactHex(value: unknown, length: 40 | 64): string | null {
+  const normalized = String(value ?? "").trim();
+  return new RegExp(`^[a-f0-9]{${length}}$`).test(normalized) ? normalized : null;
 }
 
 function updateDashboard() {
@@ -170,7 +469,7 @@ function updateDashboard() {
   if (!fs.existsSync(readmePath)) return;
   const readme = fs.readFileSync(readmePath, "utf8");
   const records = readRunRecords(root);
-  const allLatestByCluster = latestClusterRecords(records).sort(sortNewestRecordFirst);
+  const allLatestByCluster = latestResultPublicationRecords(records).sort(sortNewestRecordFirst);
   const latestByCluster = allLatestByCluster.filter(
     (record: JsonValue) => !archivedClusters.has(record.cluster_id),
   );
@@ -417,6 +716,39 @@ function writeAggregateApplyReport() {
   );
 }
 
+function recordAggregatePreparation(publicationKind: string) {
+  recordRepairLifecycleEvent(aggregateLifecycle(publicationKind), {
+    type:
+      publicationKind === "repair_dashboard"
+        ? ACTION_EVENT_TYPES.dashboardLifecycle
+        : ACTION_EVENT_TYPES.publicationLifecycle,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    mutation: false,
+    component: "publish_result",
+    operation: "publication",
+    state: "prepared",
+    publicationKind,
+    eventIdentity: {
+      publicationKind,
+      runId: String(args["run-id"] ?? "latest"),
+      state: "prepared",
+    },
+  });
+}
+
+function aggregateLifecycle(publicationKind: string, recordPath?: string): RepairLifecycleInput {
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper");
+  const runId = String(args["run-id"] ?? process.env.GITHUB_RUN_ID ?? "local");
+  return {
+    repository,
+    workKey: `${repository}:${publicationKind}:${runId}`,
+    clusterId: `publication-${publicationKind}`,
+    sourceRevision: String(args["head-sha"] ?? process.env.GITHUB_SHA ?? ""),
+    ...(recordPath ? { recordPath } : {}),
+  };
+}
+
 function summarizeActions(actions: LooseRecord[]) {
   return (Array.isArray(actions) ? actions : []).map((action: JsonValue) => ({
     target: action.target ?? null,
@@ -519,7 +851,7 @@ function normalizeReportRow(row: LooseRecord): LooseRecord {
 }
 
 function sortNewestRecordFirst(left: JsonValue, right: JsonValue) {
-  return String(right.published_at ?? "").localeCompare(String(left.published_at ?? ""));
+  return compareResultPublicationGeneration(right, left);
 }
 
 function countRows(rows: LooseRecord[], predicate: (row: LooseRecord) => boolean) {

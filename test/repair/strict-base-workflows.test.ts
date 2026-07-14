@@ -61,10 +61,6 @@ test("every merge-capable workflow binds policy reads to its exact-repository mu
         const mutationTokenId = outputStep(step.env?.GH_TOKEN, "token");
         assert.ok(mutationTokenId, `${file}:${jobName}:${step.name} has no mutation token output`);
         assert.equal(
-          outputStep(step.env?.CLAWSWEEPER_AUTHENTICATED_APP_SLUG, "app-slug"),
-          mutationTokenId,
-        );
-        assert.equal(
           outputStep(step.env?.CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID, "installation-id"),
           mutationTokenId,
         );
@@ -84,6 +80,7 @@ test("every merge-capable workflow binds policy reads to its exact-repository mu
           jobName,
           steps,
           step.env?.CLAWSWEEPER_AUTHENTICATED_APP_ID,
+          step.env?.CLAWSWEEPER_AUTHENTICATED_APP_SLUG,
           mutationTokenId,
         );
       }
@@ -114,10 +111,12 @@ function assertIdentityBinding(
   jobName: string,
   steps: WorkflowStep[],
   appIdExpression: unknown,
+  appSlugExpression: unknown,
   tokenStepId: string,
 ) {
   const identityStepId = outputStep(appIdExpression, "app_id");
   assert.ok(identityStepId, `${file}:${jobName} has no App identity output`);
+  assert.equal(outputStep(appSlugExpression, "app_slug"), identityStepId);
   const identityStep = steps.find((candidate) => candidate.id === identityStepId);
   assert.equal(outputStep(identityStep?.env?.GH_TOKEN, "token"), tokenStepId);
   assert.equal(outputStep(identityStep?.env?.APP_SLUG, "app-slug"), tokenStepId);

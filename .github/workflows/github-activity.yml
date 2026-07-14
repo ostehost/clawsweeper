@@ -55,6 +55,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
 
 concurrency:
   group: >-
@@ -103,6 +104,9 @@ jobs:
         with:
           node-version: "24"
 
+      - uses: ./.github/actions/setup-action-ledger
+        if: steps.core-budget.outputs.skip != 'true'
+
       - name: Enable pinned pnpm
         if: steps.core-budget.outputs.skip != 'true'
         shell: bash
@@ -133,6 +137,7 @@ jobs:
             ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
+        id: setup-pnpm
         if: steps.core-budget.outputs.skip != 'true'
         shell: bash
         run: |
@@ -148,13 +153,43 @@ jobs:
           done
           pnpm run build:repair
 
+      - name: Create notification ledger state token
+        id: notification-state-token
+        if: steps.core-budget.outputs.skip != 'true'
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        if: steps.core-budget.outputs.skip != 'true'
+        with:
+          token: ${{ steps.notification-state-token.outputs.token }}
+
       - name: Dispatch spam scan candidate
+        id: spam-comment-intake
         if: steps.core-budget.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
         run: |
           set -euo pipefail
           pnpm run repair:spam-comment-intake -- --write-report
+
+      - name: Finalize spam comment intake action ledger
+        id: finalize-spam-comment-intake-action-ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane spam-comment-intake \
+            --allow-empty \
+            > .artifacts/spam-comment-intake-action-ledger-manifest.json
 
       - name: Feed activity to OpenClaw
         if: steps.core-budget.outputs.skip != 'true'
@@ -166,3 +201,70 @@ jobs:
         run: |
           set -euo pipefail
           pnpm run repair:notify-github-activity -- --write-report
+
+      - name: Finalize GitHub activity notification action ledger
+        id: finalize-github-activity-notification-action-ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane github-activity \
+            --allow-empty \
+            > .artifacts/github-activity-action-ledger-manifest.json
+
+      - name: Publish immutable GitHub activity notification action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.finalize-spam-comment-intake-action-ledger.outcome == 'success' && steps.finalize-github-activity-notification-action-ledger.outcome == 'success' }}
+        env:
+          SPAM_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          paths_file=".artifacts/github-activity-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          : > "$paths_file"
+          publish_ledger() {
+            local lane="$1"
+            local manifest_file="$2"
+            local source_root="$3"
+            local import_result_file="$4"
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --allow-empty \
+              --source-root "$source_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+            jq -e --slurpfile manifest "$manifest_file" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$import_result_file" >/dev/null
+            jq -r '.paths[]?' "$import_result_file" >> "$paths_file"
+          }
+          publish_ledger \
+            spam-comment-intake \
+            .artifacts/spam-comment-intake-action-ledger-manifest.json \
+            "${SPAM_ACTION_LEDGER_OUTPUT_ROOT:?spam action ledger output root is required}" \
+            .artifacts/spam-comment-intake-action-ledger-import.json
+          publish_ledger \
+            github-activity \
+            .artifacts/github-activity-action-ledger-manifest.json \
+            "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}" \
+            .artifacts/github-activity-action-ledger-import.json
+          sort -u -o "$paths_file" "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            exit 0
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$paths_file"
+          if [ "${#action_ledger_args[@]}" -gt 0 ]; then
+            pnpm run repair:publish-main -- \
+              --message "chore: append GitHub activity notification action ledger" \
+              "${action_ledger_args[@]}"
+          fi

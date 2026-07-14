@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   finalize:
-    runs-on: ${{ inputs.runner }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - name: Create GitHub App token
@@ -50,7 +50,7 @@ jobs:
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
           permission-actions: write
-          permission-contents: write
+          permission-contents: read
           permission-issues: read
           permission-pull-requests: read
 
@@ -59,6 +59,7 @@ jobs:
           filter: blob:none
           fetch-depth: 0
           token: ${{ steps.app_token.outputs.token }}
+          persist-credentials: false
 
       - name: Create state token
         id: state-token
@@ -71,7 +72,10 @@ jobs:
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -80,17 +84,22 @@ jobs:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOW_EXECUTE: ${{ inputs.execute && vars.CLAWSWEEPER_ALLOW_EXECUTE == '1' && '1' || '0' }}
           CLAWSWEEPER_ALLOW_FIX_PR: ${{ inputs.execute && vars.CLAWSWEEPER_ALLOW_FIX_PR == '1' && '1' || '0' }}
+          EXECUTE_REQUESTED: ${{ inputs.execute }}
+          MAX_PRS: ${{ inputs.max_prs }}
+          RUNNER: blacksmith-4vcpu-ubuntu-2404
+          EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
         run: |
+          set -euo pipefail
           args=(
             --write-report
             --dispatch-repairs
-            --max-prs "${{ inputs.max_prs }}"
-            --runner "${{ inputs.runner }}"
-            --execution-runner "${{ inputs.execution_runner }}"
+            --max-prs "$MAX_PRS"
+            --runner "$RUNNER"
+            --execution-runner "$EXECUTION_RUNNER"
           )
-          if [ "${{ inputs.execute }}" = "true" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" = "1" ] && [ "${CLAWSWEEPER_ALLOW_FIX_PR}" = "1" ]; then
+          if [ "$EXECUTE_REQUESTED" = "true" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" = "1" ] && [ "${CLAWSWEEPER_ALLOW_FIX_PR}" = "1" ]; then
             args+=(--execute)
-          elif [ "${{ inputs.execute }}" = "true" ]; then
+          elif [ "$EXECUTE_REQUESTED" = "true" ]; then
             echo "execution requested, but ClawSweeper execute/fix gates are not explicitly 1; writing report without dispatching repairs"
           fi
           pnpm run repair:finalize-open-prs -- "${args[@]}"
@@ -102,6 +111,54 @@ jobs:
             --message "chore: record open PR finalizer" \
             --path repair-apply-report.json \
             --path results/finalize-open-prs.json \
+            --receipt-kind open_pr_finalizer_state \
             --path results/finalize-open-prs.md \
             --path results/finalize-open-prs-dispatch.json \
             --rebase-strategy theirs
+
+      - name: Finalize repair finalizer action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane open-pr-finalizer \
+            > .artifacts/repair-finalizer-action-ledger-manifest.json
+
+      - name: Publish immutable repair finalizer action ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/repair-finalizer-action-ledger-manifest.json"
+          event_paths_file=".artifacts/repair-finalizer-action-ledger-paths.txt"
+          import_result_file=".artifacts/repair-finalizer-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane open-pr-finalizer \
+            --manifest "$manifest_file" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Repair finalizer action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append repair finalizer action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

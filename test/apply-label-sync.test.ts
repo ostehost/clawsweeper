@@ -7,7 +7,9 @@ import {
   contextHasNonAutomationActivityAfterForTest,
   itemSourceRevisionSha256ForTest,
   renderReviewStartStatusComment,
+  writeCommentPayloadForTest,
 } from "../dist/clawsweeper.js";
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 
 import {
   implementedCloseReport,
@@ -22,6 +24,12 @@ import {
   withMockGh,
   workPlanCandidateReport,
 } from "./helpers.ts";
+
+const emptyReviewActivityCursor = createReviewedPrActivityCursor({
+  reviews: [],
+  inlineComments: [],
+});
+assert.ok(emptyReviewActivityCursor);
 
 test("command-only timeline activity is ignored only through the completed review", () => {
   const storedAtMs = Date.parse("2026-07-03T21:42:48Z");
@@ -48,6 +56,26 @@ test("command-only timeline activity is ignored only through the completed revie
     }),
     true,
   );
+});
+
+test("comment payload files are unique for concurrent mutations on one item", () => {
+  const paths = [
+    writeCommentPayloadForTest(321, "first body"),
+    writeCommentPayloadForTest(321, "second body"),
+    writeCommentPayloadForTest(321, "first body"),
+  ];
+  try {
+    assert.equal(new Set(paths).size, paths.length);
+    assert.deepEqual(
+      paths.map((path) => JSON.parse(readFileSync(path, "utf8"))),
+      [{ body: "first body" }, { body: "second body" }, { body: "first body" }],
+    );
+  } finally {
+    for (const path of paths) {
+      rmSync(path, { force: true });
+      rmSync(path.replace(/\.json$/, ".md"), { force: true });
+    }
+  }
 });
 
 test("issue apply CAS blocks a newer durable review tuple published after preflight", () => {
@@ -708,6 +736,7 @@ test("apply-decisions records PR label sync as ClawSweeper-owned churn", () => {
         item_snapshot_hash: "snapshot-a",
         item_updated_at: "2026-05-19T20:00:00Z",
         pull_head_sha: "abc123def456",
+        review_activity_cursor: emptyReviewActivityCursor,
       })}
 
 ## Summary
@@ -776,7 +805,7 @@ if (args[0] === "api" && /\\/issues\\/74478$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "contributor" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/74478\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/74478\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/74478\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
@@ -875,6 +904,7 @@ test("apply-decisions clears stale PR review labels when live head changed", () 
       item_updated_at: "2026-05-19T20:00:00Z",
       reviewed_at: "2026-05-19T20:00:00Z",
       pull_head_sha: "old-head",
+      review_activity_cursor: emptyReviewActivityCursor,
       merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
     })}
 
@@ -944,7 +974,7 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "contributor" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/74481\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/74481\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/74481\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[
@@ -1237,6 +1267,7 @@ test("apply-decisions syncs fresh-head PR labels after a command-only re-review 
       item_updated_at: "2026-07-03T21:42:48Z",
       reviewed_at: "2026-07-03T21:44:48Z",
       pull_head_sha: "bc60b889",
+      review_activity_cursor: emptyReviewActivityCursor,
       merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
     })}
 
@@ -1307,7 +1338,7 @@ if (args[0] === "api" && /\\/issues\\/74482$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "contributor" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/74482\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/74482\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/74482\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[
@@ -1805,6 +1836,7 @@ test("apply-decisions routes parsed security owner acceptance to maintainer revi
       item_created_at: "2026-02-01T00:00:00Z",
       item_updated_at: "2026-05-01T00:00:00Z",
       pull_head_sha: "head-sha",
+      review_activity_cursor: emptyReviewActivityCursor,
       merge_risk_options: JSON.stringify([
         {
           title: "Accept the reviewed security tradeoff",
@@ -1907,6 +1939,7 @@ test("apply-decisions refreshes recent PR comments after label sync adds justifi
         item_snapshot_hash: "snapshot-a",
         item_updated_at: "2026-05-19T20:00:00Z",
         pull_head_sha: "abc123def456",
+        review_activity_cursor: emptyReviewActivityCursor,
         review_comment_synced_at: "2026-05-19T23:59:00Z",
       })}
 
@@ -1973,7 +2006,7 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "contributor" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/74479\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/74479\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/74479\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[
@@ -2143,6 +2176,7 @@ test("a lease published during durable comment sync survives the write and block
       title: "Do not erase a lease while syncing the old verdict",
       pull_head_sha: headSha,
       reviewed_at: "2026-05-01T00:00:00Z",
+      review_activity_cursor: emptyReviewActivityCursor,
     });
     const synced = reportWithSyncedReviewComment(closeReport, number, "low_signal_unmergeable_pr");
     writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
@@ -2474,6 +2508,7 @@ test("apply-decisions posts an explicit close-time note before closing PR propos
       item_updated_at: "2026-05-01T00:00:00Z",
       reproduction_status: "reproduced",
       reproduction_confidence: "high",
+      review_activity_cursor: emptyReviewActivityCursor,
       fixed_pr_url: "https://github.com/openclaw/clawsweeper/pull/900",
       fixed_pr_number: "900",
       fixed_sha: "1234567890abcdef1234567890abcdef12345678",
@@ -2542,7 +2577,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "pr" && args[1] === "close" && args[2] === "321") {
   console.log("");

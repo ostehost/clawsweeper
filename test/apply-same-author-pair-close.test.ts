@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   implementedCloseReport,
   lowSignalCloseReport,
@@ -12,6 +13,43 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
+
+const reviewedPrActivity = {
+  reviews: [
+    {
+      id: 7321,
+      user: { login: "peer-reviewer" },
+      author_association: "CONTRIBUTOR",
+      state: "COMMENTED",
+      body: "reviewed the current head",
+      submitted_at: "2026-05-01T00:30:00Z",
+      commit_id: "head-sha",
+    },
+  ],
+  inlineComments: [
+    {
+      id: 8321,
+      pull_request_review_id: 7321,
+      user: { login: "peer-reviewer" },
+      author_association: "CONTRIBUTOR",
+      body: "the issue link matches this change",
+      created_at: "2026-05-01T00:31:00Z",
+      updated_at: "2026-05-01T00:31:00Z",
+      path: "src/provider.ts",
+      line: 18,
+      side: "RIGHT",
+      commit_id: "head-sha",
+    },
+  ],
+};
+const reviewedPrActivityCursor = createReviewedPrActivityCursor(reviewedPrActivity);
+if (!reviewedPrActivityCursor) throw new Error("expected bounded review activity cursor");
+const reviewedPrActivityGhBranches = `
+} else if (args[0] === "api" && /\\/pulls\\/321\\/reviews(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([${JSON.stringify(reviewedPrActivity.reviews)}]));
+} else if (args[0] === "api" && /\\/pulls\\/321\\/comments(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([${JSON.stringify(reviewedPrActivity.inlineComments)}]));
+`;
 
 test("apply-decisions starts same-author pair closes from the PR side", () => {
   const root = mkdtempSync(tmpPrefix);
@@ -42,6 +80,7 @@ test("apply-decisions starts same-author pair closes from the PR side", () => {
         title: "Paired PR",
         author: "reporter",
         action_taken: "skipped_same_author_pair",
+        review_activity_cursor: reviewedPrActivityCursor,
       }),
       321,
       "implemented_on_main",
@@ -124,7 +163,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -195,6 +235,7 @@ test("apply-decisions does not start same-author pair close when PR supersession
         author: "reporter",
         close_reason: "duplicate_or_superseded",
         action_taken: "skipped_same_author_pair",
+        review_activity_cursor: reviewedPrActivityCursor,
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
@@ -289,7 +330,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     merged_at: null,
     labels: [{ name: "bug" }]
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -346,6 +388,7 @@ test("apply-decisions records PR coverage proof retry before same-author pair sk
         author: "reporter",
         close_reason: "duplicate_or_superseded",
         action_taken: "proposed_close",
+        review_activity_cursor: reviewedPrActivityCursor,
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
@@ -450,7 +493,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     comments: 0,
     pull_request: { url: "https://api.github.com/repos/openclaw/openclaw/pulls/400" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "issue" && args[1] === "view") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
@@ -531,6 +575,7 @@ test("apply-decisions keeps same-author PR blocked when counterpart drifted", ()
         title: "Paired PR",
         author: "reporter",
         action_taken: "skipped_same_author_pair",
+        review_activity_cursor: reviewedPrActivityCursor,
       }),
       321,
       "implemented_on_main",
@@ -613,7 +658,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -707,6 +753,7 @@ test("apply-decisions keeps same-author PR blocked when counterpart needs a main
         title: "Paired PR",
         author: "reporter",
         action_taken: "skipped_same_author_pair",
+        review_activity_cursor: reviewedPrActivityCursor,
       }),
       321,
       "implemented_on_main",
@@ -794,7 +841,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
@@ -863,6 +911,7 @@ test("apply-decisions keeps same-author PR blocked when counterpart reason is di
         author: "reporter",
         action_taken: "skipped_same_author_pair",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: reviewedPrActivityCursor,
       }),
       321,
       "duplicate_or_superseded",
@@ -943,7 +992,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+${reviewedPrActivityGhBranches}
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");

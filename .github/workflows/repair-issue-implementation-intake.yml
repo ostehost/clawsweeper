@@ -83,10 +83,16 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
+        id: intake-setup-pnpm
         with:
           build-script: build:repair
+
+      - name: Setup issue implementation intake action ledger
+        id: intake-action-ledger
+        uses: ./.github/actions/setup-action-ledger
 
       - name: Resolve target repository
         id: target
@@ -150,7 +156,7 @@ jobs:
           owner: openclaw
           repositories: clawsweeper
           permission-actions: write
-          permission-contents: write
+          permission-contents: read
 
       - name: Create state token
         id: state-token
@@ -201,6 +207,7 @@ jobs:
           pnpm run repair:issue-implementation-intake -- "${args[@]}"
 
       - name: Commit intake ledger
+        id: publish-intake
         if: always()
         run: |
           set -euo pipefail
@@ -208,8 +215,39 @@ jobs:
             --message "chore: record issue implementation intake" \
             --path jobs \
             --path results \
+            --receipt-kind issue_implementation_intake_state \
             --max-attempts 12 \
             --push-attempts 4
+
+      - name: Bind immutable published job
+        id: published-job
+        if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.publish-intake.outcome == 'success' }}
+        env:
+          JOB_PATH: ${{ steps.prepare.outputs.job_path }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid issue implementation job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          immutable_job="$RUNNER_TEMP/issue-implementation-job.md"
+          git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${JOB_PATH}" > "$immutable_job"
+          job_sha256="$(sha256sum "$immutable_job" | cut -d' ' -f1)"
+          if ! printf '%s' "$job_sha256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid published job SHA-256: $job_sha256" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$immutable_job" "$JOB_PATH"
+          {
+            echo "state_revision=$state_revision"
+            echo "job_sha256=$job_sha256"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Publish automatic implementation queue status
         if: ${{ steps.prepare.outputs.should_repair == 'true' }}
@@ -221,6 +259,7 @@ jobs:
           pnpm run repair:issue-implementation-status -- \
             --repo "${{ steps.prepare.outputs.target_repo }}" \
             --item-number "${{ steps.prepare.outputs.item_number }}" \
+            --source-revision "${{ steps.prepare.outputs.source_revision }}" \
             --state "Queued" \
             --detail "Review complete; no active implementation PR was found. The Codex implementation worker is queued." \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -230,21 +269,88 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS || '' }}
-          RUNNER: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
-          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+          RUNNER: blacksmith-4vcpu-ubuntu-2404
+          EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
           MODEL: internal
+          JOB_PATH: ${{ steps.prepare.outputs.job_path }}
+          STATE_REVISION: ${{ steps.published-job.outputs.state_revision }}
+          JOB_SHA256: ${{ steps.published-job.outputs.job_sha256 }}
         run: |
           set -euo pipefail
           cap_args=()
           if [ -n "$MAX_LIVE_WORKERS" ]; then
             cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
           fi
-          git pull --rebase --autostash
-          pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
+          pnpm run repair:dispatch -- "$JOB_PATH" \
             --mode autonomous \
             --wait-for-capacity \
             "${cap_args[@]}" \
             --runner "$RUNNER" \
             --execution-runner "$EXECUTION_RUNNER" \
+            --state-revision "$STATE_REVISION" \
+            --job-sha256 "$JOB_SHA256" \
             --model "$MODEL" \
             --ref main
+
+      - name: Finalize issue implementation intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane issue-implementation-intake \
+            "${allow_empty_args[@]}" \
+            > .artifacts/issue-implementation-intake-action-ledger-manifest.json
+
+      - name: Publish immutable issue implementation intake action ledger
+        if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/issue-implementation-intake-action-ledger-manifest.json"
+          event_paths_file=".artifacts/issue-implementation-intake-action-ledger-paths.txt"
+          import_result_file=".artifacts/issue-implementation-intake-action-ledger-import.json"
+          mkdir -p .artifacts
+          test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane issue-implementation-intake \
+            --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+               [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+              exit 0
+            fi
+            echo "Issue implementation intake action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append issue implementation intake action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

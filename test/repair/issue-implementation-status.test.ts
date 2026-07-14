@@ -3,6 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 
 import {
+  isDefinitiveGitHubCommentRejection,
   issueImplementationStatusMarker,
   renderIssueImplementationStatusComment,
 } from "../../dist/repair/issue-implementation-status.js";
@@ -76,4 +77,30 @@ test("issue build workflow reports an opened PR without calling pending CI block
     workflow,
     /detail="The automatic implementation worker stopped before all post-flight gates passed:/,
   );
+});
+
+test("issue status comments use the status operation and classify definitive rejections", () => {
+  const source = fs.readFileSync("src/repair/issue-implementation-status.ts", "utf8");
+  const mutationStart = source.indexOf("const mutateCommentWithReceipt");
+  const mutationEnd = source.indexOf("mutateCommentWithReceipt();", mutationStart);
+  const mutation = source.slice(mutationStart, mutationEnd);
+
+  assert.match(mutation, /operationName: "status"/);
+  assert.match(mutation, /knownNoMutation: isDefinitiveGitHubCommentRejection/);
+  for (const status of [400, 401, 403, 404, 405, 410, 413, 415, 422, 451]) {
+    assert.equal(
+      isDefinitiveGitHubCommentRejection(
+        new Error(`gh: comment mutation rejected (HTTP ${status})`),
+      ),
+      true,
+      String(status),
+    );
+  }
+  for (const status of [408, 409, 425, 429, 500, 502, 503, 504]) {
+    assert.equal(
+      isDefinitiveGitHubCommentRejection(new Error(`gh: request failed (HTTP ${status})`)),
+      false,
+      String(status),
+    );
+  }
 });

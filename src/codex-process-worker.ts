@@ -1,10 +1,10 @@
 import { lstatSync, readFileSync, writeFileSync } from "node:fs";
-import { pipeline } from "node:stream";
 import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
+  redactCodexText,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree } from "./codex-spawn.js";
 import {
@@ -34,15 +34,18 @@ interface WorkerOptions {
 }
 
 const options = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as WorkerOptions;
+const input = await readWorkerInput();
 const childEnv: NodeJS.ProcessEnv = { ...(options.env ?? process.env), CODEX_BIN: options.command };
 if (options.isolatedPrincipal) prepareIsolatedPrincipal();
 const stdout = openCodexOutputCapture(options.stdoutPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
 const stderr = openCodexOutputCapture(options.stderrPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
 const child = spawnCodex(options.args, {
   cwd: process.cwd(),
@@ -67,9 +70,7 @@ child.stderr.on("data", (chunk: Buffer) => {
   appendCodexOutputCapture(stderr, chunk);
 });
 child.stdin.on("error", () => {});
-pipeline(process.stdin, child.stdin, (error) => {
-  if (error && !terminating && !spawnError) spawnError = error;
-});
+child.stdin.end(input.prompt);
 
 child.once("error", (error) => {
   spawnError = error;
@@ -86,7 +87,12 @@ child.once("close", (status, signal) => {
       status,
       signal,
       ...(boundaryError || timeoutError || spawnError
-        ? { error: serializedError(boundaryError ?? timeoutError ?? spawnError!) }
+        ? {
+            error: serializedError(
+              boundaryError ?? timeoutError ?? spawnError!,
+              input.redactValues,
+            ),
+          }
         : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
@@ -164,10 +170,33 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-function serializedError(error: Error): { message: string; code?: string } {
+function serializedError(
+  error: Error,
+  redactValues: readonly string[],
+): {
+  message: string;
+  code?: string;
+} {
   const code = "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
-    message: error.message,
+    message: redactCodexText(error.message, redactValues),
     ...(typeof code === "string" ? { code } : {}),
+  };
+}
+
+async function readWorkerInput(): Promise<{ prompt: string; redactValues: string[] }> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+    input?: unknown;
+    redactValues?: unknown;
+  };
+  return {
+    prompt: typeof value.input === "string" ? value.input : "",
+    redactValues: Array.isArray(value.redactValues)
+      ? value.redactValues.filter((entry): entry is string => typeof entry === "string")
+      : [],
   };
 }

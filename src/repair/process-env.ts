@@ -1,4 +1,11 @@
-import { codexLoginConfig, codexModelArgs, internalCodexModel } from "../codex-env.js";
+import {
+  codexEnv as baseCodexEnv,
+  codexInternalModelValues,
+  codexLoginConfig,
+  codexModelArgs,
+  codexSensitiveEnvValues,
+  internalCodexModel,
+} from "../codex-env.js";
 
 export { codexLoginConfig, codexModelArgs, internalCodexModel };
 
@@ -11,22 +18,19 @@ export function repairGhEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEn
 }
 
 export function codexSubprocessEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env, ...clawsweeperGitIdentityEnv() };
-  delete env.GH_TOKEN;
-  delete env.GITHUB_TOKEN;
-  delete env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN;
-  delete env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN;
-  delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
-  delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
-  for (const key of Object.keys(env)) {
-    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
-  }
-  if (process.env.GITHUB_ACTIONS === "true") {
-    delete env.OPENAI_API_KEY;
-    delete env.CODEX_API_KEY;
-  }
-  delete env.CLAWSWEEPER_INTERNAL_MODEL;
-  return withoutColor(env);
+  return withoutColor({
+    ...baseCodexEnv({ preserveCodexAuth: process.env.GITHUB_ACTIONS !== "true" }),
+    ...clawsweeperGitIdentityEnv(),
+  });
+}
+
+export function repairCodexRedactValues(
+  env: NodeJS.ProcessEnv = process.env,
+  codexHome?: string,
+): string[] {
+  return [...new Set([...codexSensitiveEnvValues(env), ...codexInternalModelValues(codexHome)])]
+    .filter((value) => value.length >= 6)
+    .sort((left, right) => right.length - left.length);
 }
 
 export function repairCodexReasoningEffort(value = process.env.CLAWSWEEPER_CODEX_REASONING_EFFORT) {

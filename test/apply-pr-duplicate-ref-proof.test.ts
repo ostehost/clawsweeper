@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   lowSignalCloseReport,
   promotionGhMock,
@@ -12,6 +13,12 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
+
+const emptyReviewActivityCursor = createReviewedPrActivityCursor({
+  reviews: [],
+  inlineComments: [],
+});
+assert.ok(emptyReviewActivityCursor);
 
 test("apply-decisions ignores bare refs inside cross-repo markdown link labels for duplicate proof", () => {
   const root = mkdtempSync(tmpPrefix);
@@ -28,6 +35,7 @@ test("apply-decisions ignores bare refs inside cross-repo markdown link labels f
         number: 357,
         title: "Provider route fallback",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify([
           "Superseded by [PR #400](https://github.com/other/repo/pull/400)",
         ]),
@@ -109,6 +117,7 @@ test("apply-decisions ignores bare refs inside same-repo markdown link labels fo
         number: 358,
         title: "Provider route fallback",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify([
           "Superseded by [fixes #123](https://github.com/openclaw/openclaw/pull/400)",
         ]),
@@ -211,6 +220,7 @@ test("apply-decisions keeps newline-start bare PR refs tied to their own line", 
         number: 358,
         title: "Provider route fallback",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify(["Links:\n#400 supersedes this PR and #500 is related"]),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
@@ -315,6 +325,7 @@ test("apply-decisions ignores unrelated same-line bare PR refs for duplicate pro
         number: 361,
         title: "Provider route fallback",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify(["Superseded by #400; #500 is related"]),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
@@ -426,6 +437,7 @@ for (const scenario of [
           number: scenario.number,
           title: "Provider route fallback",
           close_reason: "duplicate_or_superseded",
+          review_activity_cursor: emptyReviewActivityCursor,
           work_cluster_refs: JSON.stringify([`Superseded by ${scenario.refs}`]),
         }).replace(
           "Closing this PR because the branch is not a useful landing base.",
@@ -540,6 +552,7 @@ test("apply-decisions does not proof-gate duplicate PR closes with bare issue re
         number: 357,
         title: "Provider route fallback",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify(["Duplicate of #456"]),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
@@ -616,6 +629,7 @@ test("apply-decisions preserves full PR URL evidence over later bare refs", () =
         number: 348,
         title: "Already proposed duplicate close",
         close_reason: "duplicate_or_superseded",
+        review_activity_cursor: emptyReviewActivityCursor,
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),

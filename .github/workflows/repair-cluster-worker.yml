@@ -1,6 +1,6 @@
 name: repair cluster worker
 
-run-name: ${{ inputs.dispatch_key && format('{0} [{1}]', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.dispatch_key) || contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job) }}
+run-name: ${{ inputs.job_sha256 && (inputs.dispatch_key && format('{0} [{1}] ({2})', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.dispatch_key, inputs.job_sha256) || format('{0} ({1})', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.job_sha256)) || (inputs.dispatch_key && format('{0} [{1}]', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.dispatch_key) || contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job)) }}
 
 on:
   workflow_dispatch:
@@ -11,6 +11,21 @@ on:
         type: string
       dispatch_key:
         description: "Optional command-router idempotency key"
+        required: false
+        default: ""
+        type: string
+      payload_version:
+        description: "Dispatch payload contract; new producers send 2"
+        required: false
+        default: ""
+        type: string
+      state_revision:
+        description: "Immutable clawsweeper-state commit containing the exact job"
+        required: false
+        default: ""
+        type: string
+      job_sha256:
+        description: "SHA-256 of the exact immutable job bytes"
         required: false
         default: ""
         type: string
@@ -33,14 +48,6 @@ on:
         required: true
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
-      planner_sandbox:
-        description: "Codex planning sandbox; danger-full-access is for trusted ephemeral runner fallback only"
-        required: true
-        default: read-only
-        type: choice
-        options:
-          - read-only
-          - danger-full-access
       model:
         description: "Deprecated compatibility value; the workflow uses its fixed internal model"
         required: true
@@ -57,10 +64,10 @@ on:
         default: false
         type: boolean
       requeue_depth:
-        description: "Bounded automatic repair retry depth"
+        description: "Current requeue depth carried by the prior dispatch"
         required: false
-        default: 0
-        type: number
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -72,10 +79,11 @@ env:
   CLAWSWEEPER_MODEL: internal
 
 concurrency:
-  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}', inputs.job, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
+  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}-{2}', inputs.job, inputs.job_sha256, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
   # Keep an active execute run alive so its temporary gate cleanup can finish;
-  # GitHub still coalesces pending runs in this group to the newest dispatch.
+  # queue every immutable generation instead of replacing an older pending run.
   cancel-in-progress: false
+  queue: max
 
 jobs:
   receipt:
@@ -96,6 +104,7 @@ jobs:
         env:
           DISPATCH_KEY: ${{ inputs.dispatch_key }}
           JOB_PATH: ${{ inputs.job }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -109,6 +118,9 @@ jobs:
             *) title="repair cluster $JOB_PATH" ;;
           esac
           expected_title="${title} [${DISPATCH_KEY}]"
+          if [ -n "$JOB_SHA256" ]; then
+            expected_title="${expected_title} (${JOB_SHA256})"
+          fi
           owner="$(bash scripts/dispatch-receipt-owner.sh \
             repair-cluster-worker.yml "$expected_title" "$GITHUB_RUN_ID" "Plan and review cluster")"
           if [ "$owner" = "owner" ]; then
@@ -124,13 +136,17 @@ jobs:
     if: ${{ needs.receipt.outputs.proceed == 'true' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
     outputs:
       allow_execute: ${{ steps.capture_gates.outputs.allow_execute }}
       allow_fix_pr: ${{ steps.capture_gates.outputs.allow_fix_pr }}
       allow_merge: ${{ steps.capture_gates.outputs.allow_merge }}
       job_exists: ${{ steps.check_job.outputs.job_exists }}
-      producer_attempt: ${{ steps.producer_attempt.outputs.value }}
-      state_sha: ${{ steps.state_ground_truth.outputs.sha }}
+      state_revision: ${{ steps.immutable-job.outputs.state_revision }}
+      job_sha256: ${{ steps.immutable-job.outputs.job_sha256 }}
+      effective_mode: ${{ steps.recovery_inputs.outputs.effective_mode }}
     env:
       JOB_PATH: ${{ inputs.job }}
       WORKER_MODE: ${{ inputs.mode }}
@@ -146,19 +162,61 @@ jobs:
       CLAWSWEEPER_MAX_REVIEW_COMMENTS_PER_PR: ${{ vars.CLAWSWEEPER_MAX_REVIEW_COMMENTS_PER_PR || '50' }}
       CLAWSWEEPER_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1800000' }}
       CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
-      CLAWSWEEPER_CODEX_PLANNER_SANDBOX: ${{ inputs.planner_sandbox }}
       CLAWSWEEPER_STEERABLE_CODEX: ${{ vars.CLAWSWEEPER_STEERABLE_CODEX || '0' }}
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
-      - name: Record producer attempt
-        id: producer_attempt
-        run: echo "value=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v7
         with:
           filter: blob:none
           persist-credentials: false
+
+      - name: Validate job handoff contract
+        id: job-contract
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          PAYLOAD_VERSION: ${{ inputs.payload_version }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid immutable job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          payload_version="${PAYLOAD_VERSION:-1}"
+          case "$payload_version" in
+            1|2) ;;
+            *)
+              echo "Unsupported repair payload version: $payload_version" >&2
+              exit 1
+              ;;
+          esac
+          if { [ -n "$STATE_REVISION" ] && [ -z "$JOB_SHA256" ]; } ||
+             { [ -z "$STATE_REVISION" ] && [ -n "$JOB_SHA256" ]; }; then
+            echo "state_revision and job_sha256 must be provided together." >&2
+            exit 1
+          fi
+          if [ "$payload_version" = "2" ] &&
+             { [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; }; then
+            echo "repair payload version 2 requires state_revision and job_sha256." >&2
+            exit 1
+          fi
+          if [ -n "$STATE_REVISION" ]; then
+            if ! printf '%s' "$STATE_REVISION" | grep -Eq '^[a-f0-9]{40}$'; then
+              echo "Invalid immutable state revision: $STATE_REVISION" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$JOB_SHA256" | grep -Eq '^[a-f0-9]{64}$'; then
+              echo "Invalid immutable job SHA-256: $JOB_SHA256" >&2
+              exit 1
+            fi
+          fi
+          echo "payload_version=$payload_version" >> "$GITHUB_OUTPUT"
+          echo "legacy_unsealed=$([ -z "$STATE_REVISION" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: cluster-action-ledger
 
       - name: Resolve target owner
         id: target
@@ -198,21 +256,133 @@ jobs:
           sparse-checkout: jobs
           persist-credentials: false
 
-      - name: Record immutable state ground truth
-        id: state_ground_truth
+      - name: Resolve immutable job handoff
+        id: immutable-job
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+          LEGACY_UNSEALED: ${{ steps.job-contract.outputs.legacy_unsealed }}
         run: |
           set -euo pipefail
-          sha="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
-          printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          state_revision="$STATE_REVISION"
+          job_sha256="$JOB_SHA256"
+          if [ "$LEGACY_UNSEALED" = "true" ]; then
+            state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+            source_path="$CLAWSWEEPER_STATE_DIR/$JOB_PATH"
+            if [ ! -f "$source_path" ]; then
+              echo "Legacy repair job is missing from the pinned state checkout: $JOB_PATH" >&2
+              exit 1
+            fi
+            job_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+            echo "::notice title=Legacy repair payload rebound::Pinned $JOB_PATH to state revision $state_revision and forced plan-only execution."
+          fi
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid resolved state revision: $state_revision" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$job_sha256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid resolved job SHA-256: $job_sha256" >&2
+            exit 1
+          fi
+          {
+            echo "state_revision=$state_revision"
+            echo "job_sha256=$job_sha256"
+            echo "legacy_unsealed=$LEGACY_UNSEALED"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Persist immutable recovery inputs
+        id: recovery_inputs
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ steps.immutable-job.outputs.state_revision }}
+          JOB_SHA256: ${{ steps.immutable-job.outputs.job_sha256 }}
+          LEGACY_UNSEALED: ${{ steps.immutable-job.outputs.legacy_unsealed }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_MODE" in
+            plan|execute|autonomous) ;;
+            *)
+              echo "Invalid requested repair mode: $REQUESTED_MODE" >&2
+              exit 1
+              ;;
+          esac
+          effective_mode="$REQUESTED_MODE"
+          if [ "$LEGACY_UNSEALED" = "true" ] && [ "$effective_mode" != "plan" ]; then
+            echo "Legacy unsealed repair payloads are restricted to plan mode."
+            effective_mode="plan"
+          elif [ "$effective_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then
+            echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; persisting plan-only mode for requested $effective_mode run"
+            effective_mode="plan"
+          fi
+          mkdir -p .clawsweeper-repair/recovery-inputs
+          EFFECTIVE_MODE="$effective_mode" node <<'NODE'
+          const fs = require("node:fs");
+          const input = {
+            schema_version: 1,
+            source_job: process.env.JOB_PATH,
+            state_revision: process.env.STATE_REVISION,
+            job_sha256: process.env.JOB_SHA256,
+            requested_mode: process.env.REQUESTED_MODE,
+            effective_mode: process.env.EFFECTIVE_MODE,
+          };
+          fs.writeFileSync(
+            ".clawsweeper-repair/recovery-inputs/workflow-inputs.json",
+            `${JSON.stringify(input, null, 2)}\n`,
+          );
+          NODE
+          echo "effective_mode=$effective_mode" >> "$GITHUB_OUTPUT"
+
+      - name: Upload immutable recovery inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/recovery-inputs/workflow-inputs.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Checkout immutable state job
+        uses: actions/checkout@v7
+        with:
+          repository: openclaw/clawsweeper-state
+          ref: ${{ steps.immutable-job.outputs.state_revision }}
+          path: .clawsweeper-repair/immutable-state
+          token: ${{ steps.state-read-token.outputs.token }}
+          fetch-depth: 1
+          sparse-checkout: ${{ inputs.job }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
       - name: Check job file
         id: check_job
         env:
           JOB_PATH: ${{ inputs.job }}
-        run: scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
+          STATE_REVISION: ${{ steps.immutable-job.outputs.state_revision }}
+          JOB_SHA256: ${{ steps.immutable-job.outputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          actual_revision="$(git -C .clawsweeper-repair/immutable-state rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable state revision mismatch: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
+          if [ ! -f "$source_path" ]; then
+            echo "Immutable job is missing at $JOB_PATH." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable job SHA-256 mismatch: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$source_path" "$JOB_PATH"
+          echo "job_exists=1" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-pnpm
+        id: cluster-setup-pnpm
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
@@ -262,11 +432,21 @@ jobs:
 
       - name: Capture execution gates
         id: capture_gates
+        env:
+          EFFECTIVE_MODE: ${{ steps.recovery_inputs.outputs.effective_mode }}
         run: |
+          allow_execute="${CLAWSWEEPER_ALLOW_EXECUTE}"
+          allow_fix_pr="${CLAWSWEEPER_ALLOW_FIX_PR}"
+          allow_merge="${CLAWSWEEPER_ALLOW_MERGE}"
+          if [ "$EFFECTIVE_MODE" = "plan" ]; then
+            allow_execute=0
+            allow_fix_pr=0
+            allow_merge=0
+          fi
           {
-            echo "allow_execute=${CLAWSWEEPER_ALLOW_EXECUTE}"
-            echo "allow_fix_pr=${CLAWSWEEPER_ALLOW_FIX_PR}"
-            echo "allow_merge=${CLAWSWEEPER_ALLOW_MERGE}"
+            echo "allow_execute=$allow_execute"
+            echo "allow_fix_pr=$allow_fix_pr"
+            echo "allow_merge=$allow_merge"
           } >> "$GITHUB_OUTPUT"
 
       - name: Resolve run-scoped Codex session
@@ -290,13 +470,20 @@ jobs:
         with:
           codex-home: ${{ steps.codex_session.outputs.codex_home }}
 
+      - name: Register repair lifecycle receipt
+        id: lifecycle_session
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          CLAWSWEEPER_ACTION_SESSION_REMOTE: "0"
+        run: pnpm run repair:action-session -- register "$JOB_PATH"
+
       - name: Register steerable Action session
         id: crabfleet_session
         if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs.dry_run }}
         env:
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
-        run: pnpm run repair:action-session -- register "$JOB_PATH"
+        run: node dist/repair/action-session.js register "$JOB_PATH" --skip-repair-receipt
 
       - name: Verify GitHub read token
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
@@ -323,12 +510,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          EFFECTIVE_MODE: ${{ steps.recovery_inputs.outputs.effective_mode }}
         run: |
           set -euo pipefail
-          worker_mode="$WORKER_MODE"
-          if [ "$worker_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then
-            echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; rendering plan-only output for requested $worker_mode run"
-            worker_mode="plan"
+          worker_mode="$EFFECTIVE_MODE"
+          if [ -z "$worker_mode" ]; then
+            echo "Persisted effective repair mode is missing." >&2
+            exit 1
           fi
           args=("$JOB_PATH" --mode "$worker_mode")
           if [ "$DRY_RUN" = "true" ]; then
@@ -371,7 +559,6 @@ jobs:
             CLAWSWEEPER_MAX_REVIEW_COMMENTS_PER_PR
             CLAWSWEEPER_CODEX_TIMEOUT_MS
             CLAWSWEEPER_CODEX_REASONING_EFFORT
-            CLAWSWEEPER_CODEX_PLANNER_SANDBOX
             CLAWSWEEPER_STEERABLE_CODEX
             CLAWSWEEPER_MODEL
             OPENCLAW_LOCAL_CHECK
@@ -413,30 +600,89 @@ jobs:
           STAGED_ROOT: ${{ runner.temp }}/clawsweeper-worker-stage
         run: pnpm run repair:review-results -- "$STAGED_ROOT"
 
+      - name: Seal immutable source in reviewed worker artifacts
+        if: ${{ steps.stage-worker.outcome == 'success' }}
+        env:
+          STAGED_ROOT: ${{ runner.temp }}/clawsweeper-worker-stage
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ steps.immutable-job.outputs.state_revision }}
+          JOB_SHA256: ${{ steps.immutable-job.outputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          source_root=".clawsweeper-repair/immutable-state"
+          source_path="$source_root/$JOB_PATH"
+          actual_revision="$(git -C "$source_root" rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable state revision mismatch while sealing reviewed artifacts: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable job SHA-256 mismatch while sealing reviewed artifacts: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          for required in result.json cluster-plan.json; do
+            candidate="$STAGED_ROOT/$required"
+            if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+              echo "Reviewed worker artifacts are missing regular $required." >&2
+              exit 1
+            fi
+          done
+          for sealed in source-job.md source-job.json; do
+            if [ -e "$STAGED_ROOT/$sealed" ] || [ -L "$STAGED_ROOT/$sealed" ]; then
+              echo "Reviewed worker artifacts unexpectedly contain $sealed before sealing." >&2
+              exit 1
+            fi
+          done
+          cp "$source_path" "$STAGED_ROOT/source-job.md"
+          SOURCE_IDENTITY_PATH="$STAGED_ROOT/source-job.json" node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          fs.writeFileSync(
+            process.env.SOURCE_IDENTITY_PATH,
+            `${JSON.stringify(
+              {
+                job_sha256: process.env.JOB_SHA256,
+                schema_version: 1,
+                source_job: process.env.JOB_PATH,
+                state_revision: process.env.STATE_REVISION,
+              },
+              null,
+              2,
+            )}\n`,
+          );
+          NODE
+
       - name: Upload worker transfer artifacts
-        if: ${{ success() && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
+        if: ${{ success() && steps.stage-worker.outcome == 'success' && (steps.recovery_inputs.outputs.effective_mode == 'execute' || steps.recovery_inputs.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-worker-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/clawsweeper-worker-stage/result.json
             ${{ runner.temp }}/clawsweeper-worker-stage/cluster-plan.json
+            ${{ runner.temp }}/clawsweeper-worker-stage/source-job.md
+            ${{ runner.temp }}/clawsweeper-worker-stage/source-job.json
           if-no-files-found: error
 
       - name: Upload final worker artifacts
-        if: ${{ success() && !((inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run) }}
+        if: ${{ success() && steps.stage-worker.outcome == 'success' && !((steps.recovery_inputs.outputs.effective_mode == 'execute' || steps.recovery_inputs.outputs.effective_mode == 'autonomous') && !inputs.dry_run) }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/clawsweeper-worker-stage/result.json
             ${{ runner.temp }}/clawsweeper-worker-stage/cluster-plan.json
+            ${{ runner.temp }}/clawsweeper-worker-stage/source-job.md
+            ${{ runner.temp }}/clawsweeper-worker-stage/source-job.json
           if-no-files-found: error
 
       - name: Record planning completion
-        if: ${{ success() && steps.crabfleet_session.outcome == 'success' }}
+        if: ${{ success() && steps.lifecycle_session.outcome == 'success' }}
+        env:
+          EFFECTIVE_MODE: ${{ steps.recovery_inputs.outputs.effective_mode }}
         run: |
-          if [[ "$WORKER_MODE" == "plan" || "$DRY_RUN" == "true" ]]; then
+          if [[ "$EFFECTIVE_MODE" == "plan" || "$DRY_RUN" == "true" ]]; then
             pnpm run repair:action-session -- update \
               --state completed \
               --phase "done" \
@@ -450,14 +696,43 @@ jobs:
           fi
 
       - name: Record planning failure
-        if: ${{ failure() && steps.crabfleet_session.outcome == 'success' }}
+        if: ${{ failure() && steps.lifecycle_session.outcome == 'success' }}
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase planning_failed --summary "Planning Action failed" --completion-reason action_failed
+
+      - name: Finalize cluster repair action ledger
+        id: finalize-cluster-action-ledger
+        if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          allow_empty_args=()
+          allow_empty=false
+          if [ "${{ steps.check_job.outputs.job_exists }}" != "1" ] ||
+             [ "${{ steps.self_heal_head.outputs.matched }}" = "false" ]; then
+            allow_empty=true
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane cluster \
+            "${allow_empty_args[@]}" \
+            > "$output_root/repair-action-ledger-manifest.json"
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
+
+      - name: Upload cluster repair action ledger
+        if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.cluster-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
 
   execute:
     name: Prepare reviewed cluster actions without write credentials
     needs: cluster
-    if: ${{ needs.cluster.result == 'success' && needs.cluster.outputs.job_exists == '1' && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
+    if: ${{ needs.cluster.result == 'success' && needs.cluster.outputs.job_exists == '1' && (needs.cluster.outputs.effective_mode == 'execute' || needs.cluster.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 75
     permissions:
@@ -466,6 +741,7 @@ jobs:
     outputs:
       prepared_artifact_id: ${{ steps.upload-prepared.outputs.artifact-id }}
       prepared_artifact_digest: ${{ steps.upload-prepared.outputs.artifact-digest }}
+      worker_artifact_id: ${{ steps.worker-transfer-artifact.outputs.artifact_id }}
     env:
       JOB_PATH: ${{ inputs.job }}
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
@@ -492,6 +768,9 @@ jobs:
         with:
           filter: blob:none
           persist-credentials: false
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: execute-action-ledger
 
       - name: Resolve target owner
         id: target
@@ -531,11 +810,44 @@ jobs:
           sparse-checkout: jobs
           persist-credentials: false
 
+      - name: Checkout immutable execution job
+        uses: actions/checkout@v7
+        with:
+          repository: openclaw/clawsweeper-state
+          ref: ${{ needs.cluster.outputs.state_revision }}
+          path: .clawsweeper-repair/immutable-state
+          token: ${{ steps.state-read-token.outputs.token }}
+          fetch-depth: 1
+          sparse-checkout: ${{ inputs.job }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check job file
         id: check_job
         env:
           JOB_PATH: ${{ inputs.job }}
-        run: scripts/restore-repair-job.sh "$JOB_PATH" "execute"
+          STATE_REVISION: ${{ needs.cluster.outputs.state_revision }}
+          JOB_SHA256: ${{ needs.cluster.outputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          actual_revision="$(git -C .clawsweeper-repair/immutable-state rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable execution state revision mismatch: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
+          if [ ! -f "$source_path" ]; then
+            echo "Immutable execution job is missing at $JOB_PATH." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable execution job SHA-256 mismatch: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$source_path" "$JOB_PATH"
+          echo "job_exists=1" >> "$GITHUB_OUTPUT"
 
       - name: Resolve run-scoped Codex session
         id: codex_session
@@ -552,7 +864,6 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         id: execute-setup-pnpm
-        if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
 
@@ -619,12 +930,108 @@ jobs:
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
         run: pnpm run repair:action-session -- register "$JOB_PATH"
 
+      - name: Resolve latest worker transfer artifact
+        id: worker-transfer-artifact
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-worker-artifacts.json
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            > "$ARTIFACT_INVENTORY"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          import { selectLatestAttemptArtifact } from "./dist/repair/workflow-attempt-cohort.js";
+
+          const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
+          const artifact = selectLatestAttemptArtifact(
+            pages,
+            `clawsweeper-repair-worker-${process.env.RUN_ID}`,
+            process.env.RUN_ATTEMPT,
+          );
+          if (!artifact) {
+            throw new Error(
+              `no worker transfer artifact is available through attempt ${process.env.RUN_ATTEMPT}`,
+            );
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            [
+              `artifact_id=${artifact.id}`,
+              `artifact_name=${artifact.name}`,
+              `producer_attempt=${artifact.attempt}`,
+              "",
+            ].join("\n"),
+          );
+          NODE
+
       - name: Download worker artifacts
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         uses: actions/download-artifact@v8
         with:
-          name: clawsweeper-repair-worker-${{ github.run_id }}-${{ needs.cluster.outputs.producer_attempt }}
+          artifact-ids: ${{ steps.worker-transfer-artifact.outputs.artifact_id }}
           path: .clawsweeper-repair/runs
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify immutable source seal in worker artifacts
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ needs.cluster.outputs.state_revision }}
+          JOB_SHA256: ${{ needs.cluster.outputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          source_root=".clawsweeper-repair/immutable-state"
+          source_path="$source_root/$JOB_PATH"
+          actual_revision="$(git -C "$source_root" rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable execution state revision mismatch while sealing artifacts: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable execution job SHA-256 mismatch while sealing artifacts: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+
+          sealed_count=0
+          while IFS= read -r -d '' result_path; do
+            run_dir="$(dirname "$result_path")"
+            for required in cluster-plan.json source-job.md source-job.json; do
+              candidate="$run_dir/$required"
+              if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+                echo "Downloaded worker artifacts are missing regular $required." >&2
+                exit 1
+              fi
+            done
+            if ! cmp -s "$source_path" "$run_dir/source-job.md"; then
+              echo "Downloaded worker artifact source job does not match immutable state." >&2
+              exit 1
+            fi
+            jq -e \
+              --arg source_job "$JOB_PATH" \
+              --arg state_revision "$STATE_REVISION" \
+              --arg job_sha256 "$JOB_SHA256" '
+                type == "object" and
+                keys == ["job_sha256", "schema_version", "source_job", "state_revision"] and
+                .schema_version == 1 and
+                .source_job == $source_job and
+                .state_revision == $state_revision and
+                .job_sha256 == $job_sha256
+              ' "$run_dir/source-job.json" >/dev/null
+            sealed_count=$((sealed_count + 1))
+          done < <(find .clawsweeper-repair/runs -type f -name result.json -print0)
+
+          if [ "$sealed_count" -ne 1 ]; then
+            echo "Downloaded worker artifacts must contain exactly one sealed result; found $sealed_count." >&2
+            exit 1
+          fi
 
       - name: Resolve one exact worker result
         id: execution_result
@@ -795,12 +1202,40 @@ jobs:
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase preparation_failed --summary "Repair preparation failed before immutable transfer" --completion-reason action_failed
 
+      - name: Finalize execution repair action ledger
+        id: finalize-execute-action-ledger
+        if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          allow_empty_args=()
+          if [ "${{ steps.check_job.outputs.job_exists }}" != "1" ] ||
+             [ "${{ steps.self_heal_head.outputs.matched }}" = "false" ] ||
+             [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ] ||
+             [ "${CLAWSWEEPER_ALLOW_FIX_PR}" != "1" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane execute \
+            "${allow_empty_args[@]}" \
+            > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Upload execution repair action ledger
+        if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.execute-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
   publish:
     name: Publish reviewed cluster actions
     needs:
       - cluster
       - execute
-    if: ${{ always() && needs.execute.result == 'success' && needs.cluster.outputs.job_exists == '1' && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
+    if: ${{ always() && needs.execute.result == 'success' && needs.cluster.outputs.job_exists == '1' && (needs.cluster.outputs.effective_mode == 'execute' || needs.cluster.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -828,6 +1263,9 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: publish-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
         id: publish-setup-pnpm
         with:
@@ -836,8 +1274,11 @@ jobs:
       - name: Download immutable cluster result ground truth
         uses: actions/download-artifact@v8
         with:
-          name: clawsweeper-repair-worker-${{ github.run_id }}-${{ needs.cluster.outputs.producer_attempt }}
+          artifact-ids: ${{ needs.execute.outputs.worker_artifact_id }}
           path: .clawsweeper-repair/runs
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       - name: Download isolated prepared publication transfer
         if: ${{ needs.execute.outputs.prepared_artifact_id != '' }}
@@ -860,7 +1301,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: openclaw/clawsweeper-state
-          ref: ${{ needs.cluster.outputs.state_sha }}
+          ref: ${{ needs.cluster.outputs.state_revision }}
           path: clawsweeper-state-ground-truth
           token: ${{ steps.ground-truth-state-token.outputs.token }}
           sparse-checkout: ${{ inputs.job }}
@@ -891,6 +1332,10 @@ jobs:
 
       - name: Resolve one immutable cluster result
         id: ground_truth
+        env:
+          SOURCE_JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ needs.cluster.outputs.state_revision }}
+          JOB_SHA256: ${{ needs.cluster.outputs.job_sha256 }}
         run: |
           set -euo pipefail
           node --input-type=module - "$JOB_PATH" "$GITHUB_OUTPUT" <<'NODE'
@@ -923,11 +1368,38 @@ jobs:
           }
           const resultPath = matches[0];
           const runDir = path.dirname(resultPath);
-          for (const required of ["cluster-plan.json"]) {
+          for (const required of ["cluster-plan.json", "source-job.md", "source-job.json"]) {
             const candidate = path.join(runDir, required);
-            if (!fs.statSync(candidate).isFile() || fs.lstatSync(candidate).isSymbolicLink()) {
+            if (
+              !fs.existsSync(candidate) ||
+              !fs.statSync(candidate).isFile() ||
+              fs.lstatSync(candidate).isSymbolicLink()
+            ) {
               throw new Error(`immutable cluster result is missing regular ${required}`);
             }
+          }
+          const sourceJobPath = path.join(runDir, "source-job.md");
+          const sourceIdentityPath = path.join(runDir, "source-job.json");
+          const sealedSource = fs.readFileSync(sourceJobPath);
+          const immutableSource = fs.readFileSync(jobPath);
+          if (!sealedSource.equals(immutableSource)) {
+            throw new Error("sealed cluster source does not match immutable job ground truth");
+          }
+          const sourceDigest = createHash("sha256").update(sealedSource).digest("hex");
+          if (sourceDigest !== process.env.JOB_SHA256) {
+            throw new Error("sealed cluster source SHA-256 does not match immutable handoff");
+          }
+          const sourceIdentity = JSON.parse(fs.readFileSync(sourceIdentityPath, "utf8"));
+          const identityKeys = Object.keys(sourceIdentity).sort();
+          if (
+            JSON.stringify(identityKeys) !==
+              JSON.stringify(["job_sha256", "schema_version", "source_job", "state_revision"]) ||
+            sourceIdentity.schema_version !== 1 ||
+            sourceIdentity.source_job !== process.env.SOURCE_JOB_PATH ||
+            sourceIdentity.state_revision !== process.env.STATE_REVISION ||
+            sourceIdentity.job_sha256 !== process.env.JOB_SHA256
+          ) {
+            throw new Error("sealed cluster source identity does not match immutable handoff");
           }
           const sha256 = createHash("sha256").update(fs.readFileSync(resultPath)).digest("hex");
           fs.appendFileSync(
@@ -1003,6 +1475,18 @@ jobs:
             echo "mode=$mode"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Create central workflow read token after validation
+        id: workflow-read-token
+        if: ${{ steps.publication_validation.outputs.ready == 'true' && steps.publication_validation.outputs.mode == 'no-publication' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: openclaw
+          repositories: clawsweeper
+          permission-actions: read
+          permission-contents: read
+
       - name: Create narrow no-publication mutation token after validation
         id: target_post_flight_token
         if: ${{ steps.publication_validation.outputs.ready == 'true' && steps.publication_validation.outputs.mode == 'no-publication' }}
@@ -1021,7 +1505,7 @@ jobs:
         env:
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
-        run: node dist/repair/action-session.js register "$JOB_PATH"
+        run: node dist/repair/action-session.js register "$JOB_PATH" --skip-repair-receipt
 
       - name: Publish automatic implementation build status
         if: ${{ steps.publication_validation.outputs.ready == 'true' && steps.publication_validation.outputs.mode == 'no-publication' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
@@ -1082,12 +1566,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
           APP_SLUG: ${{ steps.target_post_flight_token.outputs.app-slug }}
+          EXPECTED_APP_SLUG: ${{ env.CLAWSWEEPER_APP_SLUG }}
         run: |
           set -euo pipefail
-          test -n "$APP_SLUG"
+          if [ -z "$APP_SLUG" ] || [ "$APP_SLUG" != "$EXPECTED_APP_SLUG" ]; then
+            echo "Authenticated mutation App slug is missing or unexpected: ${APP_SLUG:-<empty>}." >&2
+            exit 1
+          fi
           app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
-          test "$app_id" -gt 0
+          if ! printf '%s' "$app_id" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "Authenticated mutation App ID is invalid: ${app_id:-<empty>}." >&2
+            exit 1
+          fi
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "app_slug=$APP_SLUG" >> "$GITHUB_OUTPUT"
 
       - name: Record deterministic validation phase
         if: ${{ success() && steps.publication_validation.outputs.mode == 'no-publication' && steps.crabfleet_session.outcome == 'success' }}
@@ -1097,8 +1589,9 @@ jobs:
         if: ${{ steps.publication_validation.outputs.mode == 'no-publication' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.workflow-read-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.target_post_flight_token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
           CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.target_post_flight_token.outputs.installation-id }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
           RESULT_PATH: ${{ steps.ground_truth.outputs.result_path }}
@@ -1109,8 +1602,9 @@ jobs:
         if: ${{ steps.publication_validation.outputs.mode == 'no-publication' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.workflow-read-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.target_post_flight_token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
           CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.target_post_flight_token.outputs.installation-id }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
           RESULT_PATH: ${{ steps.ground_truth.outputs.result_path }}
@@ -1120,8 +1614,9 @@ jobs:
         if: ${{ steps.publication_validation.outputs.mode == 'no-publication' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.workflow-read-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.target_post_flight_token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
           CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.target_post_flight_token.outputs.installation-id }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
           RESULT_PATH: ${{ steps.ground_truth.outputs.result_path }}
@@ -1241,3 +1736,24 @@ jobs:
         if: ${{ always() && failure() && steps.crabfleet_session.outcome == 'success' }}
         continue-on-error: true
         run: node dist/repair/action-session.js update --state blocked --phase action_failed --summary "Repair Action failed before all completion gates passed" --completion-reason action_failed
+
+      - name: Finalize publication repair action ledger
+        id: finalize-publish-action-ledger
+        if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.publish-setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          node dist/repair/action-ledger-cli.js finalize \
+            --repair-lane publish \
+            --allow-empty \
+            > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Upload publication repair action ledger
+        if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.publish-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-worker-action-ledger-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.publish-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90

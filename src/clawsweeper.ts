@@ -83,6 +83,7 @@ import {
   ASSIST_ANSWER_MAX_BYTES,
   ASSIST_ARTIFACT_MAX_BYTES,
   assertAssistArtifactLiveRevision,
+  assistRequestSha256,
   assistSourceCommentSha256,
   createAssistArtifact,
   parseAssistArtifact,
@@ -183,6 +184,10 @@ import {
   type ReviewHistoryLedger,
 } from "./review-history.js";
 import { trailingHtmlComments } from "./review-comment-markers.js";
+import {
+  createReviewedPrActivityCursor,
+  isReviewedPrActivityCursor,
+} from "./review-activity-cursor.js";
 import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
@@ -735,6 +740,7 @@ interface ItemContext {
   pullCommitsRevision?: string;
   pullReviewComments?: unknown[];
   pullReviewCommentsRevision?: string;
+  pullReviewActivityCursor?: string;
   pullChecks?: unknown;
   counts?: {
     comments: number;
@@ -1124,6 +1130,28 @@ interface ProofLaneCursor {
   number: number;
   sortAt: number;
 }
+
+type ProofLaneName = "proof_nudges" | "bot_proof";
+
+type ProofLaneActionLedger = {
+  lane: ProofLaneName;
+  operationIdentity: {
+    repository: string;
+    lane: ProofLaneName;
+    execute: boolean;
+    limit: number;
+    processedLimit: number;
+    itemSelectionSha256: string;
+    cursorEnabled: boolean;
+  };
+  batchStartEventId: string | null;
+  lastEventId: string | null;
+  nextPhaseSeq: number;
+  startedAtMs: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+  terminal: boolean;
+};
 
 interface ProofNudgeComment {
   author?: string | undefined;
@@ -2571,27 +2599,27 @@ function maybePublishThrottleHeartbeat(options: {
     if (process.env.CLAWSWEEPER_RUN_URL) {
       statusOptions.runUrl = process.env.CLAWSWEEPER_RUN_URL;
     }
-    writeSweepStatus(statusOptions);
-    run("git", ["add", sweepStatusRelativePath()]);
-    const invocation = resolveSpawnCommand("git", ["diff", "--cached", "--quiet"], {
-      cwd: ROOT,
-      env: process.env,
+    runObservedApplyMutation({
+      identity: `throttle_status_publish:${targetRepo()}:${sha256(detail)}`,
+      operation: () => {
+        writeSweepStatus(statusOptions);
+        run("git", ["add", sweepStatusRelativePath()]);
+        const invocation = resolveSpawnCommand("git", ["diff", "--cached", "--quiet"], {
+          cwd: ROOT,
+          env: process.env,
+        });
+        const diff = spawnSync(invocation.command, invocation.args, {
+          cwd: ROOT,
+          env: process.env,
+          ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        });
+        if (diff.status === 0) return false;
+        run("git", ["commit", "-m", "chore: update sweep apply throttle status"]);
+        run("git", ["push"], { timeoutMs: githubCommandTimeoutMs() });
+        return true;
+      },
+      didMutate: (pushed) => pushed,
     });
-    const diff = spawnSync(invocation.command, invocation.args, {
-      cwd: ROOT,
-      env: process.env,
-      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    });
-    if (diff.status === 0) return;
-    run("git", ["commit", "-m", "chore: update sweep apply throttle status"]);
-    try {
-      run("git", ["push"], { timeoutMs: githubCommandTimeoutMs() });
-    } catch (error) {
-      if (error instanceof GitHubRuntimeBudgetError) throw error;
-      console.error(
-        `Best-effort throttle status push failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
   } catch (error) {
     if (error instanceof GitHubRuntimeBudgetError) throw error;
     console.error(
@@ -8315,6 +8343,13 @@ function collectItemContext(
       fullPullReviewComments === pullReviewComments
         ? filteredPullReviewComments
         : filterReviewContextComments(fullPullReviewComments, item.number);
+    if (options.reviewCacheDigest) {
+      const pullReviewActivityCursor = createReviewedPrActivityCursor({
+        reviews: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/reviews`),
+        inlineComments: fullPullReviewComments,
+      });
+      if (pullReviewActivityCursor) context.pullReviewActivityCursor = pullReviewActivityCursor;
+    }
     context.pullRequest = compactPullRequest(pullRequest);
     context.pullFiles = compactMappedWindow(pullFiles, pullFilesWindow.total, 80, compactPullFile);
     context.semanticPullFiles =
@@ -10044,27 +10079,34 @@ function publishIdempotentAssistComment(
 ): "posted" | "updated" | "unchanged" {
   if (existing && existing.body === body) return "unchanged";
   const payload = writeCommentPayload(number, body);
+  const mutationIdentity = `assist_comment:${targetRepo()}:${number}:${sha256(body)}`;
   const existingId =
     typeof existing?.id === "number" || typeof existing?.id === "string" ? existing.id : null;
   if (existingId) {
-    ghWithRetry([
-      "api",
-      `repos/${targetRepo()}/issues/comments/${existingId}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payload,
-    ]);
+    ghObservedMutationCommand({
+      identity: `${mutationIdentity}:update`,
+      args: [
+        "api",
+        `repos/${targetRepo()}/issues/comments/${existingId}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payload,
+      ],
+    });
     return "updated";
   }
-  ghWithRetry([
-    "api",
-    `repos/${targetRepo()}/issues/${number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payload,
-  ]);
+  ghObservedMutationCommand({
+    identity: `${mutationIdentity}:post`,
+    args: [
+      "api",
+      `repos/${targetRepo()}/issues/${number}/comments`,
+      "--method",
+      "POST",
+      "--input",
+      payload,
+    ],
+  });
   return "posted";
 }
 
@@ -18384,6 +18426,7 @@ function reviewVersionMarkerFromReport(markdown: string): string {
   const reviewedAt = frontMatterValue(markdown, "reviewed_at") ?? "unknown";
   const headSha = pullHeadShaFromReport(markdown) ?? "na";
   const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";
+  const reviewActivityCursor = frontMatterValue(markdown, "review_activity_cursor") ?? "unknown";
   const leaseOwner = frontMatterValue(markdown, "review_lease_owner") ?? "unknown";
   const leaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
   const attrs = [
@@ -18391,6 +18434,7 @@ function reviewVersionMarkerFromReport(markdown: string): string {
     `reviewed_at=${markerAttributeValue(reviewedAt)}`,
     `sha=${markerAttributeValue(headSha)}`,
     `source_revision=${markerAttributeValue(sourceRevision)}`,
+    `review_activity_cursor=${markerAttributeValue(reviewActivityCursor)}`,
     `lease_owner=${markerAttributeValue(leaseOwner)}`,
     `lease_comment_id=${markerAttributeValue(leaseCommentId)}`,
     "v=1",
@@ -18428,6 +18472,7 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
   const reviewLeaseOwner = frontMatterValue(markdown, "review_lease_owner") ?? "unknown";
   const reviewLeaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
   const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";
+  const reviewActivityCursor = frontMatterValue(markdown, "review_activity_cursor") ?? "unknown";
   const baseAttrs = [
     `item=${markerAttributeValue(number)}`,
     `sha=${markerAttributeValue(headSha)}`,
@@ -18437,6 +18482,7 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
     `lease_owner=${markerAttributeValue(reviewLeaseOwner)}`,
     `lease_comment_id=${markerAttributeValue(reviewLeaseCommentId)}`,
     `source_revision=${markerAttributeValue(sourceRevision)}`,
+    `review_activity_cursor=${markerAttributeValue(reviewActivityCursor)}`,
   ].join(" ");
   const securityNeedsAttention = reportSecurityReview(markdown).status === "needs_attention";
   const humanReviewMarkers = (): string => {
@@ -19193,12 +19239,17 @@ function updateReviewCommentMetadata(
 }
 
 function writeCommentPayload(number: number, body: string): string {
-  const commentFile = join(ROOT, ".artifacts", `comment-${number}.md`);
+  const payloadStem = `comment-${number}-${sha256(body).slice(0, 16)}-${randomUUID()}`;
+  const commentFile = join(ROOT, ".artifacts", `${payloadStem}.md`);
   ensureDir(dirname(commentFile));
   writeFileSync(commentFile, body, "utf8");
-  const commentPayloadFile = join(ROOT, ".artifacts", `comment-${number}.json`);
+  const commentPayloadFile = join(ROOT, ".artifacts", `${payloadStem}.json`);
   writeFileSync(commentPayloadFile, JSON.stringify({ body }), "utf8");
   return commentPayloadFile;
+}
+
+export function writeCommentPayloadForTest(number: number, body: string): string {
+  return writeCommentPayload(number, body);
 }
 
 function upsertReviewComment(
@@ -19609,7 +19660,11 @@ function closeItem(options: { number: number; kind: ItemKind; reason: CloseReaso
     });
   } else {
     const reason = isImplementationCloseReason(options.reason) ? "completed" : "not_planned";
-    const closePayloadFile = join(ROOT, ".artifacts", `close-${options.number}.json`);
+    const closePayloadFile = join(
+      ROOT,
+      ".artifacts",
+      `close-${options.number}-${reason}-${randomUUID()}.json`,
+    );
     writeFileSync(
       closePayloadFile,
       JSON.stringify({ state: "closed", state_reason: reason }),
@@ -20181,6 +20236,7 @@ review_semantic_eligible: ${options.semanticRecord?.eligible ?? false}
 review_semantic_eligibility_reason: ${options.semanticRecord?.eligibilityReason ?? "unknown"}
 review_semantic_cache_hit: false
 item_source_revision: ${options.context.sourceRevision ?? "unknown"}
+review_activity_cursor: ${options.context.pullReviewActivityCursor ?? "unknown"}
 close_comment_sha256: ${options.action.closeComment ? sha256(options.action.closeComment) : "none"}
 review_comment_sha256: none
 review_comment_id: unknown
@@ -25520,10 +25576,12 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         };
       }
     };
-    const ownedApplyMutationLeaseBlockReason = (
+    const ownedApplyMutationLeaseBlock = (
       lease: AcquiredReviewStartLease,
-    ): string | null => {
+    ): { sourceChanged: boolean; reason: string } | null => {
       try {
+        const reviewActivityBlock = currentReviewActivityBlock();
+        if (reviewActivityBlock) return reviewActivityBlock;
         const revisionBefore = fetchLiveReviewHeadSha();
         const refreshed = issueReviewCommentState(number);
         const revisionAfter = fetchLiveReviewHeadSha();
@@ -25535,7 +25593,10 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             reportReviewRevision !== null &&
             revisionAfter !== reportReviewRevision)
         ) {
-          return `${item.kind === "pull_request" ? "PR head" : "issue source revision"} changed while holding the apply mutation lease`;
+          return {
+            sourceChanged: true,
+            reason: `${item.kind === "pull_request" ? "PR head" : "issue source revision"} changed while holding the apply mutation lease`,
+          };
         }
         const winner = freshExactHeadReviewStartLease({
           comments: refreshed.leaseComments,
@@ -25550,29 +25611,39 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           winner.commentId !== lease.commentId ||
           lease.headSha !== revisionAfter
         ) {
-          return `apply mutation lease ${lease.commentId} is no longer the elected ${item.kind === "pull_request" ? "same-head" : "same-revision"} lease`;
+          return {
+            sourceChanged: false,
+            reason: `apply mutation lease ${lease.commentId} is no longer the elected ${item.kind === "pull_request" ? "same-head" : "same-revision"} lease`,
+          };
         }
-        return canonicalBoundStaleReviewReason(
+        const staleReviewReason = canonicalBoundStaleReviewReason(
           markdownBeforeApplyDecisionMutations,
           refreshed.reviewComment,
         );
+        return staleReviewReason ? { sourceChanged: false, reason: staleReviewReason } : null;
       } catch (error) {
         if (error instanceof GitHubRuntimeBudgetError) throw error;
         const detail = trimMiddle(
           (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " "),
           180,
         );
-        return `apply mutation lease verification failed; next apply will retry: ${detail}`;
+        return {
+          sourceChanged: false,
+          reason: `apply mutation lease verification failed; next apply will retry: ${detail}`,
+        };
       }
     };
     const acquireApplyMutationLease = (
       leaseState: ReturnType<typeof refreshReviewStartLeaseState>,
-    ): string | null => {
+    ): { sourceChanged: boolean; reason: string } | null => {
       if (dryRun || !requiresApplyMutationLease) return null;
       let lease: AcquiredReviewStartLease | null = null;
       if (leaseState.lease && !leaseState.preserve) {
         if (!leaseState.lease.owner || leaseState.lease.commentId === null) {
-          return "matching review lease lacks a server-confirmed owner and comment id";
+          return {
+            sourceChanged: false,
+            reason: "matching review lease lacks a server-confirmed owner and comment id",
+          };
         }
         lease = {
           owner: leaseState.lease.owner,
@@ -25591,18 +25662,28 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           purpose: "apply",
         });
         if (posted.status !== "posted") {
-          return `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper lease was acquired concurrently`;
+          return {
+            sourceChanged: false,
+            reason: `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper lease was acquired concurrently`,
+          };
         }
         lease = posted.lease;
       }
       activeApplyMutationLease = { itemNumber: number, lease };
-      return ownedApplyMutationLeaseBlockReason(lease);
+      return ownedApplyMutationLeaseBlock(lease);
     };
-    const currentApplyMutationLeaseBlockReason = (): string | null => {
+    const currentApplyMutationLeaseBlock = (): {
+      sourceChanged: boolean;
+      reason: string;
+    } | null => {
+      const reviewActivityBlock = currentReviewActivityBlock();
+      if (reviewActivityBlock) return reviewActivityBlock;
       if (dryRun || !requiresApplyMutationLease) return null;
       const active = activeApplyMutationLease;
-      if (!active || active.itemNumber !== number) return "apply mutation lease is not held";
-      return ownedApplyMutationLeaseBlockReason(active.lease);
+      if (!active || active.itemNumber !== number) {
+        return { sourceChanged: false, reason: "apply mutation lease is not held" };
+      }
+      return ownedApplyMutationLeaseBlock(active.lease);
     };
     const recordReviewGuardSkip = (
       action: "kept_open" | "skipped_stale_review_comment_sync",
@@ -25627,6 +25708,100 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             `${reason}; stale canonical comment correction remains pending`,
           )
         : recordReviewGuardSkip("kept_open", reason, restoreOriginal);
+    const markChangedSinceReview = (options: {
+      reason: string;
+      currentUpdatedAt?: string | undefined;
+      currentSnapshotHash?: string | undefined;
+    }): boolean => {
+      markdown = replaceFrontMatterValue(
+        markdown,
+        "action_taken",
+        "skipped_changed_since_review",
+      );
+      if (options.currentUpdatedAt) {
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "current_item_updated_at",
+          options.currentUpdatedAt,
+        );
+      }
+      if (options.currentSnapshotHash) {
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "current_item_snapshot_hash",
+          options.currentSnapshotHash,
+        );
+      }
+      markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+      if (!dryRun) writeReportMarkdown(path, markdown);
+      results.push({
+        number,
+        action: "skipped_changed_since_review",
+        reason: options.reason,
+        ...eventApplyDispositionProof("skipped_changed_since_review"),
+      });
+      processedCount += 1;
+      maybeLogProgress(`skipped #${number}: ${options.reason}`);
+      return processedCount >= processedLimit;
+    };
+    const expectedReviewActivityCursor = frontMatterValue(
+      markdownBeforeApplyDecisionMutations,
+      "review_activity_cursor",
+    );
+    const currentReviewActivityBlock = (): {
+      sourceChanged: boolean;
+      reason: string;
+    } | null => {
+      if (item.kind !== "pull_request") return null;
+      if (!expectedReviewActivityCursor || expectedReviewActivityCursor === "unknown") {
+        return {
+          sourceChanged: false,
+          reason: "stored pull request review activity cursor is missing; fresh review required",
+        };
+      }
+      if (!isReviewedPrActivityCursor(expectedReviewActivityCursor)) {
+        return {
+          sourceChanged: false,
+          reason: "stored pull request review activity cursor is invalid; fresh review required",
+        };
+      }
+      try {
+        const currentReviewActivityCursor = createReviewedPrActivityCursor({
+          reviews: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${number}/reviews`),
+          inlineComments: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${number}/comments`),
+        });
+        if (!currentReviewActivityCursor) {
+          return {
+            sourceChanged: true,
+            reason: "pull request review activity exceeds the bounded reviewed cursor",
+          };
+        }
+        if (currentReviewActivityCursor !== expectedReviewActivityCursor) {
+          return {
+            sourceChanged: true,
+            reason: "pull request review activity changed since review",
+          };
+        }
+        return null;
+      } catch (error) {
+        if (error instanceof GitHubRuntimeBudgetError) throw error;
+        const detail = trimMiddle(
+          (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " "),
+          180,
+        );
+        return {
+          sourceChanged: false,
+          reason: `pull request review activity could not be refreshed; next apply will retry: ${detail}`,
+        };
+      }
+    };
+    const recordReviewActivityBlock = (block: {
+      sourceChanged: boolean;
+      reason: string;
+    }, restoreOriginal = true): boolean =>
+      block.sourceChanged
+        ? markChangedSinceReview({ reason: block.reason })
+        : recordReviewLeaseSkip(block.reason, restoreOriginal);
     const recordActiveReviewLeaseSkip = (expiresAt: string): boolean =>
       recordReviewLeaseSkip(
         `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper review is active until ${expiresAt}`,
@@ -26423,6 +26598,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         : null;
     let currentPrStatusKind: PrStatusLabelKind | null = null;
     if (state === "open") {
+      const reviewActivityBlock = currentReviewActivityBlock();
+      if (reviewActivityBlock) {
+        if (recordReviewActivityBlock(reviewActivityBlock)) break;
+        continue;
+      }
       const lateLeaseState = refreshReviewStartLeaseState();
       if (lateLeaseState.blockReason) {
         if (recordReviewLeaseSkip(lateLeaseState.blockReason)) break;
@@ -26437,9 +26617,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (recordActiveReviewLeaseSkip(lateLeaseState.lease.expiresAt)) break;
         continue;
       }
-      const mutationLeaseBlockReason = acquireApplyMutationLease(lateLeaseState);
-      if (mutationLeaseBlockReason) {
-        if (recordReviewLeaseSkip(mutationLeaseBlockReason)) break;
+      const mutationLeaseBlock = acquireApplyMutationLease(lateLeaseState);
+      if (mutationLeaseBlock) {
+        if (recordReviewActivityBlock(mutationLeaseBlock)) break;
         continue;
       }
     }
@@ -26587,42 +26767,6 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         break;
       continue;
     }
-    const markChangedSinceReview = (options: {
-      reason: string;
-      currentUpdatedAt?: string | undefined;
-      currentSnapshotHash?: string | undefined;
-    }): boolean => {
-      markdown = replaceFrontMatterValue(
-        markdown,
-        "action_taken",
-        "skipped_changed_since_review",
-      );
-      if (options.currentUpdatedAt) {
-        markdown = replaceFrontMatterValue(
-          markdown,
-          "current_item_updated_at",
-          options.currentUpdatedAt,
-        );
-      }
-      if (options.currentSnapshotHash) {
-        markdown = replaceFrontMatterValue(
-          markdown,
-          "current_item_snapshot_hash",
-          options.currentSnapshotHash,
-        );
-      }
-      markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
-      if (!dryRun) writeReportMarkdown(path, markdown);
-      results.push({
-        number,
-        action: "skipped_changed_since_review",
-        reason: options.reason,
-        ...eventApplyDispositionProof("skipped_changed_since_review"),
-      });
-      processedCount += 1;
-      maybeLogProgress(`skipped #${number}: ${options.reason}`);
-      return processedCount >= processedLimit;
-    };
     const postProofFreshnessBlock = (): {
       reason: string;
       currentUpdatedAt?: string;
@@ -26828,9 +26972,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       !stalePrReviewHead &&
       labelSyncFreshEnough();
     if (state === "open" && isCurrentCompleteReport) {
-      const mutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
-      if (mutationLeaseBlockReason) {
-        if (recordReviewLeaseSkip(mutationLeaseBlockReason, false)) break;
+      const mutationLeaseBlock = currentApplyMutationLeaseBlock();
+      if (mutationLeaseBlock) {
+        if (recordReviewActivityBlock(mutationLeaseBlock, false)) break;
         continue;
       }
       try {
@@ -26898,9 +27042,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       !isCloseProposal &&
       isCurrentCompleteReport
     ) {
-      const mutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
-      if (mutationLeaseBlockReason) {
-        if (recordReviewLeaseSkip(mutationLeaseBlockReason, false)) break;
+      const mutationLeaseBlock = currentApplyMutationLeaseBlock();
+      if (mutationLeaseBlock) {
+        if (recordReviewActivityBlock(mutationLeaseBlock, false)) break;
         continue;
       }
       currentClosingPullRequests = closingPullRequestsForIssue(number);
@@ -27192,9 +27336,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           const preLeaseCanonicalGuard = applyCanonicalCommentSyncGuard(true);
           if (preLeaseCanonicalGuard.stopApply) break;
           if (preLeaseCanonicalGuard.skipCurrentItem) continue;
-          const mutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
-          if (mutationLeaseBlockReason) {
-            if (recordReviewLeaseSkip(mutationLeaseBlockReason, false)) break;
+          const mutationLeaseBlock = currentApplyMutationLeaseBlock();
+          if (mutationLeaseBlock) {
+            if (recordReviewActivityBlock(mutationLeaseBlock, false)) break;
             continue;
           }
           const latestLeaseState = refreshReviewStartLeaseState();
@@ -27479,9 +27623,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       if (markApplySkipped("kept_open", inactivityCloseBlockReason)) break;
       continue;
     }
-    const closeMutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
-    if (closeMutationLeaseBlockReason) {
-      if (recordReviewLeaseSkip(closeMutationLeaseBlockReason, false)) break;
+    const closeMutationLeaseBlock = currentApplyMutationLeaseBlock();
+    if (closeMutationLeaseBlock) {
+      if (recordReviewActivityBlock(closeMutationLeaseBlock, false)) break;
       continue;
     }
     logProgress(`closing #${number}`);
@@ -27523,9 +27667,9 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             dryRun,
           })
         : null;
-    const preCloseMutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
-    if (preCloseMutationLeaseBlockReason) {
-      if (recordReviewLeaseSkip(preCloseMutationLeaseBlockReason, false)) break;
+    const preCloseMutationLeaseBlock = currentApplyMutationLeaseBlock();
+    if (preCloseMutationLeaseBlock) {
+      if (recordReviewActivityBlock(preCloseMutationLeaseBlock, false)) break;
       continue;
     }
     ensureRuntimeDelayFits(closeDelayMs, "before close");
@@ -27678,7 +27822,7 @@ function fetchPullRequestProofNudgeDetails(number: number): ProofNudgePullReques
 
 function postProofNudgeComment(number: number, body: string): Record<string, unknown> {
   const payload = writeCommentPayload(number, body);
-  return ghJson<Record<string, unknown>>([
+  const args = [
     "api",
     `repos/${targetRepo()}/issues/${number}/comments`,
     "--method",
@@ -27687,7 +27831,19 @@ function postProofNudgeComment(number: number, body: string): Record<string, unk
     payload,
     "--jq",
     "{id,html_url}",
-  ]);
+  ];
+  return asRecord(
+    parseGhJson<unknown>(
+      ghObservedMutationCommand({
+        identity: `proof_nudge_comment:${number}:${reviewCommentBodyDigest(body)}`,
+        args,
+        attempts: 1,
+        knownNoMutation: (error) =>
+          isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
+      }),
+      args,
+    ),
+  );
 }
 
 function upsertBotProofDecisionComment(
@@ -27701,8 +27857,10 @@ function upsertBotProofDecisionComment(
     .find((comment) => typeof comment.body === "string" && comment.body.includes(marker));
   const payload = writeCommentPayload(number, body);
   const existingId = commentId(existing);
-  if (existingId !== null && canPatchReviewComment(existing)) {
-    return ghJson<Record<string, unknown>>([
+  const method = existingId !== null && canPatchReviewComment(existing) ? "PATCH" : "POST";
+  let args: string[];
+  if (method === "PATCH") {
+    args = [
       "api",
       `repos/${targetRepo()}/issues/comments/${existingId}`,
       "--method",
@@ -27711,18 +27869,43 @@ function upsertBotProofDecisionComment(
       payload,
       "--jq",
       "{id,html_url}",
-    ]);
+    ];
+  } else {
+    args = [
+      "api",
+      `repos/${targetRepo()}/issues/${number}/comments`,
+      "--method",
+      "POST",
+      "--input",
+      payload,
+      "--jq",
+      "{id,html_url}",
+    ];
   }
-  return ghJson<Record<string, unknown>>([
-    "api",
-    `repos/${targetRepo()}/issues/${number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payload,
-    "--jq",
-    "{id,html_url}",
-  ]);
+  return asRecord(
+    parseGhJson<unknown>(
+      ghObservedMutationCommand({
+        identity: `bot_proof_comment:${number}:${headSha}:${reviewCommentBodyDigest(body)}`,
+        args,
+        attempts: botProofDecisionCommentMutationAttempts(method),
+        knownNoMutation: (error) =>
+          isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
+      }),
+      args,
+    ),
+  );
+}
+
+function botProofDecisionCommentMutationAttempts(method: "POST" | "PATCH"): number | undefined {
+  // A lost POST response is ambiguous and replaying it can create a duplicate public comment.
+  // PATCH targets an existing comment id and remains safe to retry through the default policy.
+  return method === "POST" ? 1 : undefined;
+}
+
+export function botProofDecisionCommentMutationAttemptsForTest(
+  method: "POST" | "PATCH",
+): number | undefined {
+  return botProofDecisionCommentMutationAttempts(method);
 }
 
 function syncBotProofDecisionLabels(options: {
@@ -27740,7 +27923,7 @@ function syncBotProofDecisionLabels(options: {
   const nextLabels = statusResult.labels.filter((label) => normalizeLabelName(label) !== "stale");
   if (!options.dryRun) {
     for (const label of staleLabels) {
-      ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+      removeIssueLabel(options.number, label);
     }
   }
   const changed = statusResult.changed || staleLabels.length > 0;
@@ -27924,6 +28107,441 @@ export function botProofCandidateRecordsForTest(
   return botProofCandidateRecords(itemsDir, requestedItemNumbers);
 }
 
+function startProofLaneActionLedger(options: {
+  lane: ProofLaneName;
+  execute: boolean;
+  limit: number;
+  processedLimit: number;
+  requestedItemNumbers: readonly number[];
+  cursorEnabled: boolean;
+}): ProofLaneActionLedger {
+  const operationIdentity = {
+    repository: targetRepo(),
+    lane: options.lane,
+    execute: options.execute,
+    limit: options.limit,
+    processedLimit: options.processedLimit,
+    itemSelectionSha256: sha256(
+      stableJson([...options.requestedItemNumbers].sort((a, b) => a - b)),
+    ),
+    cursorEnabled: options.cursorEnabled,
+  };
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofStage,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "proof_lane_start" },
+    operation: "proof_handling",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: { operationIdentity, slot: "proof_lane_start" },
+    component: options.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      review_mode: options.lane,
+      work_kind: "proof_handling",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  return {
+    lane: options.lane,
+    operationIdentity,
+    batchStartEventId: start?.event_id ?? null,
+    lastEventId: start?.event_id ?? null,
+    nextPhaseSeq: 2,
+    startedAtMs: Date.now(),
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+    terminal: false,
+  };
+}
+
+function nextProofLanePhase(ledger: ProofLaneActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function proofLaneSubject(
+  repository: string,
+  number: number,
+  headSha?: string,
+): ActionEventSubject {
+  if (number <= 0) {
+    return {
+      repository,
+      kind: "workflow",
+    };
+  }
+  return {
+    repository,
+    kind: "pull_request",
+    number,
+    ...(headSha ? { sourceRevision: headSha } : {}),
+  };
+}
+
+function proofLaneResultDisposition(action: ProofNudgeAction | BotProofAction): {
+  status: ActionEventStatus;
+  reasonCode: ActionEventReasonCode;
+  retryable: boolean;
+  mutation: boolean;
+} {
+  if (action.endsWith("_posted")) {
+    return {
+      status: ACTION_EVENT_STATUSES.published,
+      reasonCode: ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: true,
+    };
+  }
+  if (action.endsWith("_planned")) {
+    return {
+      status: ACTION_EVENT_STATUSES.planned,
+      reasonCode: ACTION_EVENT_REASON_CODES.dryRun,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_runtime_budget") {
+    return {
+      status: ACTION_EVENT_STATUSES.yielded,
+      reasonCode: ACTION_EVENT_REASON_CODES.runtimeBudget,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_live_fetch_failed") {
+    return {
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: true,
+      mutation: false,
+    };
+  }
+  if (action === "skipped_stale_report_head") {
+    return {
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.stale,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  if (
+    action === "skipped_locked_conversation" ||
+    action === "skipped_policy_exempt" ||
+    action === "skipped_protected_label"
+  ) {
+    return {
+      status: ACTION_EVENT_STATUSES.blocked,
+      reasonCode: ACTION_EVENT_REASON_CODES.policyBlocked,
+      retryable: false,
+      mutation: false,
+    };
+  }
+  return {
+    status: ACTION_EVENT_STATUSES.skipped,
+    reasonCode: ACTION_EVENT_REASON_CODES.notApplicable,
+    retryable: false,
+    mutation: false,
+  };
+}
+
+function recordProofLaneResults(
+  ledger: ProofLaneActionLedger,
+  results: readonly (ProofNudgeResult | BotProofResult)[],
+): void {
+  for (const [index, result] of results.entries()) {
+    const disposition = proofLaneResultDisposition(result.action);
+    const event = recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofStage,
+      status: disposition.status,
+      reasonCode: disposition.reasonCode,
+      retryable: disposition.retryable,
+      mutation: disposition.mutation,
+      identity: {
+        slot: "proof_lane_result",
+        index,
+        number: result.number,
+        action: result.action,
+      },
+      operation: "proof_handling",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.lastEventId,
+      phaseSeq: nextProofLanePhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        slot: "proof_lane_result",
+        number: result.number,
+        action: result.action,
+        sourceRevision: result.headSha ?? null,
+      },
+      component: ledger.lane,
+      subject: proofLaneSubject(result.repo ?? targetRepo(), result.number, result.headSha),
+      evidence: workflowRunEvidence(),
+      attributes: {
+        completion_reason: result.action,
+        work_kind: ledger.lane,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+  }
+}
+
+function recordProofLaneArtifact(
+  ledger: ProofLaneActionLedger,
+  options: {
+    phase: typeof ACTION_EVENT_TYPES.reviewLogPublication | typeof ACTION_EVENT_TYPES.proofBinding;
+    filePath: string;
+    evidenceKind: string;
+    slot: string;
+    publicationKind: string;
+  },
+): void {
+  const evidence = actionLedgerFileEvidence(options.evidenceKind, options.filePath);
+  const recordPath = repoRelativePath(options.filePath);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: evidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
+    reasonCode: evidence ? ACTION_EVENT_REASON_CODES.completed : ACTION_EVENT_REASON_CODES.notFound,
+    retryable: false,
+    mutation: false,
+    identity: { slot: options.slot },
+    operation: "proof_handling",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextProofLanePhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: options.slot,
+      evidenceSha256: evidence?.sha256 ?? null,
+    },
+    component: ledger.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "publication",
+      ...(!recordPath.startsWith("../") ? { recordPath } : {}),
+    },
+    evidence: [...workflowRunEvidence(), ...(evidence ? [evidence] : [])],
+    attributes: {
+      log_count: evidence ? 1 : 0,
+      log_kind: options.evidenceKind,
+      publication_kind: options.publicationKind,
+      work_kind: ledger.lane,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function finishProofLaneActionLedger(
+  ledger: ProofLaneActionLedger,
+  options: {
+    processedCount: number;
+    actionCount: number;
+    resultCount: number;
+    error?: unknown;
+  },
+): void {
+  if (ledger.terminal) return;
+  const failure =
+    options.error === undefined ? null : actionLedgerFailureDisposition(options.error);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofStage,
+    status: failure?.status ?? ACTION_EVENT_STATUSES.completed,
+    reasonCode: failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.completed,
+    retryable:
+      failure !== null &&
+      proofLaneFailureRetryable(ledger.mutationObserved, ledger.uncertainMutationObserved),
+    mutation: ledger.mutationObserved,
+    identity: {
+      slot: "proof_lane_terminal",
+      completionReason: failure?.completionReason ?? "completed",
+    },
+    operation: "proof_handling",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextProofLanePhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "proof_lane_terminal",
+    },
+    component: ledger.lane,
+    subject: {
+      repository: targetRepo(),
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      action_count: options.actionCount,
+      processed_count: options.processedCount,
+      result_count: options.resultCount,
+      duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
+      completion_reason: failure?.completionReason ?? "completed",
+      work_kind: ledger.lane,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+  ledger.terminal = true;
+}
+
+function proofLaneFailureRetryable(
+  mutationObserved: boolean,
+  uncertainMutationObserved: boolean,
+): boolean {
+  return !mutationObserved || uncertainMutationObserved;
+}
+
+export function proofLaneFailureRetryableForTest(
+  mutationObserved: boolean,
+  uncertainMutationObserved: boolean,
+): boolean {
+  return proofLaneFailureRetryable(mutationObserved, uncertainMutationObserved);
+}
+
+type ProofMutationOutcome = "accepted" | "rejected" | "unknown";
+
+function proofMutationRetryable(outcome: ProofMutationOutcome): boolean {
+  return outcome === "unknown";
+}
+
+export function proofMutationRetryableForTest(outcome: ProofMutationOutcome): boolean {
+  return proofMutationRetryable(outcome);
+}
+
+function proofLaneMutationRunner(
+  ledger: ProofLaneActionLedger,
+  subject: ActionEventSubject,
+): MutationRunner {
+  let requestAttempt = 0;
+  return <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    requestAttempt += 1;
+    const publicationKind = options.identity.includes("comment")
+      ? "github_comment"
+      : "github_label";
+    const phase =
+      publicationKind === "github_comment"
+        ? ACTION_EVENT_TYPES.reviewCommentPublication
+        : ACTION_EVENT_TYPES.proofStage;
+    const mutationIdentitySha256 = sha256(options.idempotencyIdentity);
+    const attempt = recordWorkflowPhaseEvent(ROOT, {
+      phase,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: true,
+      mutation: false,
+      identity: {
+        slot: "proof_mutation_attempt",
+        requestAttempt,
+        requestIdentitySha256: sha256(options.identity),
+      },
+      operation: "proof_handling",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.lastEventId,
+      phaseSeq: nextProofLanePhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        subject,
+        mutationIdentitySha256,
+      },
+      component: ledger.lane,
+      subject,
+      evidence: workflowRunEvidence(),
+      attributes: {
+        attempt: requestAttempt,
+        publication_kind: publicationKind,
+        work_kind: ledger.lane,
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
+    const finish = (outcome: ProofMutationOutcome): void => {
+      const mutation = outcome !== "rejected";
+      const result = recordWorkflowPhaseEvent(ROOT, {
+        phase,
+        status:
+          outcome === "accepted"
+            ? ACTION_EVENT_STATUSES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_STATUSES.skipped
+              : ACTION_EVENT_STATUSES.failed,
+        reasonCode:
+          outcome === "accepted"
+            ? ACTION_EVENT_REASON_CODES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_REASON_CODES.notApplicable
+              : ACTION_EVENT_REASON_CODES.unavailable,
+        retryable: proofMutationRetryable(outcome),
+        mutation,
+        identity: {
+          slot: "proof_mutation_outcome",
+          requestAttempt,
+          requestIdentitySha256: sha256(options.identity),
+          outcome,
+        },
+        operation: "proof_handling",
+        operationIdentity: ledger.operationIdentity,
+        parentEventId: attempt?.event_id ?? ledger.lastEventId,
+        phaseSeq: nextProofLanePhase(ledger),
+        idempotencyIdentity: {
+          operationIdentity: ledger.operationIdentity,
+          subject,
+          mutationIdentitySha256,
+        },
+        component: ledger.lane,
+        subject,
+        evidence: workflowRunEvidence(),
+        attributes: {
+          attempt: requestAttempt,
+          completion_reason: `mutation_${outcome}`,
+          publication_kind: publicationKind,
+          work_kind: ledger.lane,
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      ledger.lastEventId = result?.event_id ?? ledger.lastEventId;
+      if (mutation) ledger.mutationObserved = true;
+      if (outcome === "unknown") ledger.uncertainMutationObserved = true;
+    };
+    try {
+      const result = options.operation();
+      finish(options.didMutate?.(result) === false ? "rejected" : "accepted");
+      return result;
+    } catch (error) {
+      finish(options.knownNoMutation?.(error) === true ? "rejected" : "unknown");
+      throw error;
+    }
+  };
+}
+
+function runWithProofLaneMutationRunner<T>(
+  ledger: ProofLaneActionLedger,
+  subject: ActionEventSubject,
+  operation: () => T,
+): T {
+  const previousReviewMutationRunner = activeReviewMutationRunner;
+  activeReviewMutationRunner = proofLaneMutationRunner(ledger, subject);
+  try {
+    return operation();
+  } finally {
+    activeReviewMutationRunner = previousReviewMutationRunner;
+  }
+}
+
 function proofNudgesCommand(args: Args): void {
   repoFromArgs(args);
   const itemsDir = resolve(stringArg(args.items_dir, defaultItemsDir()));
@@ -27940,176 +28558,229 @@ function proofNudgesCommand(args: Args): void {
   const reportPath = resolve(stringArg(args.report_path, join(ROOT, "proof-nudge-report.json")));
   const requestedItemNumbers = itemNumbersArg(args.item_numbers, args.item_number);
   const cursorPath = proofLaneCursorPath(args, requestedItemNumbers);
-
-  if (!existsSync(itemsDir)) {
-    const results: ProofNudgeResult[] = [];
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    console.log(JSON.stringify(results, null, 2));
-    return;
-  }
-
-  const allCandidates = proofNudgeCandidateRecords(itemsDir, requestedItemNumbers);
-  const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
-  const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+  const ledger = startProofLaneActionLedger({
+    lane: "proof_nudges",
+    execute,
+    limit,
+    processedLimit,
+    requestedItemNumbers,
+    cursorEnabled: cursorPath !== null,
+  });
   const startedAtMs = Date.now();
   const results: ProofNudgeResult[] = [];
   let processedCount = 0;
   let nudgeCount = 0;
   let lastProcessedCandidate: ProofLaneCandidate | null = null;
-  const markProcessed = (candidate: ProofLaneCandidate): void => {
-    processedCount += 1;
-    lastProcessedCandidate = candidate;
-  };
-  const logProgress = (message: string): void => {
-    const counts = results.reduce<Record<string, number>>((accumulator, result) => {
-      accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
-      return accumulator;
-    }, {});
-    console.error(
-      [
-        `[proof-nudges] ${new Date().toISOString()} ${message}`,
-        `nudges=${nudgeCount}/${limit}`,
-        `processed=${processedCount}/${processedLimit}`,
-        `dry_run=${dryRun}`,
-        `counts=${JSON.stringify(counts)}`,
-      ].join(" "),
-    );
-  };
 
-  logProgress(
-    `starting proof nudges: candidates=${allCandidates.length} min_age_days=${minAgeDays} cooldown_days=${cooldownDays} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
-  );
-  for (const candidate of candidates) {
-    if (nudgeCount >= limit) break;
-    if (processedCount >= processedLimit) break;
-    if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
-      results.push({
-        repo: targetRepo(),
-        number: 0,
-        action: "skipped_runtime_budget",
-        reason: `max runtime ${maxRuntimeMs}ms reached`,
+  try {
+    if (!existsSync(itemsDir)) {
+      ensureDir(dirname(reportPath));
+      writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.reviewLogPublication,
+        filePath: reportPath,
+        evidenceKind: "proof_nudge_report",
+        slot: "proof_nudge_report",
+        publicationKind: "local_artifact",
       });
-      logProgress(`stopping proof nudges: max runtime ${maxRuntimeMs}ms reached`);
-      break;
+      finishProofLaneActionLedger(ledger, {
+        processedCount,
+        actionCount: nudgeCount,
+        resultCount: results.length,
+      });
+      console.log(JSON.stringify(results, null, 2));
+      return;
     }
 
-    const resultBase = {
-      repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
-      number: candidate.number,
-      reviewedAt: candidate.reviewedAt,
+    const allCandidates = proofNudgeCandidateRecords(itemsDir, requestedItemNumbers);
+    const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
+    const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+    const markProcessed = (candidate: ProofLaneCandidate): void => {
+      processedCount += 1;
+      lastProcessedCandidate = candidate;
     };
-    let item: Item;
-    let state: string;
-    try {
-      const fetched = fetchItem(candidate.number);
-      item = fetched.item;
-      state = fetched.state;
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    if (state !== "open") {
-      results.push({
-        ...resultBase,
-        action: "skipped_not_open",
-        reason: `state is ${state}`,
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
-    let comments: ProofNudgeComment[] = [];
-    let authorEditedAt: string | undefined;
-    let authorReviewActivityAt: string | undefined;
-    try {
-      pullDetails =
-        item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
-      comments = item.kind === "pull_request" ? proofNudgeComments(candidate.number) : [];
-      authorEditedAt =
-        item.kind === "pull_request"
-          ? latestAuthorPullRequestEditAt(candidate.number, item.author)
-          : undefined;
-      authorReviewActivityAt =
-        item.kind === "pull_request"
-          ? latestAuthorPullRequestReviewActivityAt(candidate.number, item.author)
-          : undefined;
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const eligibility = proofNudgeEligibility({
-      item,
-      markdown: candidate.markdown,
-      comments,
-      headSha: pullDetails.headSha,
-      headCommittedAt: pullDetails.headCommittedAt,
-      authorEditedAt,
-      authorReviewActivityAt,
-      minAgeDays,
-      cooldownDays,
-    });
-    if (!eligibility.eligible) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: eligibility.reason,
-        headSha: pullDetails.headSha,
-      });
-      markProcessed(candidate);
-      continue;
-    }
+    const logProgress = (message: string): void => {
+      const counts = results.reduce<Record<string, number>>((accumulator, result) => {
+        accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
+        return accumulator;
+      }, {});
+      console.error(
+        [
+          `[proof-nudges] ${new Date().toISOString()} ${message}`,
+          `nudges=${nudgeCount}/${limit}`,
+          `processed=${processedCount}/${processedLimit}`,
+          `dry_run=${dryRun}`,
+          `counts=${JSON.stringify(counts)}`,
+        ].join(" "),
+      );
+    };
 
-    const timestamp = new Date().toISOString();
-    const headSha = pullDetails.headSha;
-    if (!headSha) {
-      results.push({
-        ...resultBase,
-        action: "skipped_no_live_head",
-        reason: "live PR head SHA could not be inspected",
+    logProgress(
+      `starting proof nudges: candidates=${allCandidates.length} min_age_days=${minAgeDays} cooldown_days=${cooldownDays} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
+    );
+    for (const candidate of candidates) {
+      if (nudgeCount >= limit) break;
+      if (processedCount >= processedLimit) break;
+      if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
+        results.push({
+          repo: targetRepo(),
+          number: 0,
+          action: "skipped_runtime_budget",
+          reason: `max runtime ${maxRuntimeMs}ms reached`,
+        });
+        logProgress(`stopping proof nudges: max runtime ${maxRuntimeMs}ms reached`);
+        break;
+      }
+
+      const resultBase = {
+        repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
+        number: candidate.number,
+        reviewedAt: candidate.reviewedAt,
+      };
+      let item: Item;
+      let state: string;
+      try {
+        const fetched = fetchItem(candidate.number);
+        item = fetched.item;
+        state = fetched.state;
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      if (state !== "open") {
+        results.push({
+          ...resultBase,
+          action: "skipped_not_open",
+          reason: `state is ${state}`,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
+      let comments: ProofNudgeComment[] = [];
+      let authorEditedAt: string | undefined;
+      let authorReviewActivityAt: string | undefined;
+      try {
+        pullDetails =
+          item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
+        comments = item.kind === "pull_request" ? proofNudgeComments(candidate.number) : [];
+        authorEditedAt =
+          item.kind === "pull_request"
+            ? latestAuthorPullRequestEditAt(candidate.number, item.author)
+            : undefined;
+        authorReviewActivityAt =
+          item.kind === "pull_request"
+            ? latestAuthorPullRequestReviewActivityAt(candidate.number, item.author)
+            : undefined;
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const eligibility = proofNudgeEligibility({
+        item,
+        markdown: candidate.markdown,
+        comments,
+        headSha: pullDetails.headSha,
+        headCommittedAt: pullDetails.headCommittedAt,
+        authorEditedAt,
+        authorReviewActivityAt,
+        minAgeDays,
+        cooldownDays,
       });
+      if (!eligibility.eligible) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: eligibility.reason,
+          headSha: pullDetails.headSha,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+
+      const timestamp = new Date().toISOString();
+      const headSha = pullDetails.headSha;
+      if (!headSha) {
+        results.push({
+          ...resultBase,
+          action: "skipped_no_live_head",
+          reason: "live PR head SHA could not be inspected",
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const body = renderProofNudgeComment({ item, headSha, timestamp });
+      if (dryRun) {
+        results.push({
+          ...resultBase,
+          action: "proof_nudge_planned",
+          reason: eligibility.reason,
+          headSha,
+        });
+      } else {
+        const comment = runWithProofLaneMutationRunner(
+          ledger,
+          proofLaneSubject(resultBase.repo, candidate.number, headSha),
+          () => postProofNudgeComment(candidate.number, body),
+        );
+        results.push({
+          ...resultBase,
+          action: "proof_nudge_posted",
+          reason: eligibility.reason,
+          url: commentUrl(comment) ?? undefined,
+          headSha,
+        });
+      }
       markProcessed(candidate);
-      continue;
+      nudgeCount += 1;
+      logProgress(`${dryRun ? "planned" : "posted"} proof nudge #${candidate.number}`);
     }
-    const body = renderProofNudgeComment({ item, headSha, timestamp });
-    if (dryRun) {
-      results.push({
-        ...resultBase,
-        action: "proof_nudge_planned",
-        reason: eligibility.reason,
-        headSha,
-      });
-    } else {
-      const comment = postProofNudgeComment(candidate.number, body);
-      results.push({
-        ...resultBase,
-        action: "proof_nudge_posted",
-        reason: eligibility.reason,
-        url: commentUrl(comment) ?? undefined,
-        headSha,
+    if (!dryRun && cursorPath && lastProcessedCandidate) {
+      writeProofLaneCursor(cursorPath, "proof_nudges", lastProcessedCandidate);
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.proofBinding,
+        filePath: cursorPath,
+        evidenceKind: "proof_nudge_cursor",
+        slot: "proof_nudge_cursor",
+        publicationKind: "cursor",
       });
     }
-    markProcessed(candidate);
-    nudgeCount += 1;
-    logProgress(`${dryRun ? "planned" : "posted"} proof nudge #${candidate.number}`);
+    ensureDir(dirname(reportPath));
+    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+    recordProofLaneResults(ledger, results);
+    recordProofLaneArtifact(ledger, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      filePath: reportPath,
+      evidenceKind: "proof_nudge_report",
+      slot: "proof_nudge_report",
+      publicationKind: "local_artifact",
+    });
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount: nudgeCount,
+      resultCount: results.length,
+    });
+    logProgress("finished proof nudges");
+    console.log(JSON.stringify(results, null, 2));
+  } catch (error) {
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount: nudgeCount,
+      resultCount: results.length,
+      error,
+    });
+    throw error;
   }
-  if (!dryRun && cursorPath && lastProcessedCandidate) {
-    writeProofLaneCursor(cursorPath, "proof_nudges", lastProcessedCandidate);
-  }
-  ensureDir(dirname(reportPath));
-  writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-  logProgress("finished proof nudges");
-  console.log(JSON.stringify(results, null, 2));
 }
 
 function botProofCommand(args: Args): void {
@@ -28123,161 +28794,221 @@ function botProofCommand(args: Args): void {
   const reportPath = resolve(stringArg(args.report_path, join(ROOT, "bot-proof-report.json")));
   const requestedItemNumbers = itemNumbersArg(args.item_numbers, args.item_number);
   const cursorPath = proofLaneCursorPath(args, requestedItemNumbers);
-
-  if (!existsSync(itemsDir)) {
-    const results: BotProofResult[] = [];
-    ensureDir(dirname(reportPath));
-    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-    console.log(JSON.stringify(results, null, 2));
-    return;
-  }
-
-  const allCandidates = botProofCandidateRecords(itemsDir, requestedItemNumbers);
-  const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
-  const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+  const ledger = startProofLaneActionLedger({
+    lane: "bot_proof",
+    execute,
+    limit,
+    processedLimit,
+    requestedItemNumbers,
+    cursorEnabled: cursorPath !== null,
+  });
   const startedAtMs = Date.now();
   const results: BotProofResult[] = [];
   let processedCount = 0;
   let actionCount = 0;
   let lastProcessedCandidate: ProofLaneCandidate | null = null;
-  const markProcessed = (candidate: ProofLaneCandidate): void => {
-    processedCount += 1;
-    lastProcessedCandidate = candidate;
-  };
-  const logProgress = (message: string): void => {
-    const counts = results.reduce<Record<string, number>>((accumulator, result) => {
-      accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
-      return accumulator;
-    }, {});
-    console.error(
-      [
-        `[bot-proof] ${new Date().toISOString()} ${message}`,
-        `actions=${actionCount}/${limit}`,
-        `processed=${processedCount}/${processedLimit}`,
-        `dry_run=${dryRun}`,
-        `counts=${JSON.stringify(counts)}`,
-      ].join(" "),
-    );
-  };
 
-  logProgress(
-    `starting bot proof handling: candidates=${allCandidates.length} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
-  );
-  for (const candidate of candidates) {
-    if (actionCount >= limit) break;
-    if (processedCount >= processedLimit) break;
-    if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
-      results.push({
-        repo: targetRepo(),
-        number: 0,
-        action: "skipped_runtime_budget",
-        reason: `max runtime ${maxRuntimeMs}ms reached`,
+  try {
+    if (!existsSync(itemsDir)) {
+      ensureDir(dirname(reportPath));
+      writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.reviewLogPublication,
+        filePath: reportPath,
+        evidenceKind: "bot_proof_report",
+        slot: "bot_proof_report",
+        publicationKind: "local_artifact",
       });
-      logProgress(`stopping bot proof handling: max runtime ${maxRuntimeMs}ms reached`);
-      break;
+      finishProofLaneActionLedger(ledger, {
+        processedCount,
+        actionCount,
+        resultCount: results.length,
+      });
+      console.log(JSON.stringify(results, null, 2));
+      return;
     }
 
-    const resultBase = {
-      repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
-      number: candidate.number,
-      reviewedAt: candidate.reviewedAt,
+    const allCandidates = botProofCandidateRecords(itemsDir, requestedItemNumbers);
+    const cursor = cursorPath ? readProofLaneCursor(cursorPath) : null;
+    const candidates = rotateProofLaneCandidates(allCandidates, cursor);
+    const markProcessed = (candidate: ProofLaneCandidate): void => {
+      processedCount += 1;
+      lastProcessedCandidate = candidate;
     };
-    let item: Item;
-    let state: string;
-    let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
-    try {
-      const fetched = fetchItem(candidate.number);
-      item = fetched.item;
-      state = fetched.state;
-      pullDetails =
-        item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
-    } catch (error) {
-      results.push({
-        ...resultBase,
-        action: "skipped_live_fetch_failed",
-        reason: proofNudgeLiveFetchFailureReason(error),
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    if (state !== "open") {
-      results.push({
-        ...resultBase,
-        action: "skipped_not_open",
-        reason: `state is ${state}`,
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const eligibility = botProofEligibility({
-      item,
-      markdown: candidate.markdown,
-      headSha: pullDetails.headSha,
-      draft: pullDetails.draft,
-    });
-    if (!eligibility.eligible) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: eligibility.reason,
+    const logProgress = (message: string): void => {
+      const counts = results.reduce<Record<string, number>>((accumulator, result) => {
+        accumulator[result.action] = (accumulator[result.action] ?? 0) + 1;
+        return accumulator;
+      }, {});
+      console.error(
+        [
+          `[bot-proof] ${new Date().toISOString()} ${message}`,
+          `actions=${actionCount}/${limit}`,
+          `processed=${processedCount}/${processedLimit}`,
+          `dry_run=${dryRun}`,
+          `counts=${JSON.stringify(counts)}`,
+        ].join(" "),
+      );
+    };
+
+    logProgress(
+      `starting bot proof handling: candidates=${allCandidates.length} item_numbers=${requestedItemNumbers.join(",") || "all"} cursor_path=${cursorPath ?? "none"}`,
+    );
+    for (const candidate of candidates) {
+      if (actionCount >= limit) break;
+      if (processedCount >= processedLimit) break;
+      if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
+        results.push({
+          repo: targetRepo(),
+          number: 0,
+          action: "skipped_runtime_budget",
+          reason: `max runtime ${maxRuntimeMs}ms reached`,
+        });
+        logProgress(`stopping bot proof handling: max runtime ${maxRuntimeMs}ms reached`);
+        break;
+      }
+
+      const resultBase = {
+        repo: markdownRepository(candidate.markdown, join(itemsDir, candidate.file)),
+        number: candidate.number,
+        reviewedAt: candidate.reviewedAt,
+      };
+      let item: Item;
+      let state: string;
+      let pullDetails: Partial<ProofNudgePullRequestDetails> = {};
+      try {
+        const fetched = fetchItem(candidate.number);
+        item = fetched.item;
+        state = fetched.state;
+        pullDetails =
+          item.kind === "pull_request" ? fetchPullRequestProofNudgeDetails(candidate.number) : {};
+      } catch (error) {
+        results.push({
+          ...resultBase,
+          action: "skipped_live_fetch_failed",
+          reason: proofNudgeLiveFetchFailureReason(error),
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      if (state !== "open") {
+        results.push({
+          ...resultBase,
+          action: "skipped_not_open",
+          reason: `state is ${state}`,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const eligibility = botProofEligibility({
+        item,
+        markdown: candidate.markdown,
         headSha: pullDetails.headSha,
+        draft: pullDetails.draft,
       });
-      markProcessed(candidate);
-      continue;
-    }
-    const headSha = pullDetails.headSha;
-    if (!headSha) {
-      results.push({
-        ...resultBase,
-        action: "skipped_no_live_head",
-        reason: "live PR head SHA could not be inspected",
-      });
-      markProcessed(candidate);
-      continue;
-    }
-    const commentBody = renderBotProofDecisionComment({
-      item,
-      headSha,
-      markdown: candidate.markdown,
-      timestamp: new Date().toISOString(),
-      mantisRecommendation: eligibility.mantisRecommendation,
-    });
-    const labelResult = syncBotProofDecisionLabels({
-      number: candidate.number,
-      labels: item.labels,
-      dryRun,
-    });
-    if (dryRun) {
-      results.push({
-        ...resultBase,
-        action: eligibility.action,
-        reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+      if (!eligibility.eligible) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: eligibility.reason,
+          headSha: pullDetails.headSha,
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const headSha = pullDetails.headSha;
+      if (!headSha) {
+        results.push({
+          ...resultBase,
+          action: "skipped_no_live_head",
+          reason: "live PR head SHA could not be inspected",
+        });
+        markProcessed(candidate);
+        continue;
+      }
+      const commentBody = renderBotProofDecisionComment({
+        item,
         headSha,
+        markdown: candidate.markdown,
+        timestamp: new Date().toISOString(),
+        mantisRecommendation: eligibility.mantisRecommendation,
       });
-    } else {
-      const comment = upsertBotProofDecisionComment(candidate.number, headSha, commentBody);
-      results.push({
-        ...resultBase,
-        action:
-          eligibility.action === "bot_proof_mantis_request_planned"
-            ? "bot_proof_mantis_request_posted"
-            : "bot_proof_decision_posted",
-        reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
-        url: commentUrl(comment) ?? undefined,
-        headSha,
+      const { labelResult, comment } = runWithProofLaneMutationRunner(
+        ledger,
+        proofLaneSubject(resultBase.repo, candidate.number, headSha),
+        () => {
+          const labelResult = syncBotProofDecisionLabels({
+            number: candidate.number,
+            labels: item.labels,
+            dryRun,
+          });
+          return {
+            labelResult,
+            comment: dryRun
+              ? undefined
+              : upsertBotProofDecisionComment(candidate.number, headSha, commentBody),
+          };
+        },
+      );
+      if (dryRun) {
+        results.push({
+          ...resultBase,
+          action: eligibility.action,
+          reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+          headSha,
+        });
+      } else {
+        results.push({
+          ...resultBase,
+          action:
+            eligibility.action === "bot_proof_mantis_request_planned"
+              ? "bot_proof_mantis_request_posted"
+              : "bot_proof_decision_posted",
+          reason: [eligibility.reason, labelResult.reason].filter(Boolean).join("; "),
+          url: commentUrl(comment) ?? undefined,
+          headSha,
+        });
+      }
+      markProcessed(candidate);
+      actionCount += 1;
+      logProgress(`${dryRun ? "planned" : "posted"} bot proof handling #${candidate.number}`);
+    }
+    if (!dryRun && cursorPath && lastProcessedCandidate) {
+      writeProofLaneCursor(cursorPath, "bot_proof", lastProcessedCandidate);
+      recordProofLaneArtifact(ledger, {
+        phase: ACTION_EVENT_TYPES.proofBinding,
+        filePath: cursorPath,
+        evidenceKind: "bot_proof_cursor",
+        slot: "bot_proof_cursor",
+        publicationKind: "cursor",
       });
     }
-    markProcessed(candidate);
-    actionCount += 1;
-    logProgress(`${dryRun ? "planned" : "posted"} bot proof handling #${candidate.number}`);
+    ensureDir(dirname(reportPath));
+    writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
+    recordProofLaneResults(ledger, results);
+    recordProofLaneArtifact(ledger, {
+      phase: ACTION_EVENT_TYPES.reviewLogPublication,
+      filePath: reportPath,
+      evidenceKind: "bot_proof_report",
+      slot: "bot_proof_report",
+      publicationKind: "local_artifact",
+    });
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount,
+      resultCount: results.length,
+    });
+    logProgress("finished bot proof handling");
+    console.log(JSON.stringify(results, null, 2));
+  } catch (error) {
+    finishProofLaneActionLedger(ledger, {
+      processedCount,
+      actionCount,
+      resultCount: results.length,
+      error,
+    });
+    throw error;
   }
-  if (!dryRun && cursorPath && lastProcessedCandidate) {
-    writeProofLaneCursor(cursorPath, "bot_proof", lastProcessedCandidate);
-  }
-  ensureDir(dirname(reportPath));
-  writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
-  logProgress("finished bot proof handling");
-  console.log(JSON.stringify(results, null, 2));
 }
 
 function applyArtifactsCommand(args: Args): void {
@@ -30128,6 +30859,292 @@ function assistPromptContextDigest(item: Item, context: ItemContext): string {
   );
 }
 
+type AssistActionLedger = {
+  operationIdentity: {
+    repository: string;
+    number: number;
+    kind: ItemKind;
+    sourceRevision: string;
+    requestSha256: string;
+    mode: string;
+    lens: string;
+  };
+  subject: ActionEventSubject;
+  lastEventId: string | null;
+  nextPhaseSeq: number;
+  startedAtMs: number;
+  mutationObserved: boolean;
+  uncertainMutationObserved: boolean;
+};
+
+function assistActionLedgerIdentity(options: {
+  repository: string;
+  number: number;
+  kind: ItemKind;
+  sourceRevision: string;
+  requestSha256: string;
+  mode: string;
+  lens: string;
+}) {
+  return {
+    repository: options.repository,
+    number: options.number,
+    kind: options.kind,
+    sourceRevision: options.sourceRevision,
+    requestSha256: options.requestSha256,
+    mode: options.mode,
+    lens: options.lens,
+  };
+}
+
+function startAssistActionLedger(options: {
+  operationIdentity: AssistActionLedger["operationIdentity"];
+  component: "assist_generate" | "assist_publish";
+  phase: typeof ACTION_EVENT_TYPES.reviewItem | typeof ACTION_EVENT_TYPES.reviewCommentPublication;
+  evidence?: readonly ActionEventEvidence[];
+}): AssistActionLedger {
+  const subject: ActionEventSubject = {
+    repository: options.operationIdentity.repository,
+    kind: options.operationIdentity.kind,
+    number: options.operationIdentity.number,
+    sourceRevision: options.operationIdentity.sourceRevision,
+  };
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "assist_start" },
+    operation: "assist",
+    operationIdentity: options.operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: {
+      operationIdentity: options.operationIdentity,
+      slot: "assist_start",
+      component: options.component,
+    },
+    component: options.component,
+    subject,
+    evidence: [...workflowRunEvidence(), ...(options.evidence ?? [])],
+    attributes: {
+      review_mode: options.operationIdentity.mode,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  return {
+    operationIdentity: options.operationIdentity,
+    subject,
+    lastEventId: start?.event_id ?? null,
+    nextPhaseSeq: 2,
+    startedAtMs: Date.now(),
+    mutationObserved: false,
+    uncertainMutationObserved: false,
+  };
+}
+
+function nextAssistActionPhase(ledger: AssistActionLedger): number {
+  const phaseSeq = ledger.nextPhaseSeq;
+  ledger.nextPhaseSeq += 1;
+  return phaseSeq;
+}
+
+function recordAssistGenerationLog(
+  ledger: AssistActionLedger,
+  options: {
+    outputPath: string;
+    model: string;
+    reasoningEffort: string;
+    failure?: unknown;
+  },
+): void {
+  const outputEvidence = actionLedgerFileEvidence("assist_review_output", options.outputPath);
+  const failure =
+    options.failure === undefined ? null : actionLedgerFailureDisposition(options.failure);
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: outputEvidence
+      ? ACTION_EVENT_STATUSES.completed
+      : (failure?.status ?? ACTION_EVENT_STATUSES.skipped),
+    reasonCode: outputEvidence
+      ? ACTION_EVENT_REASON_CODES.completed
+      : (failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.notFound),
+    retryable: failure !== null,
+    mutation: false,
+    identity: { slot: "assist_review_output" },
+    operation: "assist",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextAssistActionPhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "assist_review_output",
+    },
+    component: "assist_generate",
+    subject: ledger.subject,
+    evidence: [...workflowRunEvidence(), ...(outputEvidence ? [outputEvidence] : [])],
+    attributes: {
+      log_count: outputEvidence ? 1 : 0,
+      log_kind: "assist_review",
+      publication_kind: "local_artifact",
+      model: options.model,
+      reasoning_effort: options.reasoningEffort,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function finishAssistActionLedger(
+  ledger: AssistActionLedger,
+  options: {
+    component: "assist_generate" | "assist_publish";
+    phase:
+      | typeof ACTION_EVENT_TYPES.reviewItem
+      | typeof ACTION_EVENT_TYPES.reviewCommentPublication;
+    status: ActionEventStatus;
+    reasonCode: ActionEventReasonCode;
+    retryable: boolean;
+    mutation: boolean;
+    completionReason: string;
+    evidence?: readonly ActionEventEvidence[];
+    publicationKind?: string;
+  },
+): void {
+  const event = recordWorkflowPhaseEvent(ROOT, {
+    phase: options.phase,
+    status: options.status,
+    reasonCode: options.reasonCode,
+    retryable: options.retryable && !ledger.uncertainMutationObserved,
+    mutation: options.mutation || ledger.mutationObserved,
+    identity: { slot: "assist_terminal", completionReason: options.completionReason },
+    operation: "assist",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextAssistActionPhase(ledger),
+    idempotencyIdentity: {
+      operationIdentity: ledger.operationIdentity,
+      slot: "assist_terminal",
+      component: options.component,
+    },
+    component: options.component,
+    subject: ledger.subject,
+    evidence: [...workflowRunEvidence(), ...(options.evidence ?? [])],
+    attributes: {
+      completion_reason: options.completionReason,
+      duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
+      review_mode: ledger.operationIdentity.mode,
+      ...(options.publicationKind ? { publication_kind: options.publicationKind } : {}),
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+}
+
+function assistCommentMutationRunner(ledger: AssistActionLedger): MutationRunner {
+  let requestAttempt = 0;
+  return <T>(options: {
+    identity: string;
+    idempotencyIdentity: string;
+    operation: () => T;
+    didMutate?: ((result: T) => boolean) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }): T => {
+    requestAttempt += 1;
+    const mutationIdentitySha256 = sha256(options.idempotencyIdentity);
+    const attempt = recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: true,
+      mutation: false,
+      identity: {
+        slot: "assist_comment_mutation_attempt",
+        requestAttempt,
+        requestIdentitySha256: sha256(options.identity),
+      },
+      operation: "assist",
+      operationIdentity: ledger.operationIdentity,
+      parentEventId: ledger.lastEventId,
+      phaseSeq: nextAssistActionPhase(ledger),
+      idempotencyIdentity: {
+        operationIdentity: ledger.operationIdentity,
+        slot: "assist_comment_mutation",
+        mutationIdentitySha256,
+      },
+      component: "assist_publish",
+      subject: ledger.subject,
+      evidence: workflowRunEvidence(),
+      attributes: {
+        attempt: requestAttempt,
+        publication_kind: "github_comment",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
+    const finish = (outcome: "accepted" | "rejected" | "unknown"): void => {
+      const mutation = outcome !== "rejected";
+      const event = recordWorkflowPhaseEvent(ROOT, {
+        phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+        status:
+          outcome === "accepted"
+            ? ACTION_EVENT_STATUSES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_STATUSES.skipped
+              : ACTION_EVENT_STATUSES.failed,
+        reasonCode:
+          outcome === "accepted"
+            ? ACTION_EVENT_REASON_CODES.published
+            : outcome === "rejected"
+              ? ACTION_EVENT_REASON_CODES.notApplicable
+              : ACTION_EVENT_REASON_CODES.unavailable,
+        retryable: outcome === "unknown",
+        mutation,
+        identity: {
+          slot: "assist_comment_mutation_outcome",
+          requestAttempt,
+          requestIdentitySha256: sha256(options.identity),
+          outcome,
+        },
+        operation: "assist",
+        operationIdentity: ledger.operationIdentity,
+        parentEventId: attempt?.event_id ?? ledger.lastEventId,
+        phaseSeq: nextAssistActionPhase(ledger),
+        idempotencyIdentity: {
+          operationIdentity: ledger.operationIdentity,
+          slot: "assist_comment_mutation",
+          mutationIdentitySha256,
+        },
+        component: "assist_publish",
+        subject: ledger.subject,
+        evidence: workflowRunEvidence(),
+        attributes: {
+          attempt: requestAttempt,
+          publication_kind: "github_comment",
+          completion_reason:
+            outcome === "accepted"
+              ? "mutation_accepted"
+              : outcome === "rejected"
+                ? "mutation_rejected"
+                : "mutation_outcome_unknown",
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+      if (mutation) ledger.mutationObserved = true;
+      if (outcome === "unknown") ledger.uncertainMutationObserved = true;
+    };
+    try {
+      const result = options.operation();
+      finish(options.didMutate?.(result) === false ? "rejected" : "accepted");
+      return result;
+    } catch (error) {
+      finish(options.knownNoMutation?.(error) === true ? "rejected" : "unknown");
+      throw error;
+    }
+  };
+}
+
 function captureLiveAssistBinding(request: AssistRequestBinding): LiveAssistBinding {
   const { item, state } = fetchItem(request.itemNumber);
   if (state.toLowerCase() !== "open") {
@@ -30170,130 +31187,344 @@ function assistGenerateCommand(args: Args): void {
   const timeoutMs = numberArg(args.codex_timeout_ms, 120_000);
   const workDir = resolve(stringArg(args.work_dir, join(ROOT, ".artifacts", "assist-codex")));
   const live = captureLiveAssistBinding(request);
-  const answer = runCodexAssist({
-    item: live.item,
-    context: live.context,
-    question: request.question,
-    sourceCommentUrl: live.sourceComment?.htmlUrl ?? request.sourceCommentUrl,
-    author: live.sourceComment?.author ?? request.author,
-    model,
-    reasoningEffort: request.reasoningEffort,
-    sandboxMode,
-    timeoutMs,
-    workDir,
+  const operationIdentity = assistActionLedgerIdentity({
+    repository: request.targetRepo,
+    number: request.itemNumber,
+    kind: live.item.kind,
+    sourceRevision: live.context.sourceRevision!,
+    requestSha256: assistRequestSha256(request),
     mode: request.mode,
     lens: request.lens,
   });
-  const pullHeadSha =
-    live.item.kind === "pull_request" ? itemHeadSha(live.item, live.context) : null;
-  const artifact = createAssistArtifact({
-    generatedAt: new Date().toISOString(),
-    runId: workflow.runId,
-    runAttempt: workflow.runAttempt,
-    itemKind: live.item.kind,
-    sourceRevision: live.context.sourceRevision!,
-    contextDigest: assistPromptContextDigest(live.item, live.context),
-    pullHeadSha,
-    sourceDigest: assistSourceDigest(live.sourceComment),
-    request,
-    answer,
+  const ledger = startAssistActionLedger({
+    operationIdentity,
+    component: "assist_generate",
+    phase: ACTION_EVENT_TYPES.reviewItem,
   });
-  ensureDir(dirname(artifactPath));
-  writeFileSync(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-  console.log(
-    JSON.stringify({
-      generated: true,
-      posted: false,
-      artifact: artifactPath,
-      idempotency_key: artifact.idempotency_key,
+  const outputPath = join(workDir, `${live.item.number}.assist.md`);
+  try {
+    const answer = runCodexAssist({
+      item: live.item,
+      context: live.context,
+      question: request.question,
+      sourceCommentUrl: live.sourceComment?.htmlUrl ?? request.sourceCommentUrl,
+      author: live.sourceComment?.author ?? request.author,
+      model,
+      reasoningEffort: request.reasoningEffort,
+      sandboxMode,
+      timeoutMs,
+      workDir,
       mode: request.mode,
-      item: request.itemNumber,
+      lens: request.lens,
+    });
+    const pullHeadSha =
+      live.item.kind === "pull_request" ? itemHeadSha(live.item, live.context) : null;
+    const artifact = createAssistArtifact({
+      generatedAt: new Date().toISOString(),
+      runId: workflow.runId,
+      runAttempt: workflow.runAttempt,
+      itemKind: live.item.kind,
+      sourceRevision: live.context.sourceRevision!,
+      contextDigest: assistPromptContextDigest(live.item, live.context),
+      pullHeadSha,
+      sourceDigest: assistSourceDigest(live.sourceComment),
+      request,
+      answer,
+    });
+    ensureDir(dirname(artifactPath));
+    writeFileSync(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+    recordAssistGenerationLog(ledger, {
+      outputPath,
       model: PUBLIC_CODEX_MODEL,
       reasoningEffort: request.reasoningEffort,
-    }),
-  );
+    });
+    const artifactEvidence = actionLedgerFileEvidence("assist_review_artifact", artifactPath);
+    finishAssistActionLedger(ledger, {
+      component: "assist_generate",
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      completionReason: "completed",
+      evidence: artifactEvidence ? [artifactEvidence] : [],
+      publicationKind: "local_artifact",
+    });
+    console.log(
+      JSON.stringify({
+        generated: true,
+        posted: false,
+        artifact: artifactPath,
+        idempotency_key: artifact.idempotency_key,
+        mode: request.mode,
+        item: request.itemNumber,
+        model: PUBLIC_CODEX_MODEL,
+        reasoningEffort: request.reasoningEffort,
+      }),
+    );
+  } catch (error) {
+    recordAssistGenerationLog(ledger, {
+      outputPath,
+      model: PUBLIC_CODEX_MODEL,
+      reasoningEffort: request.reasoningEffort,
+      failure: error,
+    });
+    const failure = actionLedgerFailureDisposition(error);
+    finishAssistActionLedger(ledger, {
+      component: "assist_generate",
+      phase: ACTION_EVENT_TYPES.reviewItem,
+      status: failure.status,
+      reasonCode: failure.reasonCode,
+      retryable: true,
+      mutation: false,
+      completionReason: failure.completionReason,
+    });
+    throw error;
+  }
 }
 
 function assistPublishCommand(args: Args): void {
   repoFromArgs(args);
   const request = assistRequestFromArgs(args);
   const workflow = assistWorkflowIdentity(args);
+  const artifactPath = assistArtifactPath(args);
   const artifact = parseAssistArtifact(
-    readBoundedUtf8File(assistArtifactPath(args), ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
+    readBoundedUtf8File(artifactPath, ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
     {
       runId: workflow.runId,
       runAttempt: workflow.runAttempt,
       request,
     },
   );
-
-  const initialLive = validateLiveAssistArtifact(artifact, request);
-  const initialHead =
-    initialLive.item.kind === "pull_request"
-      ? itemHeadSha(initialLive.item, initialLive.context)
-      : "na";
-  const marker =
-    request.mode === "visual"
-      ? visualCommentMarker(request.itemNumber, request.lens, initialHead)
-      : assistCommentMarker(artifact.idempotency_key);
-  const existing = findOwnedCommentByMarker(request.itemNumber, marker);
-
-  // Re-fetch after idempotency discovery so target/source drift during artifact handling wins
-  // immediately before the only GitHub mutation in this process.
-  const live = validateLiveAssistArtifact(artifact, request);
-  const sourceCommentUrl = live.sourceComment?.htmlUrl ?? request.sourceCommentUrl;
-  const body =
-    request.mode === "visual"
-      ? renderVisualComment({
-          body: artifact.output.answer,
-          item: live.item,
-          context: live.context,
-          lens: request.lens,
-          model: PUBLIC_CODEX_MODEL,
-          reasoningEffort: request.reasoningEffort,
-          sourceCommentUrl,
-          sourceCommentId: request.sourceCommentId,
-        })
-      : renderAssistComment({
-          body: artifact.output.answer,
-          model: PUBLIC_CODEX_MODEL,
-          reasoningEffort: request.reasoningEffort,
-          sourceCommentUrl,
-          sourceCommentId: request.sourceCommentId,
-          idempotencyKey: artifact.idempotency_key,
-        });
-  const action = publishIdempotentAssistComment(request.itemNumber, existing, body);
-  console.log(
-    JSON.stringify({
-      posted: action === "posted",
-      action,
-      mode: request.mode,
-      item: request.itemNumber,
-      idempotency_key: artifact.idempotency_key,
+  const ledger = startAssistActionLedger({
+    operationIdentity: assistActionLedgerIdentity({
+      repository: artifact.target.repo,
+      number: artifact.target.item_number,
+      kind: artifact.target.item_kind,
+      sourceRevision: artifact.target.source_revision,
+      requestSha256: artifact.request.sha256,
+      mode: artifact.request.mode,
+      lens: artifact.request.lens,
     }),
-  );
+    component: "assist_publish",
+    phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+    evidence: [actionLedgerFileEvidence("assist_review_artifact", artifactPath)].filter(
+      (entry): entry is ActionEventEvidence => entry !== null,
+    ),
+  });
+  const previousReviewMutationRunner = activeReviewMutationRunner;
+  try {
+    const initialLive = validateLiveAssistArtifact(artifact, request);
+    const initialHead =
+      initialLive.item.kind === "pull_request"
+        ? itemHeadSha(initialLive.item, initialLive.context)
+        : "na";
+    const marker =
+      request.mode === "visual"
+        ? visualCommentMarker(request.itemNumber, request.lens, initialHead)
+        : assistCommentMarker(artifact.idempotency_key);
+    const existing = findOwnedCommentByMarker(request.itemNumber, marker);
+
+    // Re-fetch after idempotency discovery so target/source drift during artifact handling wins
+    // immediately before the only GitHub mutation in this process.
+    const live = validateLiveAssistArtifact(artifact, request);
+    const sourceCommentUrl = live.sourceComment?.htmlUrl ?? request.sourceCommentUrl;
+    const body =
+      request.mode === "visual"
+        ? renderVisualComment({
+            body: artifact.output.answer,
+            item: live.item,
+            context: live.context,
+            lens: request.lens,
+            model: PUBLIC_CODEX_MODEL,
+            reasoningEffort: request.reasoningEffort,
+            sourceCommentUrl,
+            sourceCommentId: request.sourceCommentId,
+          })
+        : renderAssistComment({
+            body: artifact.output.answer,
+            model: PUBLIC_CODEX_MODEL,
+            reasoningEffort: request.reasoningEffort,
+            sourceCommentUrl,
+            sourceCommentId: request.sourceCommentId,
+            idempotencyKey: artifact.idempotency_key,
+          });
+    activeReviewMutationRunner = assistCommentMutationRunner(ledger);
+    const action = publishIdempotentAssistComment(request.itemNumber, existing, body);
+    finishAssistActionLedger(ledger, {
+      component: "assist_publish",
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status:
+        action === "unchanged" ? ACTION_EVENT_STATUSES.unchanged : ACTION_EVENT_STATUSES.published,
+      reasonCode:
+        action === "unchanged"
+          ? ACTION_EVENT_REASON_CODES.contentUnchanged
+          : ACTION_EVENT_REASON_CODES.published,
+      retryable: false,
+      mutation: action !== "unchanged",
+      completionReason: action,
+      publicationKind: "github_comment",
+    });
+    console.log(
+      JSON.stringify({
+        posted: action === "posted",
+        action,
+        mode: request.mode,
+        item: request.itemNumber,
+        idempotency_key: artifact.idempotency_key,
+      }),
+    );
+  } catch (error) {
+    const failure = actionLedgerFailureDisposition(error);
+    finishAssistActionLedger(ledger, {
+      component: "assist_publish",
+      phase: ACTION_EVENT_TYPES.reviewCommentPublication,
+      status: failure.status,
+      reasonCode: failure.reasonCode,
+      retryable: true,
+      mutation: ledger.mutationObserved,
+      completionReason: ledger.uncertainMutationObserved
+        ? "mutation_outcome_unknown"
+        : failure.completionReason,
+      publicationKind: "github_comment",
+    });
+    throw error;
+  } finally {
+    activeReviewMutationRunner = previousReviewMutationRunner;
+  }
 }
 
 function assistValidateArtifactCommand(args: Args): void {
   repoFromArgs(args);
   const request = assistRequestFromArgs(args);
   const workflow = assistWorkflowIdentity(args);
-  const artifact = parseAssistArtifact(
-    readBoundedUtf8File(assistArtifactPath(args), ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
-    {
+  const artifactPath = assistArtifactPath(args);
+  const artifactRecordPath = repoRelativePath(artifactPath);
+  const operationIdentity = {
+    repository: request.targetRepo,
+    number: request.itemNumber,
+    requestSha256: assistRequestSha256(request),
+    mode: request.mode,
+    lens: request.lens,
+    runId: workflow.runId,
+    runAttempt: workflow.runAttempt,
+    artifactName: basename(artifactPath),
+  };
+  const subject: ActionEventSubject = {
+    repository: request.targetRepo,
+    kind: "publication",
+    number: request.itemNumber,
+    ...(artifactRecordPath.startsWith("../") ? {} : { recordPath: artifactRecordPath }),
+  };
+  const startedAtMs = Date.now();
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofBinding,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "assist_validation_start" },
+    operation: "assist",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: {
+      operationIdentity,
+      slot: "assist_validation_start",
+    },
+    component: "assist_validate",
+    subject,
+    evidence: workflowRunEvidence(),
+    attributes: {
+      review_mode: request.mode,
+      validation_count: 1,
+      validation_kind: "assist_artifact",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  let artifactEvidence: ActionEventEvidence | null = null;
+  try {
+    const artifactText = readBoundedUtf8File(
+      artifactPath,
+      ASSIST_ARTIFACT_MAX_BYTES,
+      "assist artifact",
+    );
+    artifactEvidence = {
+      kind: "assist_review_artifact",
+      sha256: sha256(artifactText),
+      ...(artifactRecordPath.startsWith("../") ? {} : { reportPath: artifactRecordPath }),
+    };
+    const artifact = parseAssistArtifact(artifactText, {
       runId: workflow.runId,
       runAttempt: workflow.runAttempt,
       request,
-    },
-  );
-  console.log(
-    JSON.stringify({
-      valid: true,
-      item: artifact.target.item_number,
-      mode: artifact.request.mode,
-      idempotency_key: artifact.idempotency_key,
-    }),
-  );
+    });
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofBinding,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "assist_validation_terminal", completionReason: "validated" },
+      operation: "assist",
+      operationIdentity,
+      parentEventId: start?.event_id ?? null,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operationIdentity,
+        slot: "assist_validation_terminal",
+      },
+      component: "assist_validate",
+      subject,
+      evidence: [...workflowRunEvidence(), artifactEvidence],
+      attributes: {
+        completion_reason: "validated",
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        publication_kind: "local_artifact",
+        review_mode: request.mode,
+        validation_count: 1,
+        validation_kind: "assist_artifact",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    console.log(
+      JSON.stringify({
+        valid: true,
+        item: artifact.target.item_number,
+        mode: artifact.request.mode,
+        idempotency_key: artifact.idempotency_key,
+      }),
+    );
+  } catch (error) {
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofBinding,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.validationFailed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "assist_validation_terminal", completionReason: "validation_failed" },
+      operation: "assist",
+      operationIdentity,
+      parentEventId: start?.event_id ?? null,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operationIdentity,
+        slot: "assist_validation_terminal",
+      },
+      component: "assist_validate",
+      subject,
+      evidence: [...workflowRunEvidence(), ...(artifactEvidence ? [artifactEvidence] : [])],
+      attributes: {
+        completion_reason: "validation_failed",
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        publication_kind: "local_artifact",
+        review_mode: request.mode,
+        validation_count: 1,
+        validation_kind: "assist_artifact",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    throw error;
+  }
 }
 
 function checkCommand(): void {
@@ -30312,6 +31543,13 @@ function publishActionEventsCommand(args: Args): void {
   if (!expectedProducerJob) {
     throw new UserFacingCommandError("--expected-producer-job is required");
   }
+  const expectedRunAttempt = optionalNumberArg(args.expected_run_attempt);
+  if (
+    expectedRunAttempt !== undefined &&
+    (!Number.isSafeInteger(expectedRunAttempt) || expectedRunAttempt < 1)
+  ) {
+    throw new UserFacingCommandError("--expected-run-attempt must be a positive integer");
+  }
   const currentProducer = workflowActionProducer("action_event_publisher");
   const result = importActionEventShards(sourceRoot, stateRoot, {
     expectedProducer: {
@@ -30320,14 +31558,14 @@ function publishActionEventsCommand(args: Args): void {
       workflow: currentProducer.workflow,
       job: expectedProducerJob,
       runId: currentProducer.runId,
-      runAttempt: currentProducer.runAttempt,
+      runAttempt: expectedRunAttempt ?? currentProducer.runAttempt,
     },
   });
   console.log(JSON.stringify(result, null, 2));
 }
 
 const ACTION_EVENT_PUBLISH_PATH_PATTERN =
-  /^ledger\/v1\/(?:events\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.jsonl|import-bindings\/(?:producer-runs|events|shard-sets|completed-shard-sets)\/[a-f0-9]{64}\.json)$/;
+  /^ledger\/v1\/(?:events\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.jsonl|import-bindings\/(?:(?:producer-runs|events|shard-sets|completed-shard-sets)\/[a-f0-9]{64}\.json|repair-mutation-idempotency(?:-reservations)?\/[a-f0-9]{64}\/[a-f0-9]{64}\/[a-f0-9]{64}\.json))$/;
 const ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES = ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS * 512;
 
 export function actionEventPublishPathsForTest(content: string): string[] {

@@ -110,6 +110,7 @@ test("isolated publisher defers prepared code and mints a narrow token only for 
   const groundTruth = publisher.indexOf("Download immutable cluster result ground truth");
   const stateTruth = publisher.indexOf("Checkout immutable job ground truth");
   const validation = publisher.indexOf("Independently validate publication authority");
+  const workflowRead = publisher.indexOf("Create central workflow read token after validation");
   const targetWrite = publisher.indexOf(
     "Create narrow no-publication mutation token after validation",
   );
@@ -118,12 +119,31 @@ test("isolated publisher defers prepared code and mints a narrow token only for 
     groundTruth >= 0 &&
       stateTruth > groundTruth &&
       validation > stateTruth &&
-      targetWrite > validation &&
+      workflowRead > validation &&
+      targetWrite > workflowRead &&
       publication > targetWrite,
   );
   assert.doesNotMatch(publisher, /Create state publication token|Create central requeue token/);
   assert.match(publisher, /artifact-ids: \${{ needs\.execute\.outputs\.prepared_artifact_id }}/);
   assert.match(publisher, /steps\.publication_validation\.outputs\.ready == 'true'/);
+  const workflowReadToken = publisher.slice(workflowRead, targetWrite);
+  assert.match(workflowReadToken, /owner: openclaw/);
+  assert.match(workflowReadToken, /repositories: clawsweeper/);
+  assert.match(workflowReadToken, /permission-actions: read/);
+  assert.match(workflowReadToken, /permission-contents: read/);
+  assert.doesNotMatch(workflowReadToken, /permission-[a-z-]+: write/);
+  assert.equal(
+    (
+      publisher.match(
+        /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ steps\.workflow-read-token\.outputs\.token \}\}/g,
+      ) ?? []
+    ).length,
+    3,
+  );
+  assert.doesNotMatch(
+    publisher.slice(0, publisher.indexOf("- name: Apply safe closure actions")),
+    /CLAWSWEEPER_WORKFLOW_GH_TOKEN:/,
+  );
   const afterWriteToken = publisher.slice(targetWrite);
   assert.doesNotMatch(afterWriteToken, /pnpm run/);
   assert.doesNotMatch(afterWriteToken, /setup-codex|setup-bun/);
@@ -406,7 +426,7 @@ test("exact-review lease outputs reject multiline dispatch identities", () => {
   assert.ok(
     claim.run.includes('if ! [[ "$QUEUE_LEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then'),
   );
-  assert.match(claim.run, /`lease_id=\$\{process\.env\.QUEUE_LEASE_ID\}`/);
+  assert.match(claim.run, /node dist\/repair\/exact-review-action-ledger-cli\.js claim/);
 
   for (const value of ["lease-123\nspoofed_output=value", "lease-123\rspoofed=value"]) {
     const probe = spawnSync(

@@ -337,11 +337,14 @@ The planning job performs:
 3. Durable state checkout.
 4. Execution-gate capture.
 5. Stable run-scoped Codex session path resolution.
-6. CrabFleet action-session registration.
+6. Local repair lifecycle registration, with CrabFleet session registration
+   only when steerable mode is enabled.
 7. Job validation and stale-head verification.
 8. Isolated Codex planning or autonomous artifact generation.
 9. Deterministic result review.
 10. Principal drain and exact artifact transfer.
+11. Exact current-attempt action-ledger finalization and artifact upload.
+12. Debug and transfer artifact upload; Codex session state is not restored or saved across attempts.
 
 Plan-only work ends with:
 
@@ -369,8 +372,11 @@ The execution job:
 8. Independently validates that immutable bundle without a write credential.
 9. Defers prepared code publication, or mints a narrow token after validation
    when no code publication is required and applies allowed GitHub actions.
-10. Publishes final result artifacts; principal-owned Codex session files remain
+10. Finalizes and uploads the exact current-attempt execution action ledger.
+11. Publishes final result artifacts; principal-owned Codex session files remain
     scoped to the runner attempt.
+
+The trusted `repair-publish-results` workflow checks which receipt capabilities existed at the exact worker SHA. For the current topology it requires one authenticated ledger from every started cluster or execute job, rejects missing or cross-attempt producers, imports both worker lanes with its own publication lane, and only then mutates durable result state. Older in-flight worker SHAs that did not advertise this topology remain compatible; the publisher does not manufacture receipts for them.
 
 Successful no-publication execution ends with:
 

@@ -143,6 +143,15 @@ function reviewResult(resultPath: string): JsonValue {
     ) {
       failures.push(`${target} target_updated_at does not match preflight`);
     }
+    if (MERGE_ACTIONS.has(name)) {
+      if (!action.target_timeline_cursor) {
+        failures.push(`${target} missing target_timeline_cursor`);
+      } else if (!item?.timeline_cursor) {
+        failures.push(`${target} preflight timeline cursor is unavailable`);
+      } else if (action.target_timeline_cursor !== item.timeline_cursor) {
+        failures.push(`${target} target_timeline_cursor does not match preflight`);
+      }
+    }
     if (evidenceHasExternalUrl(action.evidence ?? [])) {
       failures.push(`${target} evidence contains non-GitHub external URL`);
     }

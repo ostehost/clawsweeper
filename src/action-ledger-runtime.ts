@@ -95,6 +95,7 @@ export const ACTION_EVENT_SHARD_IMPORT_LIMITS = {
   maxEntriesPerDirectory: 512,
   maxDirectories: 512,
   maxFiles: 256,
+  maxTotalEntries: 768,
   maxFileBytes: ACTION_EVENT_SHARD_FILE_LIMITS.maxBytes,
   maxFileLines: 2_048,
   maxFileEvents: ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents,
@@ -103,8 +104,11 @@ export const ACTION_EVENT_SHARD_IMPORT_LIMITS = {
   maxCausalBindings: 256 * ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents,
 } as const;
 
+const REPAIR_MUTATION_IDEMPOTENCY_INDEX_MAX_ENTRIES = ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles;
+
 export const ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS =
-  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents + ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * 4;
+  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents * 3 +
+  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * 4;
 
 export type WorkflowActionEventInput = {
   scope: string;
@@ -161,6 +165,18 @@ export type ExpectedActionEventProducer = {
   runAttempt: number;
 };
 
+export type ValidatedActionEventShardBatch = {
+  eventPaths: string[];
+  events: ActionEvent[];
+  totalBytes: number;
+};
+
+export type ValidatedActionEventShardSource = {
+  sourceRoot: string;
+  expectedEventPaths?: readonly string[];
+  expectedProducer?: ExpectedActionEventProducer;
+};
+
 type ImportedActionEventShard = {
   relativePath: string;
   content: string;
@@ -183,6 +199,31 @@ type ImportedActionEventIdentityBinding = {
   event_id: string;
   semantic_sha256: string;
   parent_event_id: string | null;
+};
+
+type RepairMutationIdempotencyIndex = {
+  schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency";
+  schema_version: 1;
+  producer_repository_sha256: string;
+  idempotency_key_sha256: string;
+  shard_sha256: string;
+  shard: {
+    path: string;
+    replay_sha256: string;
+  };
+  events: Array<{
+    event_id: string;
+    semantic_sha256: string;
+  }>;
+};
+
+type RepairMutationIdempotencyIndexReservation = {
+  schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation";
+  schema_version: 1;
+  producer_repository_sha256: string;
+  idempotency_key_sha256: string;
+  shard_sha256: string;
+  completion_sha256: string;
 };
 
 type CrabFleetProjectionRequest = {
@@ -228,6 +269,14 @@ type ActionEventLock = {
   process_incarnation_sha256: string;
   acquired_at_ms: number;
   nonce: string;
+};
+
+type ActionEventShardReadBudget = {
+  directories: number;
+  entries: number;
+  files: number;
+  totalBytes: number;
+  totalEvents: number;
 };
 
 export function workflowActionEventsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -427,13 +476,15 @@ export async function flushWorkflowActionEvents(
 
 function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
   return (
-    event.action.status === ACTION_EVENT_STATUSES.started &&
-    (event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+    workflowActionEventIsUncertainMutationStart(event) ||
+    ((event.event_type === ACTION_EVENT_TYPES.reviewStarted ||
+      event.event_type === ACTION_EVENT_TYPES.workflowAttempt ||
+      event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
       event.event_type === ACTION_EVENT_TYPES.reviewItem ||
       event.event_type === ACTION_EVENT_TYPES.reviewRetry ||
       event.event_type === ACTION_EVENT_TYPES.applyBatch ||
-      event.event_type === ACTION_EVENT_TYPES.applyAction ||
-      event.event_type === ACTION_EVENT_TYPES.commandMutation)
+      event.event_type === ACTION_EVENT_TYPES.applyAction) &&
+      event.action.status === ACTION_EVENT_STATUSES.started)
   );
 }
 
@@ -449,9 +500,37 @@ function workflowActionEventIsUncertainMutationStart(event: ActionEvent): boolea
 function workflowActionEventIsMutationOutcome(event: ActionEvent): boolean {
   return (
     event.attributes?.completion_reason === "mutation_accepted" ||
+    event.attributes?.completion_reason === "mutation_observed" ||
     event.attributes?.completion_reason === "mutation_rejected" ||
     event.attributes?.completion_reason === "mutation_outcome_unknown"
   );
+}
+
+function workflowActionUnresolvedUnknownMutation(
+  events: readonly ActionEvent[],
+): ActionEvent | undefined {
+  const unresolved = new Map<string, ActionEvent>();
+  let dispatchUnknown: ActionEvent | undefined;
+  for (const event of [...events].sort(
+    (left, right) =>
+      left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+  )) {
+    const completionReason = event.attributes?.completion_reason;
+    const key = event.idempotency_key_sha256;
+    if (completionReason === "mutation_observed") {
+      unresolved.delete(key);
+    } else if (completionReason === "mutation_outcome_unknown") {
+      unresolved.set(key, event);
+    } else if (completionReason === "dispatch_outcome_unknown") {
+      dispatchUnknown = event;
+    }
+  }
+  return [...unresolved.values(), ...(dispatchUnknown ? [dispatchUnknown] : [])]
+    .sort(
+      (left, right) =>
+        left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+    )
+    .at(-1);
 }
 
 function workflowActionRecoveryPriority(event: ActionEvent): number {
@@ -473,6 +552,14 @@ function workflowActionEventClosesLifecycle(start: ActionEvent, event: ActionEve
     return (
       event.parent_event_id === start.event_id &&
       event.idempotency_key_sha256 === start.idempotency_key_sha256
+    );
+  }
+  if (start.event_type === ACTION_EVENT_TYPES.reviewStarted) {
+    return (
+      event.event_type === ACTION_EVENT_TYPES.reviewCompleted ||
+      event.event_type === ACTION_EVENT_TYPES.reviewFailed ||
+      (event.event_type === ACTION_EVENT_TYPES.reviewStarted &&
+        event.action.status !== ACTION_EVENT_STATUSES.started)
     );
   }
   if (
@@ -573,23 +660,25 @@ export function interruptOpenWorkflowActionEvents(
         );
       let written = 0;
       for (const start of starts) {
-        const lifecycleKey = workflowActionLifecycleKey(start);
         const lifecycleEvents = current.filter(
           (event) =>
-            event.event_id !== start.event_id && workflowActionLifecycleKey(event) === lifecycleKey,
+            event.event_id !== start.event_id && workflowActionEventSharesLifecycle(start, event),
         );
         if (lifecycleEvents.some((event) => workflowActionEventClosesLifecycle(start, event))) {
           continue;
         }
+        const aggregatesChildMutations =
+          start.event_type === ACTION_EVENT_TYPES.workflowAttempt ||
+          start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
+          start.event_type === ACTION_EVENT_TYPES.applyBatch ||
+          (start.event_type === ACTION_EVENT_TYPES.reviewRetry &&
+            start.subject.kind === "workflow");
         const uncertainMutationStarts = current
           .filter(
             (event) =>
               event.operation_id === start.operation_id &&
               event.attempt_id === start.attempt_id &&
-              (start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
-                start.event_type === ACTION_EVENT_TYPES.applyBatch ||
-                (start.event_type === ACTION_EVENT_TYPES.reviewRetry &&
-                  start.subject.kind === "workflow") ||
+              (aggregatesChildMutations ||
                 actionLedgerJson(workflowActionSubjectIdentity(event)) ===
                   actionLedgerJson(workflowActionSubjectIdentity(start))) &&
               workflowActionEventIsUncertainMutationStart(event),
@@ -635,21 +724,11 @@ export function interruptOpenWorkflowActionEvents(
         const openUncertainMutation =
           workflowActionEventIsUncertainMutationStart(start) ||
           openUncertainMutationStarts.length > 0;
-        const aggregatesChildMutations =
-          start.event_type === ACTION_EVENT_TYPES.reviewBatch ||
-          start.event_type === ACTION_EVENT_TYPES.applyBatch ||
-          (start.event_type === ACTION_EVENT_TYPES.reviewRetry &&
-            start.subject.kind === "workflow");
         const relevantMutationEvents = aggregatesChildMutations
           ? mutationEvents
           : lifecycleMutations;
-        const unknownMutationOutcome = relevantMutationEvents
-          .filter(
-            (event) =>
-              event.attributes?.completion_reason === "mutation_outcome_unknown" ||
-              event.attributes?.completion_reason === "dispatch_outcome_unknown",
-          )
-          .at(-1);
+        const unknownMutationOutcome =
+          workflowActionUnresolvedUnknownMutation(relevantMutationEvents);
         const uncertainMutation = openUncertainMutation || unknownMutationOutcome !== undefined;
         const mutationOccurred =
           workflowActionEventIsUncertainMutationStart(start) ||
@@ -756,6 +835,18 @@ function workflowActionLifecycleKey(event: ActionEvent): string {
     eventType: event.event_type,
     subject: workflowActionSubjectIdentity(event),
   });
+}
+
+function workflowActionEventSharesLifecycle(start: ActionEvent, event: ActionEvent): boolean {
+  if (start.event_type !== ACTION_EVENT_TYPES.reviewStarted) {
+    return workflowActionLifecycleKey(event) === workflowActionLifecycleKey(start);
+  }
+  return (
+    event.operation_id === start.operation_id &&
+    event.attempt_id === start.attempt_id &&
+    actionLedgerJson(workflowActionSubjectIdentity(event)) ===
+      actionLedgerJson(workflowActionSubjectIdentity(start))
+  );
 }
 
 function workflowActionSubjectIdentity(event: ActionEvent) {
@@ -1117,6 +1208,199 @@ export function importActionEventShards(
   );
 }
 
+export function readImportedRepairMutationEvents(
+  destinationRoot: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): ActionEvent[] | null {
+  const normalizedRepository = normalizeRepo(producerRepository);
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(normalizedRepository)) {
+    throw new Error("invalid repair mutation index producer repository");
+  }
+  if (!/^[a-f0-9]{64}$/.test(idempotencyKeySha256)) {
+    throw new Error("invalid repair mutation index idempotency key");
+  }
+  const root = prepareSafeReadRoot(destinationRoot, "repair mutation idempotency index");
+  const completionDirectory = repairMutationIdempotencyIndexDirectory(
+    normalizedRepository,
+    idempotencyKeySha256,
+  );
+  const reservationDirectory = repairMutationIdempotencyIndexReservationDirectory(
+    normalizedRepository,
+    idempotencyKeySha256,
+  );
+  const completionEntries = readRepairMutationIdempotencyIndexDirectory(
+    root,
+    completionDirectory,
+    "repair mutation idempotency index",
+  );
+  const reservationEntries = readRepairMutationIdempotencyIndexDirectory(
+    root,
+    reservationDirectory,
+    "repair mutation idempotency index reservation",
+  );
+  if (completionEntries === null && reservationEntries === null) return null;
+  if (
+    completionEntries === null ||
+    reservationEntries === null ||
+    completionEntries.length === 0 ||
+    reservationEntries.length === 0 ||
+    actionLedgerJson(completionEntries.map((entry) => entry.name)) !==
+      actionLedgerJson(reservationEntries.map((entry) => entry.name))
+  ) {
+    throw new Error("repair mutation idempotency index is incomplete");
+  }
+
+  const events: ActionEvent[] = [];
+  const shardPaths = new Set<string>();
+  const eventIds = new Set<string>();
+  const indexes: RepairMutationIdempotencyIndex[] = [];
+  const shardBudget: ActionEventShardReadBudget = {
+    directories: 0,
+    entries: 0,
+    files: 0,
+    totalBytes: 0,
+    totalEvents: 0,
+  };
+  for (const entry of completionEntries) {
+    const shardSha256 = entry.name.slice(0, -".json".length);
+    const completionPath = path.posix.join(
+      completionDirectory.replaceAll(path.sep, "/"),
+      entry.name,
+    );
+    const completionContent = readUtf8FileNoFollow(
+      prepareSafeReadTarget(root, completionPath, "repair mutation idempotency index"),
+      ACTION_EVENT_IMPORT_BINDING_MAX_BYTES,
+    );
+    const reservationPath = path.posix.join(
+      reservationDirectory.replaceAll(path.sep, "/"),
+      entry.name,
+    );
+    const reservationContent = readUtf8FileNoFollow(
+      prepareSafeReadTarget(root, reservationPath, "repair mutation idempotency index reservation"),
+      ACTION_EVENT_IMPORT_BINDING_MAX_BYTES,
+    );
+    parseRepairMutationIdempotencyIndexReservation(
+      reservationContent,
+      normalizedRepository,
+      idempotencyKeySha256,
+      shardSha256,
+      createHash("sha256").update(completionContent).digest("hex"),
+    );
+    const index = parseRepairMutationIdempotencyIndex(
+      completionContent,
+      normalizedRepository,
+      idempotencyKeySha256,
+      shardSha256,
+    );
+    if (shardPaths.has(index.shard.path)) {
+      throw new Error("repair mutation idempotency index contains a duplicate shard");
+    }
+    shardPaths.add(index.shard.path);
+    indexes.push(index);
+  }
+
+  const completeShardPaths = validateExpectedActionEventPaths(
+    [
+      ...new Set(
+        indexes.flatMap((index) => completeImportedActionEventShardPaths(index.shard.path)),
+      ),
+    ].sort(),
+  );
+  const shardsByPath = new Map(
+    readImportedActionEventShards(
+      root,
+      completeShardPaths,
+      { requireManifestPaths: true },
+      shardBudget,
+    ).map((shard) => [shard.relativePath, shard]),
+  );
+  for (const index of indexes) {
+    const shard = shardsByPath.get(index.shard.path);
+    if (!shard) throw new Error("repair mutation idempotency index shard is missing");
+    const shardEvents = shard.events;
+    const replaySha256 = actionEventShardReplaySha256(shardEvents);
+    const repositorySha256 = repairMutationProducerRepositorySha256(
+      shardEvents[0]?.producer.repository ?? "",
+    );
+    const matching = shardEvents
+      .filter(
+        (event) =>
+          event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+          event.idempotency_key_sha256 === idempotencyKeySha256,
+      )
+      .map((event) => ({
+        event_id: event.event_id,
+        semantic_sha256: event.semantic_sha256,
+      }));
+    if (
+      repositorySha256 !== index.producer_repository_sha256 ||
+      replaySha256 !== index.shard.replay_sha256 ||
+      actionLedgerJson(matching) !== actionLedgerJson(index.events)
+    ) {
+      throw new Error("repair mutation idempotency index does not match its referenced shard");
+    }
+    for (const event of shardEvents) {
+      if (
+        event.event_type !== ACTION_EVENT_TYPES.repairMutation ||
+        event.idempotency_key_sha256 !== idempotencyKeySha256
+      ) {
+        continue;
+      }
+      if (eventIds.has(event.event_id)) {
+        throw new Error("repair mutation idempotency index contains a duplicate event");
+      }
+      eventIds.add(event.event_id);
+      events.push(event);
+    }
+  }
+  return events;
+}
+
+function completeImportedActionEventShardPaths(relativePath: string): string[] {
+  const { shardIndex, shardCount } = importedShardPart(relativePath);
+  if (shardIndex === undefined || shardCount === undefined) return [relativePath];
+  if (shardCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+    throw new Error(
+      `action event shard manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} event paths`,
+    );
+  }
+  const match = /^(.*-part-)\d{6}(-of-\d{6}\.jsonl)$/.exec(relativePath);
+  if (!match) throw new Error(`invalid action event shard path: ${relativePath}`);
+  return Array.from(
+    { length: shardCount },
+    (_, index) => `${match[1]}${String(index + 1).padStart(6, "0")}${match[2]}`,
+  );
+}
+
+function readRepairMutationIdempotencyIndexDirectory(
+  root: SafeReadRoot,
+  relativeDirectory: string,
+  label: string,
+): ReturnType<typeof readDirectoryEntriesNoFollow> | null {
+  let entries: ReturnType<typeof readDirectoryEntriesNoFollow>;
+  try {
+    entries = readDirectoryEntriesNoFollow(
+      root,
+      relativeDirectory,
+      label,
+      REPAIR_MUTATION_IDEMPOTENCY_INDEX_MAX_ENTRIES,
+    );
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error(`refusing unsafe ${label} entry: ${entry.name}`);
+    }
+    if (!/^[a-f0-9]{64}\.json$/.test(entry.name)) {
+      throw new Error(`invalid ${label} entry: ${entry.name}`);
+    }
+  }
+  return entries;
+}
+
 function validateImportedActionEventProducer(
   shards: readonly ImportedActionEventShard[],
   expected: ExpectedActionEventProducer,
@@ -1139,6 +1423,94 @@ function validateImportedActionEventProducer(
       );
     }
   }
+}
+
+export function readValidatedActionEventShardBatch(
+  sourceRoots: string | readonly (string | ValidatedActionEventShardSource)[],
+): ValidatedActionEventShardBatch {
+  const sourcesToRead = (typeof sourceRoots === "string" ? [sourceRoots] : [...sourceRoots]).map(
+    (source): ValidatedActionEventShardSource =>
+      typeof source === "string" ? { sourceRoot: source } : source,
+  );
+  if (sourcesToRead.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
+    throw new Error(
+      `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} source root limit`,
+    );
+  }
+  const budget: ActionEventShardReadBudget = {
+    directories: 0,
+    entries: 0,
+    files: 0,
+    totalBytes: 0,
+    totalEvents: 0,
+  };
+  const sources: Array<{
+    relativePaths: string[];
+    shards: ImportedActionEventShard[];
+  }> = [];
+  for (const source of sourcesToRead) {
+    const read = readActionEventShardSource(source, budget);
+    if (read) sources.push(read);
+  }
+  const eventPaths = sources.flatMap((source) => source.relativePaths);
+  const shards = sources.flatMap((source) => source.shards);
+  const events = shards.flatMap((shard) => shard.events);
+  validateCanonicalImportedShardBatch(shards);
+  return {
+    eventPaths: eventPaths.sort(),
+    events,
+    totalBytes: budget.totalBytes,
+  };
+}
+
+function readActionEventShardSource(
+  source: ValidatedActionEventShardSource,
+  budget: ActionEventShardReadBudget,
+): {
+  relativePaths: string[];
+  shards: ImportedActionEventShard[];
+} | null {
+  let safeSource: SafeReadRoot;
+  try {
+    safeSource = prepareSafeReadRoot(source.sourceRoot, "action event shard import source");
+  } catch (error) {
+    if (isNotFoundError(error) && source.expectedEventPaths !== undefined) {
+      throw new Error("action event shard manifest source root is missing");
+    }
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  let relativePaths: string[];
+  try {
+    relativePaths = collectActionEventShardFiles(safeSource, budget);
+  } catch (error) {
+    if (
+      isNotFoundError(error) &&
+      source.expectedEventPaths !== undefined &&
+      source.expectedEventPaths.length === 0
+    ) {
+      return { relativePaths: [], shards: [] };
+    }
+    if (isNotFoundError(error) && source.expectedEventPaths !== undefined) {
+      throw new Error("action event shard manifest source root is missing");
+    }
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  if (source.expectedEventPaths !== undefined) {
+    const expected = validateExpectedActionEventPaths(source.expectedEventPaths, {
+      allowEmpty: true,
+    });
+    if (actionLedgerJson(relativePaths) !== actionLedgerJson(expected)) {
+      throw new Error("action event shard manifest source paths do not match");
+    }
+  }
+  const shards = readImportedActionEventShards(safeSource, relativePaths, {}, budget);
+  if (source.expectedProducer) validateImportedActionEventProducer(shards, source.expectedProducer);
+  return {
+    relativePaths,
+    shards,
+  };
 }
 
 function prepareActionEventShardImportBindings(
@@ -1165,6 +1537,7 @@ function actionEventShardImportBindings(
   const producerRuns = new Map<string, ActionEventShardImportBinding>();
   const eventIdentities = new Map<string, ActionEventShardImportBinding>();
   const shardSets = new Map<string, ImportedActionEventShard[]>();
+  const repairMutationIndexes: ActionEventShardImportBinding[] = [];
   for (const shard of shards) {
     const { partitionDate, ...producerIdentity } = shard.identity;
     const producerKey = actionLedgerJson(producerIdentity);
@@ -1205,6 +1578,7 @@ function actionEventShardImportBindings(
         kind: "reservation",
       });
     }
+    repairMutationIndexes.push(...repairMutationIdempotencyIndexBindings(shard));
 
     const shardSetKey = actionLedgerJson(shard.identity);
     const group = shardSets.get(shardSetKey) ?? [];
@@ -1212,7 +1586,11 @@ function actionEventShardImportBindings(
     shardSets.set(shardSetKey, group);
   }
 
-  const bindings = [...producerRuns.values(), ...eventIdentities.values()];
+  const bindings = [
+    ...producerRuns.values(),
+    ...eventIdentities.values(),
+    ...repairMutationIndexes,
+  ];
   for (const group of shardSets.values()) {
     const ordered = [...group].sort((left, right) =>
       left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0,
@@ -1256,6 +1634,216 @@ function actionEventShardImportBindings(
         ? 1
         : 0;
   });
+}
+
+function repairMutationIdempotencyIndexBindings(
+  shard: ImportedActionEventShard,
+): ActionEventShardImportBinding[] {
+  const matchingByKey = new Map<string, ActionEvent[]>();
+  for (const event of shard.events) {
+    if (event.event_type !== ACTION_EVENT_TYPES.repairMutation) continue;
+    const matching = matchingByKey.get(event.idempotency_key_sha256) ?? [];
+    matching.push(event);
+    matchingByKey.set(event.idempotency_key_sha256, matching);
+  }
+  if (matchingByKey.size === 0) return [];
+
+  const producerRepositorySha256 = repairMutationProducerRepositorySha256(
+    shard.identity.repository,
+  );
+  const replaySha256 = actionEventShardReplaySha256(shard.events);
+  const shardSha256 = repairMutationIndexShardSha256(shard.relativePath, replaySha256);
+  return [...matchingByKey.entries()].flatMap(([idempotencyKeySha256, events]) => {
+    const index: RepairMutationIdempotencyIndex = {
+      schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency",
+      schema_version: 1,
+      producer_repository_sha256: producerRepositorySha256,
+      idempotency_key_sha256: idempotencyKeySha256,
+      shard_sha256: shardSha256,
+      shard: {
+        path: shard.relativePath,
+        replay_sha256: replaySha256,
+      },
+      events: events.map((event) => ({
+        event_id: event.event_id,
+        semantic_sha256: event.semantic_sha256,
+      })),
+    };
+    const completionContent = `${actionLedgerJson(index)}\n`;
+    const filename = `${shardSha256}.json`;
+    const reservation: RepairMutationIdempotencyIndexReservation = {
+      schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation",
+      schema_version: 1,
+      producer_repository_sha256: producerRepositorySha256,
+      idempotency_key_sha256: idempotencyKeySha256,
+      shard_sha256: shardSha256,
+      completion_sha256: createHash("sha256").update(completionContent).digest("hex"),
+    };
+    return [
+      {
+        relativePath: path.join(
+          repairMutationIdempotencyIndexReservationDirectory(
+            shard.identity.repository,
+            idempotencyKeySha256,
+          ),
+          filename,
+        ),
+        content: `${actionLedgerJson(reservation)}\n`,
+        label: "repair mutation idempotency index reservation binding",
+        kind: "reservation" as const,
+      },
+      {
+        relativePath: path.join(
+          repairMutationIdempotencyIndexDirectory(shard.identity.repository, idempotencyKeySha256),
+          filename,
+        ),
+        content: completionContent,
+        label: "repair mutation idempotency index binding",
+        kind: "completion" as const,
+      },
+    ];
+  });
+}
+
+function repairMutationIdempotencyIndexDirectory(
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): string {
+  return path.join(
+    "ledger",
+    "v1",
+    "import-bindings",
+    "repair-mutation-idempotency",
+    repairMutationProducerRepositorySha256(producerRepository),
+    idempotencyKeySha256,
+  );
+}
+
+function repairMutationIdempotencyIndexReservationDirectory(
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): string {
+  return path.join(
+    "ledger",
+    "v1",
+    "import-bindings",
+    "repair-mutation-idempotency-reservations",
+    repairMutationProducerRepositorySha256(producerRepository),
+    idempotencyKeySha256,
+  );
+}
+
+function repairMutationProducerRepositorySha256(repository: string): string {
+  return createHash("sha256").update(normalizeRepo(repository)).digest("hex");
+}
+
+function repairMutationIndexShardSha256(relativePath: string, replaySha256: string): string {
+  return createHash("sha256")
+    .update(
+      actionLedgerJson({
+        path: relativePath,
+        replay_sha256: replaySha256,
+      }),
+    )
+    .digest("hex");
+}
+
+function actionEventShardReplaySha256(events: readonly ActionEvent[]): string {
+  return createHash("sha256")
+    .update(`${events.map((event) => actionEventReplayJson(event)).join("\n")}\n`)
+    .digest("hex");
+}
+
+function parseRepairMutationIdempotencyIndex(
+  content: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+  shardSha256: string,
+): RepairMutationIdempotencyIndex {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error("invalid repair mutation idempotency index");
+  }
+  const candidate = value as Partial<RepairMutationIdempotencyIndex>;
+  const shard =
+    candidate.shard && typeof candidate.shard === "object" && !Array.isArray(candidate.shard)
+      ? {
+          path: String(candidate.shard.path ?? ""),
+          replay_sha256: String(candidate.shard.replay_sha256 ?? ""),
+        }
+      : { path: "", replay_sha256: "" };
+  const events = Array.isArray(candidate.events)
+    ? candidate.events.map((event) => {
+        const entry = event as { event_id?: unknown; semantic_sha256?: unknown };
+        return {
+          event_id: typeof entry.event_id === "string" ? entry.event_id : "",
+          semantic_sha256: typeof entry.semantic_sha256 === "string" ? entry.semantic_sha256 : "",
+        };
+      })
+    : [];
+  const expected: RepairMutationIdempotencyIndex = {
+    schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency",
+    schema_version: 1,
+    producer_repository_sha256: repairMutationProducerRepositorySha256(producerRepository),
+    idempotency_key_sha256: idempotencyKeySha256,
+    shard_sha256: shardSha256,
+    shard,
+    events,
+  };
+  if (
+    candidate.schema !== expected.schema ||
+    candidate.schema_version !== expected.schema_version ||
+    candidate.producer_repository_sha256 !== expected.producer_repository_sha256 ||
+    candidate.idempotency_key_sha256 !== expected.idempotency_key_sha256 ||
+    candidate.shard_sha256 !== expected.shard_sha256 ||
+    !ACTION_EVENT_SHARD_PATH_PATTERN.test(shard.path) ||
+    !/^[a-f0-9]{64}$/.test(shard.replay_sha256) ||
+    repairMutationIndexShardSha256(shard.path, shard.replay_sha256) !== shardSha256 ||
+    events.length === 0 ||
+    events.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileEvents ||
+    events.some(
+      (event) =>
+        !/^[a-f0-9]{64}$/.test(event.event_id) || !/^[a-f0-9]{64}$/.test(event.semantic_sha256),
+    ) ||
+    new Set(events.map((event) => event.event_id)).size !== events.length ||
+    `${actionLedgerJson(value)}\n` !== content ||
+    actionLedgerJson(value) !== actionLedgerJson(expected)
+  ) {
+    throw new Error("invalid repair mutation idempotency index");
+  }
+  return expected;
+}
+
+function parseRepairMutationIdempotencyIndexReservation(
+  content: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+  shardSha256: string,
+  completionSha256: string,
+): RepairMutationIdempotencyIndexReservation {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error("invalid repair mutation idempotency index reservation");
+  }
+  const expected: RepairMutationIdempotencyIndexReservation = {
+    schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation",
+    schema_version: 1,
+    producer_repository_sha256: repairMutationProducerRepositorySha256(producerRepository),
+    idempotency_key_sha256: idempotencyKeySha256,
+    shard_sha256: shardSha256,
+    completion_sha256: completionSha256,
+  };
+  if (
+    `${actionLedgerJson(value)}\n` !== content ||
+    actionLedgerJson(value) !== actionLedgerJson(expected)
+  ) {
+    throw new Error("invalid repair mutation idempotency index reservation");
+  }
+  return expected;
 }
 
 function publishActionEventShardImportBinding(
@@ -1385,6 +1973,7 @@ function readImportedActionEventShards(
   source: SafeReadRoot,
   relativePaths: readonly string[],
   options: { requireManifestPaths?: boolean } = {},
+  sharedBudget?: ActionEventShardReadBudget,
 ): ImportedActionEventShard[] {
   let totalBytes = 0;
   const contents = relativePaths.map((relativePath) => {
@@ -1392,12 +1981,26 @@ function readImportedActionEventShards(
       throw new Error(`invalid action event shard path: ${relativePath}`);
     }
     const target = prepareSafeReadTarget(source, relativePath, "action event shard import source");
+    const remainingBytes =
+      ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes - (sharedBudget?.totalBytes ?? 0);
     let content: string;
     try {
-      content = readUtf8FileNoFollow(target, ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes);
+      content = readUtf8FileNoFollow(
+        target,
+        Math.min(ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes, Math.max(0, remainingBytes)),
+      );
     } catch (error) {
       if (options.requireManifestPaths && isNotFoundError(error)) {
         throw new Error(`action event shard manifest path is missing: ${relativePath}`);
+      }
+      if (
+        sharedBudget &&
+        remainingBytes < ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileBytes &&
+        String(error).includes("byte limit")
+      ) {
+        throw new Error(
+          `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
+        );
       }
       throw error;
     }
@@ -1408,15 +2011,26 @@ function readImportedActionEventShards(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total byte limit`,
       );
     }
+    if (sharedBudget) sharedBudget.totalBytes += bytes;
     assertImportedShardLineLimit(relativePath, content);
     if (!content.endsWith("\n")) {
       throw new Error(`action event shard must end with a newline: ${relativePath}`);
     }
+    const lineCount = importedShardLineCount(content);
+    if (
+      sharedBudget &&
+      sharedBudget.totalEvents + lineCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents
+    ) {
+      throw new Error(
+        `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
+      );
+    }
+    if (sharedBudget) sharedBudget.totalEvents += lineCount;
     return { relativePath, content };
   });
 
   let totalEvents = 0;
-  const parsed = contents.map(({ relativePath, content }) => {
+  const validated = contents.map(({ relativePath, content }) => {
     const events = parseActionEventShardContent(content, relativePath);
     assertImportedShardEventLimit(relativePath, events);
     totalEvents += events.length;
@@ -1425,18 +2039,22 @@ function readImportedActionEventShards(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents} total event limit`,
       );
     }
-    return { relativePath, content, events };
+    return {
+      relativePath,
+      content,
+      events,
+      ...validateCanonicalImportedShard(relativePath, events, content),
+    };
   });
-  const validated = parsed.map((shard) => ({
-    ...shard,
-    ...validateCanonicalImportedShard(shard.relativePath, shard.events, shard.content),
-  }));
   validateCanonicalImportedShardBatch(validated);
   return validated;
 }
 
-function validateExpectedActionEventPaths(paths: readonly string[]): string[] {
-  if (paths.length === 0) {
+function validateExpectedActionEventPaths(
+  paths: readonly string[],
+  options: { allowEmpty?: boolean } = {},
+): string[] {
+  if (paths.length === 0 && options.allowEmpty !== true) {
     throw new Error("action event shard manifest is empty");
   }
   if (paths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
@@ -1472,15 +2090,20 @@ function importedShardReplayEquivalent(
 }
 
 function assertImportedShardLineLimit(relativePath: string, content: string): void {
-  let lineCount = content.length === 0 ? 0 : content.endsWith("\n") ? 0 : 1;
-  for (let index = 0; index < content.length; index += 1) {
-    if (content.charCodeAt(index) === 10) lineCount += 1;
-  }
+  const lineCount = importedShardLineCount(content);
   if (lineCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileLines) {
     throw new Error(
       `action event shard exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileLines} line limit: ${relativePath}`,
     );
   }
+}
+
+function importedShardLineCount(content: string): number {
+  let lineCount = content.length === 0 ? 0 : content.endsWith("\n") ? 0 : 1;
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 10) lineCount += 1;
+  }
+  return lineCount;
 }
 
 function assertImportedShardEventLimit(relativePath: string, events: readonly ActionEvent[]): void {
@@ -2417,15 +3040,27 @@ function positiveIntegerEnv(env: NodeJS.ProcessEnv, name: string): number {
   return value;
 }
 
-function collectActionEventShardFiles(root: SafeReadRoot): string[] {
+function collectActionEventShardFiles(
+  root: SafeReadRoot,
+  sharedBudget?: ActionEventShardReadBudget,
+): string[] {
   const files: string[] = [];
   let directoryCount = 0;
   let fileCount = 0;
   const visit = (relativeDirectory: string, depth: number): void => {
     directoryCount += 1;
+    if (sharedBudget) sharedBudget.directories += 1;
     if (directoryCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
       throw new Error(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} directory limit`,
+      );
+    }
+    if (
+      sharedBudget &&
+      sharedBudget.directories > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories
+    ) {
+      throw new Error(
+        `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} aggregate directory limit`,
       );
     }
     const entries = readDirectoryEntriesNoFollow(
@@ -2435,6 +3070,12 @@ function collectActionEventShardFiles(root: SafeReadRoot): string[] {
       ACTION_EVENT_SHARD_IMPORT_LIMITS.maxEntriesPerDirectory,
     );
     for (const entry of entries) {
+      if (sharedBudget) sharedBudget.entries += 1;
+      if (sharedBudget && sharedBudget.entries > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEntries) {
+        throw new Error(
+          `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEntries} aggregate entry limit`,
+        );
+      }
       const relativePath = path.posix.join(relativeDirectory.replaceAll(path.sep, "/"), entry.name);
       const childDepth = depth + 1;
       if (childDepth > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDepth) {
@@ -2453,9 +3094,15 @@ function collectActionEventShardFiles(root: SafeReadRoot): string[] {
       }
       if (entry.isFile()) {
         fileCount += 1;
+        if (sharedBudget) sharedBudget.files += 1;
         if (fileCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
           throw new Error(
             `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} file limit`,
+          );
+        }
+        if (sharedBudget && sharedBudget.files > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+          throw new Error(
+            `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} aggregate file limit`,
           );
         }
         if (relativePath.endsWith(".jsonl")) files.push(relativePath);

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   reportWithSyncedReviewComment,
   runApplyDecisionsForTest,
@@ -10,6 +11,37 @@ import {
   withMockGh,
   workPlanCandidateReport,
 } from "./helpers.ts";
+
+const reviewedPrActivity = {
+  reviews: [
+    {
+      id: 7321,
+      user: { login: "peer-reviewer" },
+      author_association: "CONTRIBUTOR",
+      state: "COMMENTED",
+      body: "reviewed the current head",
+      submitted_at: "2026-05-01T00:30:00Z",
+      commit_id: "head-sha",
+    },
+  ],
+  inlineComments: [
+    {
+      id: 8321,
+      pull_request_review_id: 7321,
+      user: { login: "peer-reviewer" },
+      author_association: "CONTRIBUTOR",
+      body: "this branch still needs runtime proof",
+      created_at: "2026-05-01T00:31:00Z",
+      updated_at: "2026-05-01T00:31:00Z",
+      path: "src/provider.ts",
+      line: 18,
+      side: "RIGHT",
+      commit_id: "head-sha",
+    },
+  ],
+};
+const reviewedPrActivityCursor = createReviewedPrActivityCursor(reviewedPrActivity);
+if (!reviewedPrActivityCursor) throw new Error("expected bounded review activity cursor");
 
 function stalledUnprovenCloseReport(overrides = {}) {
   return `${workPlanCandidateReport({
@@ -24,6 +56,7 @@ function stalledUnprovenCloseReport(overrides = {}) {
     item_snapshot_hash: "reviewed-snapshot",
     item_created_at: "2026-05-01T00:00:00Z",
     item_updated_at: "2026-05-01T00:00:00Z",
+    review_activity_cursor: reviewedPrActivityCursor,
     author_association: "CONTRIBUTOR",
     item_category: "bug",
     ...overrides,
@@ -68,6 +101,7 @@ function abandonedCloseReport(overrides = {}) {
     item_snapshot_hash: "reviewed-snapshot",
     item_created_at: "2026-05-01T00:00:00Z",
     item_updated_at: "2026-05-01T00:00:00Z",
+    review_activity_cursor: reviewedPrActivityCursor,
     author_association: "CONTRIBUTOR",
     item_category: "bug",
     ...overrides,
@@ -218,7 +252,11 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/reviews(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([${JSON.stringify(reviewedPrActivity.reviews)}]));
+} else if (args[0] === "api" && /\\/pulls\\/321\\/comments(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([${JSON.stringify(reviewedPrActivity.inlineComments)}]));
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/actions\\/runs\\?/.test(path)) {
   console.log(JSON.stringify({ workflow_runs: ${JSON.stringify(sourceRuns)} }));

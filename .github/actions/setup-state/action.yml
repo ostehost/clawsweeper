@@ -24,8 +24,16 @@ inputs:
     description: Git fetch depth for the generated state repository. Publish retries fetch the remote tip before rebasing.
     required: false
     default: "1"
+  ref:
+    description: State branch, tag, or immutable commit to check out.
+    required: false
+    default: state
   sparse-checkout:
     description: Optional newline-separated state paths to hydrate.
+    required: false
+    default: ""
+  hydrate-paths:
+    description: Optional newline-separated approved generated roots to hydrate. Defaults to the standard roots; ledger must be selected explicitly.
     required: false
     default: ""
   persist-credentials:
@@ -38,7 +46,7 @@ runs:
     - uses: actions/checkout@v7
       with:
         repository: openclaw/clawsweeper-state
-        ref: state
+        ref: ${{ inputs.ref }}
         path: ${{ inputs.state-path }}
         token: ${{ inputs.token }}
         filter: ${{ inputs.filter }}
@@ -60,4 +68,5 @@ runs:
       shell: bash
       env:
         CLAWSWEEPER_STATE_DIR: ${{ inputs.state-path }}
+        CLAWSWEEPER_HYDRATE_PATHS: ${{ inputs.hydrate-paths }}
       run: node "${{ inputs.worktree-path }}/scripts/hydrate-state.ts" --state-dir "${{ inputs.state-path }}" --worktree "${{ inputs.worktree-path }}"

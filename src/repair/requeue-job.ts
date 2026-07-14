@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,10 +8,8 @@ import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
   parseArgs,
-  parseJob,
   readMaxLiveWorkers,
   repoRoot,
-  validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
 import { ghJson, ghSpawn, ghText } from "./github-cli.js";
@@ -31,6 +28,7 @@ import {
   deterministicRequeueDispatchKey,
   normalizedRequeueSourceJobPath,
 } from "./requeue-job-key.js";
+import { immutableJobDispatchArgs, resolveStateJobIdentity } from "./immutable-job-handoff.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -38,6 +36,20 @@ const DEFAULT_RUNNER = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcp
 const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
+const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
+const STATE_REVISION = /^[a-f0-9]{40}$/;
+const JOB_SHA256 = /^[a-f0-9]{64}$/;
+const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
+const WORKFLOW_INPUTS_BASENAME = "workflow-inputs.json";
+const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+
+type RecoveredRunCohort = {
+  source_job: string;
+  mode: string;
+  state_revision: string;
+  job_sha256: string;
+  producer_attempt: number;
+};
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
@@ -53,6 +65,9 @@ const execute = Boolean(args.execute || args.live);
 const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const requestedRunId = args["run-id"] ?? (looksLikeRunId(args._[0]) ? args._[0] : null);
+const runRecordsDir = path.resolve(
+  String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
+);
 const sourceRunId = String(
   args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID ?? "",
 ).trim();
@@ -61,23 +76,44 @@ const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-re
 
 const resolved = requestedRunId
   ? resolveFromRunId(String(requestedRunId))
-  : { source_job: args._[0], mode: requestedMode };
+  : {
+      source_job: args._[0],
+      mode: requestedMode,
+      state_revision: null,
+      job_sha256: null,
+    };
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--runs-dir path] [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
 
-const job = parseJob(resolved.source_job);
-const sourceJobPath = normalizedRequeueSourceJobPath(args["source-job-path"], job.relativePath);
-const authorizationSha256 = createHash("sha256").update(job.raw).digest("hex");
-const errors = validateJob(job);
-if (errors.length > 0) {
-  console.error(`invalid job: ${job.relativePath}`);
-  for (const error of errors) console.error(`- ${error}`);
-  process.exit(1);
+const sourceJobPath = normalizedRequeueSourceJobPath(
+  args["source-job-path"],
+  String(resolved.source_job),
+);
+const sourceStateRevision =
+  args["state-revision"] ?? args.state_revision ?? resolved.state_revision;
+ensureHistoricalStateRevision(sourceStateRevision);
+const immutableJob = resolveStateJobIdentity({
+  jobPath: sourceJobPath,
+  stateRevision: sourceStateRevision,
+  jobSha256: args["job-sha256"] ?? args.job_sha256 ?? resolved.job_sha256,
+});
+const job = immutableJob.job;
+const authorizationSha256 = immutableJob.jobSha256;
+if (
+  resolved.mode &&
+  resolved.mode !== "plan" &&
+  resolved.mode !== String(job.frontmatter.mode ?? "").trim()
+) {
+  throw new Error(
+    `recovered effective mode ${resolved.mode} conflicts with immutable job mode ${
+      job.frontmatter.mode
+    }`,
+  );
 }
 
 const mode = requestedMode ?? resolved.mode ?? job.frontmatter.mode;
@@ -91,6 +127,8 @@ const summary: LooseRecord = {
   workflow,
   source_run_id: sourceRunId || null,
   source_job: sourceJobPath,
+  source_state_revision: immutableJob.stateRevision,
+  source_job_sha256: immutableJob.jobSha256,
   source_authorization_sha256: authorizationSha256,
   requeue_depth: requeueDepth,
   max_requeue_depth: maxRequeueDepth,
@@ -117,13 +155,14 @@ const dispatchKey = deterministicRequeueDispatchKey({
   workflow,
   sourceRunId: sourceRunId || null,
   sourceJobPath,
+  stateRevision: immutableJob.stateRevision,
   authorizationSha256,
   depth: nextRequeueDepth,
 });
 const requeueLifecycle: CommandLifecycleInput = {
   repository: repo,
-  operationKey: `repair-requeue:${repo}:${sourceJobPath}:${authorizationSha256}:depth:${nextRequeueDepth}`,
-  sourceRevision: authorizationSha256,
+  operationKey: `repair-requeue:${repo}:${immutableJob.identityKey}:depth:${nextRequeueDepth}`,
+  sourceRevision: immutableJob.stateRevision,
   attemptId: dispatchKey,
 };
 let commandError: unknown = null;
@@ -145,6 +184,7 @@ try {
     dispatchKey,
     sourceJobPath,
     sourceJobSha256: authorizationSha256,
+    sourceStateRevision: immutableJob.stateRevision,
     depth: nextRequeueDepth,
   });
   const observedRuns = waitForStartedRuns({ headSha, since: dispatchStartedAt, expectedCount: 1 });
@@ -198,40 +238,353 @@ try {
 if (commandError) throw commandError;
 
 function resolveFromRunId(runId: string) {
-  const fromLedger = readPublishedRunRecord(runId);
-  if (fromLedger?.source_job) {
-    return { source_job: fromLedger.source_job, mode: fromLedger.mode };
-  }
-
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
   );
-  const downloaded = ghSpawn(["run", "download", runId, "--repo", repo, "--dir", artifactDir], {
-    cwd: repoRoot(),
-  });
-  if (downloaded.status !== 0) {
+  try {
+    const downloaded = ghSpawn(["run", "download", runId, "--repo", repo, "--dir", artifactDir], {
+      cwd: repoRoot(),
+    });
+    if (downloaded.status === 0) {
+      return resolveDownloadedRunCohort(artifactDir, runId, null);
+    }
+    if (!artifactDownloadUnavailable(downloaded.stderr, downloaded.stdout)) {
+      throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+    }
+
+    const fromLedger = readPublishedRunRecord(runId);
+    const ledgerSourceJob = publishedRecordField(
+      fromLedger,
+      "source_job",
+      SOURCE_JOB_PATH,
+      runId,
+      "source job",
+    );
+    const ledgerStateRevision = publishedRecordField(
+      fromLedger,
+      "source_state_revision",
+      STATE_REVISION,
+      runId,
+      "state revision",
+    );
+    const ledgerJobSha256 = publishedRecordField(
+      fromLedger,
+      "source_job_sha256",
+      JOB_SHA256,
+      runId,
+      "job digest",
+    );
+    const ledgerMode = publishedRecordMode(fromLedger, runId);
+    if (ledgerSourceJob && ledgerStateRevision && ledgerJobSha256 && ledgerMode) {
+      return {
+        source_job: ledgerSourceJob,
+        mode: ledgerMode,
+        state_revision: ledgerStateRevision,
+        job_sha256: ledgerJobSha256,
+      };
+    }
     throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+  } finally {
+    fs.rmSync(artifactDir, { recursive: true, force: true });
   }
-  const planPath = findFirstFile(artifactDir, "cluster-plan.json");
-  const resultPath = findFirstFile(artifactDir, "result.json");
-  if (!planPath) throw new Error(`run ${runId} artifact did not include cluster-plan.json`);
-  const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
-  const result = resultPath ? JSON.parse(fs.readFileSync(resultPath, "utf8")) : null;
-  return { source_job: plan.source_job, mode: result?.mode ?? plan.mode };
 }
 
-function readPublishedRunRecord(runId: string) {
-  const file = path.join(repoRoot(), "results", "runs", `${runId}.json`);
+function artifactDownloadUnavailable(stderr: unknown, stdout: unknown): boolean {
+  const detail = `${String(stderr ?? "")}\n${String(stdout ?? "")}`.toLowerCase();
+  return [
+    "artifact has expired",
+    "artifacts expired",
+    "no artifacts found",
+    "no valid artifacts",
+    "not found",
+    "http 404",
+  ].some((message) => detail.includes(message));
+}
+
+function ensureHistoricalStateRevision(value: unknown): void {
+  const stateRevision = String(value ?? "").trim();
+  if (!STATE_REVISION.test(stateRevision)) {
+    throw new Error("state revision is malformed");
+  }
+  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+  if (!stateRoot) {
+    throw new Error("CLAWSWEEPER_STATE_DIR is required for immutable job handoff");
+  }
+  if (stateCommitExists(stateRoot, stateRevision)) return;
+
+  try {
+    runText(
+      "git",
+      [
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--depth=1",
+        "--filter=blob:none",
+        "origin",
+        stateRevision,
+      ],
+      {
+        cwd: stateRoot,
+        timeoutMs: STATE_REVISION_FETCH_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+  } catch (error) {
+    const detail = String(error instanceof Error ? error.message : error).trim();
+    throw new Error(
+      detail
+        ? `could not fetch historical clawsweeper-state commit ${stateRevision}: ${detail}`
+        : `could not fetch historical clawsweeper-state commit ${stateRevision}`,
+    );
+  }
+  if (!stateCommitExists(stateRoot, stateRevision)) {
+    throw new Error(`could not fetch historical clawsweeper-state commit ${stateRevision}`);
+  }
+}
+
+function stateCommitExists(stateRoot: string, stateRevision: string): boolean {
+  try {
+    runText("git", ["cat-file", "-e", `${stateRevision}^{commit}`], {
+      cwd: stateRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeoutMs: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPublishedRunRecord(runId: string): LooseRecord | null {
+  const file = path.join(runRecordsDir, `${runId}.json`);
   if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+  const record = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    throw new Error(`run ${runId} record must be a JSON object`);
+  }
+  const recordedRunId = String(record.run_id ?? "").trim();
+  if (recordedRunId && recordedRunId !== runId) {
+    throw new Error(`run ${runId} record identity conflicts with its filename`);
+  }
+  return record;
 }
 
-function findFirstFile(root: string, basename: string) {
-  for (const entry of fs.readdirSync(root, { recursive: true })) {
-    const candidate = path.join(root, String(entry));
-    if (path.basename(candidate) === basename && fs.statSync(candidate).isFile()) return candidate;
+function publishedRecordField(
+  record: LooseRecord | null,
+  field: string,
+  pattern: RegExp,
+  runId: string,
+  label: string,
+): string | null {
+  const value = String(record?.[field] ?? "").trim();
+  if (!value) return null;
+  if (!pattern.test(value)) {
+    throw new Error(`run ${runId} record has invalid ${label}`);
   }
-  return null;
+  return value;
+}
+
+function publishedRecordMode(record: LooseRecord | null, runId: string): string | null {
+  const mode = String(record?.mode ?? "").trim();
+  if (!mode) return null;
+  if (!REPAIR_MODES.has(mode)) {
+    throw new Error(`run ${runId} record has invalid effective mode`);
+  }
+  return mode;
+}
+
+function resolveDownloadedRunCohort(
+  root: string,
+  runId: string,
+  expectedSourceJob: string | null,
+): RecoveredRunCohort {
+  const candidatesByAttempt = new Map<number, RecoveredRunCohort[]>();
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const producerAttempt = repairArtifactProducerAttempt(entry.name, runId);
+    if (producerAttempt === null) continue;
+    const artifactRoot = path.join(root, entry.name);
+    for (const inputPath of findNamedFiles(artifactRoot, WORKFLOW_INPUTS_BASENAME)) {
+      const candidate = readRecoveredWorkflowInputs({
+        inputPath,
+        producerAttempt,
+        expectedSourceJob,
+      });
+      candidatesByAttempt.set(producerAttempt, [
+        ...(candidatesByAttempt.get(producerAttempt) ?? []),
+        candidate,
+      ]);
+    }
+    for (const planPath of findNamedFiles(artifactRoot, "cluster-plan.json")) {
+      const runDir = path.dirname(planPath);
+      const resultPath = path.join(runDir, "result.json");
+      const identityPath = path.join(runDir, "source-job.json");
+      if (!fs.existsSync(resultPath) || !fs.existsSync(identityPath)) continue;
+      const candidate = readRecoveredRunCohort({
+        planPath,
+        resultPath,
+        identityPath,
+        producerAttempt,
+        expectedSourceJob,
+      });
+      candidatesByAttempt.set(producerAttempt, [
+        ...(candidatesByAttempt.get(producerAttempt) ?? []),
+        candidate,
+      ]);
+    }
+  }
+
+  for (const producerAttempt of [...candidatesByAttempt.keys()].sort(
+    (left, right) => right - left,
+  )) {
+    const candidates = candidatesByAttempt.get(producerAttempt) ?? [];
+    const unique = new Map(
+      candidates.map((candidate) => [JSON.stringify(candidate), candidate] as const),
+    );
+    if (unique.size > 1) {
+      throw new Error(
+        `run ${runId} has an ambiguous repair artifact cohort at attempt ${producerAttempt}`,
+      );
+    }
+    const selected = unique.values().next().value;
+    if (selected) return selected;
+  }
+  throw new Error(
+    `run ${runId} did not publish immutable workflow inputs or one complete sealed repair artifact cohort`,
+  );
+}
+
+function readRecoveredWorkflowInputs({
+  inputPath,
+  producerAttempt,
+  expectedSourceJob,
+}: {
+  inputPath: string;
+  producerAttempt: number;
+  expectedSourceJob: string | null;
+}): RecoveredRunCohort {
+  const input = readJsonObject(inputPath, "immutable workflow inputs");
+  const inputKeys = Object.keys(input).sort();
+  if (
+    JSON.stringify(inputKeys) !==
+    JSON.stringify([
+      "effective_mode",
+      "job_sha256",
+      "requested_mode",
+      "schema_version",
+      "source_job",
+      "state_revision",
+    ])
+  ) {
+    throw new Error("immutable workflow inputs have unexpected fields");
+  }
+  const sourceJob = String(input.source_job ?? "").trim();
+  const stateRevision = String(input.state_revision ?? "").trim();
+  const jobSha256 = String(input.job_sha256 ?? "").trim();
+  const requestedMode = String(input.requested_mode ?? "").trim();
+  const effectiveMode = String(input.effective_mode ?? "").trim();
+  if (
+    input.schema_version !== 1 ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
+    !STATE_REVISION.test(stateRevision) ||
+    !JOB_SHA256.test(jobSha256) ||
+    (expectedSourceJob !== null && sourceJob !== expectedSourceJob) ||
+    !REPAIR_MODES.has(requestedMode) ||
+    !REPAIR_MODES.has(effectiveMode) ||
+    (effectiveMode !== requestedMode && effectiveMode !== "plan")
+  ) {
+    throw new Error("immutable workflow inputs have invalid repair provenance");
+  }
+  return {
+    source_job: sourceJob,
+    mode: effectiveMode,
+    state_revision: stateRevision,
+    job_sha256: jobSha256,
+    producer_attempt: producerAttempt,
+  };
+}
+
+function readRecoveredRunCohort({
+  planPath,
+  resultPath,
+  identityPath,
+  producerAttempt,
+  expectedSourceJob,
+}: {
+  planPath: string;
+  resultPath: string;
+  identityPath: string;
+  producerAttempt: number;
+  expectedSourceJob: string | null;
+}): RecoveredRunCohort {
+  const plan = readJsonObject(planPath, "cluster plan");
+  const result = readJsonObject(resultPath, "repair result");
+  const identity = readJsonObject(identityPath, "source job identity");
+  const identityKeys = Object.keys(identity).sort();
+  if (
+    JSON.stringify(identityKeys) !==
+    JSON.stringify(["job_sha256", "schema_version", "source_job", "state_revision"])
+  ) {
+    throw new Error("sealed source job identity has unexpected fields");
+  }
+  const sourceJob = String(identity.source_job ?? "").trim();
+  const stateRevision = String(identity.state_revision ?? "").trim();
+  const jobSha256 = String(identity.job_sha256 ?? "").trim();
+  const planSourceJob = String(plan.source_job ?? "").trim();
+  if (
+    identity.schema_version !== 1 ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
+    !STATE_REVISION.test(stateRevision) ||
+    !JOB_SHA256.test(jobSha256) ||
+    planSourceJob !== sourceJob ||
+    (expectedSourceJob !== null && sourceJob !== expectedSourceJob)
+  ) {
+    throw new Error("sealed repair artifact cohort has invalid source job provenance");
+  }
+  const planMode = String(plan.mode ?? "").trim();
+  const resultMode = String(result.mode ?? planMode).trim();
+  if (!REPAIR_MODES.has(planMode) || !REPAIR_MODES.has(resultMode) || planMode !== resultMode) {
+    throw new Error("sealed repair artifact cohort has inconsistent repair mode");
+  }
+  return {
+    source_job: sourceJob,
+    mode: resultMode,
+    state_revision: stateRevision,
+    job_sha256: jobSha256,
+    producer_attempt: producerAttempt,
+  };
+}
+
+function repairArtifactProducerAttempt(name: string, runId: string): number | null {
+  const match = name.match(
+    new RegExp(`^clawsweeper-repair(?:-(?:inputs|worker))?-${runId}-([1-9][0-9]*)$`),
+  );
+  if (!match) return null;
+  const attempt = Number(match[1]);
+  return Number.isSafeInteger(attempt) ? attempt : null;
+}
+
+function findNamedFiles(root: string, basename: string): string[] {
+  const matches: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && entry.name === basename) matches.push(candidate);
+    }
+  }
+  return matches.sort();
+}
+
+function readJsonObject(file: string, label: string): LooseRecord {
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return value;
 }
 
 function dispatchJob(
@@ -247,6 +600,7 @@ function dispatchJob(
       workflow,
       sourceJobPath,
       sourceJobSha256: authorizationSha256,
+      sourceStateRevision: immutableJob.stateRevision,
       depth: nextRequeueDepth,
       dispatchKey,
     },
@@ -263,6 +617,7 @@ function dispatchJob(
           `job=${jobPath}`,
           "-f",
           `dispatch_key=${dispatchKey}`,
+          ...immutableJobDispatchArgs(immutableJob),
           "-f",
           `mode=${mode}`,
           "-f",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ function fixtureEnv(options: {
   jobs101?: unknown[];
   jobs102?: unknown[];
   runs: unknown[];
+  runPages?: unknown[][];
   failJobs?: boolean;
 }) {
   const binDir = mkdtempSync(join(tmpdir(), "dispatch-receipt-owner-"));
@@ -40,21 +41,31 @@ esac
       ...process.env,
       PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
       GITHUB_REPOSITORY: "openclaw/clawsweeper",
-      FAKE_RUNS_JSON: JSON.stringify({ workflow_runs: options.runs }),
-      FAKE_JOBS_101_JSON: JSON.stringify({ jobs: options.jobs101 ?? [] }),
-      FAKE_JOBS_102_JSON: JSON.stringify({ jobs: options.jobs102 ?? [] }),
+      FAKE_RUNS_JSON: JSON.stringify(
+        (options.runPages ?? [options.runs]).map((runs) => ({ workflow_runs: runs })),
+      ),
+      FAKE_JOBS_101_JSON: JSON.stringify([{ jobs: options.jobs101 ?? [] }]),
+      FAKE_JOBS_102_JSON: JSON.stringify([{ jobs: options.jobs102 ?? [] }]),
       FAKE_FAIL_JOBS: options.failJobs ? "1" : "0",
     },
   };
 }
 
-function runGate(options: Parameters<typeof fixtureEnv>[0], requiredJobName = "assist") {
+function runGate(
+  options: Parameters<typeof fixtureEnv>[0],
+  requiredJobName = "assist",
+  requiredStepName = "",
+) {
   const fixture = fixtureEnv(options);
   try {
-    return execFileSync("bash", [SCRIPT, "assist.yml", EXPECTED_TITLE, "200", requiredJobName], {
-      encoding: "utf8",
-      env: fixture.env,
-    }).trim();
+    return execFileSync(
+      "bash",
+      [SCRIPT, "assist.yml", EXPECTED_TITLE, "200", requiredJobName, requiredStepName],
+      {
+        encoding: "utf8",
+        env: fixture.env,
+      },
+    ).trim();
   } finally {
     rmSync(fixture.binDir, { recursive: true, force: true });
   }
@@ -95,6 +106,134 @@ test("dispatch receipt gate keeps a successfully executed worker as owner", () =
     runGate({
       runs: [
         { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "success" },
+      ],
+      jobs102: [{ name: "assist", conclusion: "success" }],
+    }),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate retries assist when comment publication fails", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Publish trusted assist comment",
+            conclusion: "failure",
+            steps: [{ name: "Revalidate and publish assist comment", conclusion: "failure" }],
+          },
+        ],
+      },
+      "Publish trusted assist comment",
+      "Revalidate and publish assist comment",
+    ),
+    "none",
+  );
+});
+
+test("dispatch receipt gate retains assist ownership after comment publication", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Publish trusted assist comment",
+            conclusion: "failure",
+            steps: [
+              { name: "Revalidate and publish assist comment", conclusion: "success" },
+              { name: "Finalize assist publication action ledger", conclusion: "failure" },
+            ],
+          },
+        ],
+      },
+      "Publish trusted assist comment",
+      "Revalidate and publish assist comment",
+    ),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate retains ownership when later finalization fails", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Intake commit finding",
+            conclusion: "failure",
+            steps: [
+              { name: "Dispatch sealed repair worker", conclusion: "success" },
+              { name: "Finalize commit finding intake action ledger", conclusion: "failure" },
+            ],
+          },
+        ],
+      },
+      "Intake commit finding",
+      "Dispatch sealed repair worker",
+    ),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate retains ownership from an earlier successful job attempt", () => {
+  assert.match(readFileSync(SCRIPT, "utf8"), /jobs\?filter=all&per_page=100/);
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Intake commit finding",
+            run_attempt: 2,
+            conclusion: "failure",
+            steps: [{ name: "Dispatch sealed repair worker", conclusion: "skipped" }],
+          },
+          {
+            name: "Intake commit finding",
+            run_attempt: 1,
+            conclusion: "failure",
+            steps: [{ name: "Dispatch sealed repair worker", conclusion: "success" }],
+          },
+        ],
+      },
+      "Intake commit finding",
+      "Dispatch sealed repair worker",
+    ),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate finds successful owners beyond the first run page", () => {
+  assert.equal(
+    runGate({
+      runs: [],
+      runPages: [
+        Array.from({ length: 100 }, (_, index) => ({
+          id: 1000 + index,
+          display_title: `unrelated-${index}`,
+          status: "completed",
+          conclusion: "success",
+        })),
+        [
+          {
+            id: 102,
+            display_title: EXPECTED_TITLE,
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
       ],
       jobs102: [{ name: "assist", conclusion: "success" }],
     }),

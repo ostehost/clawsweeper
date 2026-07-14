@@ -21,6 +21,7 @@ export interface CommitReviewFrontMatter {
 interface PublishCheckOptions {
   targetRepo: string;
   reportRepo: string;
+  reportRevision: string;
   reportPath: string;
   reportRelativePath: string;
   sha: string;
@@ -119,7 +120,7 @@ export function publishCheckFromReport(options: PublishCheckOptions): void {
   const markdown = readFileSync(options.reportPath, "utf8");
   const { frontMatter } = splitFrontMatter(markdown);
   const conclusion = checkConclusionForFrontMatter(frontMatter);
-  const reportUrl = `https://github.com/${options.reportRepo}/blob/main/${options.reportRelativePath}`;
+  const reportUrl = `https://github.com/${options.reportRepo}/blob/${options.reportRevision}/${options.reportRelativePath}`;
   const payload = {
     name: options.checkName,
     head_sha: options.sha,

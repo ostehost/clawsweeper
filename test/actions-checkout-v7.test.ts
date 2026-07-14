@@ -87,11 +87,13 @@ test("trusted-event workflows explicitly checkout the default branch", () => {
   }
 });
 
-test("trusted-event state checkout remains pinned to the state repository branch", () => {
+test("trusted-event state checkout defaults to the state branch and accepts an exact ref", () => {
   const action = parse(readFileSync(".github/actions/setup-state/action.yml", "utf8")) as {
+    inputs?: Record<string, { default?: unknown }>;
     runs?: { steps?: CheckoutStep[] };
   };
   const checkout = action.runs?.steps?.find((step) => step.uses === "actions/checkout@v7");
   assert.equal(checkout?.with?.repository, "openclaw/clawsweeper-state");
-  assert.equal(checkout?.with?.ref, "state");
+  assert.equal(action.inputs?.ref?.default, "state");
+  assert.equal(checkout?.with?.ref, "${{ inputs.ref }}");
 });

@@ -88,7 +88,8 @@ jobs:
           fi
           expected_title="Assist ${TARGET_REPO}#${ITEM_NUMBER} [${DISPATCH_KEY}]"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
-            assist.yml "$expected_title" "$GITHUB_RUN_ID" assist)"
+            assist.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Publish trusted assist comment" "Revalidate and publish assist comment")"
           if [ "$owner" = "owner" ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "An older active or successfully executed command dispatch already exists; skipping duplicate assist."
@@ -176,6 +177,9 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: assist-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
         with:
           build-script: build
@@ -246,6 +250,7 @@ jobs:
           echo "generation_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Upload assist artifact
+        if: ${{ steps.generate.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-assist-${{ github.run_id }}-${{ steps.generate.outputs.generation_attempt }}
@@ -254,10 +259,20 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Upload assist generation action ledger
+        if: ${{ always() && steps.assist-action-ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: action-ledger-assist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.assist-action-ledger.outputs.output-root }}/**
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 90
+
   publish:
     name: Publish trusted assist comment
     needs: assist
-    if: ${{ needs.assist.result == 'success' }}
+    if: ${{ always() && needs.assist.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -267,15 +282,33 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: publish-action-ledger
+
+      - name: Create state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build
 
       - name: Verify exact workflow source
+        if: ${{ needs.assist.result == 'success' }}
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Resolve validated target repository
         id: target
+        if: ${{ needs.assist.result == 'success' }}
         env:
           TARGET_REPO: ${{ github.event.client_payload.target_repo || inputs.target_repo }}
         run: |
@@ -288,12 +321,22 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download assist artifact
+        if: ${{ needs.assist.result == 'success' }}
         uses: actions/download-artifact@v8
         with:
           name: clawsweeper-assist-${{ github.run_id }}-${{ needs.assist.outputs.generation_attempt }}
           path: .artifacts/publish
 
+      - name: Download assist generation action ledger
+        id: download-assist-action-ledger
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: action-ledger-assist-${{ github.run_id }}-${{ needs.assist.outputs.generation_attempt }}
+          path: .clawsweeper-repair/action-ledger-download/assist
+
       - name: Validate untrusted assist artifact
+        if: ${{ needs.assist.result == 'success' }}
         env:
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           ITEM_NUMBER: ${{ github.event.client_payload.item_number || inputs.item_number }}
@@ -323,6 +366,7 @@ jobs:
 
       - name: Create narrow GitHub App write token
         id: write_token
+        if: ${{ needs.assist.result == 'success' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -333,6 +377,8 @@ jobs:
           permission-pull-requests: write
 
       - name: Revalidate and publish assist comment
+        id: publish-comment
+        if: ${{ needs.assist.result == 'success' }}
         env:
           GH_TOKEN: ${{ steps.write_token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -361,3 +407,45 @@ jobs:
             --codex-reasoning-effort "$REASONING_EFFORT" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GENERATION_ATTEMPT"
+
+      - name: Publish immutable assist action ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-action-ledger.outcome == 'success' }}
+        env:
+          GENERATION_ATTEMPT: ${{ needs.assist.outputs.generation_attempt }}
+          GENERATION_LEDGER_OUTCOME: ${{ steps.download-assist-action-ledger.outcome }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          test -n "$GENERATION_ATTEMPT"
+          event_paths_file=".artifacts/assist-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          : > "$event_paths_file"
+          if [ "$GENERATION_LEDGER_OUTCOME" = "success" ]; then
+            pnpm run --silent publish-action-events -- \
+              --source-root .clawsweeper-repair/action-ledger-download/assist \
+              --state-root "$CLAWSWEEPER_STATE_DIR" \
+              --expected-run-attempt "$GENERATION_ATTEMPT" \
+              --expected-producer-job assist |
+              jq -r '.paths[]?' >> "$event_paths_file"
+          fi
+          if [ -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
+            pnpm run --silent publish-action-events -- \
+              --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" \
+              --expected-producer-job "$GITHUB_JOB" |
+              jq -r '.paths[]?' >> "$event_paths_file"
+          fi
+          sort -u -o "$event_paths_file" "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "No immutable assist action events to publish."
+            exit 0
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append assist action ledger"

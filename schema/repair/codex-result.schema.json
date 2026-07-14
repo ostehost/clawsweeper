@@ -45,6 +45,7 @@
           "classification",
           "target_kind",
           "target_updated_at",
+          "target_timeline_cursor",
           "canonical",
           "duplicate_of",
           "candidate_fix",
@@ -108,6 +109,10 @@
           },
           "target_updated_at": {
             "type": ["string", "null"]
+          },
+          "target_timeline_cursor": {
+            "type": ["string", "null"],
+            "pattern": "^v1:[0-9]+:[0-9a-f]{64}$"
           },
           "canonical": {
             "type": ["string", "null"],

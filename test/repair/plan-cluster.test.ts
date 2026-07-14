@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createReviewedTimelineCursor } from "../../dist/repair/timeline-cursor.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 test("plan-cluster carries worker target checkout into artifacts", () => {
@@ -317,6 +318,53 @@ test("plan-cluster treats same-repo PR branches as writable despite raw maintain
   assert.match(pull.branch_write_reason, /same-repo head branch/);
 });
 
+test("plan-cluster binds merge-capable PRs to the reviewed timeline", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-plan-timeline-cursor-"));
+  const binDir = path.join(tmp, "bin");
+  const jobPath = path.join(tmp, "job.md");
+  const runDir = path.join(tmp, "run");
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(path.join(binDir, "gh"), fakeGhScript(), { mode: 0o755 });
+
+  fs.writeFileSync(
+    jobPath,
+    [
+      "---",
+      "repo: openclaw/openclaw",
+      "cluster_id: merge-openclaw-openclaw-74134",
+      "mode: autonomous",
+      "allowed_actions:",
+      "  - merge",
+      "canonical:",
+      "  - #74134",
+      "candidates:",
+      "  - #74134",
+      "allow_fix_pr: false",
+      "allow_merge: true",
+      "security_policy: central_security_only",
+      "security_sensitive: false",
+      "---",
+      "Review #74134 for an exact merge.",
+      "",
+    ].join("\n"),
+  );
+
+  execFileSync(process.execPath, ["dist/repair/plan-cluster.js", jobPath, "--run-dir", runDir], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      ...mockGhBinEnv(path.join(binDir, "gh"), binDir),
+    },
+    stdio: "pipe",
+  });
+
+  const clusterPlan = JSON.parse(fs.readFileSync(path.join(runDir, "cluster-plan.json"), "utf8"));
+  assert.equal(
+    clusterPlan.items[0].timeline_cursor,
+    createReviewedTimelineCursor([timelineEvent()]),
+  );
+});
+
 test("plan-cluster bounds PR file and commit hydration", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-plan-bounded-pr-"));
   const binDir = path.join(tmp, "bin");
@@ -548,6 +596,9 @@ function pagedResponse(endpoint) {
   const params = new URLSearchParams(query);
   const limit = Math.max(1, Number(params.get("per_page") || 1));
   const page = Math.max(1, Number(params.get("page") || 1));
+  if (endpointPath.endsWith("/timeline")) {
+    return page === 1 ? [${JSON.stringify(timelineEvent())}] : [];
+  }
   const total = Number(process.env.FAKE_GH_LARGE_PR_COUNT || 120);
   const start = (page - 1) * limit;
   const count = Math.max(0, Math.min(limit, total - start));
@@ -569,4 +620,14 @@ function pagedResponse(endpoint) {
   return [];
 }
 `;
+}
+
+function timelineEvent() {
+  return {
+    id: 88001,
+    event: "commented",
+    created_at: "2026-04-30T00:00:00Z",
+    user: { login: "maintainer" },
+    body: "reviewed",
+  };
 }

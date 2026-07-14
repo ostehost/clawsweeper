@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { parseArgs, repoRoot } from "./lib.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { ghJsonWithRetry as ghJson, ghPagedLimitWithRetry as ghPagedLimit } from "./github-cli.js";
@@ -20,6 +21,14 @@ import {
 } from "./spam-scanner-core.js";
 import { internalCodexModel, PUBLIC_CODEX_MODEL } from "../codex-env.js";
 import { compactText } from "./text-utils.js";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+  type ActionEventEvidence,
+  type ActionEventSubject,
+} from "../action-ledger.js";
+import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
 
 const args = parseArgs(process.argv.slice(2));
 const targetRepo = stringSetting(
@@ -54,73 +63,289 @@ const trustedBots = commaSet(
 
 assertRepo(targetRepo, "repo");
 
-const ledger = readLedger();
-const processed = new Set<string>(
-  forceReprocess
-    ? []
-    : (ledger.entries ?? [])
-        .map((entry: JsonValue) => String((entry as LooseRecord).comment_version_key ?? ""))
-        .filter(Boolean),
-);
+let processed = new Set<string>();
 
-const comments = await listCandidateComments();
-const scanComments = comments.filter((comment) => !processed.has(commentVersionKey(comment)));
-const candidates = scanComments.filter((comment) => shouldSendToCheapModel(comment, trustedBots));
-let modelError: string | null = null;
-let modelResults = new Map<string, SpamModelResult>();
-if (candidates.length > 0) {
+await runSpamScanner();
+
+async function runSpamScanner() {
+  const operationIdentity = {
+    repository: targetRepo,
+    since,
+    maxComments,
+    forceReprocess,
+    commentIds: [...commentIds].sort((left, right) => left - right),
+    reviewCommentIds: [...reviewCommentIds].sort((left, right) => left - right),
+  };
+  let phaseSeq = 1;
+  const batchStart = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.reviewBatch,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "spam_scan_start" },
+    operation: "spam_review",
+    operationIdentity,
+    phaseSeq: phaseSeq++,
+    idempotencyIdentity: { operationIdentity, slot: "spam_scan_start" },
+    component: "spam_scanner",
+    subject: {
+      repository: targetRepo,
+      kind: "workflow",
+    },
+    evidence: workflowRunEvidence(),
+    attributes: {
+      review_mode: "spam_audit",
+      model: PUBLIC_CODEX_MODEL,
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  const itemStarts = new Map<string, string | null>();
+  let primaryError: unknown = null;
   try {
-    modelResults = await scanWithModel(candidates, model);
+    const ledger = readLedger();
+    processed = new Set<string>(
+      forceReprocess
+        ? []
+        : (ledger.entries ?? [])
+            .map((entry: JsonValue) => String((entry as LooseRecord).comment_version_key ?? ""))
+            .filter(Boolean),
+    );
+
+    const comments = await listCandidateComments();
+    const scanComments = comments.filter((comment) => !processed.has(commentVersionKey(comment)));
+    const candidates = scanComments.filter((comment) =>
+      shouldSendToCheapModel(comment, trustedBots),
+    );
+    for (const [index, comment] of candidates.entries()) {
+      const start = recordWorkflowPhaseEvent(repoRoot(), {
+        phase: ACTION_EVENT_TYPES.reviewItem,
+        status: ACTION_EVENT_STATUSES.started,
+        reasonCode: ACTION_EVENT_REASON_CODES.selected,
+        retryable: false,
+        mutation: false,
+        identity: {
+          slot: "spam_review_start",
+          index,
+          commentVersionSha256: spamCommentVersionSha256(comment),
+        },
+        operation: "spam_review",
+        operationIdentity,
+        parentEventId: batchStart?.event_id ?? null,
+        phaseSeq: phaseSeq++,
+        idempotencyIdentity: spamCommentIdentity(comment, "review"),
+        component: "spam_scanner",
+        subject: spamCommentSubject(comment),
+        evidence: workflowRunEvidence(),
+        attributes: {
+          batch_index: index,
+          review_mode: "spam_audit",
+          model: PUBLIC_CODEX_MODEL,
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      itemStarts.set(spamAuditKey(comment), start?.event_id ?? null);
+    }
+
+    let modelError: string | null = null;
+    let modelResults = new Map<string, SpamModelResult>();
+    if (candidates.length > 0) {
+      try {
+        modelResults = await scanWithModel(candidates, model);
+      } catch (error) {
+        modelError = compactText(error instanceof Error ? error.message : String(error), 500);
+        console.warn(
+          `[spam-scanner] cheap model scan failed; writing deterministic audit only: ${modelError}`,
+        );
+      }
+    }
+    const audited = candidates.map((comment) => ({
+      comment,
+      result: modelResults.get(comment.id) ?? null,
+    }));
+    const auditedKeys = new Set(audited.map((audit) => spamAuditKey(audit.comment)));
+    const auditPaths = new Map<string, string>();
+
+    for (const audit of audited) {
+      auditPaths.set(
+        spamAuditKey(audit.comment),
+        writeAuditRecord(audit.comment, audit.result, modelError),
+      );
+    }
+    if (writeReport) {
+      for (const comment of scanComments) {
+        if (!auditedKeys.has(spamAuditKey(comment))) removeAuditRecord(comment);
+      }
+    }
+
+    const report = {
+      status: "audit_only",
+      generated_at: new Date().toISOString(),
+      repo: targetRepo,
+      model: PUBLIC_CODEX_MODEL,
+      since,
+      max_comments: maxComments,
+      scanned_comments: comments.length,
+      new_comments: scanComments.length,
+      model_candidates: candidates.length,
+      audited: audited.length,
+      model_error: modelError,
+      high_signal: audited.filter((audit) => audit.result?.spam_signal === "high").length,
+      medium_signal: audited.filter((audit) => audit.result?.spam_signal === "medium").length,
+      action: "none",
+      entries: audited.map((audit) => auditSummary(audit.comment, audit.result, modelError)),
+    };
+
+    appendLedger(
+      audited.map((audit) => ({
+        ...auditSummary(audit.comment, audit.result, modelError),
+        comment_version_key: commentVersionKey(audit.comment),
+        processed_at: report.generated_at,
+      })),
+    );
+
+    if (writeReport) writeReports(report);
+    for (const [index, audit] of audited.entries()) {
+      const auditPath = auditPaths.get(spamAuditKey(audit.comment));
+      const auditEvidence = auditPath
+        ? actionLedgerFileEvidence("spam_audit_record", auditPath)
+        : null;
+      const log = recordWorkflowPhaseEvent(repoRoot(), {
+        phase: ACTION_EVENT_TYPES.reviewLogPublication,
+        status: auditEvidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
+        reasonCode: auditEvidence
+          ? ACTION_EVENT_REASON_CODES.completed
+          : ACTION_EVENT_REASON_CODES.notFound,
+        retryable: false,
+        mutation: false,
+        identity: {
+          slot: "spam_audit_record",
+          index,
+          commentVersionSha256: spamCommentVersionSha256(audit.comment),
+        },
+        operation: "spam_review",
+        operationIdentity,
+        parentEventId: itemStarts.get(spamAuditKey(audit.comment)) ?? null,
+        phaseSeq: phaseSeq++,
+        idempotencyIdentity: spamCommentIdentity(audit.comment, "audit_record"),
+        component: "spam_scanner",
+        subject: spamCommentSubject(audit.comment, auditPath),
+        evidence: [...workflowRunEvidence(), ...(auditEvidence ? [auditEvidence] : [])],
+        attributes: {
+          batch_index: index,
+          log_count: auditEvidence ? 1 : 0,
+          log_kind: "spam_audit",
+          publication_kind: "local_artifact",
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+      recordWorkflowPhaseEvent(repoRoot(), {
+        phase: ACTION_EVENT_TYPES.reviewItem,
+        status: modelError ? ACTION_EVENT_STATUSES.failed : ACTION_EVENT_STATUSES.completed,
+        reasonCode: modelError
+          ? ACTION_EVENT_REASON_CODES.unavailable
+          : ACTION_EVENT_REASON_CODES.completed,
+        retryable: modelError !== null,
+        mutation: false,
+        identity: {
+          slot: "spam_review_terminal",
+          index,
+          commentVersionSha256: spamCommentVersionSha256(audit.comment),
+        },
+        operation: "spam_review",
+        operationIdentity,
+        parentEventId: log?.event_id ?? itemStarts.get(spamAuditKey(audit.comment)) ?? null,
+        phaseSeq: phaseSeq++,
+        idempotencyIdentity: spamCommentIdentity(audit.comment, "review_terminal"),
+        component: "spam_scanner",
+        subject: spamCommentSubject(audit.comment, auditPath),
+        evidence: [...workflowRunEvidence(), ...(auditEvidence ? [auditEvidence] : [])],
+        attributes: {
+          batch_index: index,
+          finding_count: audit.result?.should_investigate ? 1 : 0,
+          review_mode: "spam_audit",
+          completion_reason: modelError ? "model_unavailable" : "completed",
+        },
+        privacy: actionLedgerPrivacy(),
+      });
+    }
+    const reportEvidence = [
+      actionLedgerFileEvidence("spam_audit_ledger", ledgerPath()),
+      ...(writeReport ? [actionLedgerFileEvidence("spam_audit_report", latestReportPath())] : []),
+    ].filter((entry): entry is ActionEventEvidence => entry !== null);
+    recordWorkflowPhaseEvent(repoRoot(), {
+      phase: ACTION_EVENT_TYPES.reviewBatch,
+      status: modelError ? ACTION_EVENT_STATUSES.failed : ACTION_EVENT_STATUSES.completed,
+      reasonCode: modelError
+        ? ACTION_EVENT_REASON_CODES.unavailable
+        : ACTION_EVENT_REASON_CODES.completed,
+      retryable: modelError !== null,
+      mutation: false,
+      identity: { slot: "spam_scan_terminal" },
+      operation: "spam_review",
+      operationIdentity,
+      parentEventId: batchStart?.event_id ?? null,
+      phaseSeq: phaseSeq++,
+      idempotencyIdentity: { operationIdentity, slot: "spam_scan_terminal" },
+      component: "spam_scanner",
+      subject: {
+        repository: targetRepo,
+        kind: "workflow",
+      },
+      evidence: [...workflowRunEvidence(), ...reportEvidence],
+      attributes: {
+        candidate_count: candidates.length,
+        processed_count: audited.length,
+        finding_count: report.high_signal + report.medium_signal,
+        failed_count: modelError ? 1 : 0,
+        review_mode: "spam_audit",
+        completion_reason: modelError ? "model_unavailable" : "completed",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    console.log(JSON.stringify(report, null, 2));
   } catch (error) {
-    modelError = compactText(error instanceof Error ? error.message : String(error), 500);
-    console.warn(
-      `[spam-scanner] cheap model scan failed; writing deterministic audit only: ${modelError}`,
+    primaryError = error;
+    recordWorkflowPhaseEvent(repoRoot(), {
+      phase: ACTION_EVENT_TYPES.reviewBatch,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.exception,
+      retryable: true,
+      mutation: false,
+      identity: { slot: "spam_scan_terminal", outcome: "exception" },
+      operation: "spam_review",
+      operationIdentity,
+      parentEventId: batchStart?.event_id ?? null,
+      phaseSeq,
+      idempotencyIdentity: { operationIdentity, slot: "spam_scan_terminal" },
+      component: "spam_scanner",
+      subject: {
+        repository: targetRepo,
+        kind: "workflow",
+      },
+      evidence: workflowRunEvidence(),
+      attributes: {
+        completion_reason: "exception",
+        review_mode: "spam_audit",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+  }
+
+  try {
+    await flushWorkflowActionEvents(repoRoot());
+  } catch (flushError) {
+    if (!primaryError) throw flushError;
+    console.error(
+      `[spam-scanner] failed to flush action events after scan failure: ${
+        flushError instanceof Error ? flushError.message : String(flushError)
+      }`,
     );
   }
-}
-const audited = candidates.map((comment) => ({
-  comment,
-  result: modelResults.get(comment.id) ?? null,
-}));
-const auditedKeys = new Set(audited.map((audit) => spamAuditKey(audit.comment)));
-
-for (const audit of audited) {
-  writeAuditRecord(audit.comment, audit.result, modelError);
-}
-if (writeReport) {
-  for (const comment of scanComments) {
-    if (!auditedKeys.has(spamAuditKey(comment))) removeAuditRecord(comment);
+  if (primaryError) {
+    throw primaryError;
   }
 }
-
-const report = {
-  status: "audit_only",
-  generated_at: new Date().toISOString(),
-  repo: targetRepo,
-  model: PUBLIC_CODEX_MODEL,
-  since,
-  max_comments: maxComments,
-  scanned_comments: comments.length,
-  new_comments: scanComments.length,
-  model_candidates: candidates.length,
-  audited: audited.length,
-  model_error: modelError,
-  high_signal: audited.filter((audit) => audit.result?.spam_signal === "high").length,
-  medium_signal: audited.filter((audit) => audit.result?.spam_signal === "medium").length,
-  action: "none",
-  entries: audited.map((audit) => auditSummary(audit.comment, audit.result, modelError)),
-};
-
-appendLedger(
-  audited.map((audit) => ({
-    ...auditSummary(audit.comment, audit.result, modelError),
-    comment_version_key: commentVersionKey(audit.comment),
-    processed_at: report.generated_at,
-  })),
-);
-
-if (writeReport) writeReports(report);
-console.log(JSON.stringify(report, null, 2));
 
 async function listCandidateComments() {
   const comments: SpamScanComment[] = [];
@@ -314,6 +539,68 @@ function auditSummary(
   };
 }
 
+function spamCommentVersionSha256(comment: SpamScanComment) {
+  return sha256(commentVersionKey(comment));
+}
+
+function spamCommentIdentity(comment: SpamScanComment, slot: string) {
+  return {
+    repository: targetRepo,
+    slot,
+    commentKind: comment.kind,
+    commentVersionSha256: spamCommentVersionSha256(comment),
+  };
+}
+
+function spamCommentSubject(comment: SpamScanComment, recordPath?: string): ActionEventSubject {
+  const relativePath = recordPath
+    ? path.relative(repoRoot(), recordPath).split(path.sep).join("/")
+    : null;
+  return {
+    repository: targetRepo,
+    kind: "notification",
+    subjectId: spamAuditKey(comment),
+    sourceRevision: spamCommentVersionSha256(comment),
+    ...(relativePath && !relativePath.startsWith("../") ? { recordPath: relativePath } : {}),
+  };
+}
+
+function actionLedgerFileEvidence(kind: string, filePath: string): ActionEventEvidence | null {
+  if (!fs.existsSync(filePath)) return null;
+  const relativePath = path.relative(repoRoot(), filePath).split(path.sep).join("/");
+  return {
+    kind,
+    sha256: sha256(fs.readFileSync(filePath)),
+    ...(!relativePath.startsWith("..") ? { reportPath: relativePath } : {}),
+  };
+}
+
+function workflowRunEvidence(): ActionEventEvidence[] {
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "").trim();
+  const runId = String(process.env.GITHUB_RUN_ID ?? "").trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !/^[1-9][0-9]*$/.test(runId)) {
+    return [];
+  }
+  return [
+    {
+      kind: "workflow_run",
+      runUrl: `https://github.com/${repository}/actions/runs/${runId}`,
+    },
+  ];
+}
+
+function actionLedgerPrivacy() {
+  return {
+    classification: "internal" as const,
+    redactionVersion: "v1",
+    fieldsDropped: ["body", "prompt", "response", "reasons"],
+  };
+}
+
+function sha256(value: string | Buffer) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function readLedger() {
   const file = ledgerPath();
   if (!fs.existsSync(file)) return { updated_at: null, entries: [] };
@@ -360,6 +647,7 @@ function writeAuditRecord(
   });
   record.model_error = scanModelError;
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+  return file;
 }
 
 function removeAuditRecord(comment: SpamScanComment) {
@@ -377,11 +665,13 @@ function auditRecordPath(comment: SpamScanComment) {
 }
 
 function writeReports(report: LooseRecord) {
-  for (const name of ["spam-scanner-latest.json"]) {
-    const file = path.join(repoRoot(), "results", name);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`);
-  }
+  const file = latestReportPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`);
+}
+
+function latestReportPath() {
+  return path.join(repoRoot(), "results", "spam-scanner-latest.json");
 }
 
 function ledgerPath() {

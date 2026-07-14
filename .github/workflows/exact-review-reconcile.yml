@@ -7,6 +7,10 @@ on:
 
 permissions: {}
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+
 concurrency:
   group: exact-review-reconcile-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
@@ -17,39 +21,142 @@ jobs:
     if: ${{ github.event.workflow_run.event == 'repository_dispatch' && startsWith(github.event.workflow_run.display_title, 'Review event item ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
+      producer_run_attempt: ${{ steps.finalize-exact-review-action-ledger.outputs.producer_run_attempt }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Verify reconciler source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - uses: ./.github/actions/setup-action-ledger
+        id: exact-review-action-ledger
+        continue-on-error: true
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        with:
+          build-script: build:repair
+
       - name: Reconcile terminal run
         env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: node dist/repair/exact-review-action-ledger-cli.js reconcile
+
+      - name: Finalize exact-review reconciliation action ledger
+        id: finalize-exact-review-action-ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
         run: |
           set -euo pipefail
-          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
-          queue_url="${QUEUE_URL%/}"
-          payload="$(node -e '
-            const runAttempt = Number(process.env.SOURCE_RUN_ATTEMPT);
-            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
-            process.stdout.write(JSON.stringify({
-              runs: [{
-                run_id: process.env.SOURCE_RUN_ID,
-                run_attempt: runAttempt,
-              }],
-            }));
-          ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $signature" \
-              --data-binary "$payload" \
-              "$queue_url/internal/exact-review/reconcile" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$((attempt * 5))"
-            fi
-          done
-          exit 1
+          manifest="$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/exact-review-action-ledger-manifest.json"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane exact-review-queue \
+            --allow-empty > "$manifest"
+          echo "producer_run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact-review reconciliation action ledger
+        if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: exact-review-action-ledger-reconcile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-ledger:
+    name: Publish immutable exact-review reconciliation ledger
+    needs: reconcile
+    if: ${{ always() && needs.reconcile.outputs.action_ledger_ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Create reconciliation ledger state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:all
+
+      - name: Download exact-review reconciliation action ledger
+        uses: actions/download-artifact@v8
+        with:
+          name: exact-review-action-ledger-reconcile-${{ github.run_id }}-${{ needs.reconcile.outputs.producer_run_attempt }}
+          path: .clawsweeper-repair/exact-review-action-ledger
+
+      - name: Publish exact reconciliation producer ledger
+        env:
+          PRODUCER_RUN_ATTEMPT: ${{ needs.reconcile.outputs.producer_run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "$PRODUCER_RUN_ATTEMPT"
+          source_root=".clawsweeper-repair/exact-review-action-ledger"
+          manifest="$source_root/exact-review-action-ledger-manifest.json"
+          import_result=".artifacts/exact-review-action-ledger-import.json"
+          paths_file=".artifacts/exact-review-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane exact-review-queue \
+            --allow-empty \
+            --manifest "$manifest" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-workflow exact-review-reconcile.yml \
+            --expected-job reconcile \
+            --expected-run-id "$GITHUB_RUN_ID" \
+            --expected-run-attempt "$PRODUCER_RUN_ATTEMPT" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result"
+          if ! jq -e --slurpfile manifest "$manifest" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result" >/dev/null; then
+            echo "Imported reconciliation paths do not match the producer manifest." >&2
+            exit 1
+          fi
+          jq -r '.paths[]?' "$import_result" | sort -u > "$paths_file"
+          if [ ! -s "$paths_file" ]; then
+            echo "No immutable exact-review reconciliation events to publish."
+            exit 0
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$paths_file" \
+            --message "chore: append exact-review reconciliation ledger"

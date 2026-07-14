@@ -1,6 +1,6 @@
 name: ClawSweeper Commit Review
 
-run-name: Commit review ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}@${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?' }}
+run-name: ${{ (github.event.inputs.continuation_key || github.event.client_payload.continuation_key) && format('Commit review {0}@{1} [{2}]', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?', github.event.inputs.continuation_key || github.event.client_payload.continuation_key) || format('Commit review {0}@{1}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?') }}
 
 on:
   workflow_dispatch:
@@ -24,6 +24,10 @@ on:
         description: "Internal offset for continuation runs"
         required: false
         default: "0"
+      continuation_key:
+        description: "Stable commit review continuation idempotency key"
+        required: false
+        default: ""
       create_checks:
         description: "Create/update GitHub Checks on reviewed commits"
         required: false
@@ -47,20 +51,62 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  receipt:
+    name: Deduplicate commit review continuation receipt
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      proceed: ${{ steps.receipt.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/dispatch-receipt-owner.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: receipt
+        env:
+          CONTINUATION_KEY: ${{ github.event.inputs.continuation_key || github.event.client_payload.continuation_key || '' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CONTINUATION_KEY" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          expected_title="Commit review ${TARGET_REPO}@${COMMIT_SHA} [${CONTINUATION_KEY}]"
+          owner="$(bash scripts/dispatch-receipt-owner.sh \
+            commit-review.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Commit reports" "Complete commit review continuation receipt")"
+          if [ "$owner" = "owner" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "An older active or durably published continuation already exists; skipping duplicate review."
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
   disabled-target:
     name: Skip disabled target commit review
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Explain skipped commit review
+        env:
+          TARGET_REPO: ${{ github.event.client_payload.target_repo }}
         run: |
-          echo "Skipping commit review for ${{ github.event.client_payload.target_repo }}."
+          printf 'Skipping commit review for %s.\n' "$TARGET_REPO"
           echo "Set CLAWSWEEPER_ENABLE_CLAWHUB=1 after installing the ClawSweeper GitHub App on openclaw/clawhub."
 
   plan:
     name: Plan commits
-    if: ${{ !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
@@ -84,9 +130,12 @@ jobs:
 
       - name: Resolve mode
         id: mode
+        env:
+          REQUESTED_CREATE_CHECKS: ${{ github.event.inputs.create_checks || github.event.client_payload.create_checks || vars.CLAWSWEEPER_COMMIT_REVIEW_CREATE_CHECKS || 'false' }}
+          REQUESTED_ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || 'true' }}
         run: |
-          enabled="${{ github.event.inputs.enabled || github.event.client_payload.enabled || 'true' }}"
-          create_checks="${{ github.event.inputs.create_checks || github.event.client_payload.create_checks || vars.CLAWSWEEPER_COMMIT_REVIEW_CREATE_CHECKS || 'false' }}"
+          enabled="$REQUESTED_ENABLED"
+          create_checks="$REQUESTED_CREATE_CHECKS"
           case "$enabled" in
             false|FALSE|0|no|NO|off|OFF)
               echo "Commit review disabled by input/payload."
@@ -104,8 +153,10 @@ jobs:
 
       - name: Resolve target repository
         id: target
+        env:
+          REQUESTED_TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
         run: |
-          target_repo="${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
+          target_repo="$REQUESTED_TARGET_REPO"
           if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
             echo "Invalid target_repo: $target_repo" >&2
             exit 1
@@ -349,7 +400,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: skipped-commit-reports
+          name: skipped-commit-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: skipped-commit-artifacts
           if-no-files-found: ignore
 
@@ -360,7 +411,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
+    env:
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-${{ matrix.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -386,20 +440,8 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
 
-      - name: Create state token
-        id: state-token
-        uses: ./clawsweeper/.github/actions/create-state-token
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-
-      - uses: ./clawsweeper/.github/actions/setup-state
-        with:
-          token: ${{ steps.state-token.outputs.token }}
-          worktree-path: clawsweeper
-          fetch-depth: 1
-
       - uses: ./clawsweeper/.github/actions/setup-pnpm
+        id: review-setup-pnpm
         with:
           working-directory: clawsweeper
           build-script: build
@@ -431,14 +473,35 @@ jobs:
           if ! git -C "$TARGET_NAME" rev-parse --verify "$COMMIT_SHA^" >/dev/null 2>&1; then
             git -C "$TARGET_NAME" fetch --deepen=500 origin main || true
           fi
+          git -C "$TARGET_NAME" diff --no-ext-diff --binary "$COMMIT_SHA^" "$COMMIT_SHA" >/dev/null
+          git -C "$TARGET_NAME" remote set-url origin "https://github.com/${TARGET_REPO}.git"
           echo "Target main head: $(git -C "$TARGET_NAME" rev-parse --short HEAD)"
           echo "Commit under review: $(git -C "$TARGET_NAME" rev-parse --short "$COMMIT_SHA")"
 
-      - name: Review commit
-        working-directory: clawsweeper
+      - uses: ./clawsweeper/.github/actions/setup-action-ledger
+        id: review-action-ledger
+
+      - name: Hydrate bounded commit GitHub context
+        id: commit-context
         env:
           GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
-          COMMIT_SWEEPER_TARGET_GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+          TARGET_NAME: ${{ needs.plan.outputs.target_checkout_dir }}
+          COMMIT_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          context_path="commit-github-context-${COMMIT_SHA}.json"
+          node clawsweeper/dist/commit-sweeper.js hydrate-github-context \
+            --target-repo "$TARGET_REPO" \
+            --target-dir "$TARGET_NAME" \
+            --commit-sha "$COMMIT_SHA" \
+            --output "$context_path"
+          echo "context_path=$context_path" >> "$GITHUB_OUTPUT"
+
+      - name: Review commit
+        id: review-commit
+        working-directory: clawsweeper
+        env:
           COMMIT_SWEEPER_ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
         run: |
           node dist/commit-sweeper.js review \
@@ -450,52 +513,61 @@ jobs:
             --work-dir ../commit-work \
             --codex-model internal \
             --codex-reasoning-effort high \
-            --codex-sandbox danger-full-access \
-            --codex-timeout-ms 1800000
+            --codex-sandbox read-only \
+            --codex-timeout-ms 1800000 \
+            --require-publishable-report \
+            --defer-workflow-completion \
+            --github-context "../${{ steps.commit-context.outputs.context_path }}"
 
-      - name: Create target checks token
-        id: target-checks-token
-        if: ${{ needs.plan.outputs.create_checks == 'true' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - name: Upload commit review diagnostic
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ needs.plan.outputs.target_repo_owner }}
-          repositories: ${{ needs.plan.outputs.target_repo_name }}
-          permission-checks: write
+          name: commit-review-diagnostic-${{ matrix.sha }}-${{ github.run_attempt }}
+          path: commit-work/${{ matrix.sha }}.diagnostic.json
+          if-no-files-found: warn
+          retention-days: 30
 
-      - name: Publish commit check
-        if: ${{ needs.plan.outputs.create_checks == 'true' }}
+      - name: Finalize commit review action ledger
+        id: finalize-review-action-ledger
+        if: ${{ always() && steps.review-action-ledger.outcome == 'success' && steps.review-setup-pnpm.outcome == 'success' }}
         working-directory: clawsweeper
-        env:
-          GH_TOKEN: ${{ steps.target-checks-token.outputs.token }}
         run: |
           set -euo pipefail
-          test -n "$GH_TOKEN"
-          report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
-          if [ -z "$report_path" ]; then
-            echo "Missing report artifact for ${{ matrix.sha }}" >&2
-            exit 1
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane "commit-review-${{ matrix.sha }}" \
+            --preserve-open-workflows \
+            > "$output_root/repair-action-ledger-manifest.json"
+
+      - name: Prepare commit review receipt bundle
+        id: prepare-review-bundle
+        if: ${{ always() && steps.finalize-review-action-ledger.outcome == 'success' }}
+        working-directory: clawsweeper
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          bundle_root="../commit-review-bundle"
+          rm -rf "$bundle_root"
+          mkdir -p "$bundle_root/report" "$bundle_root/ledger"
+          if [ -d ../commit-artifacts ]; then
+            cp -R ../commit-artifacts/. "$bundle_root/report/"
           fi
-          relative_path="records/${report_path#../commit-artifacts/}"
-          node dist/commit-sweeper.js publish-check \
-            --target-repo "${{ needs.plan.outputs.target_repo }}" \
-            --commit-sha "${{ matrix.sha }}" \
-            --report-path "$report_path" \
-            --report-relative-path "$relative_path" \
-            --report-repo "${{ github.repository }}"
+          cp -R "$output_root"/. "$bundle_root/ledger/"
 
       - uses: actions/upload-artifact@v7
-        if: always()
+        if: ${{ always() && steps.prepare-review-bundle.outcome == 'success' }}
         with:
-          name: commit-review-${{ matrix.sha }}
-          path: commit-artifacts
-          if-no-files-found: ignore
+          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: commit-review-bundle
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
 
   publish:
     name: Commit reports
     needs: [plan, review]
-    if: ${{ always() && (needs.plan.outputs.planned_count != '0' || needs.plan.outputs.skipped_count != '0') }}
+    if: ${{ always() && needs.plan.result == 'success' && (needs.plan.outputs.planned_count != '0' || needs.plan.outputs.skipped_count != '0') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -515,24 +587,351 @@ jobs:
         with:
           token: ${{ steps.state-token.outputs.token }}
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: publish-setup-pnpm
         with:
           build-script: build:all
+
+      - name: Resolve exact commit report artifact cohort
+        id: commit-report-cohort
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+          SKIPPED_COUNT: ${{ needs.plan.outputs.skipped_count }}
+          ARTIFACT_INVENTORY: .artifacts/commit-review-artifacts.json
+          JOB_INVENTORY_DIR: .artifacts/commit-review-job-attempts
+          SELECTION_FILE: .artifacts/selected-commit-review-bundles.tsv
+        run: |
+          set -euo pipefail
+          case "$RUN_ATTEMPT" in
+            "" | *[!0-9]* | 0)
+              echo "Invalid workflow run attempt: $RUN_ATTEMPT" >&2
+              exit 1
+              ;;
+          esac
+          rm -rf "$JOB_INVENTORY_DIR"
+          mkdir -p .artifacts "$JOB_INVENTORY_DIR"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            > "$ARTIFACT_INVENTORY"
+          for ((attempt = 1; attempt <= RUN_ATTEMPT; attempt += 1)); do
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?filter=all&per_page=100" \
+              > "$JOB_INVENTORY_DIR/${attempt}.json"
+          done
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          import path from "node:path";
+          import {
+            selectExactAttemptArtifact,
+            selectLatestJobResult,
+          } from "./dist/repair/workflow-attempt-cohort.js";
+
+          const runId = requiredPositiveInteger(process.env.RUN_ID, "workflow run id");
+          const runAttempt = requiredPositiveInteger(
+            process.env.RUN_ATTEMPT,
+            "workflow run attempt",
+          );
+          const plannedCount = requiredNonnegativeInteger(
+            process.env.PLANNED_COUNT,
+            "planned commit count",
+          );
+          const skippedCount = requiredNonnegativeInteger(
+            process.env.SKIPPED_COUNT,
+            "skipped commit count",
+          );
+          const matrix = JSON.parse(process.env.EXPECTED_COMMIT_MATRIX || "[]");
+          if (!Array.isArray(matrix) || matrix.length !== plannedCount) {
+            throw new Error("commit review matrix does not match planned_count");
+          }
+          const shas = matrix.map((entry) => {
+            const sha = entry && typeof entry === "object" ? String(entry.sha ?? "") : "";
+            if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error("commit review matrix SHA is invalid");
+            return sha;
+          });
+          if (new Set(shas).size !== shas.length) {
+            throw new Error("commit review matrix contains duplicate SHAs");
+          }
+          const artifactPages = JSON.parse(
+            fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"),
+          );
+          const jobInventories = fs
+            .readdirSync(process.env.JOB_INVENTORY_DIR, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && /^[1-9][0-9]*\.json$/.test(entry.name))
+            .map((entry) => ({
+              attempt: Number(entry.name.slice(0, -".json".length)),
+              pages: JSON.parse(
+                fs.readFileSync(path.join(process.env.JOB_INVENTORY_DIR, entry.name), "utf8"),
+              ),
+            }));
+
+          const reviewArtifacts = shas.map((sha) => {
+            const job = selectLatestJobResult(
+              jobInventories,
+              `Review commit ${sha}`,
+              runAttempt,
+            );
+            if (job.result !== "success") {
+              throw new Error(
+                `latest Review commit ${sha} job in attempt ${job.attempt} concluded ${job.result}`,
+              );
+            }
+            const artifact = selectExactAttemptArtifact(
+              artifactPages,
+              `commit-review-${sha}-${runId}`,
+              job.attempt,
+            );
+            if (!artifact) {
+              throw new Error(
+                `successful Review commit ${sha} job in attempt ${job.attempt} has no exact artifact`,
+              );
+            }
+            return { sha, artifact };
+          });
+
+          let skippedArtifact = null;
+          if (skippedCount > 0) {
+            const planJob = selectLatestJobResult(jobInventories, "Plan commits", runAttempt);
+            if (planJob.result !== "success") {
+              throw new Error(
+                `latest Plan commits job in attempt ${planJob.attempt} concluded ${planJob.result}`,
+              );
+            }
+            skippedArtifact = selectExactAttemptArtifact(
+              artifactPages,
+              `skipped-commit-reports-${runId}`,
+              planJob.attempt,
+            );
+            if (!skippedArtifact) {
+              throw new Error(
+                `successful Plan commits job in attempt ${planJob.attempt} has no exact skipped-report artifact`,
+              );
+            }
+          }
+
+          fs.writeFileSync(
+            process.env.SELECTION_FILE,
+            reviewArtifacts
+              .map(({ sha, artifact }) => `${sha}\t${artifact.name}\t${artifact.attempt}\n`)
+              .join(""),
+            "utf8",
+          );
+          writeOutputs({
+            review_artifact_ids: reviewArtifacts.map(({ artifact }) => artifact.id).join(","),
+            skipped_artifact_name: skippedArtifact?.name ?? "",
+            skipped_producer_attempt: skippedArtifact ? String(skippedArtifact.attempt) : "",
+          });
+
+          function requiredPositiveInteger(value, label) {
+            const parsed = requiredNonnegativeInteger(value, label);
+            if (parsed === 0) throw new Error(`${label} is invalid`);
+            return parsed;
+          }
+
+          function requiredNonnegativeInteger(value, label) {
+            const text = String(value ?? "");
+            if (!/^(0|[1-9][0-9]*)$/.test(text)) throw new Error(`${label} is invalid`);
+            const parsed = Number(text);
+            if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is invalid`);
+            return parsed;
+          }
+
+          function writeOutputs(outputs) {
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              Object.entries(outputs)
+                .map(([name, value]) => `${name}=${value}\n`)
+                .join(""),
+            );
+          }
+          NODE
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         with:
-          pattern: commit-review-*
-          path: commit-artifacts
-          merge-multiple: true
+          artifact-ids: ${{ steps.commit-report-cohort.outputs.review_artifact_ids }}
+          path: .clawsweeper-repair/commit-review-download
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
-      - uses: actions/download-artifact@v8
+      - name: Verify exact commit review bundles
+        id: verify-review-bundles
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        env:
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          EXPECTED_TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
+          actual_shas_file=".artifacts/actual-commit-review-shas.txt"
+          causality_file=".artifacts/commit-review-action-ledger-causality.json"
+          selection_file=".artifacts/selected-commit-review-bundles.tsv"
+          jq -er 'map(.sha) | if all(.[]; test("^[a-f0-9]{40}$")) then .[] else error("invalid commit review SHA") end' \
+            <<< "$EXPECTED_COMMIT_MATRIX" | sort -u > "$expected_shas_file"
+          if [ "$(wc -l < "$expected_shas_file" | tr -d ' ')" != "$PLANNED_COUNT" ]; then
+            echo "Commit review matrix count does not match planned_count." >&2
+            exit 1
+          fi
+          rm -rf commit-artifacts
+          mkdir -p commit-artifacts
+          : > "$actual_shas_file"
+          printf '[]\n' > "$causality_file"
+          test -s "$selection_file"
+          if [ "$(wc -l < "$selection_file" | tr -d ' ')" != "$PLANNED_COUNT" ]; then
+            echo "Selected commit review bundle count does not match planned_count." >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r commit_sha artifact_name producer_attempt; do
+            if ! [[ "$producer_attempt" =~ ^[1-9][0-9]*$ ]] ||
+               (( producer_attempt > GITHUB_RUN_ATTEMPT )); then
+              echo "Selected commit review bundle has an invalid producer attempt." >&2
+              exit 1
+            fi
+            expected_artifact_name="commit-review-${commit_sha}-${GITHUB_RUN_ID}-${producer_attempt}"
+            if [ "$artifact_name" != "$expected_artifact_name" ]; then
+              echo "Selected commit review bundle identity does not match its planned SHA and attempt." >&2
+              exit 1
+            fi
+            bundle_root=".clawsweeper-repair/commit-review-download/$artifact_name"
+            report_root="$bundle_root/report"
+            ledger_root="$bundle_root/ledger"
+            manifest_file="$ledger_root/repair-action-ledger-manifest.json"
+            test -d "$report_root"
+            test -d "$ledger_root"
+            mapfile -d '' report_files < <(find "$report_root" -type f -name '*.md' -print0)
+            if [ "${#report_files[@]}" -ne 1 ] ||
+               [ "$(basename "${report_files[0]:-}" .md)" != "$commit_sha" ]; then
+              echo "Commit review bundle is incomplete for $commit_sha." >&2
+              exit 1
+            fi
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "commit-review-$commit_sha" \
+              --manifest "$manifest_file" \
+              --expected-job review \
+              --expected-run-attempt "$producer_attempt" \
+              --commit-report "${report_files[0]}" \
+              --expected-commit-repository "$EXPECTED_TARGET_REPO" \
+              --expected-commit-sha "$commit_sha" \
+              --source-root "$ledger_root" >/dev/null
+            source_root="$(cd "$ledger_root" && pwd -P)"
+            context_entry="$(
+              jq -c \
+                --arg source_root "$source_root" \
+                --arg subject_repository "$EXPECTED_TARGET_REPO" \
+                --arg subject_sha "$commit_sha" \
+                '{
+                  source_root: $source_root,
+                  event_paths: .event_paths,
+                  producer: {
+                    repository: .repository,
+                    sha: .sha,
+                    workflow: .workflow,
+                    job: .job,
+                    run_id: .run_id,
+                    run_attempt: .run_attempt
+                  },
+                  subject: {
+                    repository: $subject_repository,
+                    sha: $subject_sha
+                  }
+                }' \
+                "$manifest_file"
+            )"
+            jq --argjson entry "$context_entry" '. + [$entry]' "$causality_file" \
+              > "${causality_file}.tmp"
+            mv "${causality_file}.tmp" "$causality_file"
+            cp -R "$report_root"/. commit-artifacts/
+            echo "$commit_sha" >> "$actual_shas_file"
+          done < "$selection_file"
+          sort -u -o "$actual_shas_file" "$actual_shas_file"
+          if ! cmp -s "$expected_shas_file" "$actual_shas_file"; then
+            echo "Commit review bundles do not match the planned matrix." >&2
+            diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
+            exit 1
+          fi
+          echo "CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=$(pwd -P)/$causality_file" \
+            >> "$GITHUB_ENV"
+
+      - name: Attest selected commit review reports
+        id: attest-reports
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        env:
+          EXPECTED_TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r commit_sha; do
+            report_path="$(find commit-artifacts -type f -name "${commit_sha}.md" -print -quit)"
+            test -n "$report_path"
+            node dist/commit-sweeper.js attest-review \
+              --target-repo "$EXPECTED_TARGET_REPO" \
+              --commit-sha "$commit_sha" \
+              --report-path "$report_path"
+          done < .artifacts/expected-commit-review-shas.txt
+
+      - name: Download exact skipped commit reports
+        uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.skipped_count != '0' }}
         with:
-          name: skipped-commit-reports
-          path: commit-artifacts
+          name: ${{ steps.commit-report-cohort.outputs.skipped_artifact_name }}
+          path: .clawsweeper-repair/skipped-commit-report-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify and collect exact skipped commit reports
+        if: ${{ needs.plan.outputs.skipped_count != '0' }}
+        env:
+          ARTIFACT_NAME: ${{ steps.commit-report-cohort.outputs.skipped_artifact_name }}
+          PRODUCER_ATTEMPT: ${{ steps.commit-report-cohort.outputs.skipped_producer_attempt }}
+          SKIPPED_COUNT: ${{ needs.plan.outputs.skipped_count }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PRODUCER_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
+             (( PRODUCER_ATTEMPT > GITHUB_RUN_ATTEMPT )); then
+            echo "Skipped commit report artifact has an invalid producer attempt." >&2
+            exit 1
+          fi
+          expected_artifact_name="skipped-commit-reports-${GITHUB_RUN_ID}-${PRODUCER_ATTEMPT}"
+          if [ "$ARTIFACT_NAME" != "$expected_artifact_name" ]; then
+            echo "Skipped commit report artifact identity does not match its producer attempt." >&2
+            exit 1
+          fi
+          bundle_root=".clawsweeper-repair/skipped-commit-report-download"
+          test -d "$bundle_root"
+          if find "$bundle_root" -type l -print -quit | grep -q .; then
+            echo "Skipped commit report artifact contains a symlink." >&2
+            exit 1
+          fi
+          if find "$bundle_root" -type f ! -name '*.md' -print -quit | grep -q .; then
+            echo "Skipped commit report artifact contains an unexpected file." >&2
+            exit 1
+          fi
+          mapfile -d '' report_files < <(find "$bundle_root" -type f -name '*.md' -print0)
+          if [ "${#report_files[@]}" -ne "$SKIPPED_COUNT" ]; then
+            echo "Skipped commit report artifact count does not match skipped_count." >&2
+            exit 1
+          fi
+          mkdir -p commit-artifacts
+          for report_file in "${report_files[@]}"; do
+            report_sha="$(basename "$report_file" .md)"
+            if ! [[ "$report_sha" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "Skipped commit report artifact contains an invalid report path." >&2
+              exit 1
+            fi
+          done
+          cp -R "$bundle_root"/. commit-artifacts/
 
       - name: Commit reports
+        id: publish-reports
         run: |
           set -euo pipefail
           git pull --rebase --autostash
@@ -540,7 +939,14 @@ jobs:
           pnpm run repair:publish-main -- \
             --message "chore: update commit review reports" \
             --path records \
+            --receipt-kind commit_review_state \
             --rebase-strategy theirs
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          echo "state_revision=$state_revision" >> "$GITHUB_OUTPUT"
 
       - name: Create repair dispatch token
         id: clawsweeper-token
@@ -555,6 +961,7 @@ jobs:
           permission-contents: write
 
       - name: Dispatch commit findings to repair lane
+        id: dispatch-findings
         if: ${{ vars.CLAWSWEEPER_COMMIT_FINDINGS_ENABLED != 'false' }}
         env:
           GH_TOKEN: ${{ steps.clawsweeper-token.outputs.token }}
@@ -566,7 +973,8 @@ jobs:
             --repair-repo openclaw/clawsweeper \
             --repair-workflow repair-commit-finding-intake.yml \
             --dispatch-mode workflow_dispatch \
-            --report-repo "${{ github.repository }}" \
+            --report-repo openclaw/clawsweeper-state \
+            --report-revision "${{ steps.publish-reports.outputs.state_revision }}" \
             --enabled "$ENABLED"
 
       - name: Create target checks token
@@ -581,6 +989,7 @@ jobs:
           permission-checks: write
 
       - name: Publish commit checks
+        id: publish-checks
         if: ${{ needs.plan.outputs.create_checks == 'true' }}
         env:
           GH_TOKEN: ${{ steps.target-checks-token.outputs.token }}
@@ -595,8 +1004,43 @@ jobs:
               --commit-sha "$sha" \
               --report-path "$report_path" \
               --report-relative-path "$relative_path" \
-              --report-repo "${{ github.repository }}"
+              --report-repo openclaw/clawsweeper-state \
+              --report-revision "${{ steps.publish-reports.outputs.state_revision }}" \
+              --continue-workflow
           done
+
+      - name: Finalize commit review lifecycles
+        if: ${{ always() && needs.plan.outputs.planned_count != '0' && steps.publish-setup-pnpm.outcome == 'success' && steps.verify-review-bundles.outcome == 'success' }}
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest-reports.outcome }}
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
+          PUBLISH_CHECKS_OUTCOME: ${{ steps.publish-checks.outcome }}
+          PUBLISH_REPORTS_OUTCOME: ${{ steps.publish-reports.outcome }}
+        run: |
+          set -euo pipefail
+          review_outcome=success
+          if [ "$ATTEST_OUTCOME" != "success" ] ||
+             [ "$PUBLISH_REPORTS_OUTCOME" != "success" ]; then
+            review_outcome=failure
+          fi
+          check_outcome=skipped
+          if [ "$CHECKS_REQUESTED" = "true" ]; then
+            case "$PUBLISH_CHECKS_OUTCOME" in
+              success|failure|cancelled) check_outcome="$PUBLISH_CHECKS_OUTCOME" ;;
+              *) check_outcome=skipped ;;
+            esac
+          fi
+          while IFS= read -r sha; do
+            report_path="$(find commit-artifacts -type f -name "${sha}.md" -print -quit)"
+            node dist/commit-sweeper.js finish-review \
+              --target-repo "${{ needs.plan.outputs.target_repo }}" \
+              --commit-sha "$sha" \
+              --report-path "$report_path" \
+              --review-outcome "$review_outcome" \
+              --check-outcome "$check_outcome" \
+              --checks-requested "$CHECKS_REQUESTED" \
+              --error-kind "publisher:attest=$ATTEST_OUTCOME,reports=$PUBLISH_REPORTS_OUTCOME,checks=$PUBLISH_CHECKS_OUTCOME"
+          done < .artifacts/expected-commit-review-shas.txt
 
       - name: Continue commit review range
         if: ${{ success() && needs.plan.outputs.has_more == 'true' }}
@@ -607,15 +1051,133 @@ jobs:
           AFTER_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '' }}
           NEXT_OFFSET: ${{ needs.plan.outputs.next_offset }}
           CREATE_CHECKS: ${{ needs.plan.outputs.create_checks }}
-          ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
+          COMMIT_SWEEPER_ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
         run: |
           set -euo pipefail
-          gh workflow run commit-review.yml \
-            --repo "${{ github.repository }}" \
-            -f enabled=true \
-            -f target_repo="$TARGET_REPO" \
-            -f commit_sha="$AFTER_SHA" \
-            -f before_sha="$BEFORE_SHA" \
-            -f commit_offset="$NEXT_OFFSET" \
-            -f create_checks="$CREATE_CHECKS" \
-            -f additional_prompt="$ADDITIONAL_PROMPT"
+          node dist/commit-sweeper.js dispatch-continuation \
+            --repository "${{ github.repository }}" \
+            --workflow commit-review.yml \
+            --target-repo "$TARGET_REPO" \
+            --after-sha "$AFTER_SHA" \
+            --before-sha "$BEFORE_SHA" \
+            --commit-offset "$NEXT_OFFSET" \
+            --create-checks "$CREATE_CHECKS"
+
+      - name: Finalize commit publication action ledger
+        id: finalize-publication-action-ledger
+        if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        env:
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
+          CONTINUATION_REQUESTED: ${{ needs.plan.outputs.has_more }}
+          DISPATCH_COUNT: ${{ steps.dispatch-findings.outputs.dispatch_count || '0' }}
+          DISPATCH_OUTCOME: ${{ steps.dispatch-findings.outcome }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          allow_empty_args=()
+          allow_empty=false
+          if [ "$DISPATCH_OUTCOME" != "failure" ] &&
+             [ "$DISPATCH_COUNT" = "0" ] &&
+             [ "$CHECKS_REQUESTED" != "true" ] &&
+             [ "$CONTINUATION_REQUESTED" != "true" ]; then
+            allow_empty=true
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane commit-publication \
+            "${allow_empty_args[@]}" \
+            > .artifacts/commit-publication-action-ledger-manifest.json
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable selected commit review action ledger
+        if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        env:
+          ALLOW_EMPTY: ${{ steps.finalize-publication-action-ledger.outputs.allow_empty }}
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          event_paths_file=".artifacts/commit-review-action-ledger-paths.txt"
+          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
+          selection_file=".artifacts/selected-commit-review-bundles.tsv"
+          : > "$event_paths_file"
+          if [ "$PLANNED_COUNT" != "0" ]; then
+            test -s "$expected_shas_file"
+            test -s "$selection_file"
+            if [ "$(wc -l < "$selection_file" | tr -d ' ')" != "$PLANNED_COUNT" ]; then
+              echo "Selected commit review bundle count does not match planned_count." >&2
+              exit 1
+            fi
+            cut -f1 "$selection_file" | sort -u > "${selection_file}.shas"
+            cmp -s "$expected_shas_file" "${selection_file}.shas"
+            while IFS=$'\t' read -r commit_sha artifact_name producer_attempt; do
+              test -n "$commit_sha"
+              test -n "$artifact_name"
+              if ! [[ "$producer_attempt" =~ ^[1-9][0-9]*$ ]] ||
+                 (( producer_attempt > GITHUB_RUN_ATTEMPT )); then
+                echo "Selected commit review bundle has an invalid producer attempt." >&2
+                exit 1
+              fi
+              expected_artifact_name="commit-review-${commit_sha}-${GITHUB_RUN_ID}-${producer_attempt}"
+              if [ "$artifact_name" != "$expected_artifact_name" ]; then
+                echo "Selected commit review bundle identity does not match its planned SHA and attempt." >&2
+                exit 1
+              fi
+              review_root=".clawsweeper-repair/commit-review-download/$artifact_name/ledger"
+              manifest_file="$review_root/repair-action-ledger-manifest.json"
+              import_result_file=".artifacts/commit-review-$commit_sha-action-ledger-import.json"
+              pnpm run --silent repair:action-ledger -- publish \
+                --repair-lane "commit-review-$commit_sha" \
+                --manifest "$manifest_file" \
+                --expected-job review \
+                --expected-run-attempt "$producer_attempt" \
+                --source-root "$review_root" \
+                --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+              jq -e --slurpfile manifest "$manifest_file" \
+                '.eventPaths == $manifest[0].event_paths' \
+                "$import_result_file" >/dev/null
+              jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+            done < "$selection_file"
+          fi
+          manifest_file=".artifacts/commit-publication-action-ledger-manifest.json"
+          import_result_file=".artifacts/commit-publication-action-ledger-import.json"
+          allow_empty_args=()
+          if [ "$ALLOW_EMPTY" = "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane commit-publication \
+            --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+          sort -u -o "$event_paths_file" "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            if [ "$ALLOW_EMPTY" = "true" ]; then
+              exit 0
+            fi
+            echo "Commit review action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append commit review action ledger" \
+            "${action_ledger_args[@]}"
+
+      - name: Complete commit review continuation receipt
+        if: ${{ success() && (github.event.inputs.continuation_key || github.event.client_payload.continuation_key) }}
+        run: echo "Commit review continuation is durably published."

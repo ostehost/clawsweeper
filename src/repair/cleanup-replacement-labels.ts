@@ -2,10 +2,17 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
 import { DEFAULT_TARGET_REPO } from "./constants.js";
-import { ghJsonWithRetry, ghTextWithRetry } from "./github-cli.js";
+import { ghErrorText, ghJsonWithRetry, ghText } from "./github-cli.js";
 import { parseArgs, repoRoot } from "./lib.js";
+import {
+  runRepairMutation,
+  type RepairLifecycleInput,
+  type RepairMutationOptions,
+} from "./repair-action-ledger.js";
 import { replacementSourceLabelCopyable } from "./replacement-labels.js";
+import { sleepMs } from "./timing.js";
 
 const DEFAULT_HEAD_PREFIX = "clawsweeper/";
 
@@ -98,7 +105,20 @@ function classifyPullRequest(pull: LooseRecord) {
 function removeLabels(row: ReturnType<typeof classifyPullRequest>) {
   for (const label of row.lifecycle_cleanup_labels) {
     try {
-      ghTextWithRetry(["pr", "edit", String(row.number), "--repo", repo, "--remove-label", label]);
+      runLabelMutationWithRetry(
+        replacementLabelLifecycle(row, label),
+        {
+          kind: "pull_request_label_remove",
+          identity: {
+            repository: repo,
+            number: row.number,
+            label,
+            headRef: row.head_ref,
+          },
+          component: "cleanup_replacement_labels",
+        },
+        ["pr", "edit", String(row.number), "--repo", repo, "--remove-label", label],
+      );
       row.removed_labels.push(label);
     } catch (error) {
       row.remove_failures.push({
@@ -125,4 +145,60 @@ function isLifecycleCleanupLabel(label: string): boolean {
 
 function isRecord(value: unknown): value is LooseRecord {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function replacementLabelLifecycle(
+  row: ReturnType<typeof classifyPullRequest>,
+  label: string,
+): RepairLifecycleInput {
+  return {
+    repository: repo,
+    workKey: `label-housekeeping:replacement:${repo}#${row.number}:${label}`,
+    number: row.number,
+    subjectKind: "pull_request",
+  };
+}
+
+function runLabelMutationWithRetry(
+  lifecycle: RepairLifecycleInput,
+  options: Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">,
+  ghArgs: string[],
+): string {
+  const attempts = githubMutationRetryAttempts();
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return runRepairMutation(lifecycle, {
+        ...options,
+        knownNoMutation: githubMutationRejectedBeforeWrite,
+        operation: () => ghText(ghArgs),
+      });
+    } catch (error) {
+      lastError = error;
+      const retryKind = ghRetryKind(error);
+      if (attempt >= attempts || retryKind === "none" || githubMutationRejectedBeforeWrite(error)) {
+        throw error;
+      }
+      sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function githubMutationRetryAttempts(): number {
+  const configured = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  if (configured == null || configured.trim() === "") return 6;
+  const attempts = Number(configured);
+  return Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 6;
+}
+
+function githubMutationRejectedBeforeWrite(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as NodeJS.ErrnoException).code ?? "")
+      : "";
+  if (code === "ENOENT" || code === "EACCES") return true;
+  return /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
+    ghErrorText(error),
+  );
 }

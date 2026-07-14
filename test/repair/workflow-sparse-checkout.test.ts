@@ -100,7 +100,7 @@ test("sweep workflow preserves manual target branches and hydrates exact branche
   assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
   assert.match(workflow, /target_branch="\$REQUESTED_TARGET_BRANCH"/);
   assert.match(continueBlock, /TARGET_BRANCH: \$\{\{ needs\.plan\.outputs\.target_branch \}\}/);
-  assert.match(continueBlock, /-f target_branch="\$TARGET_BRANCH"/);
+  assert.match(continueBlock, /--field target_branch="\$TARGET_BRANCH"/);
   assert.match(recoveryBlock, /--arg target_branch "\$TARGET_BRANCH"/);
   assert.match(
     workflow,

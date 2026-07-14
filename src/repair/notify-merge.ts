@@ -6,6 +6,8 @@ import type { JsonObject, JsonValue } from "./json-types.js";
 import { asJsonObject, isJsonObject } from "./json-types.js";
 import { parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile } from "./json-file.js";
+import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
+import { OpenClawHookHttpError } from "./openclaw-hook.js";
 import type {
   CollectionResult,
   MergeLedgerEntry,
@@ -210,6 +212,9 @@ export async function runMergeNotifier(
   const collected = collectMergeNotifications(readJsonFile(inputPath), ledger, { runId });
   const config = resolveConfig(env);
   if (!config) {
+    for (const notification of collected.notifications) {
+      recordNotificationPhase(notificationLedgerInput(notification), "skipped", "not_configured");
+    }
     const summary = summaryRow(
       "skipped",
       collected.considered,
@@ -234,11 +239,14 @@ export async function runMergeNotifier(
   let nextLedger = ledger;
   for (const notification of collected.notifications) {
     if (dryRun) {
+      recordNotificationPhase(notificationLedgerInput(notification), "planned", "dry_run");
       reportActions.push(reportRow(notification, "planned", "dry run"));
       continue;
     }
     try {
-      const result = await postHookNotification({ config, fetcher, notification });
+      const result = await deliverNotification(notificationLedgerInput(notification), () =>
+        postHookNotification({ config, fetcher, notification }),
+      );
       const notifiedAt = now().toISOString();
       nextLedger = addLedgerEntry(nextLedger, notification, {
         notifiedAt,
@@ -282,6 +290,15 @@ export async function runMergeNotifier(
   const result = { ...summary, exitCode: failed > 0 && strict ? 1 : 0 };
   log(JSON.stringify(result, null, 2));
   return result;
+}
+
+function notificationLedgerInput(notification: MergeNotification) {
+  return {
+    repository: notification.repo,
+    key: notification.key,
+    number: notification.number,
+    ...(notification.mergeCommitSha ? { sourceRevision: notification.mergeCommitSha } : {}),
+  };
 }
 
 async function main() {
@@ -402,7 +419,7 @@ async function postHookNotification({
     });
     const body = await response.text();
     if (!response.ok) {
-      throw new Error(`OpenClaw hook returned ${response.status}: ${body.slice(0, 500)}`);
+      throw new OpenClawHookHttpError(response.status, body);
     }
     return { runId: readHookRunId(body) };
   } finally {

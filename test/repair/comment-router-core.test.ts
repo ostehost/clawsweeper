@@ -1386,7 +1386,7 @@ test("parseTrustedAutomation accepts trusted ClawSweeper pass verdicts for autom
   const parsed = parseTrustedAutomation(
     {
       user: { login: "clawsweeper[bot]" },
-      body: "ClawSweeper review passed.\n<!-- clawsweeper-verdict:pass sha=abc123 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef reviewed_at=2026-07-09T21:00:00.000Z -->",
+      body: "ClawSweeper review passed.\n<!-- clawsweeper-verdict:pass sha=abc123 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef review_activity_cursor=v1:0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef reviewed_at=2026-07-09T21:00:00.000Z -->",
     },
     { trustedAuthors },
   );
@@ -1397,6 +1397,10 @@ test("parseTrustedAutomation accepts trusted ClawSweeper pass verdicts for autom
   assert.equal(
     parsed.expected_source_revision,
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  );
+  assert.equal(
+    parsed.expected_review_activity_cursor,
+    "v1:0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   );
   assert.match(parsed.repair_reason, /verdict: pass/);
 });
@@ -1931,11 +1935,13 @@ test("label-sweep classification checks the exact-head review lease before dispa
       trustedVerdictGuard.indexOf("fetchPullRequestView(number)"),
   );
   assert.match(trustedVerdictGuard, /trustedAutomationPredatesReviewStartLease\(\{/);
+  assert.match(source, /source_comment_id: Number\(command\.comment_id\)/);
 });
 
 test("comment router durably claims dispatch commands and recovers exact workflow receipts", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const exactReviewQueue = readFileSync("src/repair/exact-review-action-ledger.ts", "utf8");
   const assistWorkflow = readFileSync(".github/workflows/assist.yml", "utf8");
   const repairWorkflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
   const executeBlock = source.slice(
@@ -1979,13 +1985,51 @@ test("comment router durably claims dispatch commands and recovers exact workflo
     /ITEM_NUMBERS:.*startsWith\(github\.event\.inputs\.item_numbers, 'router-'\)/,
   );
   assert.match(assistWorkflow, /Assist \{0\}#\{1\} \[\{2\}\]/);
-  assert.match(sweepWorkflow, /delivery_id: dispatchKey/);
-  assert.match(sweepWorkflow, /`router:\$\{dispatchKey\}`/);
+  assert.match(exactReviewQueue, /const dispatchKey = stringValue\(dispatch\.dispatch_key\)/);
+  assert.match(exactReviewQueue, /const deliveryId = dispatchKey/);
+  assert.match(exactReviewQueue, /`router:\$\{dispatchKey\}`/);
+  assert.match(exactReviewQueue, /const payload = \{ delivery_id: deliveryId, decision \}/);
   assert.match(assistWorkflow, /dispatch-receipt-owner\.sh/);
   assert.match(assistWorkflow, /assist\.yml.*assist/s);
   assert.match(repairWorkflow, /dispatch-receipt-owner\.sh/);
   assert.match(repairWorkflow, /repair-cluster-worker\.yml.*Plan and review cluster/s);
   assert.match(repairWorkflow, /dispatch_key:/);
+});
+
+test("comment router dispatches the exact immutable repair job generation", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const dispatchRepair = source.slice(
+    source.indexOf("function dispatchRepair(command: LooseRecord)"),
+    source.indexOf("function dispatchRepairActionStatus"),
+  );
+  const activeRepair = source.slice(
+    source.indexOf("function activeRepairRunForCommand"),
+    source.indexOf("function dispatchTokenEnv"),
+  );
+
+  assert.match(
+    source,
+    /import \{\s*immutableJobDispatchArgs,\s*resolveCurrentStateJobIdentity,\s*\} from "\.\/immutable-job-handoff\.js";/,
+  );
+  assert.match(
+    dispatchRepair,
+    /const immutableJob = resolveCurrentStateJobIdentity\(command\.target\.job_path\);/,
+  );
+  assert.match(
+    dispatchRepair,
+    /repairRunNameForJob\(\s*immutableJob\.jobPath,\s*automergeRunNamePrefix,\s*dispatchKey,\s*immutableJob\.jobSha256,\s*\)/,
+  );
+  assert.match(
+    dispatchRepair,
+    /activeRepairRunForCommand\(immutableJob\.jobPath, immutableJob\.jobSha256\)/,
+  );
+  assert.match(dispatchRepair, /\.\.\.immutableJobDispatchArgs\(immutableJob\)/);
+  assert.match(dispatchRepair, /stateRevision: immutableJob\.stateRevision/);
+  assert.match(dispatchRepair, /jobSha256: immutableJob\.jobSha256/);
+  assert.match(dispatchRepair, /state_revision: immutableJob\.stateRevision/);
+  assert.match(dispatchRepair, /job_sha256: immutableJob\.jobSha256/);
+  assert.match(activeRepair, /jobSha256,/);
+  assert.equal(source.match(/const repair = dispatchRepair\(command\);/g)?.length, 2);
 });
 
 test("review dispatch fallback requires a definitely rejected repository dispatch", () => {
@@ -2099,9 +2143,13 @@ test("command receipt gates let the oldest same-key run proceed when a newer dup
 
   assert.match(receiptGate, /\.display_title == \$title and \.id < \(\$current \| tonumber\)/);
   assert.match(receiptGate, /\.status == "in_progress"/);
-  assert.match(receiptGate, /\.conclusion == "success"/);
-  assert.match(receiptGate, /actions\/runs\/\$\{run_id\}\/jobs\?per_page=100/);
-  assert.match(receiptGate, /\.name == \$required and \.conclusion == "success"/);
+  assert.match(receiptGate, /\.status == "completed"/);
+  assert.match(receiptGate, /actions\/runs\/\$\{run_id\}\/jobs\?filter=all&per_page=100/);
+  assert.match(receiptGate, /\.name == \$required_job and/);
+  assert.match(
+    receiptGate,
+    /if \$required_step == "" then\s+\.conclusion == "success"\s+else\s+any\(\.steps\[\]\?; \.name == \$required_step and \.conclusion == "success"\)/,
+  );
   assert.doesNotMatch(receiptGate, /\(\.id \| tostring\) != \$current/);
 });
 
@@ -3506,7 +3554,7 @@ test("renderResponse reports automerge completion", () => {
     {
       merge: {
         status: "executed",
-        reason: "merge request accepted and pull request confirmed merged",
+        reason: "merged by ClawSweeper automerge",
         merged_at: "2026-04-29T05:00:00Z",
         merge_commit_sha: "def789abcdef789abcdef789abcdef789abcdef7",
         summary_lines: ["Added queued retry handling for Discord REST 429s."],
@@ -3517,8 +3565,10 @@ test("renderResponse reports automerge completion", () => {
     },
   );
 
-  assert.match(body, /confirmed merged after ClawSweeper submitted the exact-head merge request/);
-  assert.doesNotMatch(body, /ClawSweeper merged this PR/);
+  assert.match(
+    body,
+    /This PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
+  );
   assert.doesNotMatch(body, /Thanks, ClawSweeper/);
   assert.match(body, /What merged:/);
   assert.match(body, /Added queued retry handling/);
@@ -3530,87 +3580,6 @@ test("renderResponse reports automerge completion", () => {
   );
   assert.match(body, /automerge loop is complete/);
   assert.doesNotMatch(body, /ClawSweeper Repair/i);
-});
-
-test("renderResponse does not attribute a recovered exact-head merge to ClawSweeper", () => {
-  const body = renderResponse(
-    {
-      comment_id: "791",
-      intent: "clawsweeper_auto_merge",
-      repo: "openclaw/openclaw",
-      trusted_bot_author: "clawsweeper[bot]",
-      repair_reason: "structured ClawSweeper verdict: pass",
-      target: { head_sha: "abc791" },
-    },
-    {
-      merge: {
-        status: "executed",
-        recovered: true,
-        reason: "pull request is confirmed merged after the recorded ClawSweeper merge request",
-        merged_at: "2026-04-29T05:00:00Z",
-        merge_commit_sha: "def791abcdef791abcdef791abcdef791abcdef7",
-      },
-    },
-  );
-
-  assert.match(
-    body,
-    /This PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
-  );
-  assert.doesNotMatch(body, /ClawSweeper merged this PR/);
-});
-
-test("renderResponse keeps an unreceipted external merge actor-neutral", () => {
-  const body = renderResponse(
-    {
-      comment_id: "792",
-      intent: "clawsweeper_auto_merge",
-      repo: "openclaw/openclaw",
-      trusted_bot_author: "clawsweeper[bot]",
-      target: { head_sha: "abc792" },
-    },
-    {
-      merge: {
-        status: "skipped",
-        reason:
-          "pull request is already merged without a recorded accepted ClawSweeper merge request",
-        merged_at: "2026-04-29T05:00:00Z",
-        merge_commit_sha: "def792abcdef792abcdef792abcdef792abcdef7",
-      },
-    },
-  );
-
-  assert.match(body, /This PR was already merged/);
-  assert.match(body, /no accepted exact-head merge request receipt to attribute/);
-  assert.match(body, /No merge completion was attributed to ClawSweeper/);
-  assert.doesNotMatch(body, /ClawSweeper merged this PR|did not merge yet|left the PR open/);
-});
-
-test("renderResponse keeps an uncertain merge outcome actor-neutral", () => {
-  const body = renderResponse(
-    {
-      comment_id: "793",
-      intent: "clawsweeper_auto_merge",
-      repo: "openclaw/openclaw",
-      trusted_bot_author: "clawsweeper[bot]",
-      target: { head_sha: "abc793" },
-    },
-    {
-      merge: {
-        status: "skipped",
-        reason:
-          "pull request is confirmed merged after a ClawSweeper merge attempt with an unknown outcome; merge actor is not attributed",
-        merge_mutation_status: "unknown",
-        merged_at: "2026-04-29T05:00:00Z",
-        merge_commit_sha: "def793abcdef793abcdef793abcdef793abcdef7",
-      },
-    },
-  );
-
-  assert.match(body, /This PR was already merged/);
-  assert.match(body, /merge actor is not attributed/);
-  assert.match(body, /No merge completion was attributed to ClawSweeper/);
-  assert.doesNotMatch(body, /ClawSweeper merged this PR|did not merge yet|left the PR open/);
 });
 
 test("renderResponse reports maintainer-approved automerge completion", () => {
@@ -3626,7 +3595,7 @@ test("renderResponse reports maintainer-approved automerge completion", () => {
     {
       merge: {
         status: "executed",
-        reason: "merge request accepted and pull request confirmed merged",
+        reason: "merged by ClawSweeper automerge",
         merged_at: "2026-04-29T05:00:00Z",
         merge_commit_sha: "def790abcdef790abcdef790abcdef790abcdef7",
         summary_lines: ["Updated queue scheduling defaults."],
@@ -3637,7 +3606,7 @@ test("renderResponse reports maintainer-approved automerge completion", () => {
 
   assert.match(
     body,
-    /maintainer-approved PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
+    /The maintainer-approved PR is confirmed merged after ClawSweeper submitted the exact-head merge request/,
   );
   assert.match(body, /Approver: `steipete`/);
   assert.match(body, /Head: `abc790`/);

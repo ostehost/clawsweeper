@@ -173,10 +173,11 @@ issue job, or existing ClawSweeper implementation PR, writes the normal
 review_reproducible_bug`, or `trigger_source: review_vision_fit` to preserve
 which lane queued the intended implementation.
 
-Comment-triggered issue implementation uses the same durable job format. If a
-worker starts before the new state commit is visible in its checkout, the worker
-reconstructs the minimal `source: issue_implementation` job from the job path
-and continues instead of treating the dispatch as stale.
+Comment-triggered issue implementation uses the same durable job format. Each
+worker dispatch is bound to the exact state revision and SHA-256 of the published
+job. Legacy unsealed dispatches are rebound to the current durable job for
+planning only; mutation waits for a sealed dispatch carrying that authoritative
+state revision and digest.
 
 ### Intended Future Publication Follow-Through
 

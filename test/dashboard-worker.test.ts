@@ -681,7 +681,7 @@ test("OpenClaw Bay joins an out-of-order reused status completion to its later t
   });
 });
 
-test("hosted webhook records an edited review command through its final command update without GitHub reads", async () => {
+test("hosted webhook records an edited review command without trusting optimistic status updates", async () => {
   const statusStore = new MemoryKv();
   const env = {
     CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
@@ -781,7 +781,7 @@ test("hosted webhook records an edited review command through its final command 
   assert.deepEqual(await completion.json(), {
     ok: true,
     accepted: false,
-    reason: "recorded Bay journey completion",
+    reason: "no routable ClawSweeper command",
   });
 
   const state = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1")) || "{}");
@@ -794,13 +794,10 @@ test("hosted webhook records an edited review command through its final command 
       source_comment_id: 456,
       source_delivery_id: "test-delivery",
       triggered_at: "2026-07-13T18:03:07Z",
-      completed_at: "2026-07-13T19:23:27Z",
-      completion_kind: "final_command_status",
-      completion_comment_id: 790,
     },
   ]);
   const timings = summarizeBayJourneyTimings(state.journeys, "2026-07-13T19:30:00Z");
-  assert.deepEqual(timings.overall, { average_ms: 4_820_000, samples: 1 });
+  assert.deepEqual(timings.overall, { average_ms: null, samples: 0 });
 });
 
 class MemoryKv {
@@ -1184,6 +1181,52 @@ test("dashboard durable status store persists, expires, and prepends events", as
     [{ id: "second" }, { id: "first" }],
   );
 
+  for (const event of [
+    {
+      id: "event-a",
+      idempotency_key: "event-a",
+      received_at: "2026-07-13T10:00:00.000Z",
+      title: "Event A",
+    },
+    {
+      id: "event-b",
+      idempotency_key: "event-b",
+      received_at: "2026-07-13T10:01:00.000Z",
+      title: "Event B",
+    },
+    {
+      id: "event-a",
+      idempotency_key: "event-a",
+      received_at: "2026-07-13T10:02:00.000Z",
+      title: "Event A retry",
+    },
+  ]) {
+    await store.fetch(
+      new Request("https://clawsweeper-status-store/events", {
+        method: "POST",
+        body: JSON.stringify({
+          event,
+          limit: 10,
+          ttl_seconds: 60,
+        }),
+      }),
+    );
+  }
+  const deduplicated = JSON.parse(
+    await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+  );
+  assert.equal(
+    deduplicated.filter(
+      (event: { idempotency_key?: string }) => event.idempotency_key === "event-a",
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    deduplicated.slice(0, 2).map((event: { title: string }) => event.title),
+    ["Event B", "Event A retry"],
+  );
+  assert.equal(deduplicated[1].received_at, "2026-07-13T10:00:00.000Z");
+
   const bayStoreUrl = `https://clawsweeper-status-store/${encodeURIComponent(
     "openclaw-bay:terminal-state:v1",
   )}`;
@@ -1442,6 +1485,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
       "<!-- clawsweeper-command-status:597:re_review:0123456789abcdef0123456789abcdef01234567 -->";
     const first = buildExactReviewQueueRequest("delivery-1", 597, "opened", "issue", undefined, {
       commandStatusMarker,
+      sourceCommentId: 456,
       statusCommentId: 9001,
       additionalPrompt: "Check the maintainer-requested regression path.",
       codexTimeoutMs: 1_200_000,
@@ -1516,6 +1560,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         codex_timeout_ms: 1_200_000,
         media_proof_timeout_ms: 480_000,
         command_status_marker: commandStatusMarker,
+        source_comment_id: 456,
         status_comment_id: 9001,
         additional_prompt: "Check the maintainer-requested regression path.",
       },
@@ -1554,6 +1599,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         sourceAction: "edited",
         supersedesInProgress: true,
         commandStatusMarker,
+        sourceCommentId: 456,
         statusCommentId: 9001,
         additionalPrompt: "Check the maintainer-requested regression path.",
         codexTimeoutMs: 1_200_000,
@@ -3495,15 +3541,38 @@ test("exact-review completion rejects stale owners and is race-idempotent", asyn
 test("signed exact-review reconciliation releases only immutable terminal runs", async () => {
   const originalFetch = globalThis.fetch;
   const storage = new MemoryDurableStorage();
+  const statusStore = new MemoryKv();
+  await statusStore.put(
+    "openclaw-bay:journey-state:v1",
+    JSON.stringify(
+      mergeBayJourneyState(
+        null,
+        [
+          {
+            repository: "openclaw/openclaw",
+            number: 719,
+            source_comment_id: 456,
+            source_delivery_id: "test-delivery",
+            triggered_at: "2026-07-13T18:03:07Z",
+          },
+        ],
+        [],
+        "2026-07-13T18:03:07Z",
+      ),
+    ),
+  );
   await storage.put("exact-review-queue", {
     deliveries: {},
     items: {
       "openclaw/openclaw#711": leasedExactReviewQueueItem(711, "9001"),
       "openclaw/openclaw#712": leasedExactReviewQueueItem(712, "9002"),
-      "openclaw/openclaw#719": leasedExactReviewQueueItem(719, "9003"),
+      "openclaw/openclaw#719": leasedExactReviewQueueItem(719, "9003", 1, {
+        sourceCommentId: 456,
+        statusCommentId: 790,
+      }),
     },
   });
-  const queue = new ExactReviewQueue({ storage }, {});
+  const queue = new ExactReviewQueue({ storage }, { STATUS_STORE: statusStore });
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -3541,6 +3610,7 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
         run_attempt: 1,
         status: "completed",
         conclusion: "success",
+        updated_at: "2026-07-13T19:23:27Z",
       });
     }
     throw new Error(`unexpected fetch ${url}`);
@@ -3612,6 +3682,29 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
     assert.equal(state.items["openclaw/openclaw#712"].state, "leased");
     assert.equal(state.items["openclaw/openclaw#712"].claimedRunId, "9002");
     assert.equal(state.items["openclaw/openclaw#719"], undefined);
+    const bay = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1")) || "{}") as {
+      journeys: Array<Record<string, unknown>>;
+    };
+    assert.deepEqual(bay.journeys, [
+      {
+        id: "openclaw/openclaw#719:command:456:delivery:test-delivery",
+        item_key: "openclaw/openclaw#719",
+        repository: "openclaw/openclaw",
+        number: 719,
+        source_comment_id: 456,
+        source_delivery_id: "test-delivery",
+        triggered_at: "2026-07-13T18:03:07Z",
+        completed_at: "2026-07-13T19:23:27Z",
+        completion_kind: "exact_review_terminal",
+        completion_comment_id: 790,
+        completion_run_id: "9003",
+        completion_run_attempt: 1,
+      },
+    ]);
+    assert.deepEqual(summarizeBayJourneyTimings(bay.journeys, "2026-07-13T19:30:00Z").overall, {
+      average_ms: 4_820_000,
+      samples: 1,
+    });
     const staleFailure = await queue.fetch(
       new Request("https://clawsweeper-exact-review-queue/complete", {
         method: "POST",
@@ -3652,6 +3745,71 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("exact-review reconciliation persists before best-effort Bay completion telemetry", async () => {
+  const storage = new MemoryDurableStorage();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#720": leasedExactReviewQueueItem(720, "9004", 1, {
+        sourceCommentId: 457,
+        statusCommentId: 791,
+      }),
+    },
+  });
+  let queue!: ExactReviewQueue;
+  let telemetryWrites = 0;
+  queue = new ExactReviewQueue(
+    { storage },
+    {
+      STATUS_STORE: {
+        get: async () => null,
+        put: async () => {
+          telemetryWrites += 1;
+          const concurrent = await queue.fetch(
+            buildExactReviewQueueRequest(
+              "concurrent-delivery-720",
+              720,
+              "edited",
+              "issue",
+              "openclaw/openclaw",
+            ),
+          );
+          assert.equal(concurrent.status, 202);
+          throw new Error("status store unavailable");
+        },
+      },
+    },
+  );
+
+  const response = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/reconcile", {
+      method: "POST",
+      body: JSON.stringify({
+        runs: [
+          {
+            run_id: "9004",
+            run_attempt: 1,
+            claimed_run_attempt: 1,
+            claim_generation: 1,
+            outcome: "success",
+            completed_at: "2026-07-13T19:24:27Z",
+          },
+        ],
+      }),
+    }),
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, reconciled: 1, requeued: 0, completed: 1 });
+  assert.equal(telemetryWrites, 1);
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, Record<string, unknown>>;
+  };
+  assert.equal(state.items["openclaw/openclaw#720"].state, "pending");
+  assert.equal(state.items["openclaw/openclaw#720"].decision.sourceAction, "edited");
+  assert.equal(state.items["openclaw/openclaw#720"].claimedRunId, undefined);
 });
 
 test("exact-review reconciliation targets leases beyond 64 entries without accepting stale claims", async () => {
@@ -5773,6 +5931,19 @@ test("dashboard preserves repeated untargeted activity events", async () => {
       );
       assert.equal(ingest.status, 200);
     }
+    const oversized = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "x".repeat(257),
+        },
+        body: JSON.stringify({ event_type: "status.test" }),
+      }),
+      env,
+    );
+    assert.equal(oversized.status, 400);
 
     const response = await worker.fetch(
       new Request("https://clawsweeper.openclaw.ai/api/status"),
@@ -5793,6 +5964,489 @@ test("dashboard preserves repeated untargeted activity events", async () => {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
   }
+});
+
+test("dashboard preserves event chronology when an earlier idempotency key is retried", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      default: {
+        match: async () => undefined,
+        put: async () => undefined,
+      },
+    },
+  });
+  globalThis.fetch = activePrFetch;
+
+  try {
+    const env = {
+      INGEST_TOKEN: "test-token",
+      STATUS_STORE: new MemoryKv(),
+      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+      TARGET_REPOS: "openclaw/openclaw",
+      CACHE_TTL_SECONDS: "0",
+    };
+    const ingest = async (idempotencyKey: string, title: string) => {
+      const response = await worker.fetch(
+        new Request("https://clawsweeper.openclaw.ai/api/events", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotencyKey,
+          },
+          body: JSON.stringify({
+            event_type: "status.test",
+            mode: "test",
+            stage: "probe",
+            status: "ok",
+            title,
+          }),
+        }),
+        env,
+      );
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+
+    const firstA = await ingest("event-a", "Event A");
+    await ingest("event-b", "Event B");
+    const retryA = await ingest("event-a", "Event A retry");
+
+    assert.equal(retryA.event.received_at, firstA.event.received_at);
+    const storedEvents = JSON.parse((await env.STATUS_STORE.get("events")) ?? "[]");
+    assert.deepEqual(
+      storedEvents.map((event: { title: string }) => event.title),
+      ["Event B", "Event A retry"],
+    );
+    const latestEvent = JSON.parse((await env.STATUS_STORE.get("latest-event")) ?? "null");
+    assert.equal(latestEvent.title, "Event B");
+
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/status"),
+      env,
+      {
+        waitUntil: () => undefined,
+      },
+    );
+    const status = await response.json();
+    assert.deepEqual(
+      status.recent.events
+        .filter((event: { event_type?: string }) => event.event_type === "status.test")
+        .map((event: { title: string }) => event.title),
+      ["Event B", "Event A retry"],
+    );
+    const events = status.recent.events.filter(
+      (event: { idempotency_key?: string }) => event.idempotency_key === "event-a",
+    );
+    assert.equal(events.length, 1);
+    assert.equal(events[0].title, "Event A retry");
+  } finally {
+    globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
+  }
+});
+
+test("dashboard CI projection preserves per-item chronology across retried events", async () => {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const statusStoreStub = {
+    fetch: (request: Request, init?: RequestInit) =>
+      store.fetch(init ? new Request(request, init) : request),
+  };
+  const env = {
+    INGEST_TOKEN: "test-token",
+    STATUS_STORE: new MemoryDurableNamespace(statusStoreStub),
+  };
+  const ingest = async ({
+    idempotencyKey,
+    itemNumber,
+    state,
+    title,
+    updatedAt,
+  }: {
+    idempotencyKey: string;
+    itemNumber: number;
+    state: string;
+    title: string;
+    updatedAt: string;
+  }) => {
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({
+          event_type: "ci.status",
+          repository: "openclaw/openclaw",
+          item_number: itemNumber,
+          status: state,
+          title,
+          ci: {
+            repository: "openclaw/openclaw",
+            item_number: itemNumber,
+            state,
+            source: "github-checks",
+            head_sha: `${idempotencyKey}-${state}`,
+            updated_at: updatedAt,
+          },
+        }),
+      }),
+      env,
+    );
+    assert.equal(response.status, 200);
+  };
+
+  await ingest({
+    idempotencyKey: "ci-a",
+    itemNumber: 80609,
+    state: "red",
+    title: "Older item CI",
+    updatedAt: "2026-07-13T10:00:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-b",
+    itemNumber: 80609,
+    state: "green",
+    title: "Newer item CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-c",
+    itemNumber: 80610,
+    state: "green",
+    title: "Other item CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-b",
+    itemNumber: 80609,
+    state: "pending",
+    title: "Newer item CI retry",
+    updatedAt: "2026-07-13T10:03:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-a",
+    itemNumber: 80609,
+    state: "red",
+    title: "Older item CI retry",
+    updatedAt: "2026-07-13T10:00:00.000Z",
+  });
+
+  const itemCiResponse = await store.fetch(
+    new Request(
+      `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+    ),
+  );
+  assert.equal(itemCiResponse.status, 200);
+  const itemCi = await itemCiResponse.json();
+  assert.deepEqual(
+    {
+      state: itemCi.state,
+      head_sha: itemCi.head_sha,
+      updated_at: itemCi.updated_at,
+    },
+    {
+      state: "pending",
+      head_sha: "ci-b-pending",
+      updated_at: "2026-07-13T10:03:00.000Z",
+    },
+  );
+
+  const events = JSON.parse(
+    await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+  );
+  assert.deepEqual(
+    events.slice(0, 3).map((event: { title: string }) => event.title),
+    ["Other item CI", "Newer item CI retry", "Older item CI retry"],
+  );
+});
+
+function createCiProjectionHarness() {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const statusStoreStub = {
+    fetch: (request: Request, init?: RequestInit) =>
+      store.fetch(init ? new Request(request, init) : request),
+  };
+  const env = {
+    INGEST_TOKEN: "test-token",
+    STATUS_STORE: new MemoryDurableNamespace(statusStoreStub),
+  };
+  const ingest = async ({
+    idempotencyKey,
+    state,
+    title,
+    updatedAt,
+  }: {
+    idempotencyKey: string;
+    state: string;
+    title: string;
+    updatedAt?: string;
+  }) => {
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({
+          event_type: "ci.status",
+          repository: "openclaw/openclaw",
+          item_number: 80609,
+          status: state,
+          title,
+          ci: {
+            repository: "openclaw/openclaw",
+            item_number: 80609,
+            state,
+            source: "github-checks",
+            head_sha: `${idempotencyKey}-${state}`,
+            ...(updatedAt ? { updated_at: updatedAt } : {}),
+          },
+        }),
+      }),
+      env,
+    );
+    assert.equal(response.status, 200);
+  };
+  const projection = async () => {
+    const response = await store.fetch(
+      new Request(
+        `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+      ),
+    );
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const events = async () =>
+    JSON.parse(
+      await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+    );
+  const seed = async (key: string, value: unknown) => {
+    const response = await store.fetch(
+      new Request(`https://clawsweeper-status-store/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: JSON.stringify(value) }),
+      }),
+    );
+    assert.equal(response.status, 204);
+  };
+  const projectionStatus = async () =>
+    (
+      await store.fetch(
+        new Request(
+          `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+        ),
+      )
+    ).status;
+  return { ingest, projection, projectionStatus, events, seed };
+}
+
+test("dashboard CI projection ignores delayed distinct keys and malformed source timestamps", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.ingest({
+    idempotencyKey: "ci-b",
+    state: "green",
+    title: "Newer CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+  await harness.ingest({
+    idempotencyKey: "ci-c",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+  await harness.ingest({
+    idempotencyKey: "ci-z",
+    state: "pending",
+    title: "Malformed CI",
+    updatedAt: "not-a-timestamp",
+  });
+
+  const projected = await harness.projection();
+  assert.deepEqual(
+    {
+      state: projected.state,
+      head_sha: projected.head_sha,
+      updated_at: projected.updated_at,
+    },
+    {
+      state: "green",
+      head_sha: "ci-b-green",
+      updated_at: "2026-07-13T10:02:00.000Z",
+    },
+  );
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Malformed CI", "Delayed older CI", "Newer CI"],
+  );
+});
+
+test("dashboard CI projection preserves first-seen order when timestamps are omitted", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.ingest({
+    idempotencyKey: "ci-a",
+    state: "red",
+    title: "Older CI",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await harness.ingest({
+    idempotencyKey: "ci-b",
+    state: "green",
+    title: "Newer CI",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await harness.ingest({
+    idempotencyKey: "ci-a",
+    state: "pending",
+    title: "Older CI retry",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "ci-b-green");
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Newer CI", "Older CI retry"],
+  );
+});
+
+test("dashboard CI projection resolves equal source timestamps by first-seen order", async () => {
+  const runOrder = async (keys: string[]) => {
+    const harness = createCiProjectionHarness();
+    for (const key of keys) {
+      await harness.ingest({
+        idempotencyKey: key,
+        state: key === "ci-z" ? "green" : "red",
+        title: `CI ${key}`,
+        updatedAt: "2026-07-13T10:02:00.000Z",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const projected = await harness.projection();
+    return {
+      state: projected.state,
+      head_sha: projected.head_sha,
+      eventCount: (await harness.events()).length,
+    };
+  };
+
+  assert.deepEqual(await runOrder(["ci-z", "ci-a"]), {
+    state: "red",
+    head_sha: "ci-a-red",
+    eventCount: 2,
+  });
+  assert.deepEqual(await runOrder(["ci-a", "ci-z"]), {
+    state: "green",
+    head_sha: "ci-z-green",
+    eventCount: 2,
+  });
+});
+
+test("dashboard CI projection does not regress a newer legacy projection", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("ci:openclaw/openclaw#80609", {
+    state: "green",
+    source: "github-checks",
+    repository: "openclaw/openclaw",
+    item_number: 80609,
+    head_sha: "legacy-green",
+    updated_at: "2026-07-13T10:02:00.000Z",
+    received_at: "2026-07-13T10:02:00.000Z",
+  });
+
+  await harness.ingest({
+    idempotencyKey: "ci-delayed",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "legacy-green");
+});
+
+test("dashboard CI projection preserves newer legacy event history", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("events", [
+    {
+      id: "legacy-ci",
+      idempotency_key: "legacy-ci",
+      received_at: "2026-07-13T10:02:00.000Z",
+      updated_at: "2026-07-13T10:02:00.000Z",
+      event_type: "ci.status",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "green",
+      title: "Legacy newer CI",
+    },
+  ]);
+
+  await harness.ingest({
+    idempotencyKey: "ci-delayed",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+
+  assert.equal(await harness.projectionStatus(), 404);
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Delayed older CI", "Legacy newer CI"],
+  );
+});
+
+test("dashboard CI projection ignores newer non-CI item events", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("events", [
+    {
+      id: "repair-event",
+      idempotency_key: "repair-event",
+      received_at: "2026-07-13T10:03:00.000Z",
+      updated_at: "2026-07-13T10:03:00.000Z",
+      event_type: "repair.operation",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "completed",
+      title: "Newer repair event",
+    },
+    {
+      id: "legacy-ci",
+      idempotency_key: "legacy-ci",
+      received_at: "2026-07-13T10:01:00.000Z",
+      updated_at: "2026-07-13T10:01:00.000Z",
+      event_type: "ci.status",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "red",
+      title: "Older legacy CI",
+    },
+  ]);
+
+  await harness.ingest({
+    idempotencyKey: "ci-current",
+    state: "green",
+    title: "Current CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "ci-current-green");
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Current CI", "Newer repair event", "Older legacy CI"],
+  );
 });
 
 test("dashboard counts cluster-fixer operation events", async () => {
@@ -7896,7 +8550,12 @@ function buildExactReviewQueueRequest(
   });
 }
 
-function leasedExactReviewQueueItem(itemNumber: number, runId: string, runAttempt = 1) {
+function leasedExactReviewQueueItem(
+  itemNumber: number,
+  runId: string,
+  runAttempt = 1,
+  decisionOverrides: Record<string, unknown> = {},
+) {
   const now = Date.now();
   const decision = {
     targetRepo: "openclaw/openclaw",
@@ -7906,6 +8565,7 @@ function leasedExactReviewQueueItem(itemNumber: number, runId: string, runAttemp
     sourceEvent: "issues",
     sourceAction: "opened",
     supersedesInProgress: false,
+    ...decisionOverrides,
   };
   return {
     key: `openclaw/openclaw#${itemNumber}`,

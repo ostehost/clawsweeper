@@ -168,11 +168,13 @@ export function prepareReviewThreadsForMerge({
   number,
   targetDir,
   resolveThreads,
+  mutationBoundary,
 }: {
   repo: string;
   number: JsonValue;
   targetDir: string;
   resolveThreads: boolean;
+  mutationBoundary?: <T>(kind: string, identity: unknown, operation: () => T) => T;
 }): LooseRecord {
   const before = fetchReviewThreads(repo, number);
   if (before.hasNextPage)
@@ -188,7 +190,20 @@ export function prepareReviewThreadsForMerge({
     };
   }
   for (const thread of unresolved) {
-    resolveReviewThread(thread.id, targetDir);
+    const resolve = () => resolveReviewThread(thread.id, targetDir);
+    if (mutationBoundary) {
+      mutationBoundary(
+        "review_thread_resolve",
+        {
+          repo,
+          number,
+          threadId: String(thread.id),
+        },
+        resolve,
+      );
+    } else {
+      resolve();
+    }
   }
   const after = fetchReviewThreads(repo, number);
   const remaining = after.threads.filter((thread: JsonValue) => !thread.isResolved);

@@ -66,7 +66,14 @@ Security/privacy/supply-chain and broad findings are audit-only.
 4. Dispatch plan jobs:
 
    ```bash
-   pnpm run repair:dispatch -- jobs/openclaw/cluster-001.md jobs/openclaw/cluster-002.md --mode plan
+   state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+   for job in jobs/openclaw/inbox/cluster-001.md jobs/openclaw/inbox/cluster-002.md; do
+     job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+     pnpm run repair:dispatch -- "$job" \
+       --mode plan \
+       --state-revision "$state_revision" \
+       --job-sha256 "$job_sha256"
+   done
    ```
 
 5. Review artifacts from GitHub Actions.
@@ -107,8 +114,14 @@ fix unless a maintainer explicitly sets `allow_unmerged_fix_close: true`.
 Commit and push the new job file, then dispatch it:
 
 ```bash
-pnpm run repair:validate-job -- jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md
-pnpm run repair:dispatch -- jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md --mode autonomous
+job=jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md
+pnpm run repair:validate-job -- "$job"
+state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+pnpm run repair:dispatch -- "$job" \
+  --mode autonomous \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256"
 ```
 
 To ask for a replacement bundle for an existing useful but uneditable source
@@ -134,13 +147,15 @@ gh workflow run repair-commit-finding-intake.yml \
   --repo openclaw/clawsweeper \
   -f target_repo=openclaw/openclaw \
   -f commit_sha=<sha> \
-  -f report_repo=openclaw/clawsweeper \
-  -f report_path=records/openclaw-openclaw/commits/<sha>.md
+  -f report_repo=openclaw/clawsweeper-state \
+  -f report_path=records/openclaw-openclaw/commits/<sha>.md \
+  -f report_revision=<exact-state-commit-sha> \
+  -f report_sha256=<sha256-of-exact-report-bytes>
 ```
 
-The workflow is idempotent for the commit SHA. It updates the same audit file,
-job file, intended branch identity, and future PR metadata on rerun while
-retaining publication as a deferred bundle.
+Resolve the digest from the report bytes at `report_revision`, not from the mutable `state` branch tip. The workflow rejects another repository, a noncanonical report path, a mutable or malformed revision, a digest mismatch, or report frontmatter for another repository/commit.
+
+The workflow is idempotent for the immutable report identity. It updates the same audit file, job file, intended branch identity, and future PR metadata on rerun while retaining publication as a deferred bundle.
 
 If latest `main` no longer needs a fix, the generated artifact allows a clean
 no-PR outcome and the audit file records the skip.
@@ -247,9 +262,24 @@ labels. Public `runner` and `execution_runner` fields remain accepted only for
 dispatch and ledger compatibility; they are deprecated no-ops and cannot select
 a privileged runner.
 
+Repair intake and recovery workflows resolve immutable job identity
+automatically. A manual dispatch must name the exact published state commit and
+the SHA-256 of the job bytes at that commit:
+
 ```bash
-pnpm run repair:dispatch -- jobs/openclaw/cluster-*.md --mode plan
+state_revision=<exact-clawsweeper-state-commit>
+job=jobs/openclaw/inbox/cluster-<id>.md
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+
+pnpm run repair:dispatch -- "$job" \
+  --mode plan \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256"
 ```
+
+The dispatcher and worker reject mutable paths, missing historical objects,
+digest mismatches, and a job generation that differs from the supplied
+identity.
 
 The workflow uses Node 24 and starts a local Codex Responses proxy from
 `OPENAI_API_KEY` inside a fresh, isolated, run-scoped `CODEX_HOME`. Codex
@@ -293,6 +323,14 @@ under `fix-executor-debug/` so failed runs do not spend minutes uploading huge
 Codex JSONL files. Use the dedicated `clawsweeper-codex-debug-*` artifact when
 the full session/log backup is needed. The cap defaults to 8 MiB per copied file
 and is configurable with `CLAWSWEEPER_FIX_DEBUG_MAX_BYTES`.
+
+Cluster and execute jobs also upload exact current-run, current-attempt action
+ledger artifacts. The trusted `repair-publish-results` workflow validates the
+worker SHA capability, expected job inventory, and producer manifests before it
+imports those receipts or mutates durable result state. Commit review uses the
+same boundary: each current-attempt bundle includes the report and local ledger,
+whose events bind Codex review-log digests for publisher verification and
+attestation. Raw redacted logs remain in the separate diagnostic artifact.
 
 If a replacement repair finishes with no diff against the latest base branch,
 the executor records a skipped no-op outcome instead of retaining a deferred

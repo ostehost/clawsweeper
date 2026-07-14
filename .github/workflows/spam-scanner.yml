@@ -49,6 +49,7 @@ on:
     - cron: "17 * * * *"
 
 permissions:
+  actions: read
   contents: write
   issues: read
   pull-requests: read
@@ -78,6 +79,9 @@ jobs:
             results
             schema/clawsweeper-pr-close-coverage-proof.schema.json
             scripts/hydrate-state.ts
+            src/action-ledger-files.ts
+            src/action-ledger-runtime.ts
+            src/action-ledger.ts
             src/clawsweeper-text.ts
             src/command.ts
             src/codex-env.ts
@@ -120,7 +124,11 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -129,25 +137,39 @@ jobs:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+          WORKFLOW_LOOKBACK_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_SPAM_LOOKBACK_MINUTES || '180' }}
+          WORKFLOW_SINCE: ${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}
+          WORKFLOW_MAX_COMMENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_SPAM_MAX_COMMENTS || '100' }}
+          WORKFLOW_COMMENT_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}
+          WORKFLOW_REVIEW_COMMENT_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.review_comment_ids || '' }}
+          WORKFLOW_FORCE_REPROCESS: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}
+          DISPATCH_TARGET_REPO: ${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          DISPATCH_LOOKBACK_MINUTES: ${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_SPAM_LOOKBACK_MINUTES || '180' }}
+          DISPATCH_MAX_COMMENTS: ${{ github.event.client_payload.max_comments || '1' }}
+          DISPATCH_COMMENT_IDS: ${{ github.event.client_payload.comment_id || '' }}
+          DISPATCH_REVIEW_COMMENT_IDS: ${{ github.event.client_payload.review_comment_id || '' }}
+          DISPATCH_FORCE_REPROCESS: ${{ github.event.client_payload.force_reprocess || 'false' }}
         run: |
           set -euo pipefail
-          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
-          lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_SPAM_LOOKBACK_MINUTES || '180' }}"
-          since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
-          max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_SPAM_MAX_COMMENTS || '100' }}"
-          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
-          review_comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.review_comment_ids || '' }}"
+          target_repo="$WORKFLOW_TARGET_REPO"
+          lookback_minutes="$WORKFLOW_LOOKBACK_MINUTES"
+          since="$WORKFLOW_SINCE"
+          max_comments="$WORKFLOW_MAX_COMMENTS"
+          comment_ids="$WORKFLOW_COMMENT_IDS"
+          review_comment_ids="$WORKFLOW_REVIEW_COMMENT_IDS"
           model="internal"
-          force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
-            lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_SPAM_LOOKBACK_MINUTES || '180' }}"
+          force_reprocess="$WORKFLOW_FORCE_REPROCESS"
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            target_repo="$DISPATCH_TARGET_REPO"
+            lookback_minutes="$DISPATCH_LOOKBACK_MINUTES"
             since=""
-            max_comments="${{ github.event.client_payload.max_comments || '1' }}"
-            comment_ids="${{ github.event.client_payload.comment_id || '' }}"
-            review_comment_ids="${{ github.event.client_payload.review_comment_id || '' }}"
+            max_comments="$DISPATCH_MAX_COMMENTS"
+            comment_ids="$DISPATCH_COMMENT_IDS"
+            review_comment_ids="$DISPATCH_REVIEW_COMMENT_IDS"
             model="internal"
-            force_reprocess="${{ github.event.client_payload.force_reprocess || 'false' }}"
+            force_reprocess="$DISPATCH_FORCE_REPROCESS"
           fi
 
           args=(
@@ -173,12 +195,20 @@ jobs:
 
       - name: Commit spam scanner audit
         if: always()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REPO: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.target_repo || 'openclaw/openclaw') || github.event.inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+          COMMENT_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || github.event.client_payload.comment_id || '' }}
+          REVIEW_COMMENT_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.review_comment_ids || github.event.client_payload.review_comment_id || '' }}
         run: |
-          target_repo="${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.target_repo || 'openclaw/openclaw') || github.event.inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
-          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || github.event.client_payload.comment_id || '' }}"
-          review_comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.review_comment_ids || github.event.client_payload.review_comment_id || '' }}"
-          publish_args=(--message "chore: record ClawSweeper spam scan")
-          if [ "${{ github.event_name }}" = "repository_dispatch" ] && { [ -n "$comment_ids" ] || [ -n "$review_comment_ids" ]; }; then
+          target_repo="$TARGET_REPO"
+          comment_ids="$COMMENT_IDS"
+          review_comment_ids="$REVIEW_COMMENT_IDS"
+          publish_args=(
+            --message "chore: record ClawSweeper spam scan"
+            --receipt-kind spam_scanner_state_publication
+          )
+          if [ "$EVENT_NAME" = "repository_dispatch" ] && { [ -n "$comment_ids" ] || [ -n "$review_comment_ids" ]; }; then
             target_slug="${target_repo//\//-}"
             IFS=',' read -r -a issue_ids <<< "$comment_ids"
             for id in "${issue_ids[@]}"; do
@@ -202,3 +232,49 @@ jobs:
           pnpm run repair:publish-main -- \
             "${publish_args[@]}" \
             --rebase-strategy theirs
+
+      - name: Finalize spam state publication action ledger
+        id: finalize-state-publication-action-ledger
+        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/spam-state-publication-action-ledger-finalize.json
+
+      - name: Import immutable spam review action ledger
+        id: import-action-ledger
+        if: ${{ always() && steps.finalize-state-publication-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          import_result_file=".artifacts/spam-action-ledger-import.json"
+          paths_file=".artifacts/spam-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish-workflow \
+            --expected-producer-job scan \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$paths_file"
+
+      - name: Publish immutable spam review action ledger
+        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          paths_file=".artifacts/spam-action-ledger-paths.txt"
+          if [ ! -s "$paths_file" ]; then
+            echo "No immutable spam review action events to publish."
+            exit 0
+          fi
+          publish_args=(--message "chore: append spam review action ledger")
+          while IFS= read -r event_path; do
+            publish_args+=(--path "$event_path")
+          done < "$paths_file"
+          pnpm run repair:publish-main -- "${publish_args[@]}"
