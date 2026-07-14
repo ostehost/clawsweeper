@@ -11,8 +11,9 @@ import {
 import { join } from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
-  lowSignalCloseReport,
+  lowSignalCloseReport as baseLowSignalCloseReport,
   markedReviewCommentForTest,
   promotionGhMock,
   reportWithSyncedReviewComment,
@@ -21,6 +22,18 @@ import {
   withMockCodexProof,
   withMockGh,
 } from "./helpers.ts";
+
+const emptyReviewActivityCursor = createReviewedPrActivityCursor({
+  reviews: [],
+  inlineComments: [],
+});
+assert.ok(emptyReviewActivityCursor);
+
+const lowSignalCloseReport = (overrides: Record<string, unknown> = {}) =>
+  baseLowSignalCloseReport({
+    review_activity_cursor: emptyReviewActivityCursor,
+    ...overrides,
+  });
 
 test("apply-decisions skips stale close reports before duplicate PR coverage proof", () => {
   const root = mkdtempSync(tmpPrefix);
