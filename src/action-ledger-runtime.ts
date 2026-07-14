@@ -1246,6 +1246,13 @@ export function readImportedRepairMutationEvents(
   const events: ActionEvent[] = [];
   const shardPaths = new Set<string>();
   const eventIds = new Set<string>();
+  const shardBudget: ActionEventShardReadBudget = {
+    directories: 0,
+    entries: 0,
+    files: 0,
+    totalBytes: 0,
+    totalEvents: 0,
+  };
   for (const entry of completionEntries) {
     const shardSha256 = entry.name.slice(0, -".json".length);
     const completionPath = path.posix.join(
@@ -1282,7 +1289,14 @@ export function readImportedRepairMutationEvents(
     }
     shardPaths.add(index.shard.path);
 
-    const shardEvents = readActionEventShardAt(root, index.shard.path);
+    const shard = readImportedActionEventShards(
+      root,
+      [index.shard.path],
+      { requireManifestPaths: true },
+      shardBudget,
+    )[0];
+    if (!shard) throw new Error("repair mutation idempotency index shard is missing");
+    const shardEvents = shard.events;
     const replaySha256 = actionEventShardReplaySha256(shardEvents);
     const repositorySha256 = repairMutationProducerRepositorySha256(
       shardEvents[0]?.producer.repository ?? "",

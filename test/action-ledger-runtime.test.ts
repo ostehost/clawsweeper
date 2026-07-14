@@ -184,9 +184,10 @@ function recordWorkflowAttemptMutationOutcome(
   root: string,
   env: NodeJS.ProcessEnv,
   outcome: "unknown" | "observed",
+  attempt = 1,
 ): { started: ActionEvent; mutationOutcome: ActionEvent } {
   const operationIdentity = { workKey: `openclaw/openclaw:${outcome}` };
-  const attemptIdentity = { workKey: `openclaw/openclaw:${outcome}`, attempt: 1 };
+  const attemptIdentity = { workKey: `openclaw/openclaw:${outcome}`, attempt };
   const subject = {
     repository: "openclaw/openclaw",
     kind: "queue_item" as const,
@@ -4290,6 +4291,51 @@ test("state shard imports create replayable repair mutation idempotency indexes"
     () => importActionEventShards(source, destination),
     /repair mutation idempotency index binding conflict/,
   );
+});
+
+test("repair mutation idempotency index reads enforce aggregate shard byte limits", async () => {
+  const root = tempRoot();
+  const firstSpool = trustedChildRoot(root, "first-spool");
+  const secondSpool = trustedChildRoot(root, "second-spool");
+  const firstSource = trustedChildRoot(root, "first-source");
+  const secondSource = trustedChildRoot(root, "second-source");
+  const destination = trustedChildRoot(root, "destination");
+  const firstEnv = workflowEnv({ GITHUB_RUN_ID: "100", GITHUB_RUN_ATTEMPT: "1" });
+  const secondEnv = workflowEnv({ GITHUB_RUN_ID: "101", GITHUB_RUN_ATTEMPT: "1" });
+  const first = recordWorkflowAttemptMutationOutcome(firstSpool, firstEnv, "unknown");
+  const second = recordWorkflowAttemptMutationOutcome(secondSpool, secondEnv, "unknown", 2);
+  assert.equal(
+    first.mutationOutcome.idempotency_key_sha256,
+    second.mutationOutcome.idempotency_key_sha256,
+  );
+  await flushWorkflowActionEvents(firstSpool, { env: firstEnv, outputRoot: firstSource });
+  await flushWorkflowActionEvents(secondSpool, { env: secondEnv, outputRoot: secondSource });
+  const firstImport = importActionEventShards(firstSource, destination);
+  const secondImport = importActionEventShards(secondSource, destination);
+  const shardPaths = [...firstImport.eventPaths, ...secondImport.eventPaths];
+  const totalShardBytes = shardPaths.reduce(
+    (total, relativePath) => total + fs.statSync(path.join(destination, relativePath)).size,
+    0,
+  );
+  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
+    maxTotalBytes: number;
+  };
+  const originalMaxTotalBytes = mutableLimits.maxTotalBytes;
+
+  try {
+    mutableLimits.maxTotalBytes = totalShardBytes - 1;
+    assert.throws(
+      () =>
+        readImportedRepairMutationEvents(
+          destination,
+          first.mutationOutcome.producer.repository,
+          first.mutationOutcome.idempotency_key_sha256,
+        ),
+      new RegExp(`${totalShardBytes - 1} total byte limit`),
+    );
+  } finally {
+    mutableLimits.maxTotalBytes = originalMaxTotalBytes;
+  }
 });
 
 test("repair mutation idempotency index reads reject links and oversized manifests", async () => {
