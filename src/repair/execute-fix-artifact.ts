@@ -21,6 +21,7 @@ import {
   replacementSourceLinkComment,
 } from "./external-messages.js";
 import { runCommand as run, runCommandResult } from "./command-runner.js";
+import { sha256RegularFile, snapshotRegularFile } from "./prepared-publication-file.js";
 import {
   remainingRepairBudgetMs,
   repairTimeoutBudgetFromEnv,
@@ -4271,8 +4272,11 @@ function preparedPublicationValidationReceiptPath() {
 }
 
 function writePreparedPublicationValidationReceipt(prepared: LooseRecord) {
-  const manifestPath = preparedPublicationArtifactFile("prepared-publication.json");
-  const bundlePath = preparedPublicationArtifactFile("prepared-publication.bundle");
+  const manifestSha256 = String(prepared.manifest_sha256 ?? "");
+  const bundleSha256 = String(prepared.bundle_sha256 ?? "");
+  if (!/^[0-9a-f]{64}$/.test(manifestSha256) || !/^[0-9a-f]{64}$/.test(bundleSha256)) {
+    throw new Error("validated prepared publication is missing exact transfer hashes");
+  }
   const receipt = {
     version: 1,
     disposition: "publication_deferred",
@@ -4280,8 +4284,8 @@ function writePreparedPublicationValidationReceipt(prepared: LooseRecord) {
     cluster_id: result.cluster_id,
     job_sha256: sha256File(jobPath),
     result_sha256: sha256File(resultPath),
-    manifest_sha256: sha256File(manifestPath),
-    bundle_sha256: sha256File(bundlePath),
+    manifest_sha256: manifestSha256,
+    bundle_sha256: bundleSha256,
     base_sha: prepared.base_sha,
     commit: prepared.commit,
     tree_sha: prepared.tree_sha,
@@ -4330,8 +4334,8 @@ function readPreparedPublicationValidationReceipt(): LooseRecord {
     receipt.cluster_id !== result.cluster_id ||
     receipt.job_sha256 !== sha256File(jobPath) ||
     receipt.result_sha256 !== sha256File(resultPath) ||
-    receipt.manifest_sha256 !== sha256File(manifestPath) ||
-    receipt.bundle_sha256 !== sha256File(bundlePath) ||
+    receipt.manifest_sha256 !== sha256RegularFile(manifestPath).sha256 ||
+    receipt.bundle_sha256 !== sha256RegularFile(bundlePath).sha256 ||
     receipt.required_publisher !== "fork-or-target-native-trusted-publisher" ||
     !["repair_contributor_branch", "open_fix_pr"].includes(receipt.publication_kind)
   ) {
@@ -4435,10 +4439,13 @@ function validatePreparedPublicationArtifact({
   fixArtifact: LooseRecord;
   mutate: boolean;
 }): LooseRecord {
-  const manifestPath = preparedPublicationArtifactFile("prepared-publication.json");
-  if (!fs.existsSync(manifestPath)) {
-    throw new Error("prepared publication manifest is missing");
-  }
+  const manifestSourcePath = preparedPublicationArtifactFile("prepared-publication.json");
+  const bundleSourcePath = preparedPublicationArtifactFile("prepared-publication.bundle");
+  workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publication-control-"));
+  const manifestPath = path.join(workRoot, "validated-prepared-publication.json");
+  const bundlePath = path.join(workRoot, "validated-prepared-publication.bundle");
+  const manifestSnapshot = snapshotRegularFile(manifestSourcePath, manifestPath);
+  const bundleSnapshot = snapshotRegularFile(bundleSourcePath, bundlePath);
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   const requiredKeys = [
     "version",
@@ -4501,12 +4508,10 @@ function validatePreparedPublicationArtifact({
   ) {
     throw new Error("prepared publication bundle location or ref is invalid");
   }
-  const bundlePath = preparedPublicationArtifactFile("prepared-publication.bundle");
-  if (!fs.existsSync(bundlePath) || manifest.bundle_sha256 !== sha256File(bundlePath)) {
+  if (manifest.bundle_sha256 !== bundleSnapshot.sha256) {
     throw new Error("prepared publication bundle hash does not match the manifest");
   }
 
-  workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publication-control-"));
   targetDir = path.join(workRoot, "target");
   ensureTargetCheckout(result.repo, targetDir);
   fetchTargetRepository(
@@ -4587,7 +4592,13 @@ function validatePreparedPublicationArtifact({
     throw new Error("prepared publication mutation parameters are not commit/tree/base bound");
   }
   validatePreparedMutationParameters(publication);
-  return { ...manifest, target_dir: targetDir, bundle_path: bundlePath };
+  return {
+    ...manifest,
+    target_dir: targetDir,
+    bundle_path: bundlePath,
+    manifest_sha256: manifestSnapshot.sha256,
+    bundle_sha256: bundleSnapshot.sha256,
+  };
 }
 
 function validatePreparedMutationParameters(publication: LooseRecord) {

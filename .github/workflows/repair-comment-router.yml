@@ -108,8 +108,9 @@ jobs:
       ROUTER_ATTEMPT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || github.event.client_payload.attempt_id || '' }}
       ROUTER_EXECUTE: ${{ github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.execute) || (github.event_name == 'schedule' && vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE == '1') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
           fetch-depth: 0
           sparse-checkout: |

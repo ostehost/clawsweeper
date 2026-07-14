@@ -86,8 +86,9 @@ publish_changes() {
   local other_paths=()
   local path
   for path in "$@"; do
-    if [ "$path" = "records" ]; then
-      record_paths+=("records/${target_slug}")
+    if [ "$path" = "records" ] || [ "$path" = "records/${target_slug}" ]; then
+      echo "Refusing broad record publication; publish exact record tuples instead: $path" >&2
+      return 1
     elif [[ "$path" = records/* ]]; then
       record_paths+=("$path")
     else
@@ -113,11 +114,18 @@ publish_status() {
 publish_reconciled_records() {
   local message="$1"
   local reconcile_json="$2"
+  local item_numbers="${3:-}"
   local target_slug
   target_slug="$(target_repo_slug)"
+  local record_root="records/${target_slug}"
   local publish_paths=()
   local record_file
   local number
+  local candidate
+  local found
+  local existing_record_file
+  local already_recorded
+  local record_files=()
 
   if ! jq -e '
     .changedRecordFiles
@@ -130,15 +138,73 @@ publish_reconciled_records() {
 
   while IFS= read -r record_file; do
     [ -n "$record_file" ] || continue
+    already_recorded=false
+    for existing_record_file in "${record_files[@]+"${record_files[@]}"}"; do
+      if [ "$existing_record_file" = "$record_file" ]; then
+        already_recorded=true
+        break
+      fi
+    done
+    if [ "$already_recorded" = "false" ]; then
+      record_files+=("$record_file")
+    fi
+  done < <(jq -r '.changedRecordFiles[]' <<<"$reconcile_json")
+
+  if [ -n "$item_numbers" ]; then
+    if ! [[ "$item_numbers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+      echo "Exact record publication item numbers are invalid" >&2
+      return 1
+    fi
+    local requested_numbers=()
+    IFS=',' read -r -a requested_numbers <<<"$item_numbers"
+    local previous_nullglob
+    previous_nullglob="$(shopt -p nullglob || true)"
+    shopt -s nullglob
+    for number in "${requested_numbers[@]}"; do
+      found=false
+      for candidate in \
+        "$record_root/items/$number.md" \
+        "$record_root/items/"*-"$number.md" \
+        "$record_root/closed/$number.md" \
+        "$record_root/closed/"*-"$number.md"; do
+        [ -f "$candidate" ] || continue
+        record_file="$(basename "$candidate")"
+        if ! [[ "$record_file" =~ ^([a-z0-9][a-z0-9-]*-)?${number}\.md$ ]]; then
+          echo "Exact record publication resolved an invalid record filename: $record_file" >&2
+          eval "$previous_nullglob"
+          return 1
+        fi
+        already_recorded=false
+        for existing_record_file in "${record_files[@]+"${record_files[@]}"}"; do
+          if [ "$existing_record_file" = "$record_file" ]; then
+            already_recorded=true
+            break
+          fi
+        done
+        if [ "$already_recorded" = "false" ]; then
+          record_files+=("$record_file")
+        fi
+        found=true
+      done
+      if [ "$found" != "true" ]; then
+        echo "Exact record publication could not resolve item $number" >&2
+        eval "$previous_nullglob"
+        return 1
+      fi
+    done
+    eval "$previous_nullglob"
+  fi
+
+  for record_file in "${record_files[@]+"${record_files[@]}"}"; do
     number="${record_file%.md}"
     number="${number##*-}"
     publish_paths+=(
-      "records/${target_slug}/items/${record_file}"
-      "records/${target_slug}/closed/${record_file}"
-      "records/${target_slug}/plans/${record_file}"
-      "records/${target_slug}/decision-packets/${number}.json"
+      "$record_root/items/$record_file"
+      "$record_root/closed/$record_file"
+      "$record_root/plans/$record_file"
+      "$record_root/decision-packets/$number.json"
     )
-  done < <(jq -r '.changedRecordFiles[]' <<<"$reconcile_json")
+  done
 
   if [ "${#publish_paths[@]}" -eq 0 ]; then
     echo "Reconcile changed no durable record tuples."

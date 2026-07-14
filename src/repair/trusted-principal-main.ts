@@ -13,7 +13,6 @@ type CliArgs = {
   sourceRoot?: string;
   stageRoot?: string;
   timeoutMs?: number;
-  setprivPath?: string;
   allowEmptyTransfer: boolean;
   files: TrustedTransferFile[];
   passEnv: string[];
@@ -45,7 +44,6 @@ const staged = runAsIsolatedPrincipalAndStage({
   commandArgs: args.command.slice(1),
   childEnv,
   ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
-  ...(args.setprivPath === undefined ? {} : { setprivPath: args.setprivPath }),
 });
 console.log(JSON.stringify({ status: "staged", files: staged }));
 
@@ -77,7 +75,6 @@ function parseArgs(argv: readonly string[]): CliArgs {
     else if (arg === "--source-root") parsed.sourceRoot = value(argv, ++index, arg);
     else if (arg === "--stage-root") parsed.stageRoot = value(argv, ++index, arg);
     else if (arg === "--timeout-ms") parsed.timeoutMs = positiveInt(value(argv, ++index, arg), arg);
-    else if (arg === "--setpriv") parsed.setprivPath = value(argv, ++index, arg);
     else if (arg === "--allow-empty-transfer") parsed.allowEmptyTransfer = true;
     else if (arg === "--file") parsed.files.push(parseFile(value(argv, ++index, arg)));
     else if (arg === "--pass-env") parsed.passEnv.push(value(argv, ++index, arg));

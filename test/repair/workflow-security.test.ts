@@ -47,7 +47,7 @@ test("repair worker passes the job input to shell scripts through the environmen
   for (const line of directJobInputLines) {
     assert.match(
       line,
-      /^\s*(?:run-name:|group:|JOB_PATH:|SOURCE_JOB_PATH:|sparse-checkout:)/,
+      /^\s*(?:run-name:|group:|JOB_PATH:|SOURCE_JOB:|SOURCE_JOB_PATH:|sparse-checkout:)/,
       line,
     );
   }
@@ -243,7 +243,31 @@ test("prepare executor scrubs workflow command files and publisher rederives art
   assert.match(source, /CLAWSWEEPER_CRABFLEET_/);
   assert.match(source, /manifest\.job_sha256 !== sha256File\(jobPath\)/);
   assert.match(source, /manifest\.result_sha256 !== sha256File\(resultPath\)/);
-  assert.match(source, /manifest\.bundle_sha256 !== sha256File\(bundlePath\)/);
+  const validationStart = source.indexOf("function validatePreparedPublicationArtifact(");
+  const validationEnd = source.indexOf(
+    "function validatePreparedMutationParameters(",
+    validationStart,
+  );
+  assert.ok(validationStart >= 0 && validationEnd > validationStart);
+  const validation = source.slice(validationStart, validationEnd);
+  assert.match(
+    validation,
+    /const bundleSnapshot = snapshotRegularFile\(bundleSourcePath, bundlePath\)/,
+  );
+  assert.match(validation, /manifest\.bundle_sha256 !== bundleSnapshot\.sha256/);
+  assert.match(validation, /bundle_sha256: bundleSnapshot\.sha256/);
+  const receiptStart = source.indexOf("function writePreparedPublicationValidationReceipt(");
+  const receiptEnd = source.indexOf(
+    "function readPreparedPublicationValidationReceipt(",
+    receiptStart,
+  );
+  assert.ok(receiptStart >= 0 && receiptEnd > receiptStart);
+  const receipt = source.slice(receiptStart, receiptEnd);
+  assert.match(
+    receipt,
+    /const bundleSha256 = String\(prepared\.bundle_sha256 \?\? ""\)/,
+  );
+  assert.match(receipt, /bundle_sha256: bundleSha256/);
   assert.match(source, /independently derived publication paths do not match/);
   assert.match(source, /prepared contributor repair source branch identity or lease changed/);
   assert.match(source, /prepared replacement branch is not descended from the live remote lease/);
@@ -470,4 +494,18 @@ test("repair job restoration rejects shell metacharacters and path traversal", (
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("trusted principal CLI rejects caller-selected setpriv executables", () => {
+  const cli = path.resolve("dist/repair/trusted-principal-main.js");
+  const result = spawnSync(
+    process.execPath,
+    [cli, "--setpriv", "/tmp/untrusted-setpriv", "--", "true"],
+    {
+      encoding: "utf8",
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unknown argument: --setpriv/);
 });

@@ -103,8 +103,9 @@ jobs:
     outputs:
       proceed: ${{ steps.receipt.outputs.proceed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           sparse-checkout: scripts/dispatch-receipt-owner.sh
           sparse-checkout-cone-mode: false
 
@@ -174,7 +175,7 @@ jobs:
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -413,7 +414,7 @@ jobs:
           echo "effective_mode=$effective_mode" >> "$GITHUB_OUTPUT"
 
       - name: Upload immutable recovery inputs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: .clawsweeper-repair/recovery-inputs/workflow-inputs.json
@@ -422,7 +423,7 @@ jobs:
           include-hidden-files: true
 
       - name: Checkout immutable state job
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: openclaw/clawsweeper-state
           ref: ${{ steps.immutable-job.outputs.state_revision }}
@@ -734,7 +735,7 @@ jobs:
 
       - name: Upload worker transfer artifacts
         if: ${{ success() && steps.stage-worker.outcome == 'success' && (steps.recovery_inputs.outputs.effective_mode == 'execute' || steps.recovery_inputs.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-worker-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -746,7 +747,7 @@ jobs:
 
       - name: Upload final worker artifacts
         if: ${{ success() && steps.stage-worker.outcome == 'success' && !((steps.recovery_inputs.outputs.effective_mode == 'execute' || steps.recovery_inputs.outputs.effective_mode == 'autonomous') && !inputs.dry_run) }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -800,7 +801,7 @@ jobs:
 
       - name: Upload cluster repair action ledger
         if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.cluster-action-ledger.outputs.output-root }}/**
@@ -843,7 +844,7 @@ jobs:
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -890,7 +891,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout immutable execution job
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: openclaw/clawsweeper-state
           ref: ${{ needs.cluster.outputs.state_revision }}
@@ -1050,7 +1051,7 @@ jobs:
 
       - name: Download worker artifacts
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ steps.worker-transfer-artifact.outputs.artifact_id }}
           path: .clawsweeper-repair/runs
@@ -1267,7 +1268,7 @@ jobs:
       - name: Upload immutable prepared publication transfer
         id: upload-prepared
         if: ${{ steps.execute_fix.outputs.has_prepared == 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-prepared-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1301,7 +1302,7 @@ jobs:
 
       - name: Upload execution repair action ledger
         if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.execute-action-ledger.outputs.output-root }}/**
@@ -1337,7 +1338,7 @@ jobs:
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -1351,7 +1352,7 @@ jobs:
           build-script: build:repair
 
       - name: Download immutable cluster result ground truth
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ needs.execute.outputs.worker_artifact_id }}
           path: .clawsweeper-repair/runs
@@ -1361,7 +1362,7 @@ jobs:
 
       - name: Download isolated prepared publication transfer
         if: ${{ needs.execute.outputs.prepared_artifact_id != '' }}
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ needs.execute.outputs.prepared_artifact_id }}
           path: .clawsweeper-prepared
@@ -1377,7 +1378,7 @@ jobs:
           permission-contents: read
 
       - name: Checkout immutable job ground truth
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: openclaw/clawsweeper-state
           ref: ${{ needs.cluster.outputs.state_revision }}
@@ -1623,7 +1624,7 @@ jobs:
 
       - name: Upload immutable deferred publication receipt
         if: ${{ steps.publication_validation.outputs.mode == 'prepared' && steps.publish_outcome.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-deferred-publication-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1803,7 +1804,7 @@ jobs:
 
       - name: Upload final publication artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1829,7 +1830,7 @@ jobs:
 
       - name: Upload publication repair action ledger
         if: ${{ always() && steps.publish-action-ledger.outcome == 'success' && steps.publish-setup-pnpm.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-repair-worker-action-ledger-publish-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.publish-action-ledger.outputs.output-root }}/**

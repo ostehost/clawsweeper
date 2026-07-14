@@ -245,7 +245,7 @@ jobs:
     outputs:
       action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload exact-review enqueue action ledger
         if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: exact-review-action-ledger-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output/**
@@ -309,7 +309,7 @@ jobs:
     outputs:
       action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           fetch-depth: 0
@@ -502,7 +502,7 @@ jobs:
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
         run: pnpm run build:all
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ steps.live-item.outputs.proceed == 'true' }}
         with:
           path: ${{ steps.target.outputs.target_checkout_dir }}-cache.git
@@ -1214,7 +1214,7 @@ jobs:
 
       - name: Upload exact-review queue action ledger
         if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: exact-review-action-ledger-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output/**
@@ -1311,7 +1311,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ github.sha }}
           filter: blob:none
@@ -1354,7 +1354,7 @@ jobs:
           echo "artifact=exact-review-action-ledger-$producer_job-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Download exact-review queue action ledger
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ${{ steps.producer.outputs.artifact }}
           path: .clawsweeper-repair/exact-review-action-ledger
@@ -1411,8 +1411,9 @@ jobs:
       actions: write
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
           fetch-depth: 0
 
@@ -1560,8 +1561,9 @@ jobs:
       target_repo_name: ${{ steps.target.outputs.target_repo_name }}
       target_repo_owner: ${{ steps.target.outputs.target_repo_owner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           path: clawsweeper
           filter: blob:none
           fetch-depth: 0
@@ -2079,7 +2081,7 @@ jobs:
             --records-path "records/${target_slug}/items"
           tar -czf .artifacts/review-runtime.tar.gz -C .artifacts/review-runtime .
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: clawsweeper-runtime-dist
           path: clawsweeper/.artifacts/review-runtime.tar.gz
@@ -2177,7 +2179,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           path: clawsweeper
           filter: blob:none
@@ -2220,11 +2222,11 @@ jobs:
           permission-pull-requests: read
           permission-statuses: read
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: clawsweeper-runtime-dist
           path: clawsweeper/.artifacts
@@ -2287,7 +2289,7 @@ jobs:
             echo "proof_scratch=$principal_proof_scratch"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ needs.plan.outputs.target_checkout_dir }}-cache.git
           key: ${{ needs.plan.outputs.target_repo_name }}-git-${{ runner.os }}-${{ github.run_id }}
@@ -2470,7 +2472,7 @@ jobs:
           }
           JSON
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.drain-codex-principal.outputs.principal_drained == 'true' }}
         with:
           name: review-shard-${{ matrix.shard }}
@@ -2479,7 +2481,7 @@ jobs:
             review-artifacts/shard-${{ matrix.shard }}/review-cache-metrics.json
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.drain-codex-principal.outputs.principal_drained == 'true' }}
         with:
           name: action-ledger-review-${{ matrix.shard }}
@@ -2487,21 +2489,21 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.drain-codex-principal.outputs.principal_drained == 'true' }}
         with:
           name: review-failed-shard-${{ matrix.shard }}
           path: review-artifacts/failed-shards/shard-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.drain-codex-principal.outputs.principal_drained == 'true' }}
         with:
           name: review-metrics-${{ matrix.shard }}
           path: review-artifacts/metrics/shard-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.drain-codex-principal.outputs.principal_drained == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.expected_source_revision != '' }}
         with:
           name: review-source-revision-mismatch-${{ matrix.shard }}
@@ -2517,7 +2519,7 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -2542,7 +2544,7 @@ jobs:
         with:
           build-script: build:repair
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           pattern: review-source-revision-mismatch-*
@@ -2654,7 +2656,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           fetch-depth: 0
@@ -2694,14 +2696,14 @@ jobs:
         with:
           build-script: build:all
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         id: download-review-artifacts
         with:
           pattern: review-shard-*
           path: artifacts
           merge-multiple: true
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         id: download-review-metrics
         continue-on-error: true
         with:
@@ -2709,7 +2711,7 @@ jobs:
           path: review-metrics
           merge-multiple: true
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         id: download-review-action-ledger
         continue-on-error: true
         with:
@@ -2850,18 +2852,21 @@ jobs:
           HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
           TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
         run: |
-          target_slug="$TARGET_REPO"
-          target_slug="${target_slug//\//-}"
+          set -euo pipefail
+          source scripts/apply-workflow-helpers.sh
+          target_slug="$(target_repo_slug)"
+          review_item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
+          reconcile_json='{"changedRecordFiles":[]}'
           if [ "$HOT_INTAKE" = "true" ] && [ -z "$EXACT_ITEM" ]; then
             echo "Skipping full reconcile for broad hot-intake publish."
           else
-            pnpm run reconcile -- --target-repo "$TARGET_REPO" --skip-closed-at
+            reconcile_json="$(pnpm run --silent reconcile -- --target-repo "$TARGET_REPO" --skip-closed-at)"
+            echo "$reconcile_json"
           fi
-          pnpm run repair:publish-main -- \
-            --message "chore: update sweep records" \
-            --receipt-kind sweep_review_records_publication \
-            --path "records/${target_slug}" \
-            --rebase-strategy reconcile-records
+          publish_reconciled_records \
+            "chore: update sweep records" \
+            "$reconcile_json" \
+            "$review_item_numbers"
           echo "records_published=true" >> "$GITHUB_OUTPUT"
           pnpm run repair:publish-main -- \
             --message "chore: update sweep status" \
@@ -3108,6 +3113,7 @@ jobs:
           fi
           echo "sync_succeeded=true" >> "$GITHUB_OUTPUT"
           synced_count="$(pnpm run --silent workflow -- count-actions --report apply-report.json --action review_comment_synced)"
+          source scripts/apply-workflow-helpers.sh
           pnpm run status -- \
             --target-repo "$TARGET_REPO" \
             --state "Review comments checked" \
@@ -3120,11 +3126,10 @@ jobs:
             --due-backlog "${{ needs.plan.outputs.due_backlog }}" \
             --oldest-unreviewed-at "${{ needs.plan.outputs.oldest_unreviewed_at }}" \
             --capacity-reason "${{ needs.plan.outputs.capacity_reason }}"
-          pnpm run repair:publish-main -- \
-            --message "chore: sync selected review comments" \
-            --receipt-kind selected_review_records_publication \
-            --path "records/${target_slug}" \
-            --rebase-strategy reconcile-records
+          publish_reconciled_records \
+            "chore: sync selected review comments" \
+            '{"changedRecordFiles":[]}' \
+            "$item_numbers"
           pnpm run repair:publish-main -- \
             --message "chore: publish selected review comment status" \
             --receipt-kind selected_review_status_publication \
@@ -3266,7 +3271,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           persist-credentials: false
@@ -3291,7 +3296,7 @@ jobs:
         with:
           build-script: build:repair
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         id: failed-shards
         continue-on-error: true
         with:
@@ -3512,8 +3517,9 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
           fetch-depth: 0
 
@@ -3633,7 +3639,7 @@ jobs:
             --paths-file "$event_paths_file" \
             --message "chore: append failed review retry action ledger"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() }}
         with:
           name: failed-review-retry-report
@@ -3659,8 +3665,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
           fetch-depth: 0
 
@@ -3749,9 +3756,11 @@ jobs:
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
         run: |
           set -euo pipefail
+          source scripts/apply-workflow-helpers.sh
           git pull --rebase --autostash
           reconcile_json="$(pnpm run --silent reconcile -- --target-repo "$TARGET_REPO" --max-pages 250 --skip-closed-at)"
           echo "$reconcile_json"
+          publish_reconciled_records "chore: update sweep audit records" "$reconcile_json"
           moved_to_closed="$(jq -r '.movedToClosed' <<<"$reconcile_json")"
           moved_to_items="$(jq -r '.movedToItems' <<<"$reconcile_json")"
           removed_stale_closed_copies="$(jq -r '.removedStaleClosedCopies' <<<"$reconcile_json")"
@@ -3768,11 +3777,6 @@ jobs:
         run: |
           target_slug="$TARGET_REPO"
           target_slug="${target_slug//\//-}"
-          pnpm run repair:publish-main -- \
-            --message "chore: update sweep audit state" \
-            --receipt-kind sweep_audit_records_publication \
-            --path "records/${target_slug}" \
-            --rebase-strategy reconcile-records
           pnpm run repair:publish-main -- \
             --message "chore: publish sweep audit status" \
             --receipt-kind sweep_audit_status_publication \
@@ -3855,7 +3859,7 @@ jobs:
       proof_ready: ${{ steps.primary-proof-result.outputs.ready }}
       action_ledger_artifact_name: ${{ steps.publishable-action-ledger.outputs.name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           fetch-depth: 1
@@ -4076,7 +4080,7 @@ jobs:
 
       - name: Upload bound close coverage proofs
         if: ${{ always() && steps.proof-select.outputs.item_numbers != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ steps.proof-artifact.outputs.name }}
           path: .artifacts/apply-proof/pr-close-coverage-proof/*.proof.json
@@ -4086,7 +4090,7 @@ jobs:
       - name: Upload apply proof action events
         id: upload-action-events
         if: ${{ always() && steps.proof-select.outputs.item_numbers != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ steps.proof-artifact.outputs.action_ledger_name }}
           path: ${{ runner.temp }}/clawsweeper-action-ledger/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}/**
@@ -4107,13 +4111,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
 
       - name: Download apply proof action events
         if: ${{ needs.apply-proof.outputs.action_ledger_artifact_name != '' }}
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ${{ needs.apply-proof.outputs.action_ledger_artifact_name }}
           path: .clawsweeper-repair/action-ledger-proof
@@ -4184,7 +4189,7 @@ jobs:
       CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           filter: blob:none
           fetch-depth: 0
@@ -4256,7 +4261,7 @@ jobs:
         with:
           build-script: build:all
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           name: ${{ needs.apply-proof.outputs.artifact_name }}
@@ -4495,7 +4500,7 @@ jobs:
             --state "Apply in progress" \
             --detail "Starting apply/comment-sync run for up to $limit fresh $apply_kind closes. Close reasons: $apply_close_reasons.$candidate_quality_detail Scan window: $close_processed_limit records ($adaptive_apply_scan_reason). Existing Codex automated review comments are updated in place when closing or when comment-only sync is stale by ${comment_sync_min_age_days} day(s); checkpoints commit every $checkpoint_size fresh closes; close delay is ${close_delay_ms}ms; sync-comments-only=$sync_comments_only; item numbers=${item_numbers:-all}." \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if ! publish_changes "chore: mark sweep apply in progress" records results/sweep-status; then
+          if ! publish_changes "chore: mark sweep apply in progress" results/sweep-status; then
             echo "Best-effort apply start status update failed"
             git restore results/sweep-status || true
           fi
@@ -4530,7 +4535,11 @@ jobs:
                 --next-cursor "$next_cursor" \
                 --target-repo "$TARGET_REPO"
             fi
-            publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors
+            publish_reconciled_records \
+              "chore: sync sweep review comments checkpoint $checkpoint" \
+              '{"changedRecordFiles":[]}' \
+              "$item_numbers"
+            publish_changes "chore: sync sweep review comments checkpoint $checkpoint" apply-report.json results/comment-sync-cursors
             comment_sync_health_cursor_path=""
             comment_sync_health_cursor_required="false"
             comment_sync_health_processed_limit="$comment_sync_processed_limit"
@@ -4590,7 +4599,7 @@ jobs:
             result_count="$(pnpm run --silent workflow -- count-report --report ".artifacts/apply-reports/apply-report-$checkpoint.json")"
             closed_total=$((closed_total + closed_in_chunk))
             echo "Checkpoint $checkpoint result_count=$result_count closed_in_chunk=$closed_in_chunk closed_total=$closed_total/$limit"
-            apply_publish_paths=(records apply-report.json)
+            apply_publish_paths=(apply-report.json)
             if [ "$auto_selected_apply_batch" = "true" ]; then
               pnpm run workflow -- write-apply-cursor \
                 --cursor-path "$apply_cursor_path" \
@@ -4606,6 +4615,10 @@ jobs:
               apply_publish_paths+=(results/apply-cursors)
             fi
             examined_count="$(apply_checkpoint_examined_count)"
+            publish_reconciled_records \
+              "chore: apply sweep decisions checkpoint $checkpoint" \
+              '{"changedRecordFiles":[]}' \
+              "$item_numbers"
             publish_changes "chore: apply sweep decisions checkpoint $checkpoint" "${apply_publish_paths[@]}"
             if [ "$auto_selected_apply_batch" = "true" ]; then
               select_apply_candidate_inventory false

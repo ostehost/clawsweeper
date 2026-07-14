@@ -2741,7 +2741,9 @@ test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", (
   assert.match(retryBlock, /--path results\/failed-review-retries\/openclaw-openclaw/);
   assert.doesNotMatch(retryBlock, /--path records\/openclaw-openclaw/);
   const publishIndex = retryBlock.indexOf("- name: Publish failed-review retry state");
-  const uploadIndex = retryBlock.indexOf("- uses: actions/upload-artifact@v7");
+  const uploadIndex = retryBlock.indexOf(
+    "- uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+  );
   assert.ok(publishIndex > 0);
   assert.ok(uploadIndex > publishIndex);
   assert.match(

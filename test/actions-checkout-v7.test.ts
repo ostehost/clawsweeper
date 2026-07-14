@@ -92,7 +92,9 @@ test("trusted-event state checkout defaults to the state branch and accepts an e
     inputs?: Record<string, { default?: unknown }>;
     runs?: { steps?: CheckoutStep[] };
   };
-  const checkout = action.runs?.steps?.find((step) => step.uses === "actions/checkout@v7");
+  const checkout = action.runs?.steps?.find(
+    (step) => step.uses === `actions/checkout@${checkoutV7Commit}`,
+  );
   assert.equal(checkout?.with?.repository, "openclaw/clawsweeper-state");
   assert.equal(action.inputs?.ref?.default, "state");
   assert.equal(checkout?.with?.ref, "${{ inputs.ref }}");

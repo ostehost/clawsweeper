@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import YAML from "yaml";
 
@@ -1011,7 +1011,10 @@ test("failed-review retry cleanup restores the captured command failure", () => 
   const commandStart = retryJob.indexOf("- name: Plan or dispatch failed-review retries");
   const finalizerStart = retryJob.indexOf("- name: Finalize failed-review retry action ledger");
   const publicationStart = retryJob.indexOf("- name: Publish failed-review retry action ledger");
-  const artifactStart = retryJob.indexOf("uses: actions/upload-artifact@v7", publicationStart);
+  const artifactStart = retryJob.indexOf(
+    "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    publicationStart,
+  );
   const restoreStart = retryJob.indexOf("- name: Restore failed-review retry outcome");
 
   assert.ok(commandStart >= 0);
@@ -1029,39 +1032,22 @@ test("failed-review retry cleanup restores the captured command failure", () => 
   );
 });
 
-test("broad record publishers isolate tuple reconciliation from status and auxiliary state", () => {
+test("production record publishers stage only exact record tuples", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   for (const stepName of [
     "Commit review records",
     "Sync selected review comments",
-    "Commit Audit Health",
+    "Refresh Audit Health",
   ]) {
     const start = workflow.indexOf(`- name: ${stepName}`);
     assert.notEqual(start, -1, stepName);
     const nextStep = workflow.indexOf("\n      - ", start + 1);
     const block = workflow.slice(start, nextStep === -1 ? undefined : nextStep);
-    const recordsPath = block.indexOf('--path "records/${target_slug}"');
-    const tupleStrategy = block.indexOf("--rebase-strategy reconcile-records", recordsPath);
-    const secondPublish = block.indexOf("pnpm run repair:publish-main", tupleStrategy);
-    const statusPath = block.indexOf("results/sweep-status/${target_slug}.json", secondPublish);
-    const statusStrategy = block.indexOf("--rebase-strategy theirs", statusPath);
-
-    assert.ok(recordsPath !== -1, `${stepName} records path`);
-    assert.ok(tupleStrategy > recordsPath, `${stepName} tuple strategy`);
-    assert.ok(secondPublish > tupleStrategy, `${stepName} split publish`);
-    assert.equal(
-      block.slice(recordsPath, tupleStrategy).includes("results/sweep-status"),
-      false,
-      `${stepName} must not mix status into tuple reconciliation`,
-    );
-    assert.ok(statusPath > secondPublish, `${stepName} status path`);
-    assert.ok(statusStrategy > statusPath, `${stepName} status strategy`);
-    assert.equal(
-      block.slice(secondPublish).includes('--path "records/${target_slug}"'),
-      false,
-      `${stepName} auxiliary publish must not replay records`,
-    );
+    assert.match(block, /publish_reconciled_records/, stepName);
+    assert.doesNotMatch(block, /--path "records\/\$\{target_slug\}"/, stepName);
   }
+  assert.doesNotMatch(workflow, /--path "records\/\$\{target_slug\}"/);
+  assert.doesNotMatch(workflow, /publish_changes [^\n]* records(?: |$)/);
 });
 
 test("apply workflow isolates Codex proof from the credentialed mutation runner", () => {
@@ -1159,7 +1145,7 @@ test("apply workflow isolates Codex proof from the credentialed mutation runner"
   assert.doesNotMatch(applyJob, /setup-codex|OPENAI_API_KEY|CLAWSWEEPER_INTERNAL_MODEL/);
   assert.match(applyJob, /Create target write token/);
   assert.match(applyJob, /Create state token/);
-  assert.match(applyJob, /actions\/download-artifact@v8/);
+  assert.match(applyJob, /actions\/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/);
   assert.match(applyJob, /name: \$\{\{ needs\.apply-proof\.outputs\.artifact_name \}\}/);
   assert.doesNotMatch(applyJob, /action-ledger-proof/);
   assert.match(applyJob, /validate_coverage_proof_tree .* 8 262144 2097152/);
@@ -1208,6 +1194,7 @@ test("reconcile publication expands only exact changed record tuples", () => {
     [
       "-lc",
       [
+        "set -u",
         "source scripts/apply-workflow-helpers.sh",
         'publish_changes_with_strategy() { printf "%s\\n" "$@"; }',
         'TARGET_REPO="OpenClaw/OpenClaw"',
@@ -1234,6 +1221,7 @@ test("reconcile publication expands only exact changed record tuples", () => {
     [
       "-lc",
       [
+        "set -u",
         "source scripts/apply-workflow-helpers.sh",
         'publish_changes_with_strategy() { printf "unexpected publish\\n"; return 1; }',
         'TARGET_REPO="openclaw/openclaw"',
@@ -1245,8 +1233,8 @@ test("reconcile publication expands only exact changed record tuples", () => {
   assert.equal(emptyOutput.trim(), "Reconcile changed no durable record tuples.");
 });
 
-test("apply checkpoints split record tuples from auxiliary state", () => {
-  const output = execFileSync(
+test("apply publication rejects broad record roots and splits exact tuples from auxiliary state", () => {
+  const exactOutput = execFileSync(
     "bash",
     [
       "-lc",
@@ -1254,36 +1242,81 @@ test("apply checkpoints split record tuples from auxiliary state", () => {
         "source scripts/apply-workflow-helpers.sh",
         'publish_changes_with_strategy() { printf "%s\\n" "$@"; }',
         'TARGET_REPO="OpenClaw/OpenClaw"',
-        'publish_changes "apply checkpoint" records apply-report.json results/sweep-status results/apply-cursors',
+        'publish_changes "apply checkpoint" records/openclaw-openclaw/items/7.md apply-report.json',
       ].join("\n"),
     ],
     { encoding: "utf8" },
   );
-  assert.deepEqual(output.trim().split("\n"), [
+  assert.deepEqual(exactOutput.trim().split("\n"), [
     "reconcile-records",
     "apply checkpoint",
-    "records/openclaw-openclaw",
+    "records/openclaw-openclaw/items/7.md",
     "apply-records",
     "apply checkpoint",
     "apply-report.json",
-    "results/sweep-status",
-    "results/apply-cursors",
   ]);
 
-  const failedOutput = execFileSync(
+  const broadOutput = execFileSync(
     "bash",
     [
       "-lc",
       [
         "source scripts/apply-workflow-helpers.sh",
-        'publish_changes_with_strategy() { printf "%s\\n" "$1"; [ "$1" != reconcile-records ]; }',
+        'publish_changes_with_strategy() { printf "unexpected publish\\n"; return 1; }',
         'TARGET_REPO="openclaw/openclaw"',
-        'publish_changes "apply checkpoint" records apply-report.json || true',
+        'publish_changes "apply checkpoint" records apply-report.json 2>&1 || true',
       ].join("\n"),
     ],
     { encoding: "utf8" },
   );
-  assert.equal(failedOutput.trim(), "reconcile-records");
+  assert.equal(
+    broadOutput.trim(),
+    "Refusing broad record publication; publish exact record tuples instead: records",
+  );
+});
+
+test("exact item record publication excludes foreign record files", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const script = resolve("scripts/apply-workflow-helpers.sh");
+  try {
+    mkdirSync(join(root, "records/openclaw-openclaw/items"), { recursive: true });
+    mkdirSync(join(root, "records/openclaw-openclaw/closed"), { recursive: true });
+    writeFileSync(join(root, "records/openclaw-openclaw/items/openclaw-openclaw-51.md"), "51\n");
+    writeFileSync(join(root, "records/openclaw-openclaw/closed/52.md"), "52\n");
+    writeFileSync(
+      join(root, "records/openclaw-openclaw/items/openclaw-openclaw-999.md"),
+      "foreign\n",
+    );
+    const output = execFileSync(
+      "bash",
+      [
+        "-lc",
+        [
+          "set -u",
+          'source "$HELPER"',
+          'publish_changes_with_strategy() { printf "%s\\n" "$@"; }',
+          'TARGET_REPO="openclaw/openclaw"',
+          `publish_reconciled_records "exact publish" '{"changedRecordFiles":[]}' "51,52"`,
+        ].join("\n"),
+      ],
+      { cwd: root, encoding: "utf8", env: { ...process.env, HELPER: script } },
+    );
+    assert.deepEqual(output.trim().split("\n"), [
+      "reconcile-records",
+      "exact publish",
+      "records/openclaw-openclaw/items/openclaw-openclaw-51.md",
+      "records/openclaw-openclaw/closed/openclaw-openclaw-51.md",
+      "records/openclaw-openclaw/plans/openclaw-openclaw-51.md",
+      "records/openclaw-openclaw/decision-packets/51.json",
+      "records/openclaw-openclaw/items/52.md",
+      "records/openclaw-openclaw/closed/52.md",
+      "records/openclaw-openclaw/plans/52.md",
+      "records/openclaw-openclaw/decision-packets/52.json",
+    ]);
+    assert.doesNotMatch(output, /999/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("apply workflow rejects malformed or oversized coverage proof artifact trees", () => {
@@ -1576,15 +1609,18 @@ test("apply workflow finalization retries only target status after checkpointed 
   const finalizerStep = applyJob.slice(finalizerStart, actionLedgerStart);
   const actionLedgerStep = applyJob.slice(actionLedgerStart);
 
+  const commentRecordCheckpoint = applyStep.indexOf("publish_reconciled_records \\");
   const commentCheckpoint = applyStep.indexOf(
-    'publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors',
+    'publish_changes "chore: sync sweep review comments checkpoint $checkpoint" apply-report.json results/comment-sync-cursors',
+    commentRecordCheckpoint,
   );
-  const closePaths = applyStep.indexOf("apply_publish_paths=(records apply-report.json)");
+  const closePaths = applyStep.indexOf("apply_publish_paths=(apply-report.json)");
   const cursorPath = applyStep.indexOf("apply_publish_paths+=(results/apply-cursors)");
   const closeCheckpoint = applyStep.indexOf(
     'publish_changes "chore: apply sweep decisions checkpoint $checkpoint" "${apply_publish_paths[@]}"',
   );
-  assert.ok(commentCheckpoint !== -1);
+  assert.ok(commentRecordCheckpoint !== -1);
+  assert.ok(commentCheckpoint > commentRecordCheckpoint);
   assert.ok(closePaths !== -1);
   assert.ok(cursorPath > closePaths);
   assert.ok(closeCheckpoint > cursorPath);
@@ -1741,12 +1777,18 @@ test("apply proof and mutation start from fresh non-persisted source checkouts",
   const proofJob = workflow.slice(proofJobStart, proofPublisherStart);
   const applyJob = workflow.slice(applyJobStart);
 
-  assert.match(proofJob, /actions\/checkout@v7[\s\S]*?persist-credentials: false/);
+  assert.match(
+    proofJob,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0[\s\S]*?persist-credentials: false/,
+  );
   assert.match(
     proofJob,
     /uses: \.\/\.github\/actions\/setup-state[\s\S]*?persist-credentials: "false"/,
   );
-  assert.match(applyJob, /actions\/checkout@v7[\s\S]*?persist-credentials: false/);
+  assert.match(
+    applyJob,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0[\s\S]*?persist-credentials: false/,
+  );
   assert.doesNotMatch(proofJob, /git pull --rebase/);
   assert.doesNotMatch(applyJob, /git pull --rebase/);
 });
@@ -2123,7 +2165,8 @@ test("sweep workflow publishes target-scoped state paths", () => {
   const workflow = readText(".github/workflows/sweep.yml");
 
   assert.match(workflow, /target_slug="\$TARGET_REPO"/);
-  assert.match(workflow, /--path "records\/\$\{target_slug\}"/);
+  assert.match(workflow, /publish_reconciled_records/);
+  assert.doesNotMatch(workflow, /--path "records\/\$\{target_slug\}"/);
   assert.match(workflow, /--path "results\/sweep-status\/\$\{target_slug\}\.json"/);
   assert.doesNotMatch(workflow, /--path records\s*\\/);
   assert.doesNotMatch(workflow, /--path results\/sweep-status\s*\\/);

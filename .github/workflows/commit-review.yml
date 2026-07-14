@@ -60,7 +60,7 @@ jobs:
     outputs:
       proceed: ${{ steps.receipt.outputs.proceed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           sparse-checkout: scripts/dispatch-receipt-owner.sh
           sparse-checkout-cone-mode: false
@@ -128,8 +128,9 @@ jobs:
       target_repo_name: ${{ steps.target.outputs.target_repo_name }}
       target_repo_owner: ${{ steps.target.outputs.target_repo_owner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           path: clawsweeper
           filter: blob:none
           fetch-depth: 1
@@ -649,7 +650,7 @@ jobs:
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: skipped-commit-reports-${{ github.run_id }}-${{ github.run_attempt }}
@@ -672,7 +673,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           path: clawsweeper
           filter: blob:none
@@ -773,7 +774,7 @@ jobs:
 
       - name: Upload commit review diagnostic
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: commit-review-diagnostic-${{ matrix.sha }}-${{ github.run_attempt }}
           path: commit-work/${{ matrix.sha }}.diagnostic.json
@@ -807,7 +808,7 @@ jobs:
           fi
           cp -R "$output_root"/. "$bundle_root/ledger/"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ always() && steps.prepare-review-bundle.outcome == 'success' }}
         with:
           name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -823,8 +824,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           filter: blob:none
           fetch-depth: 0
 
@@ -1003,7 +1005,7 @@ jobs:
           }
           NODE
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         with:
           artifact-ids: ${{ steps.commit-report-cohort.outputs.review_artifact_ids }}
@@ -1130,7 +1132,7 @@ jobs:
           done < .artifacts/expected-commit-review-shas.txt
 
       - name: Download exact skipped commit reports
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         if: ${{ needs.plan.outputs.skipped_count != '0' }}
         with:
           name: ${{ steps.commit-report-cohort.outputs.skipped_artifact_name }}
