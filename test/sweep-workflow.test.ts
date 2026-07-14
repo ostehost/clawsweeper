@@ -57,7 +57,7 @@ test("ledger-producing jobs initialize immutable workflow context", () => {
   assert.match(action, /GITHUB_RUN_STARTED_AT=\$run_started_at/);
 });
 
-test("review and apply primary boundaries ignore ledger-only failures", () => {
+test("review and apply boundaries fail open only when the ledger is observational", () => {
   type WorkflowStep = {
     name?: string;
     uses?: string;
@@ -93,8 +93,16 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
     return value;
   };
 
+  assert.equal(
+    setupLedger("event-review-apply")["continue-on-error"],
+    undefined,
+    "exact-review claim setup must fail closed",
+  );
+  assert.match(
+    step("event-review-apply", "Claim exact-review queue lease").if ?? "",
+    /steps\.exact-review-action-ledger\.outcome == 'success'/,
+  );
   for (const jobName of [
-    "event-review-apply",
     "review",
     "publish",
     "retry-failed-reviews",
