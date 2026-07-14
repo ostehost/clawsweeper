@@ -37,7 +37,6 @@ import {
   isActionEventStatus,
   parseActionEventShardContent,
   readAllSpooledActionEvents,
-  readActionEventShardAt,
   sortActionEventsCausally,
   validateActionEvent,
   writeActionEvent,

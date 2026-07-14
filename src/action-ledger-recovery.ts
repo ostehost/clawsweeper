@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
