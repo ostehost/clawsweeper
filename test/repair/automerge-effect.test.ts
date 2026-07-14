@@ -886,6 +886,7 @@ test("claim recovery requires an aged claim and the exact workflow attempt to be
     owner: "comment_router",
     claimant: "comment_router:7001:2",
     createdAt: "2026-07-13T08:00:00Z",
+    dispatchedAt: "2026-07-13T08:00:00Z",
   };
   const env = {
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
@@ -913,7 +914,7 @@ test("claim recovery requires an aged claim and the exact workflow attempt to be
       env,
       Date.parse("2026-07-13T08:10:00Z"),
     ).status,
-    "active",
+    "recoverable",
   );
   assert.equal(
     exactHeadMergeClaimRecoveryDecision(

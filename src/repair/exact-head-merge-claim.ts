@@ -95,6 +95,7 @@ export type ExactHeadMergeClaimRecoveryCandidate = {
   claimant: string;
   createdAt: string | null;
   dispatched?: boolean;
+  dispatchedAt?: string | null;
 };
 
 export type ExactHeadMergeClaimRecoveryDecision =
@@ -432,6 +433,7 @@ export function ensureExactHeadMergeClaim(
         claimant: initial.claimant,
         createdAt: initial.createdAt,
         ...(initial.dispatched === undefined ? {} : { dispatched: initial.dispatched }),
+        ...(initial.dispatched ? { dispatchedAt: initial.lastClaimMutationAt } : {}),
       });
     } catch (error) {
       return {
@@ -1542,17 +1544,24 @@ export function exactHeadMergeClaimRecoveryDecision(
   if (runId === currentClaimant && runAttempt === String(env.GITHUB_RUN_ATTEMPT ?? "").trim()) {
     return { status: "active", reason: "current workflow attempt owns the merge claim" };
   }
-  const createdAtMs = candidate.createdAt ? Date.parse(candidate.createdAt) : Number.NaN;
-  if (!Number.isFinite(createdAtMs)) {
+  const recoveryGraceStartedAt = candidate.dispatched
+    ? candidate.dispatchedAt
+    : candidate.createdAt;
+  const recoveryGraceStartedAtMs = recoveryGraceStartedAt
+    ? Date.parse(recoveryGraceStartedAt)
+    : Number.NaN;
+  if (!Number.isFinite(recoveryGraceStartedAtMs)) {
     return {
       status: "active",
-      reason: "exact-head merge claim has no recoverable creation timestamp",
+      reason: candidate.dispatched
+        ? "dispatched exact-head merge claim has no recoverable dispatch timestamp"
+        : "exact-head merge claim has no recoverable creation timestamp",
     };
   }
   if (!Number.isFinite(nowMs) || !Number.isFinite(graceMs) || graceMs < 0) {
     return { status: "unknown", reason: "exact-head merge claim recovery clock is invalid" };
   }
-  if (nowMs - createdAtMs < graceMs) {
+  if (nowMs - recoveryGraceStartedAtMs < graceMs) {
     return {
       status: "active",
       reason: "exact-head merge claim remains inside its recovery grace period",
@@ -1584,18 +1593,12 @@ export function exactHeadMergeClaimRecoveryDecision(
       const conclusion = String(run.conclusion ?? "")
         .trim()
         .toLowerCase();
-      if (conclusion === "success") {
-        return {
-          status: "active",
-          reason:
-            "dispatched exact-head merge claim belongs to a successful workflow attempt; reconciliation only",
-        };
-      }
       if (
         ![
           "action_required",
           "cancelled",
           "failure",
+          "success",
           "stale",
           "startup_failure",
           "timed_out",
@@ -1610,7 +1613,7 @@ export function exactHeadMergeClaimRecoveryDecision(
     return {
       status: "recoverable",
       reason: candidate.dispatched
-        ? `workflow run ${runId} attempt ${runAttempt} failed after dispatch without an observable merge effect`
+        ? `workflow run ${runId} attempt ${runAttempt} completed after dispatch without an observable merge effect`
         : `workflow run ${runId} attempt ${runAttempt} is terminal and its merge claim was retired`,
     };
   }

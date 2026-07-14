@@ -3906,7 +3906,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     });
   }
   const claimedExistingMerge = observeExistingAutomergeEffect(command, claimedView);
-  if (claimedExistingMerge) return claimedExistingMerge;
+  if (claimedExistingMerge) return releaseBeforeDispatch(claimedExistingMerge);
   let claimedReviewLeaseBlock;
   try {
     claimedReviewLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
@@ -3949,7 +3949,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   }
   const claimedPendingReason = exactHeadAutomergePendingReason(command, claimedView);
   if (claimedPendingReason) {
-    return automergePendingAction(claimedPendingReason, waitedMs, transientObservations);
+    return releaseBeforeDispatch(
+      automergePendingAction(claimedPendingReason, waitedMs, transientObservations),
+    );
   }
   const claimedReadinessBlock = validateAutomergeReadiness({
     command,
@@ -4378,6 +4380,7 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
       merge_method: "squash",
     };
   }
+  const mergeOwned = claim.status === "existing" && claim.dispatched === true;
   const durableExpectedMessage =
     claim.status === "existing" && claim.dispatched ? claim.expectedSquashMessage : null;
   const squashCommitProof = durableExpectedMessage
@@ -4386,7 +4389,7 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
   const confirmation = confirmAutomergeEffectSnapshot(
     snapshot,
     command.expected_head_sha,
-    claim.status === "existing" && claim.dispatched
+    mergeOwned
       ? squashCommitProof
         ? { squashCommit: squashCommitProof }
         : {}
@@ -4410,8 +4413,10 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
   }
   return {
     action: "merge",
-    status: "executed",
-    reason: "merge already confirmed for the reviewed head",
+    status: mergeOwned ? "executed" : "skipped",
+    reason: mergeOwned
+      ? "merge already confirmed for the reviewed head"
+      : "already merged without a dispatched ClawSweeper claim",
     merged_at: confirmation.mergedAt,
     merge_commit_sha: confirmation.mergeCommitSha,
   };

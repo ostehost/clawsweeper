@@ -286,6 +286,33 @@ test("trusted verdict automerge rechecks reviewed PR activity around the merge c
   assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
 });
 
+test("post-claim external merge and pending state release ownership before returning", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const observeExisting = source.slice(
+    source.indexOf("function observeExistingAutomergeEffect("),
+    source.indexOf("function exactHeadAutomergePendingReason("),
+  );
+
+  assert.match(
+    executeAutomerge,
+    /const claimedExistingMerge = observeExistingAutomergeEffect\(command, claimedView\);\s+if \(claimedExistingMerge\) return releaseBeforeDispatch\(claimedExistingMerge\);/,
+  );
+  assert.match(
+    executeAutomerge,
+    /const claimedPendingReason = exactHeadAutomergePendingReason\(command, claimedView\);\s+if \(claimedPendingReason\) \{\s+return releaseBeforeDispatch\(\s+automergePendingAction\(/,
+  );
+  assert.match(
+    observeExisting,
+    /const mergeOwned = claim\.status === "existing" && claim\.dispatched === true;/,
+  );
+  assert.match(observeExisting, /status: mergeOwned \? "executed" : "skipped"/);
+  assert.match(observeExisting, /"already merged without a dispatched ClawSweeper claim"/);
+});
+
 test("activity and live state are checked after durable dispatch marking", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(
