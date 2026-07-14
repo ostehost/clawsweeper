@@ -42,6 +42,7 @@ import {
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
 import { AUTOMATION_LIMITS } from "../dist/limits.js";
+import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import {
   auditRecord,
   closeDecision,
@@ -1515,6 +1516,11 @@ test("apply-decisions ignores untrusted newer durable review markers", () => {
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
 
+    const reviewActivityCursor = createReviewedPrActivityCursor({
+      reviews: [],
+      inlineComments: [],
+    });
+    assert.ok(reviewActivityCursor);
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
         number: 321,
@@ -1524,6 +1530,7 @@ test("apply-decisions ignores untrusted newer durable review markers", () => {
         item_snapshot_hash: "old-snapshot-321",
         item_updated_at: "2026-05-01T00:00:00Z",
         pull_head_sha: "old-head",
+        review_activity_cursor: reviewActivityCursor,
       }),
       321,
     );
@@ -1604,7 +1611,7 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments$/.test(path) && args.includ
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline/.test(path)) {
   console.log(JSON.stringify([]));
@@ -1670,6 +1677,11 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
 
+    const reviewActivityCursor = createReviewedPrActivityCursor({
+      reviews: [],
+      inlineComments: [],
+    });
+    assert.ok(reviewActivityCursor);
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
         number: 321,
@@ -1679,6 +1691,7 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
         item_snapshot_hash: "old-snapshot-321",
         item_updated_at: "2026-05-01T00:00:00Z",
         pull_head_sha: "old-head",
+        review_activity_cursor: reviewActivityCursor,
       }),
       321,
     );
@@ -1756,7 +1769,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline/.test(path)) {
   console.log(JSON.stringify([]));
@@ -2235,7 +2248,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.doesNotMatch(completeLeaseStep, /JOB_STATUS:/);
   assert.match(
     completeLeaseStep,
-    /if: \$\{\{ always\(\) && steps\.finalize-exact-event-action-ledger\.outcome == 'success' && steps\.publish-exact-event-action-ledger\.outcome == 'success' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.finalize-exact-event-action-ledger\.outcome == 'success' && \(steps\.publish-exact-event-action-ledger\.outcome == 'success' \|\| steps\.target\.outputs\.target_enabled == 'false' \|\| steps\.live-item\.outputs\.terminal_noop == 'true' \|\| steps\.live-item\.outputs\.terminal_missing == 'true' \|\| steps\.live-item\.outputs\.guarded_open == 'true'\) \}\}/,
   );
   assert.match(completeLeaseStep, /continue-on-error: true/);
   assert.match(completeLeaseStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
