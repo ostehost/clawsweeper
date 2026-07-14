@@ -31435,6 +31435,13 @@ function publishActionEventsCommand(args: Args): void {
   if (!expectedProducerJob) {
     throw new UserFacingCommandError("--expected-producer-job is required");
   }
+  const expectedRunAttempt = optionalNumberArg(args.expected_run_attempt);
+  if (
+    expectedRunAttempt !== undefined &&
+    (!Number.isSafeInteger(expectedRunAttempt) || expectedRunAttempt < 1)
+  ) {
+    throw new UserFacingCommandError("--expected-run-attempt must be a positive integer");
+  }
   const currentProducer = workflowActionProducer("action_event_publisher");
   const result = importActionEventShards(sourceRoot, stateRoot, {
     expectedProducer: {
@@ -31443,7 +31450,7 @@ function publishActionEventsCommand(args: Args): void {
       workflow: currentProducer.workflow,
       job: expectedProducerJob,
       runId: currentProducer.runId,
-      runAttempt: currentProducer.runAttempt,
+      runAttempt: expectedRunAttempt ?? currentProducer.runAttempt,
     },
   });
   console.log(JSON.stringify(result, null, 2));

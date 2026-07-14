@@ -384,6 +384,15 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
     publish,
     /clawsweeper-assist-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
   );
+  assert.match(
+    publish,
+    /action-ledger-assist-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
+  );
+  assert.match(
+    publish,
+    /GENERATION_ATTEMPT: \$\{\{ needs\.assist\.outputs\.generation_attempt \}\}/,
+  );
+  assert.match(publish, /--expected-run-attempt "\$GENERATION_ATTEMPT"/);
   assert.equal(publish.match(/--run-attempt "\$GENERATION_ATTEMPT"/g)?.length, 2);
   assert.match(publish, /permission-issues: write/);
   assert.match(publish, /permission-pull-requests: write/);

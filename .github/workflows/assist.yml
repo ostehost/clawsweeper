@@ -332,7 +332,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          name: action-ledger-assist-${{ github.run_id }}-${{ github.run_attempt }}
+          name: action-ledger-assist-${{ github.run_id }}-${{ needs.assist.outputs.generation_attempt }}
           path: .clawsweeper-repair/action-ledger-download/assist
 
       - name: Validate untrusted assist artifact
@@ -411,10 +411,12 @@ jobs:
       - name: Publish immutable assist action ledger
         if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-action-ledger.outcome == 'success' }}
         env:
+          GENERATION_ATTEMPT: ${{ needs.assist.outputs.generation_attempt }}
           GENERATION_LEDGER_OUTCOME: ${{ steps.download-assist-action-ledger.outcome }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          test -n "$GENERATION_ATTEMPT"
           event_paths_file=".artifacts/assist-action-ledger-paths.txt"
           mkdir -p .artifacts
           : > "$event_paths_file"
@@ -422,6 +424,7 @@ jobs:
             pnpm run --silent publish-action-events -- \
               --source-root .clawsweeper-repair/action-ledger-download/assist \
               --state-root "$CLAWSWEEPER_STATE_DIR" \
+              --expected-run-attempt "$GENERATION_ATTEMPT" \
               --expected-producer-job assist |
               jq -r '.paths[]?' >> "$event_paths_file"
           fi
