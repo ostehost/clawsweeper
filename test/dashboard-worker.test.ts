@@ -3717,6 +3717,10 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
   const originalFetch = globalThis.fetch;
   const storage = new MemoryDurableStorage();
   const statusStore = new MemoryKv();
+  const completedAtMs = Date.now() - 60_000;
+  const triggeredAt = new Date(completedAtMs - 4_820_000).toISOString();
+  const completedAt = new Date(completedAtMs).toISOString();
+  const summarizedAt = new Date(completedAtMs + 400_000).toISOString();
   await statusStore.put(
     "openclaw-bay:journey-state:v1",
     JSON.stringify(
@@ -3728,11 +3732,11 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
             number: 719,
             source_comment_id: 456,
             source_delivery_id: "test-delivery",
-            triggered_at: "2026-07-13T18:03:07Z",
+            triggered_at: triggeredAt,
           },
         ],
         [],
-        "2026-07-13T18:03:07Z",
+        triggeredAt,
       ),
     ),
   );
@@ -3801,7 +3805,7 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
         run_attempt: 1,
         status: "completed",
         conclusion: "success",
-        updated_at: "2026-07-13T19:23:27Z",
+        updated_at: completedAt,
       });
     }
     throw new Error(`unexpected fetch ${url}`);
@@ -3882,15 +3886,15 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
         number: 719,
         source_comment_id: 456,
         source_delivery_id: "test-delivery",
-        triggered_at: "2026-07-13T18:03:07Z",
-        completed_at: "2026-07-13T19:23:27Z",
+        triggered_at: triggeredAt,
+        completed_at: completedAt,
         completion_kind: "exact_review_terminal",
         completion_comment_id: 790,
         completion_run_id: "9003",
         completion_run_attempt: 1,
       },
     ]);
-    assert.deepEqual(summarizeBayJourneyTimings(bay.journeys, "2026-07-13T19:30:00Z").overall, {
+    assert.deepEqual(summarizeBayJourneyTimings(bay.journeys, summarizedAt).overall, {
       average_ms: 4_820_000,
       samples: 1,
     });

@@ -13,8 +13,11 @@ test("failed-run self-heal budgets retries by immutable generation", () => {
   assert.match(source, /attemptCountsByGeneration\.get\(generation\)[\s\S]*maxAttemptsPerJob/);
   assert.match(source, /isMissingImmutableJobError\(error\)[\s\S]*"missing_job_file"/);
   assert.match(source, /const latestByGeneration = new Map/);
-  assert.match(source, /resolveRunRecordJob\(record, sourceJob\)/);
-  assert.match(source, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
+  assert.match(source, /resolveRunRecordJob\(record, sourceJob, recoveredInputs\)/);
+  assert.match(
+    source,
+    /activeJobGenerationKey\(candidate\.source_job, candidate\.source_job_sha256\)/,
+  );
   assert.match(source, /fetchWorkflowRunHistory/);
 });
 

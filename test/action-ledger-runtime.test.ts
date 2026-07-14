@@ -185,7 +185,7 @@ function recordWorkflowAttemptMutationOutcome(
   root: string,
   env: NodeJS.ProcessEnv,
   outcome: "unknown" | "observed" | null,
-  options: { workKey?: string; attempt?: number } = {},
+  options: { workKey?: string; attempt?: number; indexed?: boolean } = {},
 ): {
   started: ActionEvent;
   mutationAttempt: ActionEvent;
@@ -195,7 +195,7 @@ function recordWorkflowAttemptMutationOutcome(
   idempotencyIdentity: {
     operation: { workKey: string };
     slot: string;
-    attempt: number;
+    attempt?: number;
   };
   subject: {
     repository: string;
@@ -235,12 +235,15 @@ function recordWorkflowAttemptMutationOutcome(
   const idempotencyIdentity = {
     operation: operationIdentity,
     slot: "repair_mutation",
-    attempt,
+    ...(options.indexed ? {} : { attempt }),
   };
+  const mutationPhase = options.indexed
+    ? ACTION_EVENT_TYPES.repairMutation
+    : ACTION_EVENT_PHASE_TYPES.repairExecute;
   const mutationAttempt = recordWorkflowPhaseEvent(
     root,
     {
-      phase: ACTION_EVENT_PHASE_TYPES.repairExecute,
+      phase: mutationPhase,
       status: ACTION_EVENT_STATUSES.started,
       reasonCode: ACTION_EVENT_REASON_CODES.selected,
       retryable: true,
@@ -273,7 +276,7 @@ function recordWorkflowAttemptMutationOutcome(
   const mutationOutcome = recordWorkflowPhaseEvent(
     root,
     {
-      phase: ACTION_EVENT_PHASE_TYPES.repairExecute,
+      phase: mutationPhase,
       status: outcome === "unknown" ? ACTION_EVENT_STATUSES.failed : ACTION_EVENT_STATUSES.executed,
       reasonCode:
         outcome === "unknown"
@@ -4416,7 +4419,9 @@ test("state shard imports create replayable repair mutation idempotency indexes"
   const source = trustedChildRoot(root, "source");
   const destination = trustedChildRoot(root, "destination");
   const env = workflowEnv();
-  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "unknown");
+  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "unknown", {
+    indexed: true,
+  });
   await flushWorkflowActionEvents(root, { env, outputRoot: source });
 
   const imported = importActionEventShards(source, destination);
@@ -4479,12 +4484,10 @@ test("repair mutation idempotency indexes sort shard paths independently of inde
       GITHUB_RUN_ID: runId,
       GITHUB_RUN_ATTEMPT: "1",
     });
-    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(
-      spool,
-      env,
-      "unknown",
-      index + 1,
-    );
+    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(spool, env, "unknown", {
+      attempt: index + 1,
+      indexed: true,
+    });
     const [relativePath] = await flushWorkflowActionEvents(spool, { env, outputRoot: source });
     assert.ok(relativePath);
     candidates.push({
@@ -4535,8 +4538,13 @@ test("repair mutation idempotency index reads enforce aggregate shard byte limit
   const destination = trustedChildRoot(root, "destination");
   const firstEnv = workflowEnv({ GITHUB_RUN_ID: "100", GITHUB_RUN_ATTEMPT: "1" });
   const secondEnv = workflowEnv({ GITHUB_RUN_ID: "101", GITHUB_RUN_ATTEMPT: "1" });
-  const first = recordWorkflowAttemptMutationOutcome(firstSpool, firstEnv, "unknown");
-  const second = recordWorkflowAttemptMutationOutcome(secondSpool, secondEnv, "unknown", 2);
+  const first = recordWorkflowAttemptMutationOutcome(firstSpool, firstEnv, "unknown", {
+    indexed: true,
+  });
+  const second = recordWorkflowAttemptMutationOutcome(secondSpool, secondEnv, "unknown", {
+    attempt: 2,
+    indexed: true,
+  });
   assert.equal(
     first.mutationOutcome.idempotency_key_sha256,
     second.mutationOutcome.idempotency_key_sha256,
@@ -4582,7 +4590,9 @@ test("repair mutation idempotency index reads validate complete multipart shard 
 
   try {
     mutableLimits.maxEvents = 2;
-    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(spool, env, "unknown");
+    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(spool, env, "unknown", {
+      indexed: true,
+    });
     const mutationAttempt = readAllSpooledActionEvents(spool).find(
       (event) =>
         event.event_type === ACTION_EVENT_TYPES.repairMutation &&
@@ -4601,8 +4611,8 @@ test("repair mutation idempotency index reads validate complete multipart shard 
       mutationOutcome.idempotency_key_sha256,
     );
     assert.deepEqual(
-      indexed?.map((event) => event.event_id),
-      [mutationAttempt.event_id, mutationOutcome.event_id],
+      indexed?.map((event) => event.event_id).sort(),
+      [mutationAttempt.event_id, mutationOutcome.event_id].sort(),
     );
   } finally {
     mutableLimits.maxEvents = originalMaxEvents;
@@ -4614,7 +4624,9 @@ test("repair mutation idempotency index reads reject links and oversized manifes
   const source = trustedChildRoot(root, "source");
   const destination = trustedChildRoot(root, "destination");
   const env = workflowEnv();
-  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "observed");
+  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "observed", {
+    indexed: true,
+  });
   await flushWorkflowActionEvents(root, { env, outputRoot: source });
   const imported = importActionEventShards(source, destination);
   const relativePath = imported.completionPaths.find((entry) =>

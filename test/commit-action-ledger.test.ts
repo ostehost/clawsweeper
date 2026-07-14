@@ -775,7 +775,7 @@ test("commit check publisher owns every privileged check write and installs atte
 
   assert.match(review, /setup-action-ledger/);
   assert.doesNotMatch(review, /permission-checks: write|publish-check|create-state-token/);
-  assert.match(publisher, /Attest current-attempt commit review reports/);
+  assert.match(publisher, /Attest selected commit review reports/);
   assert.match(publisher, /attest-review/);
   assert.match(publisher, /commit-review-action-ledger-causality\.json/);
   assert.match(publisher, /CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=/);
