@@ -23,6 +23,14 @@ import { mockGhBinEnv } from "./helpers.ts";
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
 
+function trustedGhDefault(): string {
+  const candidates =
+    process.platform === "darwin"
+      ? ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+      : ["/usr/bin/gh", "/usr/local/bin/gh"];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
+}
+
 test("runText explains missing working directories", () => {
   const root = mkdtempSync(join(tmpdir(), "cmd-"));
   const missing = join(root, "missing");
@@ -70,7 +78,7 @@ test("runText uses trusted git default on POSIX when GIT_BIN is unset", () => {
 test("gh command resolution fails closed to an absolute path on POSIX", () => {
   if (process.platform === "win32") return;
   assert.deepEqual(resolveCommand("gh", ["api", "user"], { PATH: "" }), {
-    command: "/usr/bin/gh",
+    command: trustedGhDefault(),
     args: ["api", "user"],
   });
 });
@@ -84,9 +92,17 @@ test("git command resolution preserves overrides and Windows PATH lookup", () =>
     command: "git",
     args: ["status"],
   });
+  assert.throws(
+    () => resolveCommand("git", ["status"], { GIT_BIN: "relative-git" }, "linux"),
+    /GIT_BIN must be an absolute path/,
+  );
+  assert.throws(
+    () => resolveCommand("gh", ["api", "user"], { GH_BIN: "relative-gh.exe" }, "win32"),
+    /GH_BIN must be an absolute path/,
+  );
 });
 
-test("protected command resolution uses only executable absolute PATH entries on POSIX", () => {
+test("protected POSIX commands ignore even executable absolute PATH entries", () => {
   if (process.platform === "win32") return;
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-git-bin-"));
   const binDir = join(root, "bin");
@@ -94,15 +110,11 @@ test("protected command resolution uses only executable absolute PATH entries on
   try {
     mkdirSync(binDir);
     writeFileSync(gitPath, "#!/bin/sh\nexit 0\n");
-    chmodSync(gitPath, 0o755);
 
+    assert.equal(resolveCommand("git", ["status"], { PATH: binDir }).command, "/usr/bin/git");
     assert.equal(
-      resolveCommand("git", ["status"], { PATH: `relative-bin${delimiter}${binDir}` }).command,
-      gitPath,
-    );
-    assert.equal(
-      resolveCommand("gh", ["api", "user"], { PATH: `relative-bin${delimiter}${binDir}` }).command,
-      "/usr/bin/gh",
+      resolveCommand("gh", ["api", "user"], { PATH: binDir }).command,
+      trustedGhDefault(),
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -292,12 +304,14 @@ process.exit(1);
   }
 });
 
-test("local exact review labels Codex failures without a stack trace", () => {
+test("local exact review selects PATH Codex instead of the Desktop app binary", () => {
   const root = mkdtempSync(join(tmpdir(), "cmd-"));
   const origin = join(root, "origin.git");
   const targetDir = join(root, "target");
   const artifactDir = join(root, "artifacts");
   const binDir = join(root, "bin");
+  const localAppData = join(root, "local-app-data");
+  const codexMarker = join(root, "path-codex-ran.txt");
   try {
     execFileSync("git", ["init", "--bare", origin], { stdio: "ignore" });
     execFileSync("git", ["init", targetDir], { stdio: "ignore" });
@@ -376,9 +390,13 @@ process.exit(1);
     chmodSync(ghPath, 0o755);
 
     const codexPath = join(binDir, "codex");
+    const desktopCodexDir = join(localAppData, "OpenAI", "Codex", "bin");
+    mkdirSync(desktopCodexDir, { recursive: true });
+    writeFileSync(join(desktopCodexDir, "codex.exe"), "");
     writeFileSync(
       codexPath,
       `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(codexMarker)}, "path\\n");
 process.stdin.resume();
 process.stdin.on("end", () => process.exit(1));
 `,
@@ -402,7 +420,7 @@ process.stdin.on("end", () => process.exit(1));
         encoding: "utf8",
         env: {
           ...process.env,
-          CODEX_BIN: codexPath,
+          LOCALAPPDATA: localAppData,
           ...mockGhBinEnv(ghPath),
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         },
@@ -421,6 +439,7 @@ process.stdin.on("end", () => process.exit(1));
     assert.doesNotMatch(result.stderr, /Review complete/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
     assert.match(readFileSync(join(artifactDir, "96221.md"), "utf8"), /review_status: failed/);
+    assert.equal(readFileSync(codexMarker, "utf8"), "path\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

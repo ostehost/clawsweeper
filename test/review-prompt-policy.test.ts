@@ -343,15 +343,17 @@ test("review prompt uses token-light maturity shortlist helper", () => {
     { issue: {}, comments: [], timeline: [] },
     { mainSha: "abc123", latestRelease: null },
     "",
-    { proofScratchDir: "/tmp/proof" },
+    { proofScratchDir: "/tmp/principal-proof", proofInputDir: "/tmp/proof-input" },
   );
 
   assert.match(prompt, /maturity-stable-shortlist\.mjs/);
   assert.match(prompt, /compare the issue against the M4\+ shortlist/);
   assert.match(
     runtimePrompt,
-    /node "\$CLAWSWEEPER_PROOF_SCRATCH_DIR\/maturity-stable-shortlist\.mjs"/,
+    /node "\$CLAWSWEEPER_PROOF_INPUT_DIR\/maturity-stable-shortlist\.mjs"/,
   );
+  assert.match(runtimePrompt, /Download proof artifacts into `\/tmp\/principal-proof`/);
+  assert.match(runtimePrompt, /available at `\/tmp\/proof-input\/maturity-stable-shortlist\.mjs`/);
   assert.match(
     runtimePrompt,
     /read the full scorecard or taxonomy only if the shortlist is ambiguous/,

@@ -4,6 +4,11 @@ Read when: changing ClawSweeper PR repair automation, ClawSweeper review
 integration, comment routing, duplicate dispatch guards, or generated-PR
 marking.
 
+> **Current production boundary:** the worker can prepare and independently
+> validate an updated branch or replacement PR, but it retains that code as a
+> deferred bundle without target write credentials. The push/review loop below
+> documents the intended future behavior after a trusted publisher exists.
+
 ## Goal
 
 ClawSweeper-created PRs and maintainer-opted existing PRs should keep improving
@@ -22,10 +27,10 @@ The loop is intentionally small:
 3. The comment router sees trusted ClawSweeper feedback.
 4. ClawSweeper dispatches the existing or adopted job through
    `repair-cluster-worker.yml`.
-5. The repair worker pushes another commit to the source branch if it finds a
-   safe, narrow fix, or opens a credited replacement when the source branch
-   cannot be safely updated.
-6. ClawSweeper reviews the updated PR again.
+5. The repair worker prepares a safe, narrow source-branch fix or credited
+   replacement bundle and retains it as deferred evidence.
+6. A future trusted publisher can apply that bundle and trigger a new exact-head
+   review.
 
 For the full automerge state machine, including exact-head gating, pending
 check handling, shepherd waits, router waits, and operator replay, see

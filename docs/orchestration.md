@@ -8,11 +8,19 @@ ClawSweeper should stay simple at the orchestration boundary:
 
 1. Intake normalizes events and commands into a job or exact review request.
 2. The scheduler chooses priority and worker capacity.
-3. Codex owns review, repair, rebase, CI diagnosis, and narrow implementation.
-4. Deterministic code owns auth, repo boundaries, worker caps, exact-head merge
-   safety, and GitHub mutations.
+3. Codex owns review, local repair preparation, rebase, CI diagnosis, and narrow
+   implementation.
+4. Deterministic code owns auth, repo boundaries, worker caps, immutable bundle
+   validation, and allowed GitHub mutations.
 5. Comments, records, ledgers, and dashboards are generated status surfaces,
    not independent sources of truth.
+
+The current production boundary retains validated code as a deferred bundle: it
+does not push a branch, create or update a PR, or merge. `automerge` records
+authorization and readiness evidence, but strict base binding keeps live merge
+disabled. If a source head changes during preparation, the worker records
+`requeue_required` and stops; a trusted coordinator or operator must start the
+next attempt.
 
 ## Canonical Job Intent
 
@@ -23,8 +31,8 @@ commit-finding repair, manual repair jobs, and low-signal cleanup.
 Current intents:
 
 - `repair_cluster`: ordinary manually or scheduler-created repair work
-- `automerge_pr`: maintainer-approved PR repair/automerge loop
-- `implement_issue`: ClawSweeper-generated issue implementation PR lane
+- `automerge_pr`: maintainer-approved PR repair preparation and merge intent
+- `implement_issue`: issue implementation bundle preparation lane
 - `commit_finding`: repair job created from a ClawSweeper commit finding
 - `low_signal_pr_cleanup`: narrow stale/low-signal PR cleanup
 
@@ -63,10 +71,13 @@ Do not move these checks into model judgment:
 - maintainer/write authorization
 - target repository allow/deny boundaries
 - protected labels and maintainer-authored close guards
-- stale item drift and exact-head merge checks
+- stale item drift and exact-head or expected-base checks
 - worker-budget enforcement
-- final GitHub comments, labels, closes, pushes, and merges
+- final allowed GitHub comments, labels, and closes
+- future push, PR creation, and merge publication behind a separately trusted
+  publisher and atomic binding
 - no direct local edits to foreign PRs by a human operator
 
 Codex can decide what code needs to change; deterministic code decides whether
-the resulting mutation is allowed and applies it.
+the resulting bundle or no-publication mutation is allowed. The production
+target workflow defers prepared code instead of publishing it.

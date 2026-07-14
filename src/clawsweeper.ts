@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -645,6 +645,7 @@ interface ReviewCommentRenderOptions {
   previousLabels?: readonly string[];
   hasOpenLinkedPullRequest?: boolean;
   previousReviewCommentBody?: string;
+  suppressAutomationMarkers?: boolean;
 }
 
 interface Decision {
@@ -840,6 +841,7 @@ interface ReviewContextLedgerEntry {
 
 interface ReviewPromptRuntimeHints {
   proofScratchDir?: string;
+  proofInputDir?: string;
   mediaProofManifestPath?: string;
   mediaProofSummary?: string;
 }
@@ -1006,6 +1008,7 @@ interface PlanCandidateResult {
 }
 
 const DEFAULT_PLAN_BATCH_SIZE = 3;
+const MAX_PLAN_BATCH_SIZE = 3;
 const DEFAULT_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.normal_default;
 const MAX_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.hard_cap;
 
@@ -7884,6 +7887,24 @@ function planShardCount(shardCount: number): number {
   return Math.max(1, Math.min(MAX_PLAN_SHARD_COUNT, Math.floor(shardCount)));
 }
 
+function planBatchSize(batchSize: number): number {
+  if (!Number.isFinite(batchSize)) return 1;
+  return Math.max(1, Math.min(MAX_PLAN_BATCH_SIZE, Math.floor(batchSize)));
+}
+
+export function assertExplicitPlanCapacity(
+  itemNumbers: readonly number[],
+  batchSize: number,
+  shardCount: number,
+): void {
+  const capacity = planBatchSize(batchSize) * planShardCount(shardCount);
+  if (itemNumbers.length > capacity) {
+    throw new UserFacingCommandError(
+      `Requested ${itemNumbers.length} exact review items, which exceeds the bounded plan capacity of ${capacity}. Split the request into smaller batches.`,
+    );
+  }
+}
+
 export function shardItemNumbers(itemNumbers: readonly number[], shardCount: number): PlanShard[] {
   const count = Math.max(1, Math.min(planShardCount(shardCount), itemNumbers.length || 1));
   const shards = Array.from({ length: count }, (_, shard) => ({
@@ -7951,7 +7972,7 @@ function planCandidates(options: {
   minimumBackfillReviewAgeMs?: number;
 }): PlanCandidateResult {
   const shardCount = planShardCount(options.shardCount);
-  const batchSize = Math.max(1, options.batchSize);
+  const batchSize = planBatchSize(options.batchSize);
   const capacity = batchSize * shardCount;
   const activeFloor =
     options.hotIntake || options.itemNumber || options.itemNumbers
@@ -7959,6 +7980,7 @@ function planCandidates(options: {
       : Math.max(0, Math.min(capacity, Math.floor(options.minimumActiveShards ?? 0)));
   const minimumBackfillReviewAgeMs = Math.max(0, options.minimumBackfillReviewAgeMs ?? 0);
   if (options.itemNumbers) {
+    assertExplicitPlanCapacity(options.itemNumbers, batchSize, shardCount);
     const candidates = openExplicitItems(options.itemNumbers);
     const shards = shardItemNumbers(
       candidates.map((item) => item.number),
@@ -8930,8 +8952,9 @@ function mediaProofRuntimePrompt(summary: string | undefined, manifestPath: stri
 function mediaProofRuntimeHints(
   proofScratchDir: string,
   preparedMediaProof: PreparedMediaProof,
+  proofInputDir = proofScratchDir,
 ): ReviewPromptRuntimeHints {
-  const hints: ReviewPromptRuntimeHints = { proofScratchDir };
+  const hints: ReviewPromptRuntimeHints = { proofScratchDir, proofInputDir };
   if (preparedMediaProof.manifestPath)
     hints.mediaProofManifestPath = preparedMediaProof.manifestPath;
   if (preparedMediaProof.summaryPath && preparedMediaProof.artifacts.length) {
@@ -8963,8 +8986,9 @@ function buildReviewPrompt(
   const contextJson = contextJsonForPrompt(context);
   const schema = reviewDecisionSchemaText();
   const proofScratchDir = runtimeHints.proofScratchDir?.trim();
-  const maturityHelperPath = proofScratchDir
-    ? `\`${proofScratchDir}/maturity-stable-shortlist.mjs\``
+  const proofInputDir = runtimeHints.proofInputDir?.trim() || proofScratchDir;
+  const maturityHelperPath = proofInputDir
+    ? `\`${proofInputDir}/maturity-stable-shortlist.mjs\``
     : "the scratch directory as `maturity-stable-shortlist.mjs`";
   const mediaProofPrompt = mediaProofRuntimePrompt(
     runtimeHints.mediaProofSummary,
@@ -9000,7 +9024,7 @@ ${additionalPrompt.trim()}
 - You may use the available network and read-only GitHub token to inspect PR body links, comments, screenshots, videos, logs, terminal output, and target-repo artifacts.
 - Download proof artifacts into ${proofScratchDir ? `\`${proofScratchDir}\`` : "a temporary scratch directory"} before inspecting them.
 - The target checkout is read-only for review. Do not modify repository files; use the scratch directory or /tmp for downloaded evidence and generated video stills/contact sheets.
-- A token-light maturity helper is available at ${maturityHelperPath}. For issue maturity labels, first run \`node "$CLAWSWEEPER_PROOF_SCRATCH_DIR/maturity-stable-shortlist.mjs"\` from the target checkout and compare the issue against that shortlist; read the full scorecard or taxonomy only if the shortlist is ambiguous.
+- A token-light maturity helper is available at ${maturityHelperPath}. For issue maturity labels, first run \`node "$CLAWSWEEPER_PROOF_INPUT_DIR/maturity-stable-shortlist.mjs"\` from the target checkout and compare the issue against that shortlist; read the full scorecard or taxonomy only if the shortlist is ambiguous.
 ${mediaProofPrompt}
 
 ## GitHub Context
@@ -9423,7 +9447,6 @@ export function runCodex(options: {
   serviceTier: string;
   forcedLoginMethod?: string;
   preserveCodexAuth?: boolean;
-  preferWindowsAppBinary?: boolean;
   timeoutMs: number;
   workDir: string;
   additionalPrompt?: string;
@@ -9436,6 +9459,10 @@ export function runCodex(options: {
   const proofScratchDir =
     options.proofScratchDir ?? join(options.workDir, "proof-scratch", String(options.item.number));
   ensureDir(proofScratchDir);
+  const writableProofScratchDir = codexWritableProofScratchDir(
+    proofScratchDir,
+    options.item.number,
+  );
   prepareMaturityStableShortlistScript(proofScratchDir, options.openclawDir);
   const preparedMediaProof = options.prompt
     ? { manifestPath: null, summaryPath: null, artifacts: [] }
@@ -9449,7 +9476,7 @@ export function runCodex(options: {
       options.context,
       options.git,
       options.additionalPrompt,
-      mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
+      mediaProofRuntimeHints(writableProofScratchDir, preparedMediaProof, proofScratchDir),
     ).text;
   writeFileSync(promptPath, prompt, "utf8");
   const dirtyBefore = openclawDirtyStatus(options.openclawDir);
@@ -9499,6 +9526,9 @@ export function runCodex(options: {
           options.sandboxMode,
           "--add-dir",
           proofScratchDir,
+          ...(writableProofScratchDir === proofScratchDir
+            ? []
+            : ["--add-dir", writableProofScratchDir]),
           "-",
         ],
         cwd: options.openclawDir,
@@ -9507,8 +9537,8 @@ export function runCodex(options: {
             ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN,
             preserveCodexAuth: options.preserveCodexAuth,
           }),
-          CLAWSWEEPER_PROOF_SCRATCH_DIR: proofScratchDir,
-          ...(options.preferWindowsAppBinary ? { CLAWSWEEPER_PREFER_WINDOWS_CODEX_APP: "1" } : {}),
+          CLAWSWEEPER_PROOF_INPUT_DIR: proofScratchDir,
+          CLAWSWEEPER_PROOF_SCRATCH_DIR: writableProofScratchDir,
         },
         input: prompt,
         stderrPath: join(options.workDir, `${options.item.number}.${attempt}.codex.stderr.log`),
@@ -9622,6 +9652,15 @@ export function runCodex(options: {
       throw combinedCodexReviewError(error, retryError, options.reasoningEffort);
     }
   }
+}
+
+function codexWritableProofScratchDir(fallback: string, itemNumber: number): string {
+  const configured = process.env.CLAWSWEEPER_CODEX_PRINCIPAL_PROOF_SCRATCH_DIR?.trim();
+  if (!configured) return fallback;
+  if (!isAbsolute(configured)) {
+    throw new Error("CLAWSWEEPER_CODEX_PRINCIPAL_PROOF_SCRATCH_DIR must be absolute");
+  }
+  return join(configured, String(itemNumber));
 }
 
 function stripTextFence(markdown: string): string {
@@ -17807,7 +17846,9 @@ export function renderReviewCommentFromReport(
     (!requiresMaintainerDecision || reason === "unsponsored_feature_request")
       ? renderCloseCommentFromReport(markdown, reason)
       : renderKeepOpenCommentFromReport(markdown, options);
-  const markers = reviewAutomationMarkersFromReport(markdown);
+  const markers = options.suppressAutomationMarkers
+    ? ""
+    : reviewAutomationMarkersFromReport(markdown);
   return [body.trimEnd(), markers, reviewVersionMarkerFromReport(markdown)]
     .filter(Boolean)
     .join("\n\n");
@@ -20402,6 +20443,7 @@ function planCommand(args: Args): void {
   if (hasItemNumbersInput || itemNumbers.length > 0) planOptions.itemNumbers = itemNumbers;
   if (hotIntake) planOptions.hotIntake = true;
   const plan = planCandidates(planOptions);
+  const plannedItemKinds = new Map(plan.candidates.map((item) => [item.number, item.kind]));
   console.log(
     JSON.stringify(
       {
@@ -20410,6 +20452,9 @@ function planCommand(args: Args): void {
         matrix: plan.shards.map((shard) => ({
           shard: shard.shard,
           item_numbers: shard.itemNumbers.join(",") || "none",
+          item_kinds: Object.fromEntries(
+            shard.itemNumbers.map((number) => [number, plannedItemKinds.get(number) ?? "issue"]),
+          ),
         })),
       },
       null,
@@ -21283,7 +21328,7 @@ function finishReviewActionLedger(options: {
 function reviewCommand(args: Args): void {
   const profile = repoFromArgs(args);
   // `--local-range` is inherently a local, offline operation, so it implies `--local-only`
-  // (no GitHub writes, and the local Codex auth / Windows-launcher path in runCodex below).
+  // (no GitHub writes, and the local Codex auth path in runCodex below).
   const localRange = boolArg(args.local_range);
   const localOnly = boolArg(args.local_only) || localRange;
   const verbose = boolArg(args.verbose);
@@ -22300,6 +22345,7 @@ function reviewCommand(args: Args): void {
       }
       const codexWorkDir = join(artifactDir, "codex");
       const proofScratchDir = join(codexWorkDir, "proof-scratch", String(item.number));
+      const writableProofScratchDir = codexWritableProofScratchDir(proofScratchDir, item.number);
       // --local-range is a pre-PR LOCAL code review — it has no telegram-visible-proof to
       // capture, and prepareMediaProofArtifacts would host-side `curl` + `ffmpeg` any media URL
       // in the synthetic body (commit message / --body-file). Skip it entirely for local-range:
@@ -22312,7 +22358,7 @@ function reviewCommand(args: Args): void {
         context,
         git,
         additionalPrompt,
-        mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
+        mediaProofRuntimeHints(writableProofScratchDir, preparedMediaProof, proofScratchDir),
       );
       const snapshotHash = itemSnapshotHash(item, context);
       let decision: Decision;
@@ -22345,7 +22391,6 @@ function reviewCommand(args: Args): void {
           serviceTier,
           forcedLoginMethod,
           preserveCodexAuth: localOnly,
-          preferWindowsAppBinary: localOnly,
           timeoutMs,
           workDir: codexWorkDir,
           additionalPrompt,
@@ -23586,6 +23631,10 @@ function reviewRetryIdempotencySlot(
     : "retry_observation";
 }
 
+export function reviewRetryActionNeedsItemEventForTest(action: FailedReviewRetryAction): boolean {
+  return action !== "skipped_not_failed_review";
+}
+
 export function reviewRetryBatchEventDisposition(
   actions: readonly FailedReviewRetryAction[],
   failure: ReturnType<typeof actionLedgerFailureDisposition> | null = null,
@@ -23665,6 +23714,9 @@ function recordFailedReviewRetryEvents(options: {
   const operationIdentity = options.ledger.operationIdentity;
   let dispatchOutcomeUnknownEventId: string | null = null;
   for (const [index, result] of options.results.entries()) {
+    // Healthy records dominate the hourly scan. Keep their count in the batch
+    // terminal event instead of creating thousands of immutable no-op receipts.
+    if (!reviewRetryActionNeedsItemEventForTest(result.action)) continue;
     const disposition = reviewRetryActionDisposition(result.action);
     const reportMarkdown =
       result.reportPath && existsSync(result.reportPath)
@@ -24871,6 +24923,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     args.require_precomputed_pr_close_coverage_proof,
   );
   const syncCommentsOnly = boolArg(args.sync_comments_only);
+  const suppressAutomationMarkers = boolArg(args.suppress_automation_markers);
   const emitEventApplyProof = boolArg(args.event_apply_proof);
   const commentSyncMinAgeDays = numberArg(args.comment_sync_min_age_days, 0);
   const maxRuntimeMs = numberArg(args.max_runtime_ms, 0);
@@ -25100,7 +25153,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     return;
   }
   logProgress(
-    `starting apply: files=${files.length} dry_run=${dryRun} apply_kind=${applyKind} min_age=${minAgeDescription} apply_close_reasons=${closeReasonFilterText(applyCloseReasons)} stale_min_age_days=${staleMinAgeDays} close_delay_ms=${closeDelayMs} sync_comments_only=${syncCommentsOnly} comment_sync_min_age_days=${commentSyncMinAgeDays} max_runtime_ms=${maxRuntimeMs} item_numbers=${requestedItemNumbers.join(",") || "all"}`,
+    `starting apply: files=${files.length} dry_run=${dryRun} apply_kind=${applyKind} min_age=${minAgeDescription} apply_close_reasons=${closeReasonFilterText(applyCloseReasons)} stale_min_age_days=${staleMinAgeDays} close_delay_ms=${closeDelayMs} sync_comments_only=${syncCommentsOnly} suppress_automation_markers=${suppressAutomationMarkers} comment_sync_min_age_days=${commentSyncMinAgeDays} max_runtime_ms=${maxRuntimeMs} item_numbers=${requestedItemNumbers.join(",") || "all"}`,
   );
   // oxfmt-ignore
   for (const entry of fileEntries) {
@@ -26240,7 +26293,10 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       }
     }
     existingReviewComment ??= issueReviewComment(number, [
-      renderReviewCommentFromReport(markdown, closeReason ?? "none", { previousLabels }),
+      renderReviewCommentFromReport(markdown, closeReason ?? "none", {
+        previousLabels,
+        suppressAutomationMarkers,
+      }),
       reviewSectionValue(markdown, "closeComment"),
     ]);
     const markedReviewCommentForApply = (body: string): string =>
@@ -26478,6 +26534,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     const renderOptions: ReviewCommentRenderOptions = {
       prStatusKind: currentPrStatusKind,
       previousLabels,
+      suppressAutomationMarkers,
     };
     if (item.kind === "issue" && currentClosingPullRequests) {
       renderOptions.hasOpenLinkedPullRequest =

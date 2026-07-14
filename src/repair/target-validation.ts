@@ -42,6 +42,10 @@ const DEFAULT_TARGET_VALIDATION_TIMEOUT_MS = 12 * 60 * 1000;
 const DEFAULT_TARGET_PNPM = "pnpm@10.33.0";
 const MAX_BOUND_HOOK_ENTRIES = 256;
 const MAX_BOUND_HOOK_BYTES = 2 * 1024 * 1024;
+const MAX_TARGET_IDENTITY_ENTRIES = 100_000;
+const MAX_TARGET_IDENTITY_BYTES = 1024 * 1024 * 1024;
+const MAX_TARGET_IDENTITY_FILE_BYTES = 256 * 1024 * 1024;
+const TARGET_IDENTITY_DEADLINE_MS = 60_000;
 const PNPM_PACKAGE_MANAGER_PATTERN =
   /^pnpm@(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+sha(1|224|256|384|512)\.([a-f0-9]+))?$/;
 
@@ -794,23 +798,27 @@ function assertRawTargetCheckoutClean(cwd: string, activeRoots = new Set<string>
       transformedEntries,
     });
 
-    const untracked = runTargetIdentityGit(root, [
-      "ls-files",
-      "--others",
-      "--exclude-per-directory=.gitignore",
-      "--exclude=!.gitignore",
-      "--exclude=!**/.gitignore",
-      "-z",
-    ])
-      .split("\0")
-      .filter(Boolean);
-    if (untracked.length > 0) {
-      throw new Error(
-        `target validation receipt requires no untracked source files: ${untracked[0]}`,
-      );
-    }
+    assertNoUntrackedTargetSource(root);
   } finally {
     activeRoots.delete(root);
+  }
+}
+
+function assertNoUntrackedTargetSource(cwd: string): void {
+  const untracked = runTargetIdentityGit(cwd, [
+    "ls-files",
+    "--others",
+    "--exclude-per-directory=.gitignore",
+    "--exclude=!.gitignore",
+    "--exclude=!**/.gitignore",
+    "-z",
+  ])
+    .split("\0")
+    .filter(Boolean);
+  if (untracked.length > 0) {
+    throw new Error(
+      `target validation receipt requires no untracked source files: ${untracked[0]}`,
+    );
   }
 }
 
@@ -1161,6 +1169,9 @@ export function captureTargetValidationReceipt(cwd: string): TargetValidationRec
   assertSafeTargetReceiptConfig(cwd, gitPaths);
   assertNoActiveGitObjectReplacement(cwd);
   assertNoActiveTargetGitOperation(cwd, gitPaths);
+  // Reject by path before hashing worktree contents. The full raw-clean proof
+  // below remains authoritative and closes the race after identity capture.
+  assertNoUntrackedTargetSource(cwd);
   const sourceIdentity = targetSourceIdentity(cwd);
   assertRawTargetCheckoutClean(cwd);
   const headTreeSha = runTargetIdentityGit(cwd, [
@@ -1199,7 +1210,21 @@ export function assertTargetValidationReceipt(cwd: string, receipt: TargetValida
   }
 }
 
-function targetWorktreeSha256(cwd: string, activeRoots = new Set<string>()) {
+type TargetIdentityBudget = {
+  bytes: number;
+  deadline: number;
+  entries: number;
+};
+
+function targetWorktreeSha256(
+  cwd: string,
+  activeRoots = new Set<string>(),
+  budget: TargetIdentityBudget = {
+    bytes: 0,
+    deadline: Date.now() + TARGET_IDENTITY_DEADLINE_MS,
+    entries: 0,
+  },
+) {
   const root = fs.realpathSync(cwd);
   if (activeRoots.has(root)) throw new Error(`target gitlink cycle detected at ${root}`);
   activeRoots.add(root);
@@ -1215,6 +1240,7 @@ function targetWorktreeSha256(cwd: string, activeRoots = new Set<string>()) {
       .split("\0")
       .filter(Boolean);
     for (const entry of entries) {
+      consumeTargetIdentityEntry(budget);
       const match = entry.match(/^([0-7]{6}) ([a-f0-9]{40,64}) ([0-3])\t([\s\S]+)$/);
       if (!match || match[3] !== "0") {
         throw new Error("target dependency setup requires an unambiguous tracked index");
@@ -1228,7 +1254,7 @@ function targetWorktreeSha256(cwd: string, activeRoots = new Set<string>()) {
       updateTargetSourceDigest(digest, "mode", mode!);
       updateTargetSourceDigest(digest, "index", indexObject!);
       if (mode === "160000") {
-        updateTargetGitlinkDigest(digest, root, absolutePath, relativePath!, activeRoots);
+        updateTargetGitlinkDigest(digest, root, absolutePath, relativePath!, activeRoots, budget);
         continue;
       }
       try {
@@ -1255,13 +1281,15 @@ function targetWorktreeSha256(cwd: string, activeRoots = new Set<string>()) {
               targetPath,
               `${relativePath!}\0target`,
               new Set(),
+              "tracked",
+              budget,
             );
           } else {
             updateTargetSourceDigest(digest, "symlink-target", "<absent>");
           }
         } else if (stat.isFile()) {
           updateTargetSourceDigest(digest, "working-tree-mode", stat.mode.toString(8));
-          updateTargetFileDigest(digest, "file", absolutePath);
+          updateTargetFileDigest(digest, "file", absolutePath, budget);
         } else {
           updateTargetSourceDigest(digest, "working-tree", "<non-file>");
         }
@@ -1270,7 +1298,7 @@ function targetWorktreeSha256(cwd: string, activeRoots = new Set<string>()) {
         updateTargetSourceDigest(digest, "working-tree", "<absent>");
       }
     }
-    updateUntrackedTargetWorktreeDigest(digest, cwd, root);
+    updateUntrackedTargetWorktreeDigest(digest, cwd, root, budget);
     return digest.digest("hex");
   } finally {
     activeRoots.delete(root);
@@ -1283,6 +1311,7 @@ function updateTargetGitlinkDigest(
   gitlinkPath: string,
   relativePath: string,
   activeRoots: Set<string>,
+  budget: TargetIdentityBudget,
 ) {
   const state = targetGitlinkFilesystemState(root, gitlinkPath, relativePath);
   if (state.kind === "absent") {
@@ -1307,6 +1336,8 @@ function updateTargetGitlinkDigest(
       gitlinkRoot,
       `${relativePath}\0uninitialized`,
       new Set(),
+      "tracked",
+      budget,
     );
     return;
   }
@@ -1332,7 +1363,7 @@ function updateTargetGitlinkDigest(
   updateTargetSourceDigest(
     digest,
     "gitlink-worktree",
-    targetWorktreeSha256(gitlinkRoot, activeRoots),
+    targetWorktreeSha256(gitlinkRoot, activeRoots, budget),
   );
 }
 
@@ -1340,6 +1371,7 @@ function updateUntrackedTargetWorktreeDigest(
   digest: ReturnType<typeof createHash>,
   cwd: string,
   root: string,
+  budget: TargetIdentityBudget,
 ) {
   const paths = runTargetIdentityGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
     .split("\0")
@@ -1347,6 +1379,7 @@ function updateUntrackedTargetWorktreeDigest(
     .sort();
   updateTargetSourceDigest(digest, "untracked-count", String(paths.length));
   for (const relativePath of paths) {
+    consumeTargetIdentityEntry(budget);
     const absolutePath = path.resolve(root, ...relativePath.split("/"));
     if (!isTargetPathWithin(root, absolutePath)) {
       throw new Error(`untracked target input escapes checkout: ${relativePath}`);
@@ -1381,13 +1414,14 @@ function updateUntrackedTargetWorktreeDigest(
         `${relativePath}\0target`,
         new Set(),
         "untracked",
+        budget,
       );
       continue;
     }
     if (!stat.isFile()) {
       throw new Error(`untracked target input has unsupported type: ${relativePath}`);
     }
-    updateTargetFileDigest(digest, "untracked-bytes", absolutePath);
+    updateTargetFileDigest(digest, "untracked-bytes", absolutePath, budget);
   }
 }
 
@@ -1421,7 +1455,9 @@ function updateTargetFilesystemDigest(
   logicalPath: string,
   activeDirectories: Set<string>,
   inputKind: "tracked" | "untracked" = "tracked",
+  budget?: TargetIdentityBudget,
 ) {
+  if (budget) consumeTargetIdentityEntry(budget);
   const stat = fs.lstatSync(entryPath);
   updateTargetSourceDigest(digest, "entry", logicalPath);
   updateTargetSourceDigest(digest, "entry-mode", stat.mode.toString(8));
@@ -1440,11 +1476,12 @@ function updateTargetFilesystemDigest(
       `${logicalPath}\0target`,
       activeDirectories,
       inputKind,
+      budget,
     );
     return;
   }
   if (stat.isFile()) {
-    updateTargetFileDigest(digest, "entry-bytes", entryPath);
+    updateTargetFileDigest(digest, "entry-bytes", entryPath, budget);
     return;
   }
   if (!stat.isDirectory()) {
@@ -1456,7 +1493,7 @@ function updateTargetFilesystemDigest(
   }
   activeDirectories.add(realDirectory);
   try {
-    const children = fs.readdirSync(entryPath).sort();
+    const children = boundedTargetIdentityChildren(entryPath, budget);
     updateTargetSourceDigest(digest, "entry-children", children.join("\0"));
     for (const child of children) {
       updateTargetFilesystemDigest(
@@ -1466,6 +1503,7 @@ function updateTargetFilesystemDigest(
         `${logicalPath}/${child}`,
         activeDirectories,
         inputKind,
+        budget,
       );
     }
   } finally {
@@ -1473,15 +1511,86 @@ function updateTargetFilesystemDigest(
   }
 }
 
+function boundedTargetIdentityChildren(entryPath: string, budget?: TargetIdentityBudget): string[] {
+  if (!budget) return fs.readdirSync(entryPath).sort();
+  const directory = fs.opendirSync(entryPath);
+  const children: string[] = [];
+  try {
+    while (true) {
+      assertTargetIdentityDeadline(budget);
+      const entry = directory.readSync();
+      if (!entry) break;
+      if (budget.entries + children.length + 1 > MAX_TARGET_IDENTITY_ENTRIES) {
+        throw new Error("target worktree identity exceeds the entry budget");
+      }
+      children.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return children.sort();
+}
+
 function updateTargetFileDigest(
   digest: ReturnType<typeof createHash>,
   label: string,
   filePath: string,
+  budget?: TargetIdentityBudget,
 ) {
-  const bytes = fs.readFileSync(filePath);
-  digest.update(`${label}:${bytes.length}:`);
-  digest.update(bytes);
-  digest.update("\0");
+  if (!budget) {
+    const bytes = fs.readFileSync(filePath);
+    digest.update(`${label}:${bytes.length}:`);
+    digest.update(bytes);
+    digest.update("\0");
+    return;
+  }
+  assertTargetIdentityDeadline(budget);
+  const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const metadata = fs.fstatSync(descriptor);
+    if (!metadata.isFile())
+      throw new Error(`target identity path is not a regular file: ${filePath}`);
+    if (metadata.size > MAX_TARGET_IDENTITY_FILE_BYTES) {
+      throw new Error("target worktree identity exceeds the per-file byte budget");
+    }
+    budget.bytes += metadata.size;
+    if (budget.bytes > MAX_TARGET_IDENTITY_BYTES) {
+      throw new Error("target worktree identity exceeds the aggregate byte budget");
+    }
+    digest.update(`${label}:${metadata.size}:`);
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, metadata.size)));
+    let position = 0;
+    while (position < metadata.size) {
+      assertTargetIdentityDeadline(budget);
+      const bytesRead = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        Math.min(buffer.length, metadata.size - position),
+        position,
+      );
+      if (bytesRead <= 0) throw new Error(`short read while hashing target identity: ${filePath}`);
+      digest.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    digest.update("\0");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function consumeTargetIdentityEntry(budget: TargetIdentityBudget) {
+  assertTargetIdentityDeadline(budget);
+  budget.entries += 1;
+  if (budget.entries > MAX_TARGET_IDENTITY_ENTRIES) {
+    throw new Error("target worktree identity exceeds the entry budget");
+  }
+}
+
+function assertTargetIdentityDeadline(budget: TargetIdentityBudget) {
+  if (Date.now() > budget.deadline) {
+    throw new Error("target worktree identity exceeded its time budget");
+  }
 }
 
 function assertNoHiddenTrackedIndexFlags(cwd: string) {

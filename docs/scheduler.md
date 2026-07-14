@@ -138,24 +138,38 @@ single-item review only needs the target repository and live GitHub item state;
 generated state is checked out afterward, just before publishing the review
 record, safe close result, and command-router ledger.
 
-## Automerge Fast Path
+## Automerge Preparation and Intended Publication Path
 
 Automerge is an exact-item event path. A maintainer command dispatches one
-review for the current PR head. If review requests a repair, the adopted repair
-worker may push a branch fix; after a successful contributor-branch repair it
-immediately dispatches another exact-head review and then shepherds the repaired
-head for a bounded window instead of exiting immediately. That keeps the normal
-path to:
+review for the current PR head. If review requests a repair, the adopted worker
+prepares and independently validates a branch-fix bundle. The production
+publisher retains that bundle as deferred evidence without a target write token;
+it does not push, open a replacement PR, or merge. `automerge` records merge
+authorization and readiness evidence, but strict base binding keeps live merge
+disabled.
+
+If the source head changes during preparation, the worker records
+`requeue_required` and stops without mutation. A trusted coordinator or operator
+must start the next attempt against the new head; the worker does not
+self-dispatch.
+
+After a separately trusted publisher exists, the intended publication path is:
 
 1. command acknowledgement;
 2. exact-head review;
-3. optional branch repair;
+3. publish the validated branch repair;
 4. immediate exact-head re-review;
-5. merge after checks, review verdict, and policy gates pass.
+5. merge after checks, review verdict, policy gates, and atomic bindings pass.
 
 The complete state machine is documented in
 [`docs/repair/automerge-flow.md`](repair/automerge-flow.md). Keep this section
 as the scheduler-facing summary.
+
+### Intended Future Push and Merge Behavior
+
+The remaining push, shepherd, re-review, and merge behavior in this section is
+the intended state machine for that future trusted publisher. It is not reached
+by the current production target workflow.
 
 The automerge status comment is the live progress surface. It is edited in
 place and records review, repair, re-review, and merge events with durations,

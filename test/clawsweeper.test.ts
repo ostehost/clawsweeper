@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   applyDecisionPriority,
+  assertExplicitPlanCapacity,
   auditFromSnapshot,
   auditHasStrictFailures,
   auditHealthSection,
@@ -120,6 +121,24 @@ test("close proposals that require maintainer decisions render as kept open", ()
   assert.doesNotMatch(comment, /Closing this PR/);
   assert.doesNotMatch(comment, /clawsweeper-verdict:close/);
   assert.doesNotMatch(comment, /clawsweeper-action:close-required/);
+});
+
+test("review-only comments omit actionable automation markers", () => {
+  const report = implementedCloseReport({
+    repository: "openclaw/openclaw",
+    type: "pull_request",
+    pull_head_sha: "abc123def456",
+  });
+  const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
+  const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {
+    suppressAutomationMarkers: true,
+  });
+
+  assert.match(routableComment, /clawsweeper-(?:verdict|action):/);
+  assert.match(comment, /Review details/);
+  assert.match(comment, /clawsweeper-review-version/);
+  assert.doesNotMatch(comment, /clawsweeper-verdict:/);
+  assert.doesNotMatch(comment, /clawsweeper-action:/);
 });
 
 test("apply-decisions archives live-closed skipped records without reopening close gates", () => {
@@ -1238,6 +1257,26 @@ test("explicit item numbers shard targeted review runs", () => {
   assert.deepEqual(shardItemNumbers([], 50), [{ shard: 0, itemNumbers: [] }]);
 });
 
+test("explicit review plans reject requests beyond bounded recovery capacity", () => {
+  const maximum = AUTOMATION_LIMITS.review_shards.hard_cap * 3;
+  assert.doesNotThrow(() =>
+    assertExplicitPlanCapacity(
+      Array.from({ length: maximum }, (_, index) => index + 1),
+      9999,
+      9999,
+    ),
+  );
+  assert.throws(
+    () =>
+      assertExplicitPlanCapacity(
+        Array.from({ length: maximum + 1 }, (_, index) => index + 1),
+        9999,
+        9999,
+      ),
+    new RegExp(`exceeds the bounded plan capacity of ${maximum}`),
+  );
+});
+
 test("planned review shards stay within the Codex worker cap", () => {
   const itemNumbers = Array.from({ length: 300 }, (_, index) => index + 1);
   const shards = shardItemNumbers(itemNumbers, 400);
@@ -2098,8 +2137,8 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
   assert.equal(workflow.match(/uses: \.\/\.github\/actions\/setup-state/g)?.length, 2);
-  assert.match(workflow, /sparse-checkout: jobs/);
-  assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
+  assert.equal(workflow.match(/sparse-checkout: jobs/g)?.length, 2);
+  assert.doesNotMatch(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
   assert.match(
     workflow,
     /cluster:[\s\S]*?producer_attempt: \$\{\{ steps\.producer_attempt\.outputs\.value \}\}/,
@@ -2122,22 +2161,16 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   );
   assert.doesNotMatch(workerArtifactDownload, /github\.run_attempt/);
   assert.match(workflow, /CLAWSWEEPER_STEERABLE_CODEX/);
-  assert.match(workflow, /actions\/cache\/restore@v6/);
-  assert.match(workflow, /actions\/cache\/save@v6/);
+  assert.doesNotMatch(workflow, /actions\/cache\/restore@v6/);
+  assert.doesNotMatch(workflow, /actions\/cache\/save@v6/);
   assert.match(workflow, /repair:action-session -- register/);
   assert.match(workflow, /completion-reason gates_passed/);
   assert.match(workflow, /post_flight_report=.*post-flight-report\.json/);
   assert.match(workflow, /\.action == "finalize_fix_pr"/);
   assert.match(workflow, /\.status == "ready"/);
-  assert.match(
-    workflow,
-    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
-  );
-  assert.match(
-    workflow,
-    /if: \$\{\{ always\(\) && failure\(\) && steps\.crabfleet_session\.outcome == 'success' && \(steps\.repair_requeue\.outputs\.count == '' \|\| steps\.repair_requeue\.outputs\.count == '0' \|\| steps\.requeue_dispatch\.outcome != 'success'\) \}\}/,
-  );
-  assert.equal(workflow.match(/id: crabfleet_session/g)?.length, 2);
+  assert.doesNotMatch(workflow, /id: requeue_dispatch/);
+  assert.doesNotMatch(workflow, /repair-requeue-ledger/);
+  assert.equal(workflow.match(/id: crabfleet_session/g)?.length, 3);
   assert.equal(workflow.match(/steps\.crabfleet_session\.outcome == 'success'/g)?.length, 6);
   assert.doesNotMatch(workflow, /if: \$\{\{[^\n]*env\.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN/);
 });
@@ -2168,14 +2201,12 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   const claimIndex = eventReviewBlock.indexOf("- name: Claim exact-review queue lease");
   const setupPnpmIndex = eventReviewBlock.indexOf("- uses: ./.github/actions/setup-pnpm");
-  const inProgressStatusIndex = eventReviewBlock.indexOf(
-    "- name: Mark re-review command in progress",
-  );
   const setupCodexIndex = eventReviewBlock.indexOf("- uses: ./.github/actions/setup-codex");
   const exactReviewIndex = eventReviewBlock.indexOf("- name: Review exact event item");
   const primaryResultIndex = eventReviewBlock.indexOf("- name: Export exact review primary result");
   const failReviewIndex = eventReviewBlock.indexOf("- name: Fail unsuccessful exact review");
   const completeLeaseIndex = eventReviewBlock.indexOf("- name: Complete exact-review queue lease");
+  const publishLedgerIndex = eventReviewBlock.indexOf("- name: Publish exact event action ledger");
   const claimStep = eventReviewBlock.slice(
     claimIndex,
     eventReviewBlock.indexOf("\n      - ", claimIndex + 1),
@@ -2184,7 +2215,8 @@ test("sweep workflow executes only durable queue leases without runner-side admi
     completeLeaseIndex,
     eventReviewBlock.indexOf("\n      - ", completeLeaseIndex + 1),
   );
-  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, failReviewIndex);
+  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, completeLeaseIndex);
+  const failReviewStep = eventReviewBlock.slice(failReviewIndex, publishLedgerIndex);
   const exactReviewStep = eventReviewBlock.slice(
     exactReviewIndex,
     eventReviewBlock.indexOf("- name: Create state token", exactReviewIndex),
@@ -2205,13 +2237,13 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(eventReviewBlock, /cancel-in-progress: false/);
   assert.ok(claimIndex >= 0);
   assert.ok(setupPnpmIndex > claimIndex);
-  assert.ok(inProgressStatusIndex > setupPnpmIndex);
-  assert.ok(setupCodexIndex > inProgressStatusIndex);
+  assert.ok(setupCodexIndex > setupPnpmIndex);
   assert.ok(exactReviewIndex > setupCodexIndex);
   assert.ok(primaryResultIndex > exactReviewIndex);
   assert.equal(eventReviewBlock.match(/- name: Fail unsuccessful exact review/g)?.length, 1);
-  assert.ok(failReviewIndex > primaryResultIndex);
-  assert.ok(completeLeaseIndex > failReviewIndex);
+  assert.ok(completeLeaseIndex > primaryResultIndex);
+  assert.ok(failReviewIndex > completeLeaseIndex);
+  assert.ok(publishLedgerIndex > failReviewIndex);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/complete/);
   assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
@@ -2222,18 +2254,9 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(claimStep, /response\.protocol_version \|\| 1/);
   assert.match(claimStep, /const legacyDecision = \{/);
   assert.match(claimStep, /run_attempt: runAttempt/);
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.review-exact-event-item\.outcome != 'success'/,
-  );
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.publish-event-result\.outcome != 'success'/,
-  );
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.route-synced-verdict\.outcome != 'success'/,
-  );
+  assert.match(failReviewStep, /steps\.review-exact-event-item\.outcome != 'success'/);
+  assert.match(failReviewStep, /steps\.publish-event-result\.outcome != 'success'/);
+  assert.match(failReviewStep, /steps\.route-synced-verdict\.outcome != 'success'/);
   assert.match(primaryResultStep, /PRIMARY_JOB_STATUS: \$\{\{ job\.status \}\}/);
   assert.doesNotMatch(primaryResultStep, /JOB_CANCELLED|\$\{\{ cancelled\(\) \}\}/);
   assert.match(primaryResultStep, /PRIMARY_JOB_STATUS" = "cancelled"/);
@@ -2257,7 +2280,8 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(completeLeaseStep, /lease_revision: leaseRevision/);
   assert.match(completeLeaseStep, /run_attempt: runAttempt/);
   assert.match(completeLeaseStep, /outcome,/);
-  assert.match(eventReviewBlock, /exact-review queue leased this run/);
+  assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
+  assert.doesNotMatch(eventReviewBlock, /exact-review queue leased this run/);
   assert.doesNotMatch(eventReviewBlock, /repair:codex-capacity/);
   assert.doesNotMatch(eventReviewBlock, /capacity-requeue/);
   assert.doesNotMatch(eventReviewBlock, /Waiting for Codex capacity/);
@@ -2292,9 +2316,9 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
     ".github/workflows/commit-review.yml",
     ".github/workflows/maintainer-activity-report.yml",
     ".github/workflows/repair-cluster-worker.yml",
-    ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/sweep.yml",
   ].map((file) => readText(file));
+  const commitFindingWorkflow = readText(".github/workflows/repair-commit-finding-intake.yml");
 
   assert.match(action, /codex-version:[\s\S]*default: "0\.139\.0"/);
   assert.match(action, /proxy-version:[\s\S]*default: "0\.139\.0"/);
@@ -2303,6 +2327,7 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
   assert.doesNotMatch(action, /@latest/);
   assert.match(localCheck, /CLAWSWEEPER_LOCAL_CODEX_MODEL \?\? "gpt-5\.6-sol"/);
   assert.match(localCheck, /model_reasoning_effort="high"/);
+  assert.doesNotMatch(localCheck, /CLAWSWEEPER_PREFER_WINDOWS_CODEX_APP/);
   assert.doesNotMatch(localCheck, /gpt-5\.5/);
   assert.match(action, /env -u OPENAI_API_KEY[\s\S]*-u CLAWSWEEPER_INTERNAL_MODEL/);
   assert.equal(action.match(/--ignore-scripts/g)?.length, 2);
@@ -2316,6 +2341,8 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
       assert.match(line, /^\s{10,}/);
     }
   }
+  assert.match(commitFindingWorkflow, /CLAWSWEEPER_MODEL: internal/);
+  assert.doesNotMatch(commitFindingWorkflow, /CLAWSWEEPER_INTERNAL_MODEL|setup-codex/);
 });
 
 test("background review fanout keeps per-review transient recovery", () => {
@@ -2540,6 +2567,13 @@ test("sweep target write tokens can merge pull requests", () => {
 
 test("sweep review recovery uses explicit failed shard artifacts", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const publishEventResult = readText("src/repair/publish-event-result.ts");
+  const recoveryStart = workflow.indexOf("\n  recover-review-failures:");
+  const retryStart = workflow.indexOf("\n  retry-failed-reviews:", recoveryStart);
+  const eventReviewStart = workflow.indexOf("\n  event-review-apply:");
+  const targetFanoutStart = workflow.indexOf("\n  target-fanout:", eventReviewStart);
+  const recoveryJob = workflow.slice(recoveryStart, retryStart);
+  const eventReviewJob = workflow.slice(eventReviewStart, targetFanoutStart);
 
   assert.match(
     workflow,
@@ -2558,6 +2592,68 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   assert.doesNotMatch(
     workflow,
     /needs\.review\.result == 'failure' \|\| needs\.review\.result == 'cancelled'/,
+  );
+  assert.match(recoveryJob, /actions: read/);
+  assert.match(recoveryJob, /contents: read/);
+  assert.match(recoveryJob, /timeout-minutes: 40/);
+  assert.match(recoveryJob, /QUEUE_URL:/);
+  assert.match(recoveryJob, /CLAWSWEEPER_WEBHOOK_SECRET:/);
+  assert.match(recoveryJob, /delivery_id: \("router:" \+ \$dispatch_key\)/);
+  assert.match(recoveryJob, /sourceAction: "failed_review_shard_recovery"/);
+  assert.match(recoveryJob, /\.item_kinds\[\$item_number\]/);
+  assert.match(recoveryJob, /pull_request\) source_event="pull_request"/);
+  assert.match(recoveryJob, /--arg dispatch_key/);
+  assert.match(recoveryJob, /x-clawsweeper-exact-review-signature/);
+  assert.match(recoveryJob, /\/internal\/exact-review\/enqueue/);
+  assert.match(
+    recoveryJob,
+    /\.ok == true and \(\.queued == true or \.deduped == true or \.accepted == false\)/,
+  );
+  assert.match(recoveryJob, /Recovery skipped because the target is disabled/);
+  assert.match(recoveryJob, /for attempt in 1 2 3/);
+  assert.match(recoveryJob, /failed_recovery_dispatches/);
+  assert.match(
+    recoveryJob,
+    /max_additional_prompt_bytes=\$\(\(5000 - \$\{#recovery_marker\} - 2\)\)/,
+  );
+  assert.match(recoveryJob, /LC_ALL=C wc -c/);
+  assert.match(recoveryJob, /MAX_BYTES="\$max_additional_prompt_bytes" node/);
+  assert.match(recoveryJob, /Buffer\.from\(input, "utf8"\)/);
+  assert.doesNotMatch(recoveryJob, /head -c|iconv -f UTF-8/);
+  assert.doesNotMatch(recoveryJob, /workflow run sweep\.yml/);
+  assert.doesNotMatch(recoveryJob, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
+  assert.match(eventReviewJob, /RECOVERY_TARGET_BRANCH:/);
+  assert.match(eventReviewJob, /RECOVERY_TARGET_BRANCH:-\$\(gh api/);
+  assert.match(eventReviewJob, /REVIEW_ONLY:/);
+  assert.match(
+    eventReviewJob,
+    /sourceAction == 'failed_review_shard_recovery' && 'true' \|\| 'false'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Route synced ClawSweeper verdict[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Queue deferred exact verdict router[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Fail unsuccessful exact review[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /React to target item completion[\s\S]*sourceAction == 'failed_review_shard_recovery'/,
+  );
+  assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" != "true" \]/);
+  assert.match(
+    eventReviewJob,
+    /Export exact review primary result[\s\S]*REVIEW_ONLY:[\s\S]*\[ "\$REVIEW_ONLY" = "true" \]/,
+  );
+  assert.match(publishEventResult, /reviewOnly: process\.env\.REVIEW_ONLY === "true"/);
+  assert.match(
+    publishEventResult,
+    /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
   );
 });
 

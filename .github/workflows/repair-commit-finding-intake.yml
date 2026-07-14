@@ -35,7 +35,7 @@ on:
         default: ""
         type: string
       runner:
-        description: "Runner label for commit finding intake"
+        description: "Deprecated compatibility value; intake uses a fixed trusted runner"
         required: false
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
@@ -56,7 +56,6 @@ env:
   CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS || '1200000' }}
   CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: "2400000"
   CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: ${{ vars.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS || '300000' }}
-  CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS || '120000' }}
   CLAWSWEEPER_MODEL: internal
   CLAWSWEEPER_TARGET_VALIDATION_MODE: ${{ vars.CLAWSWEEPER_TARGET_VALIDATION_MODE || 'changed-only' }}
   CLAWSWEEPER_RESOLVE_REVIEW_THREADS: ${{ vars.CLAWSWEEPER_RESOLVE_REVIEW_THREADS || '1' }}

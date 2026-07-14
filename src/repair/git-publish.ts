@@ -177,6 +177,9 @@ export function spawnGit(args: readonly string[], options: GitRunOptions = {}): 
 function guardStateRootHardReset(target: string): void {
   const root = publishRoot();
   if (!root) return;
+  if (lstatSync(root).isSymbolicLink()) {
+    throw new Error("Refusing hard reset: state publish root must not be a symlink");
+  }
   const realRoot = realpathSync(root);
   const realCwd = realpathSync(process.cwd());
   const cwdFromRoot = relative(realRoot, realCwd);
@@ -190,6 +193,20 @@ function guardStateRootHardReset(target: string): void {
   const topLevel = spawnGit(["rev-parse", "--show-toplevel"], { quiet: true });
   if (topLevel.status !== 0 || realpathSync(topLevel.stdout.trim()) !== realRoot) {
     throw new Error("Refusing hard reset: state publish root is not a dedicated Git worktree root");
+  }
+
+  const expectedRepository = process.env.CLAWSWEEPER_STATE_REPOSITORY?.trim();
+  if (process.env.GITHUB_ACTIONS === "true" && !expectedRepository) {
+    throw new Error("Refusing hard reset: state repository identity is not bound");
+  }
+  if (expectedRepository) {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)) {
+      throw new Error("Refusing hard reset: invalid expected state repository identity");
+    }
+    const origin = runGit(["remote", "get-url", "origin"], { quiet: true }).trim();
+    if (githubRepositoryFromRemote(origin)?.toLowerCase() !== expectedRepository.toLowerCase()) {
+      throw new Error(`Refusing hard reset: state origin does not match ${expectedRepository}`);
+    }
   }
 
   const mergeBase = spawnGit(["merge-base", "HEAD", target], { quiet: true });
@@ -213,6 +230,14 @@ function guardStateRootHardReset(target: string): void {
   if (unsafePath) {
     throw new Error(`Refusing hard reset of non-state path: ${unsafePath}`);
   }
+}
+
+function githubRepositoryFromRemote(remote: string): string | undefined {
+  const match =
+    /^(?:https?:\/\/(?:[^/@]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(
+      remote.trim(),
+    );
+  return match?.[1];
 }
 
 function recordGitProcess(action: string | undefined): void {

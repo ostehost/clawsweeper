@@ -8,6 +8,8 @@ dashboard data, credentials, or GitHub API traffic.
 The sequence proves:
 
 - visible partial-telemetry diagnostics;
+- the Bay timing badge naming its bounded **review trigger → final review** measurement, completed by the command-status update emitted after the durable review summary;
+- a 390px portrait layout that stacks Arriving through Applying vertically, keeps the terminal pools at the waterline, and has no horizontal page overflow;
 - advancing crustacean-claw and master-sweeper animations;
 - a READY flag followed by a physical forward sweep and landing;
 - a changed run ID using the retrigger tunnel and resurfacing path;
@@ -25,11 +27,11 @@ The sequence proves:
 ## Artifacts
 
 - [`playwright-proof-storyboard.jpg`](playwright-proof-storyboard.jpg) is a
-  labelled 17-state contact sheet that can be inspected without video codecs.
+  labelled 18-state contact sheet that can be inspected without video codecs.
 - [`trace.zip`](trace.zip) is the Playwright action, DOM snapshot, and network
   trace. Open it with
   `npx --yes playwright@1.60.0 show-trace docs/proof/openclaw-bay/trace.zip`.
-- [`proof-summary.json`](proof-summary.json) records all 25 passing assertions,
+- [`proof-summary.json`](proof-summary.json) records all 27 passing assertions,
   sanitized request/response metadata, safe drawer links, the unchanged
   terminal keys before and after both preview modes, and the proved real-tide
   clear.
@@ -64,21 +66,21 @@ crabbox run \
 
 ## Provenance and privacy
 
-- implementation source: `d4390494189680c25a2aa8fa9454df5f332613a9`
+- implementation source: `a59c19f698393955404e46fe7bd413a7828adb4a`
 - provider: Crabbox `local-container`
-- lease: `cbx_a397c065e00e` (`swift-shrimp`)
+- lease: `cbx_260d3395d7b0` (`tidal-lobster`)
 - image: `mcr.microsoft.com/playwright:v1.60.0-noble`
 - fixture SHA-256:
-  `FC584F8F0521221B77897384BDEB3A167E85AA6C17708A7783740FCDF363CD21`
+  `F766EE78A4E8E4F41EA9F2F64C9C85DFE3D04D7962B647007F073F40AF94ADA5`
 - exact response SHA-256 values:
   - `01-initial.json`:
-    `F052DEC5FD41FB83AB5237076DDE644A2363332580242AEE3B5C4ECB359BAEB0`
+    `9D6CA7EDD926508DBB3DB7ED3B8328405F8404E16AEE303AE9057CA6B3BA0397`
   - `02-forward.json`:
-    `34AA3F22C198D67C3FB6B9E9731C13ACD55E37E27BD829FABA54399124A2A0E2`
+    `7D102233EE8A63E7987DAAB53A231C1DD35008C0734A771119488BC54F4499C9`
   - `03-retrigger.json`:
-    `39DA760BF2E1A9E982404B2F27ABAE8649EF18B21A20E558787921D314BFC4C0`
+    `9BAF0B764E413369EC8D9554D731A4E6B008B2DCB266B5D2837E94E820CEEBFE`
 - derived real-tide response:
-  `B7F86FC41DC7D3868D9BA17793C262B5A2BA0D4FC5871157A2A8B13768EED880`
+  `18FAF63BD6529D1F4EB03BF880343E20244413F82FE62029F055AABC13F44DA9`
 
 The browser allowed only `bay-proof.test:8787`, mapped to the local Wrangler
 Worker. The trace contains no cookies or authorization headers. A binary text

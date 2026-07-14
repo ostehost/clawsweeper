@@ -12,16 +12,19 @@ private key material, and one-off execution windows out of this file.
 ClawSweeper is a conservative, targeted automation layer for OpenClaw issue and
 PR maintenance. It does not scan the whole backlog by itself. It takes a known
 cluster, hydrates current GitHub state, asks Codex for a structured decision,
-then lets deterministic scripts perform the allowed writes.
+then lets deterministic scripts perform only the allowed no-publication writes.
+Prepared code remains an exact hash-bound bundle for a future trusted publisher.
 
 The core invariants:
 
 - One cluster maps to one job file.
-- One implementation path maps to one branch: `clawsweeper/<cluster-id>`.
-- One branch should produce or update one PR.
+- One implementation path reserves one target branch:
+  `clawsweeper/<cluster-id>`.
+- One prepared bundle carries the metadata for at most one future PR.
 - Codex workers do not get GitHub write tokens.
-- GitHub writes happen through deterministic scripts with live-state checks.
-- Merge stays closed unless a maintainer explicitly opens the merge gate.
+- Guarded comments and closeouts happen through deterministic scripts with
+  live-state checks; prepared code is never pushed by the production workflow.
+- Automated merge always fails closed at the atomic base-binding check.
 - Security-sensitive work is out of scope and must be routed elsewhere.
 
 ## Main Objects
@@ -80,7 +83,9 @@ Artifact names:
 The repair workflow snapshots recent Codex session JSONL files, Codex log files,
 and ClawSweeper-captured `codex exec --json` outputs after both the planning job
 and the fix execution job. Session/log files come from the job's isolated
-`CODEX_HOME` when set, otherwise `~/.codex`; captured repair outputs come from
+run-scoped `CODEX_HOME`; the workflow never restores a Codex cache or reuses a
+session across jobs or attempts. Local invocations may fall back to `~/.codex`.
+Captured repair outputs come from
 `.clawsweeper-repair/runs`.
 The collector deliberately excludes Codex auth and config files, redacts common
 OpenAI and GitHub token shapes, and writes a `manifest.json` with
@@ -93,10 +98,10 @@ does not download raw session logs just to continue a repair.
 Path: `.clawsweeper-repair/runs/<run>/fix-artifact.json` and embedded result
 fields.
 
-A fix artifact tells the deterministic executor how to repair a contributor
-branch or create/update a ClawSweeper replacement branch. It includes likely
-files, validation commands, credit notes, changelog requirements, source PRs,
-and the planned PR title/body.
+A fix artifact tells the deterministic executor how to prepare local changes
+intended for a contributor branch or ClawSweeper replacement branch. It
+includes likely files, validation commands, credit notes, changelog
+requirements, source PRs, and the planned future PR title/body.
 
 ### Published Ledger
 
@@ -119,15 +124,17 @@ structured JSON. No GitHub writes should happen.
 
 ### `execute`
 
-Structured-result application mode. It can apply reviewed safe comments,
-closures, and explicit merge actions, but only through deterministic scripts
-and only when gates permit.
+Structured-result application mode. It can apply reviewed safe comments and
+closures through deterministic scripts when gates permit. It can validate and
+record merge intent, but production merge always fails closed at strict base
+binding.
 
 ### `autonomous`
 
 Full targeted repair mode. ClawSweeper hydrates live state, asks Codex to produce
-or refine a fix plan, then `execute-fix-artifact` can repair a branch or open a
-replacement PR. Direct mutation still happens outside Codex.
+or refine a fix plan, then `execute-fix-artifact` prepares and validates the
+exact branch or replacement-PR bundle. The production workflow defers that
+publication; direct code mutation remains disabled.
 
 ## Cloud Worker Flow
 
@@ -168,26 +175,28 @@ The cluster worker has three jobs:
 The workflow concurrency group is based on job path and mode, so repeat
 dispatches of the same job queue instead of racing each other.
 
-## Creating Implementation PRs
+## Preparing Implementation Bundles
 
 Script: `scripts/execute-fix-artifact.ts`
 
-This is the PR creation and branch repair engine.
+This is the branch/PR preparation engine. Its library routines can publish in a
+separately trusted context, but the production target workflow deliberately
+stops at a validated deferred bundle.
 
 It can:
 
-- update a maintainer-editable contributor branch when that path is safe
-- fall back to a replacement branch when the source branch is uneditable or
+- prepare local changes intended for a maintainer-editable contributor branch
+  when that path is safe
+- prepare a replacement-branch bundle when the source branch is uneditable or
   unsafe
-- fast-path adopted automerge base-sync repairs by rebasing, applying known
-  mechanical conflict resolvers, pushing, and letting the fresh exact-head
-  review/check gates handle merge readiness
-- create or update `clawsweeper/<cluster-id>`
-- push checkpoint commits after Codex edits
+- fast-path adopted automerge base-sync preparation by rebasing and applying
+  known mechanical conflict resolvers
+- build the local `clawsweeper/<cluster-id>` target ref
+- commit checkpoint changes locally after Codex edits
 - run changed-surface validation
 - run Codex `/review`
 - address Codex review findings
-- open or update the target PR
+- prepare the metadata needed to open or update the target PR
 - post an idempotent adopted-automerge outcome comment when no executable fix
   artifact is available
 - preserve contributor credit in co-author trailers, PR body, and closeout comments
@@ -198,20 +207,19 @@ commits and validates the reviewed tree locally. In the production Actions
 workflow, the fresh publisher retains that commit as a deferred bundle instead
 of pushing or opening a PR.
 
-For same-branch automerge repairs, the executor can stay alive after pushing a
-deterministic repair. It waits for the exact-head ClawSweeper verdict and GitHub
-checks on the new head, then dispatches the comment router immediately when the
-PR is ready so merge does not depend on the next scheduled sweep. See
-[`automerge-flow.md`](automerge-flow.md) for the full wait and repair decision
-table.
+The same-branch post-push shepherd remains library support for a future trusted
+publisher. The production target workflow does not reach it because prepared
+code is deferred before any branch push. See
+[`automerge-flow.md`](automerge-flow.md) for the intended future wait and repair
+decision table.
 
-When replacing a meaningful contributor PR, the executor fetches the source PR
-author, skips bot authors, adds `Co-authored-by` trailers to replacement
-checkpoint commits, records carried-forward credit in the replacement PR body,
-and says in the source close comment that the contribution is carried forward
-rather than rejected.
+When preparing a replacement for a meaningful contributor PR, the executor
+fetches the source PR author, skips bot authors, adds `Co-authored-by` trailers
+to replacement checkpoint commits, and records carried-forward credit in the
+future PR body and planned source close comment.
 
-Generated ClawSweeper PRs are marked by:
+Existing ClawSweeper PRs, and PRs created by a future trusted publisher, are
+identified by:
 
 - branch prefix: `clawsweeper/`
 - committed repair job metadata for the branch cluster id
@@ -219,17 +227,19 @@ Generated ClawSweeper PRs are marked by:
 The `clawsweeper` label is a reporting hint from `scripts/tag-clawsweeper-targets.ts`,
 not a PR identity boundary.
 
-Current operational gotcha: OpenClaw's PR queue policy can close PRs when the
-ClawSweeper app author has more than 10 active PRs. That is a target-repo policy
-interaction, not evidence that the generated PR is invalid. Reduce or land the
-active ClawSweeper queue before reopening those PRs.
+Post-publication operational gotcha: OpenClaw's PR queue policy can close PRs
+when the ClawSweeper app author has more than 10 active PRs. That is a
+target-repo policy interaction, not evidence that the generated PR is invalid.
+A future trusted publisher must respect the active queue before opening or
+reopening those PRs.
 
-Replacement PR creation also has a per-area backpressure guard. Before opening a
-new `clawsweeper/*` replacement branch, `execute-fix-artifact` groups the proposed
-`likely_files` into touched areas such as `extensions/discord`, `src/core`, or
-`docs`, reads open ClawSweeper PRs in the target repo, and blocks if the same area
-already has `CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA` open ClawSweeper PRs. The default
-limit is `50`; set it to `0` only for a deliberately uncapped execution window.
+Replacement-bundle preparation also has a per-area backpressure guard. Before
+finalizing a bundle for a new `clawsweeper/*` replacement branch,
+`execute-fix-artifact` groups the proposed `likely_files` into touched areas
+such as `extensions/discord`, `src/core`, or `docs`, reads open ClawSweeper PRs
+in the target repo, and blocks if the same area already has
+`CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA` open ClawSweeper PRs. The default limit is
+`50`; set it to `0` only for a deliberately uncapped preparation window.
 Common changelog and release-note files are ignored for this backpressure check
 because they are shared support files rather than a meaningful repair area.
 
@@ -243,8 +253,8 @@ review report has `result: findings`. ClawSweeper treats that report as a source
 finding, not as an order to open a PR.
 
 The intake step fetches the report from latest `openclaw/clawsweeper@main`,
-writes one audit file, and then decides whether an automatic repair PR is
-allowed:
+writes one audit file, and then decides whether automatic repair-bundle
+preparation is allowed:
 
 - audit path: `results/commit-findings/<repo-slug>/<sha>.md`
 - job path: `jobs/<owner>/inbox/clawsweeper-commit-<repo-slug>-<shortsha>.md`
@@ -272,22 +282,26 @@ close actions remain blocked.
 
 ## Issue Implementation Commands
 
-Maintainer comments can turn an open issue into one ClawSweeper implementation
-PR with `/clawsweeper implement`, `@clawsweeper fix`, `/clawsweeper build`,
-`@clawsweeper create pr`, or `@clawsweeper fix issue`.
+Maintainer comments can request one ClawSweeper implementation bundle for an
+open issue with `/clawsweeper implement`, `@clawsweeper fix`,
+`/clawsweeper build`, `@clawsweeper create pr`, or
+`@clawsweeper fix issue`. Command names retain the intended PR vocabulary, but
+production publication is deferred.
 
 The comment router creates or reuses
 `jobs/<owner>/inbox/issue-<owner>-<repo>-<number>.md` with
 `source: issue_implementation` and target branch
-`clawsweeper/issue-<owner>-<repo>-<number>`. The job allows comment, label,
-fix, and raise-pr actions, blocks close and merge, and tells the repair worker
-to verify the issue against latest `main` before emitting
-`repair_strategy: new_fix_pr`.
+`clawsweeper/issue-<owner>-<repo>-<number>`. The job records comment, label, fix,
+and raise-PR intent, blocks close and merge, and tells the repair worker to
+verify the issue against latest `main` before emitting
+`repair_strategy: new_fix_pr`. The raise-PR intent becomes deferred metadata,
+not a live PR mutation.
 
-This lane is intentionally PR-only: it does not merge, close the source issue,
-or convert broad/security-sensitive requests into public branches. Reruns reuse
-the same job and branch, so repeated maintainer comments update one PR instead
-of creating duplicates.
+This lane is intentionally bundle-only in production: it does not push, open a
+PR, merge, close the source issue, or convert broad/security-sensitive requests
+into public branches. Reruns reuse the same job and intended branch identity so
+repeated maintainer comments update one deferred bundle instead of creating
+duplicate publication targets.
 
 ### Reviewed Reproducible Bug Intake
 
@@ -329,15 +343,16 @@ branch. Strict-bug worker prompts are bug-only: reproduce first, fix broken
 existing behavior only, and stop if implementation requires a feature, config
 option, product decision, or broad design change. Vision-fit worker prompts
 re-read `VISION.md`, keep the PR small, and stop when the work no longer fits
-the vision guardrails. Any PR created from the job is labeled
+the vision guardrails. Future-publication metadata reserves
 `clawsweeper:autogenerated` in addition to the normal `clawsweeper` tracking
 label.
 
-## Applying Comments, Closures, And Merges
+## Applying Comments And Closures
 
 Script: `scripts/apply-result.ts`
 
-This script owns safe GitHub mutations from reviewed worker results.
+This script owns safe no-publication GitHub mutations from reviewed worker
+results. Prepared-publication mode does not invoke it with a target write token.
 
 It re-fetches every live target before writing. It blocks when:
 
@@ -351,7 +366,9 @@ It re-fetches every live target before writing. It blocks when:
 
 Close comments include idempotency markers so reruns do not post duplicates.
 
-Merging is intentionally hard. Merge requires:
+The schema retains merge evidence for audit and a future trusted publisher.
+Even when all of the following are present, production merge fails closed at
+the atomic base-binding check:
 
 - job allows merge
 - `allow_merge: true`
@@ -364,21 +381,19 @@ Merging is intentionally hard. Merge requires:
 - validation evidence
 - security clearance
 
-With merge gated closed, ClawSweeper labels ready candidates for human review
-instead of merging.
+ClawSweeper can label ready candidates for human review, but it never merges
+them automatically.
 
 ## Post-Flight Finalization
 
 Script: `scripts/post-flight.ts`
 
-Post-flight watches the PRs that `execute-fix-artifact` opened or repaired.
-It waits for merge readiness, validates merge preflight, and either:
+Post-flight can inspect existing PRs associated with prepared work. It validates
+merge preflight and either labels the PR with human-review/merge-ready labels or
+records the exact blocker. The production path never merges.
 
-- merges when the merge gate is explicitly open, or
-- labels the PR with human-review/merge-ready labels, or
-- records the exact blocker.
-
-After a canonical fix lands, post-flight can apply planned post-merge closeouts
+After a canonical fix lands through a human or other trusted publisher,
+post-flight can apply planned post-merge closeouts
 for duplicate or superseded items covered by that fix.
 
 ## Open PR Finalizer
@@ -500,8 +515,8 @@ Behavior:
   adopted job if needed, and dispatch a ClawSweeper review for the current
   head.
 - `approve`: maintainer-only exact-head approval after human review; clears
-  pause labels and merges only through the normal automerge readiness checks and
-  merge gates.
+  eligible pause labels and reruns readiness checks, but automated merge remains
+  blocked at strict base binding.
 - `stop`: label the item for human review.
 
 Repair commands apply to existing ClawSweeper PRs and PRs opted into
@@ -522,23 +537,22 @@ a single PR cannot loop forever.
 
 For PRs labeled `clawsweeper:autofix` or `clawsweeper:automerge`, trusted
 ClawSweeper `pass`, `approved`, or `no-changes` verdict markers become
-`clawsweeper_auto_merge`. Autofix waits for required checks to appear, settle
-green, and reach GitHub merge-state readiness, then treats that marker as
-terminal success, removes its repair-loop label, and leaves the PR open.
-Generated issue PRs do the same even if a stale automerge label is present.
-Automerge merges only when the marker SHA matches
-the current PR head, checks are green, GitHub
+`clawsweeper_auto_merge` intent. Autofix can wait for required checks to appear,
+settle green, and reach GitHub merge-state readiness, then treat that marker as
+terminal success and leave the PR open. Automerge records readiness only when
+the marker SHA matches the current PR head, checks are green, GitHub
 mergeability is clean, no human-review label is present, the PR is not draft,
-and `CLAWSWEEPER_ALLOW_MERGE=1` is set. The `clawsweeper:automerge` opt-in is
-the per-PR automerge authorization for non-generated PRs.
-Otherwise it leaves the PR open and labels it `clawsweeper:human-review` and
-`clawsweeper:merge-ready` when merge gates are closed.
+and `CLAWSWEEPER_ALLOW_MERGE=1` is set. Strict atomic base binding still blocks
+the merge itself. The `clawsweeper:automerge` opt-in is authorization metadata,
+not sufficient publication or merge authority. Ready PRs remain open for human
+review.
 
 The scheduled workflow is dry by default. Set
 `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1` to let scheduled runs post replies and
 dispatch workers. Manual workflow dispatch can also pass `execute=true`.
-Branch mutation still requires the downstream `CLAWSWEEPER_ALLOW_EXECUTE=1` and
-`CLAWSWEEPER_ALLOW_FIX_PR=1` gates.
+Repair-bundle preparation still requires the downstream
+`CLAWSWEEPER_ALLOW_EXECUTE=1` and `CLAWSWEEPER_ALLOW_FIX_PR=1` gates; those gates
+do not grant branch mutation authority.
 
 Ledgers:
 
@@ -580,7 +594,9 @@ These scripts manage the ClawSweeper backlog:
 - resolve a run id or job path and requeue it
 
 They should not create new implementation PRs by themselves. They control job
-inventory and dispatch pressure.
+inventory and dispatch pressure. Source-head drift records
+`requeue_required: true` and stops; only this trusted external tooling or an
+operator starts the fresh run. The worker never requeues itself.
 
 ## Dashboard Publishing
 
@@ -612,17 +628,19 @@ Important gates:
   the same store snapshot.
 - `CLAWSWEEPER_ALLOW_EXECUTE`: allows deterministic write lanes. Workflows treat
   any value except literal `1` as closed.
-- `CLAWSWEEPER_ALLOW_FIX_PR`: allows branch repair and replacement PR creation.
-  Workflows treat any value except literal `1` as closed.
-- `CLAWSWEEPER_ALLOW_MERGE`: allows ClawSweeper to merge. Keep this `0` unless a
-  maintainer explicitly opens it.
+- `CLAWSWEEPER_ALLOW_FIX_PR`: allows isolated branch/PR preparation and immutable
+  bundle validation. Workflows treat any value except literal `1` as closed;
+  production publication remains deferred.
+- `CLAWSWEEPER_ALLOW_MERGE`: records merge authorization. Strict base binding
+  still blocks automated merge even when a maintainer explicitly opens it.
 - `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE`: lets scheduled comment routing post
   replies and dispatch workers.
 
 Important defaults:
 
 - `CLAWSWEEPER_MODEL`: GitHub Actions secret containing the actual worker model.
-  Public workflow inputs and generated state use only `internal`.
+  Public workflow inputs and generated state use only `internal`; the public
+  `model` input is a deprecated no-op retained for caller compatibility.
 - `CLAWSWEEPER_CODEX_REASONING_EFFORT`: model reasoning effort. Repair workers
   default to `high` and normalize accidental `xhigh` overrides back to `high`
   to keep automerge repair latency predictable.
@@ -631,6 +649,9 @@ Important defaults:
 - `CLAWSWEEPER_CODEX_LOGIN_METHOD`: Codex login mode for local runs. Defaults
   to `api`; set `chatgpt` to preserve an existing Codex OAuth session. Any other
   non-empty value fails before Codex starts.
+- Workflow Codex state is run-scoped: each invocation receives a fresh
+  `CODEX_HOME`, and no Actions cache or prior session is restored across jobs or
+  attempts.
 - `CLAWSWEEPER_CODEX_HEARTBEAT_MS`: repair-worker and execute-side Codex
   subprocess heartbeat interval; default `60000`.
 - `CODEX_BIN`: optional Codex executable override. Native Windows runs resolve
@@ -642,17 +663,18 @@ Important defaults:
 - `CLAWSWEEPER_DISPATCH_RECHECK_MS`: short active-worker recheck before
   dispatching a repair worker; default `5000` to avoid duplicate queued workers
   when parallel routers race GitHub run visibility.
-- In-flight branch repair execution re-fetches live PR labels immediately before
-  branch mutation and refuses to push when `clawsweeper:human-review` is present.
+- In-flight repair preparation re-fetches live PR labels immediately before
+  finalizing the bundle and stops when `clawsweeper:human-review` is present.
   This makes trusted needs-human verdicts and maintainer stop commands win over
-  stale already-queued repair workers.
+  stale already-queued repair workers without attempting a push.
 - `CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA`: replacement PR area backpressure; default
   is `50` open ClawSweeper PRs per touched area, and `0` disables the cap.
 - ClawSweeper commit-finding repair PRs get the `clawsweeper:commit-finding`
   label in addition to the standard `clawsweeper` tracking label.
 - `CLAWSWEEPER_TARGET_VALIDATION_MODE`: changed-only validation by default.
-- `CLAWSWEEPER_RESOLVE_REVIEW_THREADS`: lets fix execution resolve threads after
-  it addresses them.
+- `CLAWSWEEPER_RESOLVE_REVIEW_THREADS`: reserved for a trusted publication lane;
+  current bundle preparation records addressed-thread evidence without mutating
+  review threads.
 
 ## Where To Add New Behavior
 

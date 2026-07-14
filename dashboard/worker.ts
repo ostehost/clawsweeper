@@ -25,6 +25,9 @@ type WorkflowRunSummary = {
   created_at?: string;
   updated_at?: string;
 };
+
+const FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION = "failed_review_shard_recovery";
+
 type ExactReviewDecision = {
   targetRepo: string;
   targetBranch: string;
@@ -104,11 +107,14 @@ const TERMINAL_BAD_CONCLUSIONS = new Set(["failure", "timed_out", "action_requir
 const EVENT_LIMIT = 200;
 const EVENT_STORE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const BAY_TERMINAL_STATE_KEY = "openclaw-bay:terminal-state:v1";
+const BAY_JOURNEY_STATE_KEY = "openclaw-bay:journey-state:v1";
 const BAY_TIDE_THRESHOLD = 20;
 const BAY_SEEN_EVENT_LIMIT = 256;
 const BAY_WASH_VISIBLE_MS = 60_000;
 const BAY_TIMING_WINDOW_MS = 60 * 60 * 1000;
 const BAY_TIMING_MAX_SAMPLE_MS = 24 * 60 * 60 * 1000;
+const BAY_JOURNEY_LIMIT = 100;
+const BAY_JOURNEY_TTL_SECONDS = 24 * 60 * 60;
 const AVERAGE_LIMIT = 4;
 const RECENT_CLOSED_LIMIT = 8;
 const CLOSED_STATS_HOURS = 24;
@@ -116,8 +122,8 @@ const CLOSED_STATS_PAGE_LIMIT = 10;
 const DEFAULT_CLAWSWEEPER_BOT_LOGINS = ["clawsweeper[bot]", "openclaw-clawsweeper[bot]"];
 const GITHUB_TIMEOUT_MS = 4500;
 const DEFAULT_STALE_QUEUED_WORKFLOW_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 28;
-const DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT = 24;
+const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 48;
+const DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT = 44;
 const DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS = 10 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
@@ -382,6 +388,35 @@ export class StatusStore {
       return json(next);
     }
 
+    if (request.method === "POST" && key === BAY_JOURNEY_STATE_KEY) {
+      const body = await request.json();
+      const current = (await this.storage.get(key)) as StoredValue | undefined;
+      const currentValue =
+        current?.value && (!current.expires_at || current.expires_at > Date.now())
+          ? JSON.parse(current.value)
+          : null;
+      const generatedAt = String(body?.generated_at || new Date().toISOString());
+      const next = mergeBayJourneyState(
+        currentValue,
+        body?.triggers,
+        body?.completions,
+        generatedAt,
+      );
+      if (
+        currentValue &&
+        bayJourneyStateSignature(currentValue) === bayJourneyStateSignature(next)
+      ) {
+        return json(currentValue);
+      }
+      const expiresAt = Date.now() + numberFrom(body?.ttl_seconds, BAY_JOURNEY_TTL_SECONDS) * 1000;
+      await this.storage.put(key, {
+        value: JSON.stringify(next),
+        expires_at: expiresAt,
+      });
+      await this.scheduleCleanup(expiresAt);
+      return json(next);
+    }
+
     if (request.method === "POST" && key === "events") {
       const body = await request.json();
       const current = (await this.storage.get("events")) as StoredValue | undefined;
@@ -487,21 +522,30 @@ export class ExactReviewQueue {
         }
 
         const state = this.readStateSync();
+        // A delayed or lost alarm must not let an expired one-shot recovery
+        // suppress the next failed shard's recovery delivery.
+        reclaimExpiredExactReviewLeases(state, now);
         const key = exactReviewItemKey(decision);
         const current = state.items[key];
         const nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
         if (current) {
-          // A pending command has no executor yet, so an ordinary item event must not erase its
-          // acknowledgement context. Once dispatched, that lease already owns the context and a
-          // newer revision should start clean unless it carries its own command fields.
-          current.decision =
-            current.state === "pending"
-              ? mergePendingExactReviewDecision(current.decision, decision)
-              : decision;
-          current.revision += 1;
-          current.updatedAt = now;
-          current.nextAttemptAt = nextAttemptAt;
-          if (current.state === "pending") current.attempts = 0;
+          const ignoredRecovery =
+            decision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+          // A recovery is only a one-shot repair of a failed shard. It may create a queue item,
+          // but must never supersede an existing pending, dispatching, or leased decision: doing
+          // so can leave either ordinary work or another recovery as a stale follow-up revision.
+          // Ordinary source events retain normal replacement behavior, including the
+          // command-context merge for pending items.
+          if (!ignoredRecovery) {
+            current.decision =
+              current.state === "pending"
+                ? mergePendingExactReviewDecision(current.decision, decision)
+                : decision;
+            current.revision += 1;
+            current.updatedAt = now;
+            current.nextAttemptAt = nextAttemptAt;
+            if (current.state === "pending") current.attempts = 0;
+          }
         } else {
           state.items[key] = {
             key,
@@ -1763,6 +1807,12 @@ async function githubWebhook(request, env, ctx) {
     );
   }
 
+  const completion = bayJourneyCompletionFromGithubWebhook({ event, payload, env });
+  if (completion) {
+    await recordBayJourneyTelemetry(env, ctx, [], [completion]);
+    return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
+  }
+
   const decision = classifyGithubWebhook({ event, payload });
   if (!decision.accepted) {
     return json({ ok: true, accepted: false, reason: decision.reason }, 202);
@@ -1778,6 +1828,13 @@ async function githubWebhook(request, env, ctx) {
     if (!queued) return json({ error: "exact_review_queue_not_configured" }, 503);
     return json({ ok: true, ...queued }, 202);
   }
+
+  const trigger = bayJourneyTriggerFromGithubWebhook({
+    decision,
+    payload,
+    deliveryId: request.headers.get("x-github-delivery"),
+  });
+  if (trigger) await recordBayJourneyTelemetry(env, ctx, [trigger], []);
 
   const credentials = githubAppCredentials(env);
   if (!credentials) return json({ error: "github_app_not_configured" }, 503);
@@ -1827,6 +1884,79 @@ async function githubWebhook(request, env, ctx) {
     waitUntil: ctx?.waitUntil?.bind(ctx),
   });
   return json({ ok: true, status_comment_id: statusCommentId }, 202);
+}
+
+async function recordBayJourneyTelemetry(env, ctx, triggers, completions) {
+  if (!env.STATUS_STORE) return;
+  const write = updateBayJourneyState(env, triggers, completions, new Date().toISOString()).catch(
+    () => undefined,
+  );
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(write);
+    return;
+  }
+  await write;
+}
+
+function bayJourneyTriggerFromGithubWebhook({ decision, payload, deliveryId }) {
+  if (!decision?.accepted || decision?.type !== "issue_comment") return null;
+  const comment = objectValue(payload?.comment);
+  const commandText = commandTextForClawSweeperFastAck(String(comment.body || ""));
+  if (!isClawSweeperReReviewCommandText(commandText)) return null;
+  const triggerAt = exactWebhookTimestamp(
+    String(payload?.action || "") === "edited"
+      ? comment.updated_at || comment.created_at
+      : comment.created_at || comment.updated_at,
+  );
+  const sourceDeliveryId = nullableString(deliveryId);
+  if (!triggerAt || !sourceDeliveryId) return null;
+  return {
+    repository: decision.targetRepo,
+    number: decision.itemNumber,
+    source_comment_id: decision.commentId,
+    source_delivery_id: sourceDeliveryId,
+    triggered_at: triggerAt,
+  };
+}
+
+function bayJourneyCompletionFromGithubWebhook({ event, payload, env }) {
+  if (event !== "issue_comment") return null;
+  const comment = objectValue(payload?.comment);
+  if (!clawsweeperBotLogins(env).has(normalizedLogin(objectValue(comment.user).login))) return null;
+  const issue = objectValue(payload?.issue);
+  const repo = objectValue(payload?.repository);
+  if (!isEligibleGithubWebhookRepository(repo)) return null;
+  const repository = String(repo.full_name || "").toLowerCase();
+  const number = Number(issue.number);
+  const body = String(comment.body || "");
+  const sourceCommentId = Number(body.match(/<!--\s*clawsweeper-command-ack:(\d+)\s*-->/i)?.[1]);
+  const status = body.match(/<!--\s*clawsweeper-command-status:(\d+):(review|re_review):[^>]*-->/i);
+  const completedAt = exactWebhookTimestamp(comment.updated_at || comment.created_at);
+  const completed =
+    /<!--\s*clawsweeper-command-progress:start\s*-->[\s\S]*?^- State:\s*Complete\s*$[\s\S]*?<!--\s*clawsweeper-command-progress:end\s*-->/im.test(
+      body,
+    );
+  if (
+    !repository ||
+    !Number.isInteger(number) ||
+    number <= 0 ||
+    !Number.isSafeInteger(sourceCommentId) ||
+    sourceCommentId <= 0 ||
+    !status ||
+    Number(status[1]) !== number ||
+    !completedAt ||
+    !completed
+  ) {
+    return null;
+  }
+  return {
+    repository,
+    number,
+    source_comment_id: sourceCommentId,
+    completed_at: completedAt,
+    completion_kind: "final_command_status",
+    completion_comment_id: Number(comment.id),
+  };
 }
 
 function classifyGithubWebhook({ event, payload }) {
@@ -2427,11 +2557,16 @@ function finishExactReviewQueueItem(
 ) {
   const retryingFailure = outcome !== "success";
   const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
-  const requeued = retryingFailure || hasNewerRevision || requeueLatest;
+  // A regular queue item may back off and retry after a failed lease. Failed
+  // sweep shards already consumed their one recovery attempt before reaching
+  // the queue, so only a newer source revision may supersede that recovery.
+  const oneShotRecovery =
+    item.leaseDecision?.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+  const requeued = (!oneShotRecovery && retryingFailure) || hasNewerRevision || requeueLatest;
   if (requeued) {
     clearExactReviewLease(item);
     item.state = "pending";
-    if (retryingFailure) {
+    if (retryingFailure && !hasNewerRevision && !requeueLatest) {
       item.attempts += 1;
       item.nextAttemptAt = Math.max(
         exactReviewQueueEnqueueAttemptAt(state, now),
@@ -2476,14 +2611,24 @@ function isLiveExactReviewLease(item: ExactReviewQueueItem, now: number) {
 
 function reclaimExpiredExactReviewLeases(state: ExactReviewQueueState, now: number) {
   let changed = false;
-  for (const item of Object.values(state.items)) {
+  for (const [key, item] of Object.entries(state.items)) {
     if (
       (item.state === "dispatching" || item.state === "leased") &&
       !isLiveExactReviewLease(item, now)
     ) {
+      const oneShotRecovery =
+        (item.leaseDecision || item.decision).sourceAction ===
+        FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+      const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
+      if (oneShotRecovery && !hasNewerRevision) {
+        delete state.items[key];
+        changed = true;
+        continue;
+      }
       clearExactReviewLease(item);
       item.state = "pending";
       item.nextAttemptAt = now;
+      if (hasNewerRevision) item.attempts = 0;
       item.updatedAt = now;
       changed = true;
     }
@@ -2687,7 +2832,7 @@ export function exactReviewQueueCapacity(env) {
   return Math.max(
     1,
     Math.min(
-      32,
+      numberFrom(env.WORKER_BUDGET, 128),
       numberFrom(env.EXACT_REVIEW_QUEUE_MAX_CONCURRENT, DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT),
     ),
   );
@@ -3207,7 +3352,7 @@ function constantTimeEqual(left, right) {
 async function statusSnapshot(env) {
   const ttl = numberFrom(env.CACHE_TTL_SECONDS, 20);
   const cached = await readCachedSnapshot(env, ttl);
-  if (cached?.bay?.timings?.sample_kind === "latest_completed_jobs") {
+  if (cached?.bay?.timings?.sample_kind === "completed_review_journeys") {
     return cached;
   }
 
@@ -3317,9 +3462,13 @@ async function statusSnapshot(env) {
     errors.push(`OpenClaw Bay terminal state: ${error instanceof Error ? error.message : error}`);
     return emptyBayTerminalState(generatedAt);
   });
+  const journeyBay = await readBayJourneyState(env).catch((error) => {
+    errors.push(`OpenClaw Bay journey state: ${error instanceof Error ? error.message : error}`);
+    return { journeys: [] };
+  });
   const bay = {
     ...terminalBay,
-    timings: summarizeBayTimings(workerHealth.recent_attempts, generatedAt),
+    timings: summarizeBayJourneyTimings(journeyBay.journeys, generatedAt),
   };
   const { recent_attempts: _recentAttempts, ...publicWorkerHealth } = workerHealth;
 
@@ -4469,15 +4618,16 @@ function boundedBayTimingDuration(startedAt, completedAt) {
   return duration;
 }
 
-export function summarizeBayTimings(attempts, generatedAt) {
+export function summarizeBayJourneyTimings(journeys, generatedAt) {
   const parsedNow = Date.parse(String(generatedAt || ""));
   const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
   const cutoff = now - BAY_TIMING_WINDOW_MS;
   const overallDurations: number[] = [];
-  for (const attempt of Array.isArray(attempts) ? attempts : []) {
-    const completedAt = Date.parse(String(attempt?.completed_at || ""));
+  for (const journey of Array.isArray(journeys) ? journeys : []) {
+    const triggeredAt = Date.parse(String(journey?.triggered_at || ""));
+    const completedAt = Date.parse(String(journey?.completed_at || ""));
     if (!Number.isFinite(completedAt) || completedAt < cutoff || completedAt > now) continue;
-    const totalDuration = Number(attempt?.total_duration_ms);
+    const totalDuration = completedAt - triggeredAt;
     if (
       Number.isFinite(totalDuration) &&
       totalDuration >= 0 &&
@@ -4488,8 +4638,8 @@ export function summarizeBayTimings(attempts, generatedAt) {
   }
   return {
     window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
-    sample_kind: "latest_completed_jobs",
-    sample_limit: 50,
+    sample_kind: "completed_review_journeys",
+    sample_limit: BAY_JOURNEY_LIMIT,
     overall: {
       average_ms: overallDurations.length
         ? Math.round(
@@ -4499,6 +4649,268 @@ export function summarizeBayTimings(attempts, generatedAt) {
       samples: overallDurations.length,
     },
   };
+}
+
+function bayJourneyId(repository, itemNumber, sourceCommentId, sourceDeliveryId, triggeredAt) {
+  const prefix = `${String(repository || "").toLowerCase()}#${Number(itemNumber)}:command:${Number(sourceCommentId)}`;
+  return sourceDeliveryId
+    ? `${prefix}:delivery:${sourceDeliveryId}`
+    : `${prefix}:at:${Date.parse(triggeredAt)}`;
+}
+
+function bayJourneyCompletionId(
+  repository,
+  itemNumber,
+  sourceCommentId,
+  completionCommentId,
+  completedAt,
+) {
+  const completedMarker = Date.parse(completedAt);
+  const marker =
+    Number.isSafeInteger(Number(completionCommentId)) && Number(completionCommentId) > 0
+      ? `comment:${Number(completionCommentId)}:at:${completedMarker}`
+      : `at:${completedMarker}`;
+  return `${String(repository || "").toLowerCase()}#${Number(itemNumber)}:command:${Number(sourceCommentId)}:completion:${marker}`;
+}
+
+function bayJourneyTimestamp(value) {
+  const text = String(value || "").trim();
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
+}
+
+function normalizeBayJourneyTrigger(value) {
+  const trigger = objectValue(value);
+  const repository = nullableString(trigger.repository)?.toLowerCase() || null;
+  const number = Number(trigger.number);
+  const sourceCommentId = Number(trigger.source_comment_id);
+  const sourceDeliveryId = nullableString(trigger.source_delivery_id);
+  const triggeredAt = bayJourneyTimestamp(trigger.triggered_at);
+  if (
+    !repository ||
+    !Number.isInteger(number) ||
+    number <= 0 ||
+    !Number.isSafeInteger(sourceCommentId) ||
+    sourceCommentId <= 0 ||
+    !triggeredAt
+  ) {
+    return null;
+  }
+  return {
+    id: bayJourneyId(repository, number, sourceCommentId, sourceDeliveryId, triggeredAt),
+    item_key: `${repository}#${number}`,
+    repository,
+    number,
+    source_comment_id: sourceCommentId,
+    source_delivery_id: sourceDeliveryId,
+    triggered_at: triggeredAt,
+  };
+}
+
+function normalizeBayJourneyCompletion(value) {
+  const completion = objectValue(value);
+  const repository = nullableString(completion.repository)?.toLowerCase() || null;
+  const number = Number(completion.number);
+  const sourceCommentId = Number(completion.source_comment_id);
+  const completedAt = bayJourneyTimestamp(completion.completed_at);
+  const completionKind = nullableString(completion.completion_kind);
+  const completionCommentId = Number(completion.completion_comment_id);
+  if (
+    !repository ||
+    !Number.isInteger(number) ||
+    number <= 0 ||
+    !Number.isSafeInteger(sourceCommentId) ||
+    sourceCommentId <= 0 ||
+    !completedAt
+  ) {
+    return null;
+  }
+  return {
+    id: bayJourneyCompletionId(
+      repository,
+      number,
+      sourceCommentId,
+      completionCommentId,
+      completedAt,
+    ),
+    item_key: `${repository}#${number}`,
+    repository,
+    number,
+    source_comment_id: sourceCommentId,
+    completed_at: completedAt,
+    completion_kind: completionKind || "final_command_status",
+    completion_comment_id:
+      Number.isSafeInteger(completionCommentId) && completionCommentId > 0
+        ? completionCommentId
+        : null,
+  };
+}
+
+function normalizeBayJourneyRecord(value) {
+  const record = objectValue(value);
+  const trigger = normalizeBayJourneyTrigger(record);
+  const completion = normalizeBayJourneyCompletion(record);
+  if (!trigger && !completion) return null;
+  const source = trigger || completion;
+  return {
+    id: source.id,
+    item_key: source.item_key,
+    repository: source.repository,
+    number: source.number,
+    source_comment_id: source.source_comment_id,
+    source_delivery_id: trigger?.source_delivery_id || null,
+    triggered_at: trigger?.triggered_at || null,
+    completed_at: completion?.completed_at || null,
+    completion_kind: completion?.completion_kind || null,
+    completion_comment_id: completion?.completion_comment_id || null,
+  };
+}
+
+export function mergeBayJourneyState(previous, triggers, completions, generatedAt) {
+  const parsedNow = Date.parse(String(generatedAt || ""));
+  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  const cutoff = now - BAY_JOURNEY_TTL_SECONDS * 1000;
+  const records = new Map();
+  for (const value of Array.isArray(previous?.journeys) ? previous.journeys : []) {
+    const record = normalizeBayJourneyRecord(value);
+    const activityAt = Math.max(
+      Date.parse(String(record?.completed_at || "")) || 0,
+      Date.parse(String(record?.triggered_at || "")) || 0,
+    );
+    if (record && activityAt >= cutoff) records.set(record.id, record);
+  }
+  for (const value of Array.isArray(triggers) ? triggers : []) {
+    const trigger = normalizeBayJourneyTrigger(value);
+    if (!trigger) continue;
+    const completedOrphan = [...records.values()]
+      .filter(
+        (record) =>
+          record.repository === trigger.repository &&
+          record.number === trigger.number &&
+          record.source_comment_id === trigger.source_comment_id &&
+          !record.triggered_at &&
+          (Date.parse(String(record.completed_at || "")) || 0) >= Date.parse(trigger.triggered_at),
+      )
+      .sort(
+        (left, right) =>
+          (Date.parse(String(left.completed_at || "")) || 0) -
+          (Date.parse(String(right.completed_at || "")) || 0),
+      )[0];
+    const current = records.get(trigger.id) || completedOrphan || {};
+    if (completedOrphan && completedOrphan.id !== trigger.id) records.delete(completedOrphan.id);
+    records.set(trigger.id, {
+      ...current,
+      ...trigger,
+      id: trigger.id,
+      triggered_at: trigger.triggered_at,
+    });
+  }
+  for (const value of Array.isArray(completions) ? completions : []) {
+    const completion = normalizeBayJourneyCompletion(value);
+    if (!completion) continue;
+    const current =
+      [...records.values()]
+        .filter(
+          (record) =>
+            record.repository === completion.repository &&
+            record.number === completion.number &&
+            record.source_comment_id === completion.source_comment_id &&
+            record.triggered_at &&
+            !record.completed_at &&
+            Date.parse(record.triggered_at) <= Date.parse(completion.completed_at),
+        )
+        .sort(
+          (left, right) =>
+            (Date.parse(String(right.triggered_at || "")) || 0) -
+            (Date.parse(String(left.triggered_at || "")) || 0),
+        )[0] ||
+      [...records.values()].find(
+        (record) =>
+          record.repository === completion.repository &&
+          record.number === completion.number &&
+          record.source_comment_id === completion.source_comment_id &&
+          record.completion_comment_id === completion.completion_comment_id &&
+          record.completed_at === completion.completed_at,
+      ) ||
+      records.get(completion.id) ||
+      {};
+    const recordId = current.id || completion.id;
+    const currentCompletedAt = Date.parse(String(current.completed_at || ""));
+    const completionAt = Date.parse(completion.completed_at);
+    if (Number.isFinite(currentCompletedAt) && currentCompletedAt > completionAt) continue;
+    if (current.id && current.id !== recordId) records.delete(current.id);
+    records.set(recordId, {
+      ...current,
+      ...completion,
+      id: recordId,
+      completed_at: completion.completed_at,
+      completion_kind: completion.completion_kind,
+      completion_comment_id: completion.completion_comment_id,
+    });
+  }
+  const journeys = [...records.values()]
+    .sort(
+      (left, right) =>
+        Math.max(
+          Date.parse(String(right.completed_at || "")) || 0,
+          Date.parse(String(right.triggered_at || "")) || 0,
+        ) -
+        Math.max(
+          Date.parse(String(left.completed_at || "")) || 0,
+          Date.parse(String(left.triggered_at || "")) || 0,
+        ),
+    )
+    .slice(0, BAY_JOURNEY_LIMIT);
+  return {
+    schema_version: 1,
+    journeys,
+    updated_at: new Date(now).toISOString(),
+  };
+}
+
+function bayJourneyStateSignature(state) {
+  return JSON.stringify({
+    schema_version: state?.schema_version,
+    journeys: state?.journeys,
+  });
+}
+
+function publicBayJourneyState(state) {
+  const journeys = (Array.isArray(state?.journeys) ? state.journeys : [])
+    .map(normalizeBayJourneyRecord)
+    .filter(Boolean)
+    .slice(0, BAY_JOURNEY_LIMIT);
+  return { journeys };
+}
+
+async function updateBayJourneyState(env, triggers, completions, generatedAt) {
+  if (!env.STATUS_STORE) return { journeys: [] };
+  if (isDurableStatusStore(env.STATUS_STORE)) {
+    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(
+      statusStoreRequest(BAY_JOURNEY_STATE_KEY, "POST"),
+      {
+        method: "POST",
+        body: JSON.stringify({
+          triggers,
+          completions,
+          generated_at: generatedAt,
+          ttl_seconds: BAY_JOURNEY_TTL_SECONDS,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`status store Bay journey merge failed: ${response.status}`);
+    return publicBayJourneyState(await response.json());
+  }
+  const stored = await readStoredJson(env, BAY_JOURNEY_STATE_KEY);
+  const next = mergeBayJourneyState(stored, triggers, completions, generatedAt);
+  if (!stored || bayJourneyStateSignature(stored) !== bayJourneyStateSignature(next)) {
+    await writeStoredJson(env, BAY_JOURNEY_STATE_KEY, next, BAY_JOURNEY_TTL_SECONDS);
+  }
+  return publicBayJourneyState(next);
+}
+
+async function readBayJourneyState(env) {
+  if (!env.STATUS_STORE) return { journeys: [] };
+  return publicBayJourneyState(await readStoredJson(env, BAY_JOURNEY_STATE_KEY));
 }
 
 function workerHealthAttempt(run, job) {

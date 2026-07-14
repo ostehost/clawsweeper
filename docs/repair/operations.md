@@ -49,7 +49,8 @@ pnpm run status -- \
 For commit-review findings, ClawSweeper dispatches
 `clawsweeper_commit_finding` to this repository. ClawSweeper fetches the latest
 markdown report, writes `results/commit-findings/<repo-slug>/<sha>.md`, and
-only opens a PR when the finding is an ordinary narrow bug/regression candidate.
+only prepares a deferred implementation bundle when the finding is an ordinary
+narrow bug/regression candidate. It does not open a PR.
 Security/privacy/supply-chain and broad findings are audit-only.
 
 ## Batch Flow
@@ -72,16 +73,17 @@ Security/privacy/supply-chain and broad findings are audit-only.
 6. Require `pnpm run repair:review-results -- <artifact-dir>` to pass before promotion.
 7. Change selected jobs to `mode: execute` or `mode: autonomous`.
 8. Set repo variable `CLAWSWEEPER_ALLOW_EXECUTE=1` only for the execution window.
-9. Set `CLAWSWEEPER_ALLOW_FIX_PR=1` only when reviewed fix artifacts are allowed to repair branches or open credited replacement PRs.
-10. Dispatch execute/autonomous jobs for reviewed clusters only. Workers still return JSON; `execute-fix-artifact` owns branch repair/replacement PR creation, and `apply-result` performs remaining safe GitHub mutations afterward.
+9. Set `CLAWSWEEPER_ALLOW_FIX_PR=1` only when reviewed fix artifacts are allowed to enter isolated preparation and immutable bundle validation.
+10. Dispatch execute/autonomous jobs for reviewed clusters only. Workers still return JSON; `execute-fix-artifact` prepares the exact branch/PR publication bundle, and the production publisher retains it as deferred evidence without a target write token. `apply-result` handles only validated no-publication GitHub actions.
 11. Reset `CLAWSWEEPER_ALLOW_EXECUTE=0` and `CLAWSWEEPER_ALLOW_FIX_PR=0`.
 
-## Manual Fix PR From Issue or PR Refs
+## Manual Fix Bundle From Issue or PR Refs
 
 Use `scripts/create-job.ts` when ClawSweeper or a maintainer has identified a
-valid issue/PR cluster that should get one implementation PR. It writes one
-idempotent job file and checks for an existing open PR or branch before creating
-another job.
+valid issue/PR cluster that should produce one implementation bundle. It writes
+one idempotent job file and checks for an existing open PR or branch before
+creating another job. The current production workflow validates and retains the
+bundle without pushing its intended branch or opening its intended PR.
 
 ```bash
 pnpm run repair:create-job -- \
@@ -109,20 +111,21 @@ pnpm run repair:validate-job -- jobs/openclaw/inbox/clawsweeper-openclaw-opencla
 pnpm run repair:dispatch -- jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md --mode autonomous
 ```
 
-To ask for a replacement PR from an existing useful but uneditable source PR,
-make the prompt explicit:
+To ask for a replacement bundle for an existing useful but uneditable source
+PR, make the prompt explicit:
 
 ```md
 Treat #123 as useful source work. If the branch cannot be safely updated
-because it is uneditable, stale, draft-only, or unsafe, create a narrow
-ClawSweeper replacement PR instead of waiting. Preserve the source PR author as
-co-author, credit the source PR in the replacement PR body, and close only that
-source PR after the replacement PR is opened.
+because it is uneditable, stale, draft-only, or unsafe, prepare a narrow
+ClawSweeper replacement bundle instead of waiting. Preserve the source PR
+author as co-author and credit the source PR in the future PR body. Do not close
+the source PR unless a trusted publisher later opens and lands the replacement.
 ```
 
-Keep `CLAWSWEEPER_ALLOW_MERGE=0` unless a human explicitly opens the merge gate.
+`CLAWSWEEPER_ALLOW_MERGE` records authorization only. Automated merge remains
+disabled at the atomic base-binding check even when a human sets it to `1`.
 
-## Manual Fix PR From Commit Finding
+## Manual Fix Bundle From Commit Finding
 
 Use the `commit finding intake` workflow for a ClawSweeper commit report:
 
@@ -136,14 +139,15 @@ gh workflow run repair-commit-finding-intake.yml \
 ```
 
 The workflow is idempotent for the commit SHA. It updates the same audit file,
-job file, branch, and PR path on rerun.
+job file, intended branch identity, and future PR metadata on rerun while
+retaining publication as a deferred bundle.
 
 If latest `main` no longer needs a fix, the generated artifact allows a clean
 no-PR outcome and the audit file records the skip.
 
 ## Security Boundary
 
-Security-sensitive work is centrally managed outside ClawSweeper Repair by default. The importer skips those clusters by default, the job schema rejects `security_sensitive: true`, the planner marks hydrated security-sensitive items only from explicit security labels or structured ClawSweeper security markers, `review-results` fails mutating recommendations against those items unless they carry an explicit `clawsweeper:autofix` or `clawsweeper:automerge` opt-in, and live merge/close finalizers re-check those deterministic signals before mutating.
+Security-sensitive work is centrally managed outside ClawSweeper Repair by default. The importer skips those clusters by default, the job schema rejects `security_sensitive: true`, the planner marks hydrated security-sensitive items only from explicit security labels or structured ClawSweeper security markers, `review-results` fails mutating recommendations against those items unless they carry an explicit `clawsweeper:autofix` or `clawsweeper:automerge` opt-in, and live closeout and merge-readiness finalizers re-check those deterministic signals before any allowed mutation. Automated merge remains disabled.
 
 Use the central OpenClaw security path for:
 
@@ -152,7 +156,7 @@ Use the central OpenClaw security path for:
 - SSRF, XSS, CSRF, RCE, auth-token leakage, or similar security-class bugs.
 
 This boundary is intentionally conservative. If a cluster is borderline, do not stage it here.
-For adopted automerge jobs, do not classify security from review prose at planning, repair, merge, or closeout time. ClawSweeper must emit a deterministic marker such as `<!-- clawsweeper-security:security-sensitive item=<pr> sha=<head-sha> -->` when the automerge loop should treat the PR as security-sensitive. If that PR, or a linked replacement PR, has an explicit maintainer automation label, bounded repair may continue, but merge still waits for a later clean exact-head review and the normal gates.
+For adopted automerge jobs, do not classify security from review prose at planning, repair, merge-readiness, or closeout time. ClawSweeper must emit a deterministic marker such as `<!-- clawsweeper-security:security-sensitive item=<pr> sha=<head-sha> -->` when the automerge loop should treat the PR as security-sensitive. If that PR, or a linked replacement PR, has an explicit maintainer automation label, bounded preparation may continue, but automated merge still fails closed after later exact-head review and all other gates.
 
 ## Auto-Closure
 
@@ -181,13 +185,18 @@ ClawSweeper events. The notifier reads `repair-apply-report.json` plus the
 published run record under `results/runs/<run-id>.json`, then posts
 `/hooks/agent` to the Hetzner OpenClaw gateway.
 
-Current event classes:
+The event schema covers:
 
-- merged PRs from executed `merge_candidate` and `merge_canonical` rows;
+- merged PRs observed after a human or future trusted publisher lands an
+  executed `merge_candidate` or `merge_canonical` row;
 - item closures from executed close actions;
 - blocked or failed merge/close actions;
-- opened replacement fix PRs and repaired contributor branches;
+- opened replacement fix PRs and repaired contributor branches from historical
+  runs or a future trusted publisher;
 - blocked or failed repair actions.
+
+The current target workflow emits no branch-push, PR-open, or automated-merge
+success event because those mutations are disabled.
 
 The standalone `repair:notify-merge` script remains for compatibility, but the
 workflow uses `repair:notify-events`.
@@ -218,7 +227,7 @@ publish workflow reruns.
 - `cluster-plan.json`: live cluster inventory and canonical candidates;
 - `fix-artifact.json`: drive plan, gates, permissions, and per-item matrix.
 
-Autonomous workers receive those artifacts in the prompt. They can emit instant close actions for high-confidence duplicate/superseded/fixed-by-candidate items, and they can emit `build_fix_artifact` when a canonical fix PR is needed.
+Autonomous workers receive those artifacts in the prompt. They can emit instant close actions for high-confidence duplicate/superseded/fixed-by-candidate items, and they can emit `build_fix_artifact` when a canonical deferred fix bundle is needed.
 
 They still must not mutate GitHub directly. Missing checkout, failing checks, conflicts, unclear canonical choice, or stale item state means `needs_human`.
 
@@ -233,17 +242,23 @@ Use `openclaw/clawsweeper` as the target repo when you need a self-contained
 event, review, comment-router, or automerge smoke that should not touch product
 repositories.
 
-Use Blacksmith labels only when you intentionally want a non-parity hosted runner for bulk planning/execution:
+Cluster planning/review and fix/apply execution use fixed Blacksmith runner
+labels. Public `runner` and `execution_runner` fields remain accepted only for
+dispatch and ledger compatibility; they are deprecated no-ops and cannot select
+a privileged runner.
 
 ```bash
-pnpm run repair:dispatch -- jobs/openclaw/cluster-*.md --mode plan --runner blacksmith-4vcpu-ubuntu-2404
+pnpm run repair:dispatch -- jobs/openclaw/cluster-*.md --mode plan
 ```
 
 The workflow uses Node 24 and starts a local Codex Responses proxy from
-`OPENAI_API_KEY` inside an isolated per-run `CODEX_HOME`. Codex subprocesses use
-that proxy config and run without raw OpenAI or Codex API key environment
-variables. The legacy `codex login` path remains available only through the
-local `setup-codex` action's `auth-mode: login` input.
+`OPENAI_API_KEY` inside a fresh, isolated, run-scoped `CODEX_HOME`. Codex
+subprocesses use that proxy config and run without raw OpenAI or Codex API key
+environment variables. No Codex cache or session is restored across jobs or
+attempts. The legacy `codex login` path remains available only through the
+local `setup-codex` action's `auth-mode: login` input. The public `model` field
+is also a deprecated no-op; the internal model is fixed by trusted
+configuration.
 
 Codex classification and fix preparation receive no GitHub write token. The workflow runs target-controlled work under a dedicated capability-free UID, drains that UID, and transfers only exact bounded reviewed files to a fresh publisher. The publisher independently validates the immutable job, result, plan, base, tree, paths, and bundle. Prepared code is not pushed: the exact evidence and a hash-bound deferred receipt are retained for 30 days until a fork-based or target-native publisher can avoid privileged target-workflow execution. Only the no-publication path may mint a narrow issues/pull-requests token for guarded comment and closeout actions. Automated merge is also disabled because GitHub cannot atomically bind the expected base branch at merge time.
 
@@ -253,16 +268,18 @@ heartbeat. If a model call is slow, Actions logs should show
 `[clawsweeper repair] ... still running` about once a minute instead of ending
 with a silent no-output timeout.
 
-Automerge repair execution also updates the existing mutable automerge status
-comment at coarse milestones: validation plan, Codex edit
-passes, validation/review loops, final base sync, and the post-repair automerge
-wait. These updates append or replace rows in the single progress timeline
-instead of adding new comments.
+Automerge repair preparation records coarse milestones in its artifacts:
+validation plan, Codex edit passes, validation/review loops, and final base
+sync. A separately authorized no-publication path may reflect validated status
+in the existing mutable comment; the isolated preparation worker has no target
+write token. There is no production post-push automerge wait.
 
 Network calls in fix execution are also bounded. Contributor-branch clone,
-fetch, push, status-comment, and review-thread calls should time out before the
-GitHub Actions step limit, leaving the final repair report and debug artifacts
-for the comment router instead of a bare step timeout.
+fetch, and read calls time out before the GitHub Actions step limit, leaving the
+final repair report and debug artifacts for the comment router instead of a
+bare step timeout. Dormant trusted-publisher push, status-comment, and
+review-thread helpers use the same bounds but are not reached by the production
+publication path.
 
 For deep debugging, download the `clawsweeper-codex-debug-cluster-*` and
 `clawsweeper-codex-debug-execute-*` artifacts from the repair worker run. They
@@ -278,10 +295,10 @@ the full session/log backup is needed. The cap defaults to 8 MiB per copied file
 and is configurable with `CLAWSWEEPER_FIX_DEBUG_MAX_BYTES`.
 
 If a replacement repair finishes with no diff against the latest base branch,
-the executor records a skipped no-op outcome instead of calling `gh pr create`.
-This avoids failing on GitHub's "No commits between" response when the repair is
-already represented on `main` or the resumed replacement branch collapsed to an
-empty diff after rebase.
+the executor records a skipped no-op outcome instead of retaining a deferred
+bundle. This also protects a future publisher from GitHub's "No commits
+between" response when the repair is already represented on `main` or the
+replacement target collapsed to an empty diff after rebase.
 
 Runs for the same job path and mode share a concurrency group. Different cluster jobs can still run in parallel.
 
@@ -347,15 +364,16 @@ Supported triggers:
 
 `review` and `re-review` dispatch ClawSweeper review again for an open issue or PR.
 Issue implementation commands (`implement`, `fix`, `build`, `create pr`, `fix issue`)
-dispatch the repair worker for one open issue and ask it to create or update a
-single ClawSweeper implementation PR. The generated job uses
+dispatch the repair worker for one open issue and ask it to prepare or update a
+single deferred implementation bundle. The command names preserve future PR
+intent, but the production workflow does not push or open one. The generated job uses
 `source: issue_implementation`, `repair_strategy: new_fix_pr`, blocks merge and
 close actions, and reuses `clawsweeper/issue-<repo>-<number>` on reruns.
 Workers can reconstruct this minimal job from the requested `jobs/.../issue-*.md`
 path when a dispatch races ahead of state propagation, so the request does not
 silently skip as stale.
-After opening the PR, the worker updates the existing ClawSweeper command status
-comment with the generated PR link.
+After validating the bundle, the worker records a hash-bound deferred receipt;
+there is no generated PR link to publish.
 If an issue implementation request is refused, the visible status comment must
 include the concrete reason, whether it is a soft or hard blocker, relevant
 evidence when available, the override command `/clawsweeper build override`,
@@ -363,7 +381,8 @@ and what the override will do for that blocker class. Soft blockers include
 automatic-lane ineligibility, medium/large/unclear implementation complexity,
 new-feature or new-config shape, missing validation commands, incomplete review
 shape, and expected decomposition. A maintainer override for a soft blocker
-allows one bounded attempt to create or update a reviewable implementation PR.
+allows one bounded attempt to prepare or update a reviewable implementation
+bundle.
 Hard blockers include security-sensitive signals, protected labels, locked or
 closed issues, existing linked PRs, existing ClawSweeper implementation PRs,
 unsupported target repos, and missing usable request/context. A maintainer
@@ -373,15 +392,15 @@ or human-review handoff.
 When `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS=1`, review publish can also dispatch
 the same lane automatically for strict bug reports only: `item_category: bug`,
 `reproduction_status: reproduced`, `reproduction_confidence: high`, high
-work confidence, and no feature/config/product-decision blockers. Those PRs are
-labeled `clawsweeper:autogenerated`.
+work confidence, and no feature/config/product-decision blockers. Their
+future-publication metadata reserves `clawsweeper:autogenerated`.
 When `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT=1`, review publish can also
 dispatch the sibling vision-fit lane for small `VISION.md`-aligned issue work:
 `auto_implementation_candidate: vision_fit`, `vision_fit: aligned`,
 `implementation_complexity: small`, high-confidence `queue_fix_pr` work, no
 security/protected signal, no product-decision blocker, and complete repair
-shape. Those jobs use `trigger_source: review_vision_fit` and still only open or
-update one generated PR.
+shape. Those jobs use `trigger_source: review_vision_fit` and still prepare only
+one deferred publication target.
 Repair commands apply to existing ClawSweeper PRs and to PRs opted into
 `clawsweeper:autofix` or `clawsweeper:automerge`. Existing ClawSweeper PRs are
 identified by the `clawsweeper/*` branch prefix. Opted-in non-ClawSweeper PRs
@@ -404,17 +423,16 @@ synthetic command dispatches the normal repair worker. PRs paused with
 Use `--comment-id <id>`, `--comment-ids <a,b>`, `--item-number <number>`, or
 `--item-numbers <a,b>` to route only specific comments or specific open issue
 or PR comments. The event review workflow uses this targeted path after syncing
-its durable ClawSweeper verdict so automerge can act on a fresh `pass` marker
-without waiting for the scheduled comment-router sweep. No-op targeted
-acknowledgements, such as already-processed commands or already-enabled
-automerge commands, do not publish a durable ledger commit.
+its durable ClawSweeper verdict so automerge readiness can be assessed from a
+fresh `pass` marker without waiting for the scheduled comment-router sweep.
+No-op targeted acknowledgements, such as already-processed commands or
+already-enabled automerge commands, do not publish a durable ledger commit.
 
-Same-branch automerge repairs also use a shepherd wait inside the repair
-executor. After a deterministic rebase or known mechanical conflict repair is
-pushed, the executor polls the repaired head for GitHub checks and the
-exact-head ClawSweeper pass marker, then dispatches the comment router as soon
-as merge gates are ready. Codex fix/edit remains the fallback when the
-deterministic repair path cannot complete cleanly.
+The same-branch post-push shepherd remains future trusted-publisher library
+support. Production execution stops after deterministic rebase or known
+mechanical conflict repair is validated and bundled; it does not push, poll a
+new remote head, or dispatch a merge attempt. Codex fix/edit remains the
+fallback when local deterministic preparation cannot complete cleanly.
 
 For the full automerge decision table, including why pending checks wait instead
 of dispatching repair and how to replay a fixed router against an exact trusted
@@ -444,20 +462,21 @@ two auto-repairs per PR head SHA by default, controlled by
 head SHA changes, so the automatic loop stops after ten ClawSweeper-triggered
 repair passes.
 
-Maintainers can start the bounded review/fix loop on any open PR with
-`/clawsweeper autofix`, or the bounded review/fix/merge loop with
+Maintainers can start bounded review/fix preparation on any open PR with
+`/clawsweeper autofix`, or record automerge intent with
 `/clawsweeper automerge`. The router adds `clawsweeper:autofix` or
 `clawsweeper:automerge`, creates an adopted job when needed, dispatches
 ClawSweeper for the current head, and then reacts to trusted ClawSweeper
-markers. `needs-changes` repairs the source branch when safe or opens a credited
-replacement when it is not. `pass`, `approved`, or `no-changes` never merge
-autofix or draft PRs. Automerge may merge only when the marker SHA matches the
-current head, checks and mergeability are clean, pause labels have been cleared,
-the PR is not draft, and `CLAWSWEEPER_ALLOW_MERGE=1` is set. The
-`clawsweeper:automerge` opt-in is the per-PR merge authorization. A trusted
+markers. `needs-changes` prepares a source-branch or credited replacement
+bundle. `pass`, `approved`, or `no-changes` record readiness without merging.
+Automerge readiness additionally requires that the marker SHA match the current
+head, checks and mergeability are clean, pause labels are cleared, the PR is not
+draft, and `CLAWSWEEPER_ALLOW_MERGE=1` is set. Strict atomic base binding then
+blocks the merge itself. The `clawsweeper:automerge` opt-in is per-PR
+authorization metadata, not merge authority. A trusted
 `needs-human` or `human-review` verdict on an opted-in PR adds
 `clawsweeper:human-review` and pauses the loop; a later trusted pass for the
-exact current head clears stale pause labels before continuing automerge.
+exact current head clears stale pause labels before readiness is reported.
 ClawSweeper must emit an accepted repair verdict or action marker to dispatch
 the repair/rebase loop.
 
@@ -470,6 +489,11 @@ If `main` advanced after validation, the worker rebases again; any conflicts are
 handed back to Codex for resolution, then validation and Codex `/review` rerun
 before the deferred publication receipt is recorded.
 
+If the source head changes instead, the worker records
+`requeue_required: true` and stops without mutation. A trusted coordinator or
+operator must start a fresh run through the bounded requeue tool; the worker
+does not dispatch itself.
+
 The scheduled workflow is dry by default. Set
 `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1` in repo variables to let scheduled runs
 post replies and dispatch workers. Manual workflow dispatch can also pass
@@ -479,16 +503,24 @@ the production workflow defers branch publication.
 
 ## Token Strategy
 
-CI mints one short-lived GitHub App token and passes it to deterministic repair steps as `GH_TOKEN`.
+CI uses separately scoped, short-lived GitHub App tokens. Isolated preparation
+gets read access only. Prepared-publication mode mints no target write token;
+only the independently validated no-publication applicator may receive an
+exact-repository issues/pull-requests token.
 
-Minimum useful app permissions depend on action tier:
+Permission shapes retained for current and future action tiers are:
 
 - classification/preflight: metadata read, issues read, pull requests read, contents read
 - comments and closeout: issues write, pull requests write
-- merge/automerge: contents write, pull requests write, issues write
-- fix PRs: contents write, pull requests write, issues write
+- future trusted merge/automerge publisher: contents write, pull requests write,
+  issues write
+- future trusted fix-PR publisher: contents write, pull requests write, issues
+  write
 
-Do not put tokens in job files. Codex receives no GitHub token; the read token is scoped to preflight, and the write token is scoped to the deterministic apply step.
+Do not put tokens in job files. Codex receives no GitHub token; the read token is
+scoped to preflight, and the current write token is scoped to deterministic
+no-publication apply actions. The production publisher receives no target write
+token.
 
 ## Promotion Rules
 

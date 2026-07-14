@@ -24,12 +24,12 @@ on:
           - execute
           - autonomous
       runner:
-        description: "Runner label for cluster planning/review work"
+        description: "Deprecated compatibility value; planning uses a fixed trusted runner"
         required: true
         default: blacksmith-4vcpu-ubuntu-2404
         type: string
       execution_runner:
-        description: "Runner label for fix/apply execution work"
+        description: "Deprecated compatibility value; execution uses a fixed trusted runner"
         required: true
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
@@ -42,7 +42,7 @@ on:
           - read-only
           - danger-full-access
       model:
-        description: "Internal Codex model alias"
+        description: "Deprecated compatibility value; the workflow uses its fixed internal model"
         required: true
         default: internal
         type: string
@@ -269,7 +269,7 @@ jobs:
             echo "allow_merge=${CLAWSWEEPER_ALLOW_MERGE}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Codex session cache
+      - name: Resolve run-scoped Codex session
         id: codex_session
         if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
         env:
@@ -289,18 +289,6 @@ jobs:
           CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
         with:
           codex-home: ${{ steps.codex_session.outputs.codex_home }}
-
-      - name: Restore Codex session
-        id: restore_codex_session
-        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ${{ steps.codex_session.outputs.codex_home }}/sessions
-            ${{ steps.codex_session.outputs.codex_home }}/clawsweeper-thread-state.json
-          key: ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}-cluster
-          restore-keys: |
-            ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-
 
       - name: Register steerable Action session
         id: crabfleet_session
@@ -480,11 +468,6 @@ jobs:
       prepared_artifact_digest: ${{ steps.upload-prepared.outputs.artifact-digest }}
     env:
       JOB_PATH: ${{ inputs.job }}
-      REQUEUE_MODE: ${{ inputs.mode }}
-      REQUEUE_DEPTH: ${{ inputs.requeue_depth }}
-      REQUEUE_RUNNER: ${{ inputs.runner }}
-      REQUEUE_EXECUTION_RUNNER: ${{ inputs.execution_runner }}
-      REQUEUE_MODEL: ${{ inputs.model }}
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
@@ -554,7 +537,7 @@ jobs:
           JOB_PATH: ${{ inputs.job }}
         run: scripts/restore-repair-job.sh "$JOB_PATH" "execute"
 
-      - name: Resolve Codex session cache
+      - name: Resolve run-scoped Codex session
         id: codex_session
         if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
         env:
@@ -627,17 +610,6 @@ jobs:
         with:
           cache-suffix: target-pnpm
           codex-home: ${{ steps.codex_session.outputs.codex_home }}
-
-      - name: Restore Codex session
-        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ${{ steps.codex_session.outputs.codex_home }}/sessions
-            ${{ steps.codex_session.outputs.codex_home }}/clawsweeper-thread-state.json
-          key: ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}-cluster
-          restore-keys: |
-            ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-
 
       - name: Resume steerable Action session
         id: crabfleet_session
@@ -1253,7 +1225,7 @@ jobs:
 
       - name: Record work completion
         if: ${{ success() && steps.crabfleet_session.outcome == 'success' }}
-        run: node dist/repair/action-session.js update --state completed --phase "done" --summary "Repair, validation, review, push, and post-flight gates completed" --completion-reason gates_passed
+        run: node dist/repair/action-session.js update --state completed --phase "done" --summary "Validated GitHub actions and post-flight gates completed" --completion-reason gates_passed
 
       - name: Upload final publication artifacts
         if: always()

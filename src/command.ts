@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, normalize, resolve, win32 } from "node:path";
 
 export type RunTextOptions = {
   cwd?: string | undefined;
@@ -99,38 +99,40 @@ export function resolveCommand(
   const key = commandBinKey(command);
   const configured = env[`${key}_BIN`]?.trim();
   if (configured) {
+    if (protectedCommands.has(command) && !absoluteCommand(configured, platform)) {
+      throw new UserFacingCommandError(`${key}_BIN must be an absolute path`);
+    }
     return {
       command: configured,
       args: [...envArgs(`${key}_BIN_ARGS`, env), ...args],
     };
   }
-  return { command: defaultCommand(command, env, platform), args: [...args] };
+  return { command: defaultCommand(command, platform), args: [...args] };
 }
 
-function defaultCommand(
-  command: string,
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform,
-): string {
+function defaultCommand(command: string, platform: NodeJS.Platform): string {
   if (platform !== "win32" && protectedCommands.has(command)) {
-    return trustedPosixCommand(command, env);
+    if (command === "git") return "/usr/bin/git";
+    const candidates =
+      platform === "darwin"
+        ? ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        : ["/usr/bin/gh", "/usr/local/bin/gh"];
+    return candidates.find(isExecutableFile) ?? candidates[0]!;
   }
   return command;
 }
 
-function trustedPosixCommand(command: string, env: NodeJS.ProcessEnv): string {
-  for (const directory of (env.PATH ?? "").split(":")) {
-    // Relative and empty PATH entries could resolve inside an untrusted target checkout.
-    if (!isAbsolute(directory)) continue;
-    const candidate = join(directory, command);
-    try {
-      accessSync(candidate, constants.X_OK);
-      if (statSync(candidate).isFile()) return candidate;
-    } catch {
-      // Try the next absolute PATH entry before using the controlled-runner default.
-    }
+function isExecutableFile(filePath: string): boolean {
+  try {
+    accessSync(filePath, constants.X_OK);
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
   }
-  return join("/usr/bin", command);
+}
+
+function absoluteCommand(command: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32" ? win32.isAbsolute(command) : isAbsolute(command);
 }
 
 export function resolveSpawnCommand(
@@ -206,17 +208,24 @@ function resolveWindowsCommand(
   const extensions = (windowsEnvironmentValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .filter(Boolean);
-  const candidates = [command, ...extensions.map((extension) => `${command}${extension}`)];
-  for (const directory of (windowsEnvironmentValue(env, "PATH") || "").split(";").filter(Boolean)) {
+  let unsupportedExtensionlessCommand: string | undefined;
+  for (const directory of (windowsEnvironmentValue(env, "PATH") || "")
+    .split(delimiter)
+    .filter(Boolean)) {
     if (absolutePathEntriesOnly && !isAbsolute(directory)) continue;
-    for (const candidate of candidates) {
-      const parent = resolve(cwd, directory);
+    const parent = resolve(cwd, directory);
+    for (const candidate of extensions.map((extension) => `${command}${extension}`)) {
       const filePath = resolve(parent, candidate);
       const actualPath = actualCasePath(parent, candidate);
       if (actualPath || existsSync(filePath)) return actualPath ?? filePath;
     }
+    const extensionlessCommand = actualCasePath(parent, command) ?? resolve(parent, command);
+    if (existsSync(extensionlessCommand)) {
+      if (nodeShebangScript(extensionlessCommand)) return extensionlessCommand;
+      unsupportedExtensionlessCommand ??= extensionlessCommand;
+    }
   }
-  return undefined;
+  return unsupportedExtensionlessCommand;
 }
 
 function actualCasePath(parent: string, candidate: string): string | undefined {

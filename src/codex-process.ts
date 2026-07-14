@@ -129,7 +129,7 @@ export function runCodexProcess(options: {
         args: [...options.args],
         command: isolatedPrincipal
           ? trustedCodexExecutable(options.env, options.cwd)
-          : codexProcessCommand(options.env),
+          : codexProcessCommand(options.env, process.platform, options.cwd),
         timeoutMs: options.timeoutMs,
         resultPath,
         stdoutPath,
@@ -233,6 +233,7 @@ export function isolatedCodexEnvironment(env: NodeJS.ProcessEnv): NodeJS.Process
     "https_proxy",
     "http_proxy",
     "no_proxy",
+    "CLAWSWEEPER_PROOF_INPUT_DIR",
     "CLAWSWEEPER_PROOF_SCRATCH_DIR",
   ]) {
     const value = env[name];

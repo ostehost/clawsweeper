@@ -2,7 +2,7 @@
 
 Read this guide to understand how ClawSweeper turns GitHub work into bounded,
 observable, steerable Codex sessions. It covers issue-to-PR work, PR repair,
-GitCrawl cluster intake, GitHub App authentication, durable session resumption,
+GitCrawl cluster intake, GitHub App authentication, run-scoped Codex sessions,
 CrabFleet terminal steering, worker capacity, completion gates, dashboards,
 opt-out controls, and failure recovery.
 
@@ -12,6 +12,12 @@ This is the system-level guide. Detailed repair policy remains in
 [`live-dashboard.md`](live-dashboard.md), and the CrabFleet transport contract
 in
 [`openclaw/crabfleet/docs/github-actions-sessions.md`](https://github.com/openclaw/crabfleet/blob/main/docs/github-actions-sessions.md).
+
+Current production boundary: isolated workers can prepare and independently
+validate code, but prepared publication is recorded as a deferred, hash-bound
+bundle. They do not push branches or open PRs, and strict base binding keeps
+automerge fail-closed. References to eventual PR publication below describe the
+intended trusted-publisher destination, not a live mutation path.
 
 ## Goals
 
@@ -45,8 +51,8 @@ flowchart LR
   E <--> F
   F <--> H[Browser Ghostty terminal]
   D --> I[Deterministic validation and review]
-  I --> J[GitHub App mutation steps]
-  J --> K[PR, repaired branch, comments, labels, or guarded merge]
+  I --> J[Trusted publication decision]
+  J --> K[Deferred bundle or allowed no-publication mutation]
   D --> L[Result ledger and dashboard events]
   L --> M[ClawSweeper dashboard]
   F --> N[CrabFleet fleet dashboard]
@@ -72,14 +78,20 @@ Ownership boundaries:
 Every steerable repair job is presented in the dashboards as one of three work
 types.
 
-| Work kind | Durable job intent | Purpose |
-| --- | --- | --- |
-| `issue_to_pr` | `implement_issue` | Verify one issue and open or update one focused implementation PR. |
-| `pr_repair` | `automerge_pr` | Repair, rebase, validate, re-review, and optionally merge an opted-in PR. |
-| `repair_cluster` | `repair_cluster` or another repair intent | Review and repair related issues and PRs, including GitCrawl imports. |
+| Work kind        | Durable job intent                        | Current production purpose                                                |
+| ---------------- | ----------------------------------------- | ------------------------------------------------------------------------- |
+| `issue_to_pr`    | `implement_issue`                         | Verify one issue and prepare one focused deferred implementation bundle.  |
+| `pr_repair`      | `automerge_pr`                            | Repair, rebase, validate, and defer a bundle; record merge intent only.   |
+| `repair_cluster` | `repair_cluster` or another repair intent | Review related work and prepare bounded bundles, including GitCrawl work. |
 
 The work kind affects dashboard grouping and operator context. It does not
 bypass repair policy or mutation gates.
+
+Under the current hardened publication boundary, `issue_to_pr` and `pr_repair`
+can prepare and independently validate an immutable code bundle, but the target
+workflow retains it as deferred evidence instead of pushing a branch, opening a
+PR, or merging. The table describes durable job intent, not a currently enabled
+publication capability.
 
 ## Intake Paths
 
@@ -116,10 +128,10 @@ PR commands use the same repair worker:
 @clawsweeper rebase
 ```
 
-`autofix` permits bounded repair but never merge. `automerge` adds per-PR merge
-authorization, but merge still requires the global merge gate, a clean
-exact-head review, green checks, clean mergeability, and no unresolved safety
-blocker.
+`autofix` and `automerge` permit bounded repair preparation. `automerge` also
+records per-PR merge authorization, but automated merge remains fail-closed
+because GitHub cannot atomically bind the reviewed base branch. Prepared code
+is retained as a deferred publication bundle.
 
 ### Automatic Issue Intake
 
@@ -219,8 +231,9 @@ Repair clusters carry a stable `cluster_id`. The CrabFleet work key is:
 <target-repo>:<cluster-id>
 ```
 
-That key maps repeated GitHub Actions attempts to one logical CrabFleet session
-and one durable Codex thread state.
+That key maps repeated GitHub Actions attempts to one logical CrabFleet work
+identity. Each Actions attempt starts a run-scoped Codex session; session trees
+are not restored across attempts.
 
 ### GitCrawl Store Ledger
 
@@ -293,7 +306,7 @@ This lets the logical work survive runner replacement, retries, planning to
 execution transitions, and requeues. The Action runner is disposable; the work
 identity is not.
 
-## Persistent Codex Threads
+## Run-Scoped Codex Threads
 
 Steerable mode is enabled with:
 
@@ -302,19 +315,16 @@ CLAWSWEEPER_STEERABLE_CODEX=1
 ```
 
 For each job path, the workflow derives a stable work hash and uses a dedicated
-`CODEX_HOME`. It restores and saves only:
+`CODEX_HOME` for the current runner attempt. Codex thread files remain inside
+the isolated principal boundary and are not restored from or uploaded to the
+Actions cache. This prevents a model-controlled session tree or a legacy cache
+entry from introducing links or unbounded content into a later trusted runner.
 
-- the Codex app-server `sessions/` directory;
-- `clawsweeper-thread-state.json`, containing the thread ID and optional session
-  ID.
-
-The planning and execution jobs use restore prefixes for the same work hash.
-The app-server wrapper first attempts `thread/resume`; if that stored thread is
-unavailable, it reports the fallback and starts a new non-ephemeral thread.
-
-The persistent thread provides conversational continuity. It does not make one
-GitHub Actions process run for days. Individual runner jobs remain bounded by
-workflow timeouts, while later attempts can resume the same logical work.
+The CrabFleet action-session identity remains durable across retries, planning
+to execution transitions, and requeues, but a replacement runner starts a new
+Codex thread and rebuilds context from the durable job and hydrated artifacts.
+Cross-attempt Codex thread persistence stays disabled until it can use a
+bounded, validated, host-owned snapshot format.
 
 ## GitHub Actions Lifecycle
 
@@ -326,13 +336,12 @@ The planning job performs:
 2. Short-lived read-only GitHub App token creation.
 3. Durable state checkout.
 4. Execution-gate capture.
-5. Stable Codex session path resolution and cache restore.
+5. Stable run-scoped Codex session path resolution.
 6. CrabFleet action-session registration.
 7. Job validation and stale-head verification.
-8. Codex planning or autonomous artifact generation.
+8. Isolated Codex planning or autonomous artifact generation.
 9. Deterministic result review.
-10. Debug and transfer artifact upload.
-11. Codex session cache save.
+10. Principal drain and exact artifact transfer.
 
 Plan-only work ends with:
 
@@ -349,18 +358,21 @@ execution job.
 
 The execution job:
 
-1. Mints a separate write-capable GitHub App token.
-2. Restores durable state and the same Codex thread.
+1. Mints a separate exact-repository read-only GitHub App token.
+2. Restores durable state and starts a run-scoped Codex thread.
 3. Re-registers the same CrabFleet work key, rotating credentials.
 4. Downloads the planning artifact.
 5. Revalidates the job and source head.
 6. Runs the bounded Codex edit, validation, and review loop when execution gates
    are open.
-7. Applies allowed close or merge actions deterministically.
-8. Runs post-flight checks against the pushed head and live GitHub state.
-9. Publishes final result artifacts and saves the Codex session.
+7. Drains the isolated principal and transfers only the exact prepared bundle.
+8. Independently validates that immutable bundle without a write credential.
+9. Defers prepared code publication, or mints a narrow token after validation
+   when no code publication is required and applies allowed GitHub actions.
+10. Publishes final result artifacts; principal-owned Codex session files remain
+    scoped to the runner attempt.
 
-Successful execution ends with:
+Successful no-publication execution ends with:
 
 ```text
 state: completed
@@ -368,9 +380,15 @@ phase: done
 completion_reason: gates_passed
 ```
 
+Prepared code takes the fail-closed path instead: the publisher persists a
+`deferred` report and uploads the independently validated bundle without
+receiving a target mutation token. A separate trusted publication design is
+required before that bundle can update a branch or open a pull request.
+
 If the source head changes during work, the executor records a requeue request
-and the workflow dispatches the same job against the new head. CrabFleet reports
-`running / requeued` rather than incorrectly marking the logical work complete.
+and the current attempt stops without mutation. The hardened worker does not
+self-dispatch; a trusted coordinator or operator must use the bounded requeue
+tooling to start the same job against the new head.
 
 ### Failure States
 
@@ -392,7 +410,7 @@ ClawSweeper launches `codex app-server` over stdio when steerable mode is
 enabled. The wrapper:
 
 1. Initializes the app-server.
-2. Starts or resumes the durable thread.
+2. Starts a run-scoped thread, or resumes it within the same runner attempt.
 3. Starts a turn with the normal prompt, sandbox policy, output schema, and
    configured model alias.
 4. Connects outbound to CrabFleet through the session-scoped runner WebSocket.
@@ -460,17 +478,18 @@ The Codex turn ending is not the completion signal.
 Work is complete only when the workflow emits a terminal work state with an
 explicit completion reason:
 
-| State | Completion reason | Meaning |
-| --- | --- | --- |
-| `completed` | `plan_complete` | Planning and deterministic result review passed; no mutation was requested. |
-| `completed` | `gates_passed` | Repair, validation, review, push, and post-flight gates passed. |
-| `blocked` | `action_failed` | The Action ended before all required gates passed. |
-| `canceled` | `stopped from Crabfleet` | An authorized operator canceled the action session. |
+| State       | Completion reason        | Meaning                                                                     |
+| ----------- | ------------------------ | --------------------------------------------------------------------------- |
+| `completed` | `plan_complete`          | Planning and deterministic result review passed; no mutation was requested. |
+| `completed` | `gates_passed`           | Validated no-publication actions and post-flight gates passed.              |
+| `blocked`   | `action_failed`          | The Action ended before all required gates passed.                          |
+| `canceled`  | `stopped from Crabfleet` | An authorized operator canceled the action session.                         |
 
-For execute or autonomous work, `gates_passed` means the relevant deterministic
-steps finished. Depending on job policy, the result may be a repaired source
-branch, a replacement PR, a generated issue implementation PR, a guarded merge,
-or a blocked or no-op outcome recorded in the result ledger.
+For execute or autonomous work, `gates_passed` means the allowed deterministic
+no-publication steps finished. Prepared branch or pull-request changes instead
+produce a deferred publication artifact and do not claim publication success.
+Other outcomes can include an allowed no-publication mutation, a closure, or a
+blocked or no-op result recorded in the ledger. Live merge remains disabled.
 
 Operators should use all three proof surfaces:
 
@@ -485,10 +504,12 @@ Operators should use all three proof surfaces:
 ClawSweeper uses the `clawsweeper` GitHub App to mint short-lived installation
 tokens per job and permission tier.
 
-Planning receives read permissions for contents, issues, and pull requests.
-Execution creates a separate token with the write permissions needed for the
-selected repair path. State and central workflow dispatch use independently
-scoped installation tokens.
+Planning and repair preparation receive separate exact-repository read-only
+tokens. Only after independent validation, and only when no prepared code must
+be published, may the publisher mint the narrow write token required by the
+selected deterministic GitHub action. Prepared code publication intentionally
+receives no target write token. State access uses independently scoped
+installation tokens.
 
 There is no PAT fallback for write operations. Missing GitHub App permissions
 fail token creation or the deterministic write step.
@@ -529,15 +550,15 @@ The checked-in source of truth is `config/automation-limits.json`.
 
 Current global and key lane limits:
 
-| Limit | Value |
-| --- | ---: |
-| Global Codex worker budget | 128 |
-| Interactive reserve | 16 |
-| Expansion reserve | 8 |
-| Existing repair, PR repair, and issue implementation default | 51 |
-| Imported GitCrawl cluster repair | 2 |
-| Quiet normal-review ceiling | 89 |
-| Quiet hot-intake ceiling | 44 |
+| Limit                                                        | Value |
+| ------------------------------------------------------------ | ----: |
+| Global Codex worker budget                                   |   128 |
+| Interactive reserve                                          |    16 |
+| Expansion reserve                                            |     8 |
+| Existing repair, PR repair, and issue implementation default |    51 |
+| Imported GitCrawl cluster repair                             |     2 |
+| Quiet normal-review ceiling                                  |    89 |
+| Quiet hot-intake ceiling                                     |    44 |
 
 Important behavior:
 
@@ -638,19 +659,19 @@ maintainer authorship rules, validation results, internal review findings,
 GitHub checks, mergeability, and unresolved review threads as applicable.
 
 Issue implementation jobs intentionally set merge and close behavior off. They
-open or update a PR, apply `clawsweeper:autogenerated` and
-`clawsweeper:autofix`, and continue exact-head review/repair until no actionable
-findings remain. The terminal clean review waits for required checks to appear
-and settle green plus GitHub merge-state readiness, then removes the repair-loop
-label and leaves the PR open for maintainer review and manual merge.
+prepare and independently validate one focused implementation bundle, then
+retain it as deferred evidence without opening or updating a PR. A future
+trusted publisher may apply `clawsweeper:autogenerated` and
+`clawsweeper:autofix` and resume exact-head review only after publication has a
+safe target-native or fork-based boundary.
 
 ## Failure and Recovery
 
 ### Runner Ends or Is Replaced
 
-The next attempt registers the same work key, rotates the agent token,
-disconnects the previous runner, restores the thread cache, and attempts
-`thread/resume`.
+The next attempt registers the same work key, rotates the agent token, and
+disconnects the previous runner. It starts a fresh Codex thread from the durable
+job and hydrated artifacts; principal-owned thread files do not cross attempts.
 
 ### Codex Thread Cannot Resume
 
@@ -661,8 +682,9 @@ from the new prompt and hydrated artifacts.
 ### Source Branch Changes
 
 Force-with-lease and exact-head checks prevent overwriting contributor work. The
-executor records `requeue_required`, publishes the result, and dispatches a new
-attempt against the latest head.
+executor records `requeue_required`, publishes the result, and stops without
+mutation. A trusted coordinator or operator must dispatch the next attempt
+against the latest head; the worker does not recursively dispatch itself.
 
 ### Validation or Internal Review Fails
 
@@ -718,13 +740,14 @@ so missing drill-down detail should not hide an active run.
 ### Start PR Repair
 
 1. Use `@clawsweeper autofix` for repair-only or
-   `@clawsweeper automerge` for repair plus guarded merge.
+   `@clawsweeper automerge` for repair preparation plus merge intent. Live
+   merge remains disabled by strict base binding.
 2. Add `clawsweeper:human-review` or use `@clawsweeper stop` at any time to
    pause.
 3. Watch the PR Repair filter and mutable automerge status comment.
 4. Steer only while the Codex turn is active.
-5. Verify the exact-head review and GitHub checks before considering the PR
-   ready.
+5. Verify the exact-head input review, prepared-tree validation, and deferred
+   result before considering the preparation complete.
 
 ### Run a Plan-Only Cluster
 
@@ -742,48 +765,48 @@ This invokes Codex but does not enter the execution job. Success reports
 ### Requeue a Failed Attempt
 
 Use the repair requeue tooling with the existing run ID or job path. Requeueing
-preserves the logical job, stable work key, CrabFleet session, and resumable
-Codex thread when the cache remains available.
+preserves the logical job, stable work key, and CrabFleet session. The new
+runner rebuilds Codex context from durable inputs.
 
 ## Configuration Summary
 
 Core steerable-session configuration:
 
-| Name | Purpose |
-| --- | --- |
-| `CLAWSWEEPER_STEERABLE_CODEX` | Enables app-server threads, cache persistence, and CrabFleet steering. |
-| `CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN` | Registers or resumes the logical action session. |
-| `CLAWSWEEPER_CRABFLEET_URL` | CrabFleet API and dashboard base URL. |
-| `CLAWSWEEPER_CRABFLEET_OWNER` | Active CrabFleet user principal for new action sessions. |
-| `CLAWSWEEPER_CODEX_TIMEOUT_MS` | Planning Codex call timeout. |
-| `CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS` | Per-call execution Codex timeout. |
-| `CLAWSWEEPER_FIX_STEP_TIMEOUT_MS` | Overall fix executor step budget. |
+| Name                                  | Purpose                                                       |
+| ------------------------------------- | ------------------------------------------------------------- |
+| `CLAWSWEEPER_STEERABLE_CODEX`         | Enables run-scoped app-server threads and CrabFleet steering. |
+| `CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN` | Registers or resumes the logical action session.              |
+| `CLAWSWEEPER_CRABFLEET_URL`           | CrabFleet API and dashboard base URL.                         |
+| `CLAWSWEEPER_CRABFLEET_OWNER`         | Active CrabFleet user principal for new action sessions.      |
+| `CLAWSWEEPER_CODEX_TIMEOUT_MS`        | Planning Codex call timeout.                                  |
+| `CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS`    | Per-call execution Codex timeout.                             |
+| `CLAWSWEEPER_FIX_STEP_TIMEOUT_MS`     | Overall fix executor step budget.                             |
 
 Issue implementation controls:
 
-| Name | Purpose |
-| --- | --- |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES` | Master automatic issue-to-PR gate; default off. |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS` | Strict reproduced-bug automatic lane. |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT` | Small vision-aligned automatic lane. |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS` | Issue implementation live-worker override. |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_DISPATCH_PER_SWEEP` | Per-publish dispatch cap. |
+| Name                                                | Purpose                                         |
+| --------------------------------------------------- | ----------------------------------------------- |
+| `CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES`                 | Master automatic issue-to-PR gate; default off. |
+| `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS`             | Strict reproduced-bug automatic lane.           |
+| `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT`             | Small vision-aligned automatic lane.            |
+| `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS`       | Issue implementation live-worker override.      |
+| `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_DISPATCH_PER_SWEEP` | Per-publish dispatch cap.                       |
 
 GitCrawl controls:
 
-| Name | Purpose |
-| --- | --- |
-| `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED` | Enables scheduled GitCrawl cluster intake. |
-| `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` | Maximum clusters imported by one intake run. |
-| `CLAWSWEEPER_MAX_LIVE_WORKERS` | Optional explicit repair dispatch override. |
+| Name                                         | Purpose                                      |
+| -------------------------------------------- | -------------------------------------------- |
+| `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED` | Enables scheduled GitCrawl cluster intake.   |
+| `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT`    | Maximum clusters imported by one intake run. |
+| `CLAWSWEEPER_MAX_LIVE_WORKERS`               | Optional explicit repair dispatch override.  |
 
 Mutation controls:
 
-| Name | Purpose |
-| --- | --- |
-| `CLAWSWEEPER_ALLOW_EXECUTE` | Enables deterministic execute or autonomous mutation steps. |
-| `CLAWSWEEPER_ALLOW_FIX_PR` | Enables branch repair or replacement and generated PR creation. |
-| `CLAWSWEEPER_ALLOW_MERGE` | Enables final guarded merge. |
+| Name                        | Purpose                                                         |
+| --------------------------- | --------------------------------------------------------------- |
+| `CLAWSWEEPER_ALLOW_EXECUTE` | Enables deterministic execute or autonomous mutation steps.     |
+| `CLAWSWEEPER_ALLOW_FIX_PR`  | Enables repair preparation and immutable bundle validation.     |
+| `CLAWSWEEPER_ALLOW_MERGE`   | Records merge intent; strict base binding still blocks merging. |
 
 ## Invariants
 

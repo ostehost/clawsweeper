@@ -43,7 +43,7 @@ test("repair requeue receipts remain stable but the isolated worker never recurs
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
   assert.match(workflow, /JOB_PATH: \$\{\{ inputs\.job \}\}/);
-  assert.match(workflow, /REQUEUE_DEPTH: \$\{\{ inputs\.requeue_depth \}\}/);
+  assert.doesNotMatch(workflow, /^\s+REQUEUE_(?:MODE|DEPTH|RUNNER|EXECUTION_RUNNER|MODEL):/m);
   assert.doesNotMatch(workflow, /repair:requeue|requeue-job\.js/);
   assert.doesNotMatch(workflow, /setup-action-ledger|repair-requeue action ledger/);
   assert.doesNotMatch(workflow, /count-requeue-required|--source-job-path/);

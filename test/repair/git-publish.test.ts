@@ -13,6 +13,7 @@ import {
   publishMainCommit,
   refreshSourceAfterStatePublish,
   setTokenOrigin,
+  spawnGit,
   stagePaths,
   uniqueNonEmpty,
 } from "../../dist/repair/git-publish.js";
@@ -21,6 +22,7 @@ for (const key of [
   "CLAWSWEEPER_STATE_DIR",
   "CLAWSWEEPER_PUBLISH_ROOT",
   "CLAWSWEEPER_PUBLISH_BRANCH",
+  "CLAWSWEEPER_STATE_REPOSITORY",
 ]) {
   delete process.env[key];
 }
@@ -2221,7 +2223,7 @@ test("state hard reset rejects a state-root symlink or ancestor of the source cw
       withEnv({ CLAWSWEEPER_STATE_DIR: stateLink }, () =>
         withCwd(source, () => hardResetToRemoteMain()),
       ),
-    /state publish root must be separate from the source cwd/,
+    /state publish root must not be a symlink/,
   );
   assert.equal(run("git", ["rev-parse", "HEAD"], source), before);
 
@@ -2235,6 +2237,32 @@ test("state hard reset rejects a state-root symlink or ancestor of the source cw
     /state publish root must be separate from the source cwd/,
   );
   assert.equal(run("git", ["rev-parse", "HEAD"], source), before);
+});
+
+test("state hard reset rejects a clean worktree with the wrong repository identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reset-identity-"));
+  const origin = path.join(root, "origin.git");
+  const state = path.join(root, "state");
+  const source = path.join(root, "source");
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, state], root);
+  configureUser(state);
+  write(path.join(state, "results/base.json"), "{}\n");
+  run("git", ["add", "."], state);
+  run("git", ["commit", "-m", "initial wrong state"], state);
+  fs.mkdirSync(source);
+
+  assert.throws(
+    () =>
+      withEnv(
+        {
+          CLAWSWEEPER_STATE_DIR: state,
+          CLAWSWEEPER_STATE_REPOSITORY: "openclaw/clawsweeper-state",
+        },
+        () => withCwd(source, () => spawnGit(["reset", "--hard", "HEAD"])),
+      ),
+    /state origin does not match openclaw\/clawsweeper-state/,
+  );
 });
 
 test("publishMainCommit refreshes published source paths after a state rebase", () => {

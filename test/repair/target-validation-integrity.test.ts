@@ -845,6 +845,42 @@ test("target validation receipts do not trust Git info excludes", () => {
   );
 });
 
+test(
+  "target validation receipts reject untracked paths before traversing their contents",
+  { skip: process.platform === "win32" },
+  () => {
+    const cwd = gitPackageFixture();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-receipt-outside-"));
+    fs.symlinkSync(outside, path.join(cwd, "untracked-proof"));
+
+    assert.throws(
+      () => captureTargetValidationReceipt(cwd),
+      /requires no untracked source files: untracked-proof/,
+    );
+  },
+);
+
+test(
+  "target validation receipts bound ignored content reached through tracked symlinks",
+  { skip: process.platform === "win32" },
+  () => {
+    const cwd = gitPackageFixture();
+    const ignored = path.join(cwd, "ignored");
+    fs.mkdirSync(ignored);
+    fs.appendFileSync(path.join(cwd, ".gitignore"), "ignored/\n");
+    fs.symlinkSync("ignored/payload.bin", path.join(cwd, "proof.bin"));
+    git(cwd, "add", ".gitignore", "proof.bin");
+    git(cwd, "commit", "-m", "test: add bounded ignored symlink target");
+    fs.closeSync(fs.openSync(path.join(ignored, "payload.bin"), "w"));
+    fs.truncateSync(path.join(ignored, "payload.bin"), 256 * 1024 * 1024 + 1);
+
+    assert.throws(
+      () => captureTargetValidationReceipt(cwd),
+      /target worktree identity exceeds the per-file byte budget/,
+    );
+  },
+);
+
 test("target validation receipts reject repository-controlled global excludes", () => {
   const cwd = gitPackageFixture();
   const excludes = path.join(
@@ -936,7 +972,7 @@ test(
 
     assert.throws(
       () => captureTargetValidationReceipt(cwd),
-      /gitlink parent has wrong type: vendor\/sub/,
+      /requires no untracked source files: vendor/,
     );
   },
 );

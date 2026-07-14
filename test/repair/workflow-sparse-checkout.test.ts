@@ -87,16 +87,24 @@ test("sweep workflow preserves manual target branches and hydrates exact branche
   const workflow = readText(".github/workflows/sweep.yml");
   const dispatchTargetBranchResolver =
     /REQUESTED_TARGET_BRANCH: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}/g;
-  const continuationTargetBranch =
-    /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
+  const continueBlock = workflow.slice(
+    workflow.indexOf("- name: Continue sweep"),
+    workflow.indexOf("\n\n  recover-review-failures:"),
+  );
+  const recoveryBlock = workflow.slice(
+    workflow.indexOf("\n  recover-review-failures:"),
+    workflow.indexOf("\n\n  retry-failed-reviews:"),
+  );
 
   assert.match(workflow, /target_branch:\n\s+description: "Target repository branch to review"/);
   assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
   assert.match(workflow, /target_branch="\$REQUESTED_TARGET_BRANCH"/);
-  assert.equal([...workflow.matchAll(continuationTargetBranch)].length, 2);
+  assert.match(continueBlock, /TARGET_BRANCH: \$\{\{ needs\.plan\.outputs\.target_branch \}\}/);
+  assert.match(continueBlock, /-f target_branch="\$TARGET_BRANCH"/);
+  assert.match(recoveryBlock, /--arg target_branch "\$TARGET_BRANCH"/);
   assert.match(
     workflow,
-    /target_branch="\$\(gh api "repos\/\$TARGET_REPO" --jq \.default_branch\)"/,
+    /target_branch="\$\{RECOVERY_TARGET_BRANCH:-\$\(gh api "repos\/\$TARGET_REPO" --jq \.default_branch\)\}"/,
   );
   assert.match(workflow, /target_branch="\$\{\{ steps\.live-item\.outputs\.target_branch \}\}"/);
 });

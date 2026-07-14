@@ -3,6 +3,13 @@
 Read when: changing automerge routing, exact-head review gates, repair worker
 shepherd waits, pending-check handling, merge comments, or operator replays.
 
+> **Current production boundary:** routing, review, and isolated repair
+> preparation are active, but prepared code is retained as a deferred bundle
+> without a target write token. Automated merge is also blocked by strict base
+> binding. Push, shepherd, and merge steps below describe the intended state
+> machine for a future trusted publisher; they are not currently reachable in
+> the target workflow.
+
 ## Purpose
 
 Automerge is the bounded version of "review, fix, re-review, and merge" for a
@@ -20,8 +27,9 @@ should not redefine the state machine.
   merge.
 - **Event review workflow:** Reviews exactly one PR head and syncs one durable
   ClawSweeper review comment with hidden verdict markers.
-- **Repair cluster worker:** Performs branch repair. For same-branch automerge
-  repairs, it may push a deterministic rebase or a Codex-authored fix.
+- **Repair cluster worker:** Prepares and validates branch repair. The current
+  workflow retains a deterministic rebase or Codex-authored fix as a deferred
+  bundle.
 - **Shepherd wait:** A post-push wait inside the repair worker. It polls the new
   head for exact-head review and GitHub checks, then wakes the router.
 - **Transient router wait:** A final pre-merge wait inside the comment router.
@@ -109,13 +117,12 @@ repair, with the local gate driven by each target repository's
 `config/target-repositories.json#changed_gate`: `pnpm check:changed` for
 `openclaw/openclaw`, and the project's own commands (e.g. `bun run check` for
 `openclaw/clawhub`) when `changed_gate` is `null`. Adopted
-OpenClaw automerge repairs strengthen that local gate to strict validation and
-also require `pnpm lint` plus `pnpm check:test-types` before push, because
-maintainer automerge opt-in means ClawSweeper should keep fixing terminal CI
-failures rather than handing back another red head. The executor still re-runs
-the normalized gate as the authority before push; if anything remains, it feeds
-the full failure back into a dedicated validation-fix pass before spending the
-next review attempt.
+OpenClaw automerge repairs make that changed-surface command mandatory without
+adding full-repository lint or typecheck gates. Exact-head hosted CI remains the
+authority for broader repository health, so unrelated baseline failures cannot
+expand or block a narrow repair. The executor re-runs the normalized gate before
+push; if it fails, it feeds the full failure back into a dedicated validation-fix
+pass before spending the next review attempt.
 
 ## Exact-Head Rule
 

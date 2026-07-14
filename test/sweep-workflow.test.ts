@@ -69,6 +69,7 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   };
   type WorkflowJob = {
     if?: string;
+    "continue-on-error"?: boolean;
     steps: WorkflowStep[];
   };
 
@@ -132,7 +133,7 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
     assert.match(condition, /always\(\)/);
     assert.match(
       condition,
-      /steps\.live-item\.outputs\.proceed != 'true' \|\| steps\.review-exact-event-item\.outputs\.principal_drained == 'true'/,
+      /steps\.live-item\.outputs\.proceed != 'true' \|\| steps\.drain-codex-principal\.outputs\.principal_drained == 'true'/,
     );
     assert.match(condition, /steps\.live-item\.outputs\.proceed == 'true'/);
     assert.match(condition, /steps\.target\.outputs\.has_command_context == 'true'/);
@@ -140,8 +141,20 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   const exactStatusIndex = job("event-review-apply").steps.findIndex(
     (candidate) => candidate.name === "Mark re-review complete",
   );
+  const exactDrainIndex = job("event-review-apply").steps.findIndex(
+    (candidate) => candidate.name === "Drain isolated Codex principal",
+  );
+  const exactWriteTokenIndex = job("event-review-apply").steps.findIndex(
+    (candidate) => candidate.name === "Create target write token",
+  );
   const exactLedgerPublishIndex = job("event-review-apply").steps.findIndex(
     (candidate) => candidate.name === "Publish exact event action ledger",
+  );
+  assert.ok(exactDrainIndex >= 0);
+  assert.ok(exactWriteTokenIndex > exactDrainIndex);
+  assert.match(
+    step("event-review-apply", "Create target write token").if ?? "",
+    /steps\.drain-codex-principal\.outputs\.principal_drained == 'true'/,
   );
   assert.ok(exactStatusIndex >= 0);
   assert.ok(exactLedgerPublishIndex > exactStatusIndex);
@@ -294,9 +307,20 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.doesNotMatch(exactReviewStep, /--skip-start-comment/);
   assert.doesNotMatch(reviewJob, /--skip-start-comment/);
   assert.match(reviewJob, /runs-on: ubuntu-latest/);
+  assert.doesNotMatch(
+    reviewJob.slice(0, reviewJob.indexOf("\n    permissions:")),
+    /continue-on-error/,
+  );
   for (const job of [eventReviewJob, reviewJob]) {
     assert.match(job, /name: Prepare isolated Codex principal/);
     assert.match(job, /--no-create-home --shell \/usr\/sbin\/nologin --user-group/);
+    assert.match(job, /principal_proof_scratch="\$principal_tmp\/proof-scratch"/);
+    assert.match(
+      job,
+      /CLAWSWEEPER_CODEX_PRINCIPAL_PROOF_SCRATCH_DIR: \$\{\{ steps\.codex-principal\.outputs\.proof_scratch \}\}/,
+    );
+    assert.match(job, /name: Drain isolated Codex principal/);
+    assert.match(job, /if: \$\{\{ always\(\) && steps\.codex-principal\.outcome == 'success' \}\}/);
     assert.match(job, /dist\/trusted-principal-drain\.js/);
     assert.match(job, /echo "principal_drained=true" >> "\$GITHUB_OUTPUT"/);
   }
@@ -311,15 +335,13 @@ test("review execution tokens can read check runs and commit statuses", () => {
   const eventReviewJob = workflow.slice(eventReviewStart, planStart);
   const scheduledReviewJob = workflow.slice(reviewStart, publishStart);
 
-  for (const [job, tokenId] of [
-    [eventReviewJob, "target-write-token"],
-    [scheduledReviewJob, "target-read-token"],
-  ] as const) {
+  for (const job of [eventReviewJob, scheduledReviewJob]) {
     const permissions = job.slice(job.indexOf("\n    permissions:"), job.indexOf("\n    steps:"));
-    const targetTokenStart = job.indexOf(`id: ${tokenId}`);
+    const targetTokenStart = job.indexOf("id: codex-inspection-token");
     const targetTokenEnd = job.indexOf("\n      - ", targetTokenStart);
     const targetToken = job.slice(targetTokenStart, targetTokenEnd);
 
+    assert.match(targetToken, /permission-actions: read/);
     assert.match(permissions, /checks: read/);
     assert.match(permissions, /statuses: read/);
     assert.match(targetToken, /permission-checks: read/);
@@ -327,8 +349,9 @@ test("review execution tokens can read check runs and commit statuses", () => {
   }
   assert.match(
     eventReviewJob,
-    /Review exact event item[\s\S]*GH_TOKEN: \$\{\{ steps\.target-write-token\.outputs\.token \}\}/,
+    /Review exact event item[\s\S]*CLAWSWEEPER_PROOF_INSPECTION_TOKEN: \$\{\{ steps\.codex-inspection-token\.outputs\.token \}\}/,
   );
+  assert.match(scheduledReviewJob, /test -n "\$CLAWSWEEPER_PROOF_INSPECTION_TOKEN"/);
 });
 
 test("renewed direct-routing token retains check run and commit status reads", () => {
@@ -344,6 +367,7 @@ test("renewed direct-routing token retains check run and commit status reads", (
 
   assert.ok(renewalStart > 0);
   assert.match(renewal, /id: router-mutation-token/);
+  assert.match(renewal, /sourceAction != 'failed_review_shard_recovery'/);
   assert.match(renewal, /permission-checks: read/);
   assert.match(renewal, /permission-statuses: read/);
 });
@@ -410,10 +434,8 @@ test("exact event publish and routing require a successful fresh review artifact
   );
   const completeStart = eventReviewJob.indexOf("- name: Mark re-review complete", routeStart);
   const failStart = eventReviewJob.indexOf("- name: Fail unsuccessful exact review");
-  const leaseCompleteStart = eventReviewJob.indexOf(
-    "- name: Complete exact-review queue lease",
-    failStart,
-  );
+  const leaseCompleteStart = eventReviewJob.indexOf("- name: Complete exact-review queue lease");
+  const exactLedgerStart = eventReviewJob.indexOf("- name: Publish exact event action ledger");
   const liveItemStep = eventReviewJob.slice(liveItemStart, setupPnpmStart);
   const setupCodexStep = eventReviewJob.slice(setupCodexStart, exactReviewStart);
   const exactReviewStep = eventReviewJob.slice(exactReviewStart, publishStart);
@@ -424,7 +446,7 @@ test("exact event publish and routing require a successful fresh review artifact
   const reactStep = eventReviewJob.slice(reactStart, primaryResultStart);
   const releaseLeaseStep = eventReviewJob.slice(releaseLeaseStart, confirmTerminalStart);
   const confirmTerminalStep = eventReviewJob.slice(confirmTerminalStart, completeStart);
-  const failStep = eventReviewJob.slice(failStart, leaseCompleteStart);
+  const failStep = eventReviewJob.slice(failStart, exactLedgerStart);
   const publisherCompleteStart = publisher.indexOf("const complete =");
   const authoritativeReset = publisher.indexOf("hardResetToRemoteMain();", publisherCompleteStart);
   const authoritativeRefresh = publisher.indexOf(
@@ -441,6 +463,9 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.ok(deferredRouteStart > routeStart);
   assert.ok(releaseLeaseStart > routeStart);
   assert.ok(confirmTerminalStart > releaseLeaseStart);
+  assert.ok(leaseCompleteStart > primaryResultStart);
+  assert.ok(failStart > leaseCompleteStart);
+  assert.ok(exactLedgerStart > failStart);
   assert.match(liveItemStep, /id: live-item/);
   assert.match(liveItemStep, /repos\/\$TARGET_REPO\/issues\/\$ITEM_NUMBER/);
   assert.match(liveItemStep, /echo "proceed=false" >> "\$GITHUB_OUTPUT"/);
@@ -485,6 +510,8 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.match(releaseUnsuccessfulStep, /owner=\$LEASE_OWNER/);
   assert.match(releaseUnsuccessfulStep, /issues\/comments\/\$lease_id/);
   assert.match(releaseUnsuccessfulStep, /--method DELETE/);
+  assert.match(releaseUnsuccessfulStep, /reactions\?content=eyes/);
+  assert.match(releaseUnsuccessfulStep, /Removed unsuccessful eyes reaction/);
   assert.match(publisher, /"--event-apply-proof"/);
   assert.match(publisher, /exactEventApplyProof\(/);
   assert.match(publisher, /const requeueLatestExpected = applyDisposition === "source_drift"/);
@@ -655,7 +682,10 @@ test("exact event publish and routing require a successful fresh review artifact
     eventReviewJob,
     /React to target item completion[\s\S]*steps\.publish-event-result\.outputs\.policy_noop == 'true'/,
   );
-  assert.match(eventReviewJob, /if \[ "\$POLICY_NOOP" != "true" \]; then/);
+  assert.match(
+    eventReviewJob,
+    /if \[ "\$POLICY_NOOP" != "true" \] && \[ "\$REVIEW_ONLY" != "true" \]; then/,
+  );
 });
 
 test("exact event workflow binds all work to the canonical queue claim", () => {
@@ -2042,6 +2072,7 @@ test("target hot sweep dispatches honor shard cap payload", () => {
   );
   assert.match(modeBlock, /shard_count="\$REQUESTED_HOT_SHARD_COUNT"/);
   assert.match(modeBlock, /shard_count="\$hot_intake_shards"/);
+  assert.match(modeBlock, /Capping review batch size from \$batch_size to 3/);
 });
 
 test("review git info follows checked-out target branch", () => {
@@ -2069,15 +2100,146 @@ test("sweep review continuations stay workflow-dispatch compatible", () => {
     workflow.indexOf("- name: Continue sweep"),
     workflow.indexOf("\n\n  recover-review-failures:"),
   );
+
+  assert.match(continueBlock, /TARGET_REPO: \$\{\{ needs\.plan\.outputs\.target_repo \}\}/);
+  assert.match(continueBlock, /TARGET_BRANCH: \$\{\{ needs\.plan\.outputs\.target_branch \}\}/);
+  assert.match(continueBlock, /-f target_repo="\$TARGET_REPO"/);
+  assert.match(continueBlock, /-f target_branch="\$TARGET_BRANCH"/);
+  assert.doesNotMatch(continueBlock, /run:[\s\S]*\$\{\{ needs\.plan\.outputs\./);
+});
+
+test("failed review recovery waits for durable exact-review queue acknowledgement", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const publisher = readText("src/repair/publish-event-result.ts");
   const recoveryBlock = workflow.slice(
-    workflow.indexOf("args=(\n            workflow run sweep.yml"),
-    workflow.indexOf("\n\n  audit-dashboard:"),
+    workflow.indexOf("\n  recover-review-failures:"),
+    workflow.indexOf("\n\n  retry-failed-reviews:"),
   );
 
-  for (const block of [continueBlock, recoveryBlock]) {
-    assert.match(block, /-f target_repo="\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
-    assert.match(block, /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/);
+  assert.match(recoveryBlock, /TARGET_REPO: \$\{\{ needs\.plan\.outputs\.target_repo \}\}/);
+  assert.match(recoveryBlock, /TARGET_BRANCH: \$\{\{ needs\.plan\.outputs\.target_branch \}\}/);
+  assert.match(
+    recoveryBlock,
+    /CODEX_TIMEOUT_MS: \$\{\{ needs\.plan\.outputs\.codex_timeout_ms \}\}/,
+  );
+  assert.match(recoveryBlock, /--arg target_repo "\$TARGET_REPO"/);
+  assert.match(recoveryBlock, /--arg target_branch "\$TARGET_BRANCH"/);
+  assert.match(recoveryBlock, /--arg codex_timeout_ms "\$CODEX_TIMEOUT_MS"/);
+  assert.doesNotMatch(recoveryBlock, /run:[\s\S]*\$\{\{ needs\.plan\.outputs\./);
+  assert.match(recoveryBlock, /sourceAction: "failed_review_shard_recovery"/);
+  assert.match(recoveryBlock, /delivery_id: \("router:" \+ \$dispatch_key\)/);
+  assert.match(recoveryBlock, /\/internal\/exact-review\/enqueue/);
+  assert.match(
+    publisher,
+    /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
+  );
+  assert.match(
+    recoveryBlock,
+    /\.ok == true and \(\.queued == true or \.deduped == true or \.accepted == false\)/,
+  );
+  assert.doesNotMatch(recoveryBlock, /workflow run sweep\.yml/);
+  assert.doesNotMatch(recoveryBlock, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
+  assert.match(recoveryBlock, /for attempt in 1 2 3/);
+  assert.match(recoveryBlock, /enqueue_recovery_item "\$item_number" &/);
+  assert.match(recoveryBlock, /"\$\{#recovery_pids\[@\]\}" -ge 16/);
+  assert.match(recoveryBlock, /wait_for_recovery_batch/);
+  assert.doesNotMatch(recoveryBlock, /head -c|iconv -f UTF-8/);
+
+  const truncator = recoveryBlock.match(
+    /MAX_BYTES="\$max_additional_prompt_bytes" node <<'NODE'\n([\s\S]*?)\n\s+NODE/,
+  )?.[1];
+  assert.ok(truncator, "missing UTF-8-aware recovery prompt truncator");
+  const truncated = execFileSync(process.execPath, ["-e", truncator], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ADDITIONAL_PROMPT: "🦀".repeat(2_000),
+      MAX_BYTES: "4966",
+    },
+  });
+  assert.ok(Buffer.byteLength(truncated, "utf8") <= 4966);
+  assert.doesNotMatch(truncated, /�/);
+});
+
+test("failed review recovery aggregates concurrent enqueue failures", () => {
+  const parsed = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<string, { steps: Array<{ name?: string; run?: string }> }>;
+  };
+  const script = parsed.jobs["recover-review-failures"]?.steps.find(
+    (step) => step.name === "Requeue planned review items once",
+  )?.run;
+  assert.ok(script);
+
+  const root = mkdtempSync(`${tmpPrefix}recovery-failure-`);
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  mkdirSync(join(root, "failed-review-shards"));
+  writeFileSync(join(root, "failed-review-shards", "shard-0.json"), '{"shard":0}\n');
+  writeFileSync(join(bin, "curl"), "#!/bin/sh\nexit 1\n");
+  writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(
+    join(bin, "find"),
+    `#!/bin/bash
+if printf '%s\\n' "$@" | grep -q -- '-print0'; then
+  printf 'failed-review-shards/shard-0.json\\0'
+  exit 0
+fi
+root="$1"
+shopt -s nullglob
+for file in "$root"/*; do
+  [ -f "$file" ] && basename "$file"
+done
+`,
+  );
+  for (const command of ["curl", "sleep", "find"]) chmodSync(join(bin, command), 0o755);
+
+  try {
+    assert.throws(
+      () =>
+        execFileSync("/bin/bash", ["-c", script], {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            ADDITIONAL_PROMPT: "",
+            CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+            CODEX_TIMEOUT_MS: "1200000",
+            GH_TOKEN: "test-token",
+            GITHUB_REPOSITORY: "openclaw/clawsweeper",
+            GITHUB_RUN_ATTEMPT: "1",
+            GITHUB_RUN_ID: "1234",
+            MATRIX_JSON: JSON.stringify([
+              {
+                shard: 0,
+                item_numbers: "41,42",
+                item_kinds: { 41: "issue", 42: "pull_request" },
+              },
+            ]),
+            PATH: `${bin}:${process.env.PATH}`,
+            QUEUE_URL: "https://queue.invalid",
+            RUNNER_TEMP: root,
+            TARGET_BRANCH: "main",
+            TARGET_REPO: "openclaw/openclaw",
+          },
+        }),
+      (error: unknown) => {
+        const stderr = String((error as { stderr?: string }).stderr ?? "");
+        assert.match(stderr, /Unable to queue failed review recovery for item numbers: 41 42/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
   }
+});
+
+test("isolated review proof scratch is separated by item", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const source = readText("src/clawsweeper.ts");
+
+  assert.match(workflow, /principal_proof_scratch\/\$ITEM_NUMBER/);
+  assert.match(workflow, /principal_proof_scratch\/\$item_number/);
+  assert.match(source, /return join\(configured, String\(itemNumber\)\)/);
 });
 
 test("target sweep dispatches preserve disabled ClawHub guard", () => {

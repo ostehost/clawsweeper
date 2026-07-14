@@ -720,7 +720,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
   assert.ok(reviewUpload > reviewFinalizer);
   assert.match(
     workflow.slice(reviewFinalizer, reviewUpload),
-    /if: \$\{\{ always\(\) && steps\.review-shard\.outputs\.principal_drained == 'true' \}\}[\s\S]*node dist\/clawsweeper\.js finalize-action-events/,
+    /if: \$\{\{ always\(\) && steps\.drain-codex-principal\.outputs\.principal_drained == 'true' \}\}[\s\S]*node dist\/clawsweeper\.js finalize-action-events/,
   );
   assert.ok(applyProofStep >= 0);
   assert.ok(applyProofFinalizer > applyProofStep);

@@ -75,7 +75,11 @@ test("runCommand does not execute checkout-local gh from a relative PATH entry",
     assert.equal(
       runCommand("gh", [], {
         cwd: root,
-        env: { PATH: `.${delimiter}${binDir}`, GH_TOKEN: "dummy-secret" },
+        env: {
+          PATH: `.${delimiter}${binDir}`,
+          GH_BIN: trustedGh,
+          GH_TOKEN: "dummy-secret",
+        },
       }),
       "trusted",
     );
@@ -133,7 +137,7 @@ test("protected Windows commands ignore checkout-relative PATH entries", () => {
     const invocation = resolveSpawnCommand("gh", ["api", "user"], {
       cwd: root,
       env: {
-        Path: `.;${binDir}`,
+        Path: `.${delimiter}${binDir}`,
         PATHEXT: ".CMD",
         SystemRoot: String.raw`C:\Windows`,
       },
