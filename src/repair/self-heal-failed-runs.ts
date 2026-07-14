@@ -18,7 +18,6 @@ import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import {
   immutableJobDispatchArgs,
-  immutableJobIdentityKey,
   isMissingImmutableJobError,
   resolveCurrentStateJobIdentity,
   resolveStateJobIdentity,
@@ -42,6 +41,9 @@ const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
 const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
 const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
+const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
+const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+const preparedStateRevisions = new Set<string>();
 
 type GateState = {
   exists: boolean;
@@ -88,6 +90,9 @@ if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0) {
 }
 if (!Number.isInteger(maxAttemptsPerJob) || maxAttemptsPerJob < 1) {
   throw new Error("CLAWSWEEPER_SELF_HEAL_MAX_ATTEMPTS_PER_JOB must be a positive integer");
+}
+if (requestedMode !== null && !REPAIR_MODES.has(requestedMode)) {
+  throw new Error("--mode must be plan, execute, or autonomous");
 }
 
 const candidates = selectCandidates().slice(0, maxJobs);
@@ -261,11 +266,16 @@ function selectCandidates() {
           source_job: immutableJob.jobPath,
           source_state_revision: immutableJob.stateRevision,
           source_job_sha256: immutableJob.jobSha256,
-          immutable_job_key: immutableJob.identityKey,
+          immutable_job_key: jobContentGenerationKey(immutableJob.jobPath, immutableJob.jobSha256),
           ...(immutableJob.legacyUnsealed ? { legacy_unsealed: true } : {}),
-          mode: immutableJob.legacyUnsealed
-            ? "plan"
-            : (requestedMode ?? record.mode ?? immutableJob.job.frontmatter.mode),
+          mode: retryMode({
+            legacyUnsealed: immutableJob.legacyUnsealed,
+            persistedMode:
+              immutableJob.effectiveMode ??
+              record.effective_mode ??
+              record.mode ??
+              immutableJob.job.frontmatter.mode,
+          }),
         };
       } catch (error) {
         skippedCandidates.push({
@@ -319,7 +329,9 @@ function selectCandidates() {
 
 function runRecordGenerationKey(record: LooseRecord, sourceJob: string): string {
   const jobSha256 = String(record.source_job_sha256 ?? "").trim();
-  return JOB_SHA256.test(jobSha256) ? `${sourceJob}:${jobSha256}` : `${sourceJob}:unsealed`;
+  return JOB_SHA256.test(jobSha256)
+    ? jobContentGenerationKey(sourceJob, jobSha256)
+    : `${sourceJob}:unsealed`;
 }
 
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
@@ -327,29 +339,34 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
   const jobSha256 = String(record.source_job_sha256 ?? "").trim();
   if (stateRevision) {
     if (!STATE_REVISION.test(stateRevision)) throw new Error("state revision is malformed");
+    ensureHistoricalStateRevision(stateRevision);
     return {
       ...resolveStateJobIdentity({
         jobPath: sourceJob,
         stateRevision,
         jobSha256,
       }),
+      effectiveMode: null,
       legacyUnsealed: false,
     };
   }
   if (jobSha256) {
     if (!JOB_SHA256.test(jobSha256)) throw new Error("job SHA-256 is malformed");
     const recovered = resolveRunRecoveryInputs(record.run_id, sourceJob, jobSha256);
+    ensureHistoricalStateRevision(recovered.stateRevision);
     return {
       ...resolveStateJobIdentity({
         jobPath: sourceJob,
         stateRevision: recovered.stateRevision,
         jobSha256: recovered.jobSha256,
       }),
+      effectiveMode: recovered.effectiveMode,
       legacyUnsealed: false,
     };
   }
   return {
     ...resolveCurrentStateJobIdentity(sourceJob),
+    effectiveMode: null,
     legacyUnsealed: true,
   };
 }
@@ -393,15 +410,36 @@ function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobS
         if (bytes.length > 64 * 1024) {
           throw new Error(`immutable recovery input artifact is oversized for run ${runId}`);
         }
-        return JSON.parse(bytes.toString("utf8")) as LooseRecord;
+        const input = JSON.parse(bytes.toString("utf8")) as LooseRecord;
+        const keys = Object.keys(input).sort();
+        if (
+          JSON.stringify(keys) !==
+          JSON.stringify([
+            "effective_mode",
+            "job_sha256",
+            "requested_mode",
+            "schema_version",
+            "source_job",
+            "state_revision",
+          ])
+        ) {
+          throw new Error(`immutable recovery inputs have unexpected fields for run ${runId}`);
+        }
+        return input;
       })
-      .filter(
-        (input) =>
+      .filter((input) => {
+        const requested = String(input.requested_mode ?? "").trim();
+        const effective = String(input.effective_mode ?? "").trim();
+        return (
           input.schema_version === 1 &&
           input.source_job === sourceJob &&
           input.job_sha256 === jobSha256 &&
-          STATE_REVISION.test(String(input.state_revision ?? "")),
-      );
+          STATE_REVISION.test(String(input.state_revision ?? "")) &&
+          REPAIR_MODES.has(requested) &&
+          REPAIR_MODES.has(effective) &&
+          (effective === requested || effective === "plan")
+        );
+      });
     if (inputs.length === 0) {
       throw new Error(`immutable recovery inputs are unavailable for run ${runId}`);
     }
@@ -410,6 +448,7 @@ function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobS
         JSON.stringify({
           stateRevision: input.state_revision,
           jobSha256: input.job_sha256,
+          effectiveMode: input.effective_mode,
         }),
       ),
     );
@@ -419,6 +458,7 @@ function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobS
     return {
       stateRevision: String(inputs[0]!.state_revision),
       jobSha256: String(inputs[0]!.job_sha256),
+      effectiveMode: String(inputs[0]!.effective_mode),
     };
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
@@ -780,21 +820,20 @@ function summarizeCandidate(candidate: LooseRecord) {
 }
 
 function attemptImmutableJobKey(attempt: LooseRecord): string | null {
-  const stateRevision = attempt.source_state_revision;
   const jobSha256 = attempt.source_job_sha256;
-  if (!stateRevision && !jobSha256) return null;
+  if (!jobSha256) return null;
   try {
-    return immutableJobIdentityKey({
-      jobPath: attempt.source_job,
-      stateRevision,
-      jobSha256,
-    });
+    return jobContentGenerationKey(attempt.source_job, jobSha256);
   } catch {
     return null;
   }
 }
 
 function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): string {
+  return jobContentGenerationKey(jobPath, jobSha256);
+}
+
+function jobContentGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): string {
   const pathText = String(jobPath ?? "").trim();
   const digest = String(jobSha256 ?? "").trim();
   if (!SOURCE_JOB_PATH.test(pathText)) {
@@ -804,4 +843,75 @@ function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): strin
     throw new Error("active repair run contains a malformed job SHA-256");
   }
   return `${pathText}:${digest}`;
+}
+
+function retryMode({
+  legacyUnsealed,
+  persistedMode,
+}: {
+  legacyUnsealed: boolean;
+  persistedMode: JsonValue;
+}): string {
+  if (legacyUnsealed) return "plan";
+  const mode = String(persistedMode ?? "").trim();
+  if (!REPAIR_MODES.has(mode)) throw new Error("persisted repair mode is malformed");
+  if (mode === "plan") return "plan";
+  return requestedMode ?? mode;
+}
+
+function ensureHistoricalStateRevision(value: JsonValue): void {
+  const stateRevision = String(value ?? "").trim();
+  if (!STATE_REVISION.test(stateRevision)) throw new Error("state revision is malformed");
+  if (preparedStateRevisions.has(stateRevision)) return;
+  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+  if (!stateRoot) {
+    throw new Error("CLAWSWEEPER_STATE_DIR is required for immutable job handoff");
+  }
+  if (stateCommitExists(stateRoot, stateRevision)) {
+    preparedStateRevisions.add(stateRevision);
+    return;
+  }
+
+  const fetched = spawnSync(
+    "git",
+    [
+      "-C",
+      stateRoot,
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--depth=1",
+      "--filter=blob:none",
+      "origin",
+      stateRevision,
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: STATE_REVISION_FETCH_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  if (fetched.status !== 0 || fetched.error || !stateCommitExists(stateRoot, stateRevision)) {
+    const detail = String(fetched.stderr || fetched.stdout || fetched.error?.message || "").trim();
+    throw new Error(
+      detail
+        ? `could not fetch historical clawsweeper-state commit ${stateRevision}: ${detail}`
+        : `could not fetch historical clawsweeper-state commit ${stateRevision}`,
+    );
+  }
+  preparedStateRevisions.add(stateRevision);
+}
+
+function stateCommitExists(stateRoot: string, stateRevision: string): boolean {
+  const result = spawnSync(
+    "git",
+    ["-C", stateRoot, "cat-file", "-e", `${stateRevision}^{commit}`],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 10_000,
+    },
+  );
+  return result.status === 0 && !result.error;
 }

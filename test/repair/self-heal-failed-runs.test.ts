@@ -154,7 +154,7 @@ test("failed-run self-heal restricts unsealed legacy records to plan mode", () =
 });
 
 test("failed-run self-heal recovers live sealed provenance from the inputs artifact", () => {
-  const fixture = createFixture("live-artifact");
+  const fixture = createFixture("live-artifact", "autonomous");
   const now = new Date().toISOString();
   try {
     fs.writeFileSync(
@@ -191,7 +191,7 @@ test("failed-run self-heal recovers live sealed provenance from the inputs artif
         source_job: fixture.jobPath,
         source_state_revision: fixture.stateRevision,
         source_job_sha256: fixture.jobSha256,
-        mode: "plan",
+        mode: "autonomous",
         run_url: "https://github.test/actions/runs/910003",
       },
     ]);
@@ -199,6 +199,137 @@ test("failed-run self-heal recovers live sealed provenance from the inputs artif
       fs.readFileSync(fixture.commandLog, "utf8"),
       /run download 910003 .*--pattern clawsweeper-repair-inputs-910003-\*/,
     );
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("failed-run self-heal preserves a persisted plan-only effective mode", () => {
+  const fixture = createFixture("persisted-plan", "autonomous");
+  const now = new Date().toISOString();
+  try {
+    fs.writeFileSync(
+      fixture.recoveryInputsFile,
+      `${JSON.stringify({
+        schema_version: 1,
+        source_job: fixture.jobPath,
+        state_revision: fixture.stateRevision,
+        job_sha256: fixture.jobSha256,
+        requested_mode: "autonomous",
+        effective_mode: "plan",
+      })}\n`,
+    );
+    writeRunPages(fixture, {
+      1: [
+        {
+          id: 910_004,
+          display_title: `repair cluster ${fixture.jobPath} (${fixture.jobSha256})`,
+          status: "completed",
+          conclusion: "failure",
+          created_at: now,
+          updated_at: now,
+          html_url: "https://github.test/actions/runs/910004",
+        },
+      ],
+    });
+
+    const result = runSelfHeal(fixture, { args: ["--mode", "autonomous"] });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("failed-run self-heal fetches an exact historical state revision before resolving", () => {
+  const fixture = createFixture("historical-state");
+  const remoteRoot = path.join(fixture.root, "state-remote.git");
+  try {
+    writeRunRecord(fixture, "910005", {
+      source_job: fixture.jobPath,
+      workflow_conclusion: "failure",
+      workflow_updated_at: new Date().toISOString(),
+      mode: "plan",
+    });
+    execFileSync("git", ["init", "--bare", "-q", remoteRoot]);
+    execFileSync("git", ["remote", "add", "origin", remoteRoot], { cwd: fixture.stateRoot });
+    execFileSync("git", ["push", "-q", "origin", "HEAD:main"], { cwd: fixture.stateRoot });
+    fs.writeFileSync(path.join(fixture.stateRoot, "latest.txt"), "latest\n");
+    execFileSync("git", ["add", "latest.txt"], { cwd: fixture.stateRoot });
+    execFileSync("git", ["commit", "-qm", "advance state"], { cwd: fixture.stateRoot });
+    execFileSync("git", ["push", "-q", "origin", "HEAD:main"], { cwd: fixture.stateRoot });
+    fs.rmSync(fixture.stateRoot, { recursive: true, force: true });
+    execFileSync(
+      "git",
+      ["clone", "-q", "--depth=1", "--branch", "main", `file://${remoteRoot}`, fixture.stateRoot],
+      { cwd: fixture.root },
+    );
+    assert.notEqual(
+      spawnSync("git", ["-C", fixture.stateRoot, "cat-file", "-e", fixture.stateRevision]).status,
+      0,
+    );
+
+    const result = runSelfHeal(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_state_revision, fixture.stateRevision);
+    assert.equal(
+      spawnSync("git", ["-C", fixture.stateRoot, "cat-file", "-e", fixture.stateRevision]).status,
+      0,
+    );
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("failed-run self-heal applies retry caps to identical content across state revisions", () => {
+  const fixture = createFixture("content-generation");
+  const appRoot = path.join(fixture.root, "app");
+  try {
+    fs.writeFileSync(path.join(fixture.stateRoot, "latest.txt"), "latest\n");
+    execFileSync("git", ["add", "latest.txt"], { cwd: fixture.stateRoot });
+    execFileSync("git", ["commit", "-qm", "advance state"], { cwd: fixture.stateRoot });
+    const latestRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: fixture.stateRoot,
+      encoding: "utf8",
+    }).trim();
+    writeRunRecord(fixture, "910006", {
+      source_job: fixture.jobPath,
+      source_state_revision: latestRevision,
+      workflow_conclusion: "failure",
+      workflow_updated_at: new Date().toISOString(),
+      mode: "plan",
+    });
+    fs.mkdirSync(path.join(appRoot, "results"), { recursive: true });
+    fs.cpSync(path.resolve("dist"), path.join(appRoot, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("config"), path.join(appRoot, "config"), { recursive: true });
+    fs.writeFileSync(
+      path.join(appRoot, "results", "self-heal.json"),
+      `${JSON.stringify({
+        attempts: [
+          {
+            source_run_id: "900000",
+            source_job: fixture.jobPath,
+            source_state_revision: fixture.stateRevision,
+            source_job_sha256: fixture.jobSha256,
+          },
+        ],
+      })}\n`,
+    );
+
+    const result = runSelfHeal(fixture, {
+      appRoot,
+      env: { CLAWSWEEPER_SELF_HEAL_MAX_ATTEMPTS_PER_JOB: "1" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.status, "no_candidates");
+    assert.equal(summary.skipped_candidates.length, 1);
+    assert.equal(summary.skipped_candidates[0].reason, "retry_limit_reached");
+    assert.equal(summary.skipped_candidates[0].source_state_revision, latestRevision);
   } finally {
     cleanupFixture(fixture);
   }
@@ -223,7 +354,7 @@ test("failed-run self-heal uses paginated history and receipts real mutations", 
 
 type Fixture = ReturnType<typeof createFixture>;
 
-function createFixture(label: string) {
+function createFixture(label: string, jobMode: "plan" | "autonomous" = "plan") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `clawsweeper-self-heal-${label}-`));
   const runsDir = path.join(root, "runs");
   const binDir = path.join(root, "bin");
@@ -236,7 +367,7 @@ function createFixture(label: string) {
   const jobBytes = `---
 repo: openclaw/openclaw
 cluster_id: ${label}
-mode: plan
+mode: ${jobMode}
 allowed_actions:
   - fix
 candidates:
@@ -304,11 +435,15 @@ function writeRunPages(fixture: Fixture, pages: Record<number, Array<Record<stri
   fs.writeFileSync(fixture.pagesFile, `${JSON.stringify(pages)}\n`);
 }
 
-function runSelfHeal(fixture: Fixture, options: { args?: string[]; env?: NodeJS.ProcessEnv } = {}) {
+function runSelfHeal(
+  fixture: Fixture,
+  options: { args?: string[]; env?: NodeJS.ProcessEnv; appRoot?: string } = {},
+) {
+  const appRoot = options.appRoot ?? process.cwd();
   return spawnSync(
     process.execPath,
     [
-      path.resolve("dist/repair/self-heal-failed-runs.js"),
+      path.join(appRoot, "dist", "repair", "self-heal-failed-runs.js"),
       "--runs-dir",
       fixture.runsDir,
       "--max-age-hours",
@@ -316,7 +451,7 @@ function runSelfHeal(fixture: Fixture, options: { args?: string[]; env?: NodeJS.
       ...(options.args ?? []),
     ],
     {
-      cwd: process.cwd(),
+      cwd: appRoot,
       encoding: "utf8",
       env: {
         ...process.env,
