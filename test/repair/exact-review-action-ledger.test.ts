@@ -445,6 +445,7 @@ test("exact-review completion and reconciliation emit accepted mutation boundari
       retry_at: "2026-07-13T21:00:00Z",
     });
     assert.deepEqual(JSON.parse(requests[1]?.body ?? "{}"), {
+      include_all_claimed: true,
       runs: [{ run_id: "4242", run_attempt: 3 }],
     });
     assert.equal(
@@ -509,14 +510,20 @@ test("exact-review workflows isolate state credentials and publish exact manifes
     );
   }
   assert.match(reconcileProducer, /exact-review-action-ledger-cli\.js reconcile/);
-  assert.match(reconcileProducer, /actions\/checkout@v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/);
+  assert.match(
+    reconcileProducer,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/,
+  );
   assert.match(
     reconcileProducer,
     /Verify reconciler source revision[\s\S]*test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/,
   );
   for (const producer of [legacy, event, reconcileProducer]) {
     assert.match(producer, /--repair-lane exact-review-queue/);
-    assert.match(producer, /actions\/upload-artifact@v7/);
+    assert.match(
+      producer,
+      /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7/,
+    );
   }
   assert.doesNotMatch(legacy, /create-state-token|setup-state/);
   assert.doesNotMatch(reconcileProducer, /create-state-token|setup-state/);
@@ -579,7 +586,10 @@ test("exact-review workflows isolate state credentials and publish exact manifes
     assert.match(trustedPublisher, /publish-action-event-paths/);
     assert.doesNotMatch(trustedPublisher, /github\.event\.client_payload/);
   }
-  assert.match(reconcilePublisher, /actions\/checkout@v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/);
+  assert.match(
+    reconcilePublisher,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/,
+  );
   assert.doesNotMatch(sweep, /internal\/exact-review\/(?:enqueue|claim|complete)/);
   assert.doesNotMatch(reconcile, /internal\/exact-review\/reconcile/);
 });

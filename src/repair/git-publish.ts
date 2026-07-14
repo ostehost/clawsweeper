@@ -322,6 +322,23 @@ export function hasStagedChanges(): boolean {
   return spawnGit(["diff", "--cached", "--quiet"]).status !== 0;
 }
 
+function assertIndexWithinPublishPaths(paths: readonly string[], context: string): void {
+  const publishPaths = uniqueNonEmpty(paths).map(normalizedPublishPath).filter(Boolean);
+  const stagedPaths = runGit(["diff", "--cached", "--no-renames", "--name-only", "-z"], {
+    quiet: true,
+  })
+    .split("\0")
+    .filter(Boolean);
+  const foreignPath = stagedPaths
+    .filter((path) => !publishPaths.some((publishPath) => pathIsWithin(publishPath, path)))
+    .sort()[0];
+  if (foreignPath) {
+    throw new Error(
+      `Refusing ${context}: staged path outside exact publication scope: ${foreignPath}`,
+    );
+  }
+}
+
 export function hasWorktreePath(path: string): boolean {
   return spawnGit(["ls-files", "--error-unmatch", path]).status === 0;
 }
@@ -363,6 +380,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   if (rebaseStrategy === "comment-router-ledger") {
     assertCommentRouterLedgerPublishPaths(options.paths);
   }
+  assertIndexWithinPublishPaths(options.paths, "publish with pre-existing index content");
   const refreshFailureMode = options.refreshFailureMode ?? "strict";
   gitPublishPhase(
     "sync",
@@ -391,6 +409,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   }
 
   const commitMessage = commitMessageForPublishedPaths(options.message, options.paths);
+  assertIndexWithinPublishPaths(options.paths, "publish commit");
   runGit(["commit", "-m", commitMessage]);
   let sourceCommit = runGit(["rev-parse", "HEAD"]).trim();
   if (rebaseStrategy === "comment-router-ledger") {
@@ -1351,6 +1370,7 @@ function rebuildCommentRouterLedgerCommit(options: {
       console.log("No comment router transaction changes remain after preserving the remote state");
       return "unchanged";
     }
+    assertIndexWithinPublishPaths(COMMENT_ROUTER_TRANSACTION_PATHS, "comment router rebuild");
     runGit(["commit", "-C", options.sourceCommit]);
     return "committed";
   } catch (error) {
@@ -1461,6 +1481,7 @@ function rebuildReconciliationCommit(
   const sourceCommit = reconciliationSourceCommit ?? runGit(["rev-parse", "HEAD"]).trim();
   const baseCommit = runGit(["merge-base", sourceCommit, remoteRef]).trim();
   const localPaths = changedPathsBetween(baseCommit, sourceCommit);
+  assertIndexWithinPublishPaths(localPaths, "reconciliation rebuild preflight");
   const localIdentities = new Map<string, RecordTupleIdentity>();
   for (const path of localPaths) {
     const identity = recordTupleIdentityForPath(path);
@@ -1519,6 +1540,7 @@ function rebuildReconciliationCommit(
     return true;
   }
 
+  assertIndexWithinPublishPaths(selectedPaths, "reconciliation rebuild");
   runGit(["commit", "-C", sourceCommit]);
   return true;
 }
@@ -1529,6 +1551,7 @@ function normalizeReconciliationCommit(sourceCommit: string): {
 } {
   const baseCommit = runGit(["rev-parse", `${sourceCommit}^`], { quiet: true }).trim();
   const localPaths = changedPathsBetween(baseCommit, sourceCommit);
+  assertIndexWithinPublishPaths(localPaths, "reconciliation normalization preflight");
   const identities = new Map<string, RecordTupleIdentity>();
   for (const path of localPaths) {
     const identity = recordTupleIdentityForPath(path);
@@ -1574,6 +1597,7 @@ function normalizeReconciliationCommit(sourceCommit: string): {
   );
   if (selectedPaths.length > 0) stagePaths(selectedPaths);
   if (!hasStagedChanges()) return { commit: baseCommit, changed: false };
+  assertIndexWithinPublishPaths(selectedPaths, "reconciliation normalization");
   runGit(["commit", "-C", sourceCommit]);
   return { commit: runGit(["rev-parse", "HEAD"]).trim(), changed: true };
 }
@@ -1851,6 +1875,7 @@ function rebuildPublishCommit(options: {
   paths: readonly string[];
   sourceCommit: string;
 }): PublishResult {
+  assertIndexWithinPublishPaths(options.paths, "publish rebuild preflight");
   console.log(`Rebuilding publish commit on ${options.remote}/${options.branch}`);
   runGit(["fetch", options.remote, options.branch]);
   const remoteCommit = runGit(["rev-parse", `${options.remote}/${options.branch}`], {
@@ -1885,6 +1910,7 @@ function rebuildPublishCommit(options: {
     return "unchanged";
   }
 
+  assertIndexWithinPublishPaths(options.paths, "publish rebuild");
   runGit(["commit", "-m", options.message]);
   return "committed";
 }
@@ -2022,6 +2048,10 @@ function applySweepStatusMerges(options: {
     runGit(["reset", "--hard", options.remoteCommit]);
     return;
   }
+  assertIndexWithinPublishPaths(
+    options.statusMerges.map(({ path }) => path),
+    "sweep status merge",
+  );
   const commitsAhead = Number(
     runGit(["rev-list", "--count", `${options.remoteCommit}..HEAD`], { quiet: true }).trim(),
   );

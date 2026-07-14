@@ -900,11 +900,15 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   );
   assert.match(workflow, /SOURCE_RUN_ID: \$\{\{ github\.event\.workflow_run\.id \}\}/);
   assert.match(producer, /exact-review-action-ledger-cli\.js reconcile/);
-  assert.match(producer, /actions\/checkout@v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/);
+  assert.match(
+    producer,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/,
+  );
   assert.match(
     producer,
     /Verify reconciler source revision[\s\S]*test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/,
   );
+  assert.match(client, /include_all_claimed: true/);
   assert.match(client, /run_id: sourceRunId/);
   assert.match(client, /run_attempt: sourceRunAttempt/);
   assert.match(client, /createHmac\("sha256"/);

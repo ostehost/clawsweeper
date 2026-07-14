@@ -131,6 +131,76 @@ test("stagePaths normalizes tracked deletion pathspecs", () => {
   assert.equal(run("git", ["diff", "--cached", "--name-only"], root), `${file}\n`);
 });
 
+test("publishMainCommit rejects foreign pre-staged content without altering the index", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-index-"));
+  write(path.join(root, "results/ledger.txt"), "initial\n");
+  write(path.join(root, "operator.txt"), "initial\n");
+  run("git", ["init"], root);
+  configureUser(root);
+  run("git", ["add", "."], root);
+  run("git", ["commit", "-m", "initial"], root);
+
+  write(path.join(root, "results/ledger.txt"), "publish\n");
+  write(path.join(root, "operator.txt"), "operator staged\n");
+  run("git", ["add", "operator.txt"], root);
+  const beforeHead = run("git", ["rev-parse", "HEAD"], root);
+  const beforeIndex = run("git", ["show", ":operator.txt"], root);
+
+  assert.throws(
+    () =>
+      withCwd(root, () =>
+        publishMainCommit({
+          message: "chore: publish ledger",
+          paths: ["results"],
+          maxAttempts: 1,
+          pushAttempts: 1,
+        }),
+      ),
+    /staged path outside exact publication scope: operator\.txt/,
+  );
+
+  assert.equal(run("git", ["rev-parse", "HEAD"], root), beforeHead);
+  assert.equal(run("git", ["diff", "--cached", "--name-only"], root), "operator.txt\n");
+  assert.equal(run("git", ["show", ":operator.txt"], root), beforeIndex);
+  assert.equal(fs.readFileSync(path.join(root, "results/ledger.txt"), "utf8"), "publish\n");
+});
+
+test("reconciliation publication rejects foreign pre-staged content before rebuild work", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-reconcile-index-"));
+  const record = "records/openclaw-openclaw/items/1.md";
+  write(path.join(root, record), "initial record\n");
+  write(path.join(root, "operator.txt"), "initial\n");
+  run("git", ["init"], root);
+  configureUser(root);
+  run("git", ["add", "."], root);
+  run("git", ["commit", "-m", "initial"], root);
+
+  write(path.join(root, record), "reconciled record\n");
+  write(path.join(root, "operator.txt"), "operator staged\n");
+  run("git", ["add", "operator.txt"], root);
+  const beforeHead = run("git", ["rev-parse", "HEAD"], root);
+  const beforeIndex = run("git", ["show", ":operator.txt"], root);
+
+  assert.throws(
+    () =>
+      withCwd(root, () =>
+        publishMainCommit({
+          message: "chore: reconcile records",
+          paths: ["records"],
+          maxAttempts: 1,
+          pushAttempts: 1,
+          rebaseStrategy: "reconcile-records",
+        }),
+      ),
+    /staged path outside exact publication scope: operator\.txt/,
+  );
+
+  assert.equal(run("git", ["rev-parse", "HEAD"], root), beforeHead);
+  assert.equal(run("git", ["diff", "--cached", "--name-only"], root), "operator.txt\n");
+  assert.equal(run("git", ["show", ":operator.txt"], root), beforeIndex);
+  assert.equal(fs.readFileSync(path.join(root, record), "utf8"), "reconciled record\n");
+});
+
 test("publishMainCommit commits selected paths and restores volatile tracked files", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-"));
   const origin = path.join(root, "origin.git");

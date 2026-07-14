@@ -254,6 +254,7 @@ function reconcileRequest(env: NodeJS.ProcessEnv): ExactReviewQueueRequest {
   if (!/^\d+$/.test(sourceRunId)) throw new Error("SOURCE_RUN_ID must be numeric");
   const sourceRunAttempt = positiveInteger(env.SOURCE_RUN_ATTEMPT, "SOURCE_RUN_ATTEMPT");
   const payload = {
+    include_all_claimed: true,
     runs: [
       {
         run_id: sourceRunId,

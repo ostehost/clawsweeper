@@ -25,6 +25,44 @@ function workflowRunScripts(workflowPath: string): { label: string; run: string 
   return scripts;
 }
 
+test("exact-review reconciliation pins every external action to reviewed commits", () => {
+  const workflow = fs.readFileSync(".github/workflows/exact-review-reconcile.yml", "utf8");
+  const externalActions = [...workflow.matchAll(/^\s*(?:-\s*)?uses:\s+([^\s#]+)/gm)]
+    .map((match) => match[1] ?? "")
+    .filter((reference) => reference && !reference.startsWith("./"));
+
+  assert.deepEqual(externalActions, [
+    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  ]);
+  for (const reference of externalActions) {
+    assert.match(reference, /^[^/@]+\/[^/@]+@[a-f0-9]{40}$/);
+  }
+});
+
+test("scoped privileged workflows grant only the mechanically required job permissions", () => {
+  const parse = (workflowPath: string) =>
+    YAML.parse(fs.readFileSync(workflowPath, "utf8")) as {
+      permissions?: Record<string, string>;
+      jobs?: Record<string, { permissions?: Record<string, string> }>;
+    };
+  const sweep = parse(".github/workflows/sweep.yml");
+  const commit = parse(".github/workflows/commit-review.yml");
+  const router = parse(".github/workflows/repair-comment-router.yml");
+
+  assert.deepEqual(sweep.jobs?.["apply-existing"]?.permissions, {
+    actions: "write",
+    contents: "read",
+  });
+  assert.deepEqual(commit.permissions, {});
+  assert.deepEqual(commit.jobs?.plan?.permissions, { actions: "write", contents: "read" });
+  assert.deepEqual(commit.jobs?.publish?.permissions, { actions: "write", contents: "read" });
+  assert.deepEqual(router.permissions, {});
+  assert.deepEqual(router.jobs?.["route-comments"]?.permissions, { contents: "read" });
+});
+
 test("repository dispatch payloads cannot select repair runners", () => {
   for (const path of intakeWorkflows) {
     const workflow = fs.readFileSync(path, "utf8");
@@ -263,10 +301,7 @@ test("prepare executor scrubs workflow command files and publisher rederives art
   );
   assert.ok(receiptStart >= 0 && receiptEnd > receiptStart);
   const receipt = source.slice(receiptStart, receiptEnd);
-  assert.match(
-    receipt,
-    /const bundleSha256 = String\(prepared\.bundle_sha256 \?\? ""\)/,
-  );
+  assert.match(receipt, /const bundleSha256 = String\(prepared\.bundle_sha256 \?\? ""\)/);
   assert.match(receipt, /bundle_sha256: bundleSha256/);
   assert.match(source, /independently derived publication paths do not match/);
   assert.match(source, /prepared contributor repair source branch identity or lease changed/);
