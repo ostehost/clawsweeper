@@ -116,6 +116,13 @@ test("failed-run self-heal exposes exact immutable generation provenance", () =>
         source_state_revision: fixture.stateRevision,
         source_job_sha256: fixture.jobSha256,
         mode: "plan",
+        runner: "blacksmith-4vcpu-ubuntu-2404",
+        execution_runner: "blacksmith-16vcpu-ubuntu-2404",
+        planner_sandbox: "read-only",
+        model: "internal",
+        dry_run: true,
+        requeue: false,
+        requeue_depth: 0,
       },
     ]);
   } finally {
@@ -146,6 +153,13 @@ test("failed-run self-heal restricts unsealed legacy records to plan mode", () =
         source_job_sha256: fixture.jobSha256,
         legacy_unsealed: true,
         mode: "plan",
+        runner: "blacksmith-4vcpu-ubuntu-2404",
+        execution_runner: "blacksmith-16vcpu-ubuntu-2404",
+        planner_sandbox: "read-only",
+        model: "internal",
+        dry_run: true,
+        requeue: false,
+        requeue_depth: 0,
       },
     ]);
   } finally {
@@ -192,6 +206,13 @@ test("failed-run self-heal recovers live sealed provenance from the inputs artif
         source_state_revision: fixture.stateRevision,
         source_job_sha256: fixture.jobSha256,
         mode: "autonomous",
+        runner: "blacksmith-4vcpu-ubuntu-2404",
+        execution_runner: "blacksmith-16vcpu-ubuntu-2404",
+        planner_sandbox: "read-only",
+        model: "internal",
+        dry_run: true,
+        requeue: false,
+        requeue_depth: 0,
         run_url: "https://github.test/actions/runs/910003",
       },
     ]);
@@ -238,6 +259,60 @@ test("failed-run self-heal preserves a persisted plan-only effective mode", () =
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.candidates.length, 1);
     assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("failed-run self-heal replays current retry inputs only with sealed job provenance", () => {
+  const fixture = createFixture("current-retry-inputs", "autonomous");
+  try {
+    fs.writeFileSync(
+      fixture.recoveryInputsFile,
+      `${JSON.stringify({
+        schema_version: 1,
+        source_job: fixture.jobPath,
+        source_dispatch_key: "original-dispatch",
+        requested_mode: "autonomous",
+        effective_mode: "plan",
+        runner: "original-runner",
+        execution_runner: "original-execution-runner",
+        planner_sandbox: "read-only",
+        model: "original-model",
+        dry_run: false,
+        requeue: false,
+        requeue_depth: 0,
+      })}\n`,
+    );
+    writeRunRecord(fixture, "910007", {
+      source_job: fixture.jobPath,
+      workflow_conclusion: "failure",
+      workflow_updated_at: new Date().toISOString(),
+      mode: "autonomous",
+    });
+
+    const result = runSelfHeal(fixture, { args: ["--mode", "autonomous"] });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.candidates.length, 1);
+    assert.deepEqual(
+      {
+        mode: summary.candidates[0].mode,
+        runner: summary.candidates[0].runner,
+        execution_runner: summary.candidates[0].execution_runner,
+        planner_sandbox: summary.candidates[0].planner_sandbox,
+        model: summary.candidates[0].model,
+        dry_run: summary.candidates[0].dry_run,
+      },
+      {
+        mode: "plan",
+        runner: "original-runner",
+        execution_runner: "original-execution-runner",
+        planner_sandbox: "read-only",
+        model: "original-model",
+        dry_run: false,
+      },
+    );
   } finally {
     cleanupFixture(fixture);
   }

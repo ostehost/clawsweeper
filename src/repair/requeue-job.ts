@@ -3,7 +3,8 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runText } from "../command.js";
+import { spawnSync } from "node:child_process";
+import { resolveSpawnCommand, runText } from "../command.js";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
@@ -12,7 +13,7 @@ import {
   repoRoot,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
-import { ghJson, ghSpawn, ghText } from "./github-cli.js";
+import { ghEnv, ghJson, ghSpawn, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
@@ -29,6 +30,13 @@ import {
   normalizedRequeueSourceJobPath,
 } from "./requeue-job-key.js";
 import { immutableJobDispatchArgs, resolveStateJobIdentity } from "./immutable-job-handoff.js";
+import {
+  isRepairWorkflowArtifactUnavailable,
+  parseRepairWorkflowRecoveryInputs,
+  readNewestRepairWorkflowRecoveryInputs,
+  resolveRepairWorkflowRetryMode,
+  type RepairWorkflowRecoveryInputs,
+} from "./workflow-recovery-inputs.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -42,6 +50,7 @@ const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
 const WORKFLOW_INPUTS_BASENAME = "workflow-inputs.json";
 const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+const WORKFLOW_INPUT_DOWNLOAD_TIMEOUT_MS = 60_000;
 
 type RecoveredRunCohort = {
   source_job: string;
@@ -51,41 +60,72 @@ type RecoveredRunCohort = {
   producer_attempt: number;
 };
 
+type ResolvedRequeueSource = {
+  source_job: JsonValue;
+  mode: string | null;
+  state_revision: JsonValue;
+  job_sha256: JsonValue;
+  workflow_inputs: RepairWorkflowRecoveryInputs | null;
+};
+
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
 const workflow = String(args.workflow ?? DEFAULT_WORKFLOW);
-const runner = String(args.runner ?? DEFAULT_RUNNER);
-const executionRunner = String(
-  args["execution-runner"] ?? args.execution_runner ?? DEFAULT_EXECUTION_RUNNER,
-);
-const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
-const maxLiveWorkers = readMaxLiveWorkers(args);
-const waitForCapacity = Boolean(args["wait-for-capacity"]);
-const execute = Boolean(args.execute || args.live);
-const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const requestedRunId = args["run-id"] ?? (looksLikeRunId(args._[0]) ? args._[0] : null);
 const runRecordsDir = path.resolve(
   String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
 );
-const sourceRunId = String(
-  args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID ?? "",
-).trim();
-const requeueDepth = nonNegativeIntegerArg(args["requeue-depth"], "requeue-depth", 0);
-const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-requeue-depth", 1);
-
-const resolved = requestedRunId
+const resolved: ResolvedRequeueSource = requestedRunId
   ? resolveFromRunId(String(requestedRunId))
   : {
       source_job: args._[0],
       mode: requestedMode,
       state_revision: null,
       job_sha256: null,
+      workflow_inputs: null,
     };
+const recoveredInputs = resolved.workflow_inputs;
+const runner = String(args.runner ?? recoveredInputs?.runner ?? DEFAULT_RUNNER);
+const executionRunner = String(
+  args["execution-runner"] ??
+    args.execution_runner ??
+    recoveredInputs?.execution_runner ??
+    DEFAULT_EXECUTION_RUNNER,
+);
+const plannerSandbox = String(
+  args["planner-sandbox"] ??
+    args.planner_sandbox ??
+    recoveredInputs?.planner_sandbox ??
+    "read-only",
+);
+if (!["read-only", "danger-full-access"].includes(plannerSandbox)) {
+  throw new Error(`unsupported planner sandbox: ${plannerSandbox}`);
+}
+const model = String(
+  args.model ?? recoveredInputs?.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal",
+);
+const dryRun = booleanArg(
+  args["dry-run"] ?? args.dry_run,
+  recoveredInputs?.dry_run ?? Boolean(requestedRunId),
+);
+const maxLiveWorkers = readMaxLiveWorkers(args);
+const waitForCapacity = Boolean(args["wait-for-capacity"]);
+const execute = Boolean(args.execute || args.live);
+const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
+const sourceRunId = String(
+  args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID ?? "",
+).trim();
+const requeueDepth = nonNegativeIntegerArg(
+  args["requeue-depth"],
+  "requeue-depth",
+  recoveredInputs?.requeue_depth ?? 0,
+);
+const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-requeue-depth", 1);
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--runs-dir path] [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--runs-dir path] [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--planner-sandbox read-only|danger-full-access] [--model model] [--dry-run true|false] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -116,10 +156,11 @@ if (
   );
 }
 
-const mode = requestedMode ?? resolved.mode ?? job.frontmatter.mode;
-if (!["plan", "execute", "autonomous"].includes(mode)) {
-  throw new Error(`unsupported mode: ${mode}`);
-}
+const mode = resolveRepairWorkflowRetryMode({
+  requestedMode,
+  recoveredMode: recoveredInputs?.effective_mode ?? (requestedRunId ? "plan" : null),
+  fallbackMode: resolved.mode ?? job.frontmatter.mode,
+});
 
 const summary: LooseRecord = {
   status: execute ? "dispatching" : "dry_run",
@@ -135,7 +176,9 @@ const summary: LooseRecord = {
   mode,
   runner,
   execution_runner: executionRunner,
+  planner_sandbox: plannerSandbox,
   model,
+  dry_run: dryRun,
   max_live_workers: maxLiveWorkers,
 };
 
@@ -168,14 +211,14 @@ const requeueLifecycle: CommandLifecycleInput = {
 let commandError: unknown = null;
 
 try {
-  if (openExecuteWindow && ["execute", "autonomous"].includes(mode)) {
+  if (!dryRun && openExecuteWindow && ["execute", "autonomous"].includes(mode)) {
     openGate("CLAWSWEEPER_ALLOW_EXECUTE", requeueLifecycle);
     if (job.frontmatter.allow_fix_pr === true || job.frontmatter.allowed_actions.includes("fix")) {
       openGate("CLAWSWEEPER_ALLOW_FIX_PR", requeueLifecycle);
     }
   }
 
-  assertGateOpenIfNeeded(mode);
+  assertGateOpenIfNeeded(mode, dryRun);
   summary.live_worker_capacity_before_dispatch = waitForCapacity
     ? waitForLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers })
     : assertLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers });
@@ -237,19 +280,35 @@ try {
 }
 if (commandError) throw commandError;
 
-function resolveFromRunId(runId: string) {
+function resolveFromRunId(runId: string): ResolvedRequeueSource {
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
   );
   try {
-    const downloaded = ghSpawn(["run", "download", runId, "--repo", repo, "--dir", artifactDir], {
-      cwd: repoRoot(),
-    });
-    if (downloaded.status === 0) {
-      return resolveDownloadedRunCohort(artifactDir, runId, null);
+    const downloads = [
+      `clawsweeper-repair-inputs-${runId}-*`,
+      `clawsweeper-repair-${runId}-*`,
+      `clawsweeper-repair-worker-${runId}-*`,
+    ].map((pattern) => downloadRunArtifacts(runId, artifactDir, pattern));
+    const failedDownload = downloads.find(
+      (download) =>
+        download.status !== 0 &&
+        !isRepairWorkflowArtifactUnavailable(download.stderr, download.stdout),
+    );
+    if (failedDownload) {
+      throw new Error(
+        `could not resolve run ${runId}: ${failedDownload.stderr || failedDownload.stdout}`,
+      );
     }
-    if (!artifactDownloadUnavailable(downloaded.stderr, downloaded.stdout)) {
-      throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+    if (downloads.some((download) => download.status === 0)) {
+      const recoveryDir = artifactDir;
+      const workflowInputs = readNewestRepairWorkflowRecoveryInputs(recoveryDir, runId);
+      const cohort = resolveDownloadedRunCohort(
+        artifactDir,
+        runId,
+        workflowInputs?.source_job ?? null,
+      );
+      return resolvedRequeueSource(cohort, workflowInputs);
     }
 
     const fromLedger = readPublishedRunRecord(runId);
@@ -281,24 +340,57 @@ function resolveFromRunId(runId: string) {
         mode: ledgerMode,
         state_revision: ledgerStateRevision,
         job_sha256: ledgerJobSha256,
+        workflow_inputs: null,
       };
     }
-    throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+    throw new Error(
+      `could not resolve run ${runId}: ${downloads
+        .map((download) => download.stderr || download.stdout || download.error?.message)
+        .filter(Boolean)
+        .join("; ")}`,
+    );
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
 }
 
-function artifactDownloadUnavailable(stderr: unknown, stdout: unknown): boolean {
-  const detail = `${String(stderr ?? "")}\n${String(stdout ?? "")}`.toLowerCase();
-  return [
-    "artifact has expired",
-    "artifacts expired",
-    "no artifacts found",
-    "no valid artifacts",
-    "not found",
-    "http 404",
-  ].some((message) => detail.includes(message));
+function downloadRunArtifacts(runId: string, artifactDir: string, pattern: string) {
+  const env = ghEnv();
+  const cwd = repoRoot();
+  const command = resolveSpawnCommand(
+    "gh",
+    ["run", "download", runId, "--repo", repo, "--dir", artifactDir, "--pattern", pattern],
+    { cwd, env },
+  );
+  return spawnSync(command.command, command.args, {
+    cwd,
+    encoding: "utf8",
+    env,
+    stdio: "pipe",
+    timeout: WORKFLOW_INPUT_DOWNLOAD_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+    ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+  });
+}
+
+function resolvedRequeueSource(
+  cohort: RecoveredRunCohort,
+  workflowInputs: RepairWorkflowRecoveryInputs | null,
+): ResolvedRequeueSource {
+  if (workflowInputs && workflowInputs.source_job !== cohort.source_job) {
+    throw new Error("immutable workflow inputs conflict with the sealed repair artifact cohort");
+  }
+  return {
+    source_job: cohort.source_job,
+    mode: resolveRepairWorkflowRetryMode({
+      requestedMode: null,
+      recoveredMode: workflowInputs?.effective_mode ?? "plan",
+      fallbackMode: cohort.mode,
+    }),
+    state_revision: cohort.state_revision,
+    job_sha256: cohort.job_sha256,
+    workflow_inputs: workflowInputs,
+  };
 }
 
 function ensureHistoricalStateRevision(value: unknown): void {
@@ -411,6 +503,7 @@ function resolveDownloadedRunCohort(
         producerAttempt,
         expectedSourceJob,
       });
+      if (!candidate) continue;
       candidatesByAttempt.set(producerAttempt, [
         ...(candidatesByAttempt.get(producerAttempt) ?? []),
         candidate,
@@ -463,38 +556,19 @@ function readRecoveredWorkflowInputs({
   inputPath: string;
   producerAttempt: number;
   expectedSourceJob: string | null;
-}): RecoveredRunCohort {
-  const input = readJsonObject(inputPath, "immutable workflow inputs");
-  const inputKeys = Object.keys(input).sort();
-  if (
-    JSON.stringify(inputKeys) !==
-    JSON.stringify([
-      "effective_mode",
-      "job_sha256",
-      "requested_mode",
-      "schema_version",
-      "source_job",
-      "state_revision",
-    ])
-  ) {
-    throw new Error("immutable workflow inputs have unexpected fields");
+}): RecoveredRunCohort | null {
+  const input = parseRepairWorkflowRecoveryInputs(
+    readJsonObject(inputPath, "immutable workflow inputs"),
+  );
+  if (typeof input.state_revision !== "string" || typeof input.job_sha256 !== "string") {
+    return null;
   }
-  const sourceJob = String(input.source_job ?? "").trim();
-  const stateRevision = String(input.state_revision ?? "").trim();
-  const jobSha256 = String(input.job_sha256 ?? "").trim();
-  const requestedMode = String(input.requested_mode ?? "").trim();
-  const effectiveMode = String(input.effective_mode ?? "").trim();
-  if (
-    input.schema_version !== 1 ||
-    !SOURCE_JOB_PATH.test(sourceJob) ||
-    !STATE_REVISION.test(stateRevision) ||
-    !JOB_SHA256.test(jobSha256) ||
-    (expectedSourceJob !== null && sourceJob !== expectedSourceJob) ||
-    !REPAIR_MODES.has(requestedMode) ||
-    !REPAIR_MODES.has(effectiveMode) ||
-    (effectiveMode !== requestedMode && effectiveMode !== "plan")
-  ) {
-    throw new Error("immutable workflow inputs have invalid repair provenance");
+  const sourceJob = input.source_job;
+  const stateRevision = input.state_revision;
+  const jobSha256 = input.job_sha256;
+  const effectiveMode = input.effective_mode;
+  if (expectedSourceJob !== null && sourceJob !== expectedSourceJob) {
+    throw new Error("immutable workflow inputs conflict with the expected source job");
   }
   return {
     source_job: sourceJob,
@@ -625,7 +699,11 @@ function dispatchJob(
           "-f",
           `execution_runner=${executionRunner}`,
           "-f",
+          `planner_sandbox=${plannerSandbox}`,
+          "-f",
           `model=${model}`,
+          "-f",
+          `dry_run=${dryRun}`,
           "-f",
           "requeue=true",
           "-f",
@@ -662,7 +740,8 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
   return latest.slice(-expectedCount);
 }
 
-function assertGateOpenIfNeeded(mode: string) {
+function assertGateOpenIfNeeded(mode: string, isDryRun: boolean) {
+  if (isDryRun) return;
   if (!["execute", "autonomous"].includes(mode)) return;
   if (readGate("CLAWSWEEPER_ALLOW_EXECUTE") !== "1") {
     throw new Error(
@@ -753,4 +832,11 @@ function nonNegativeIntegerArg(value: JsonValue, name: string, fallback: number)
     throw new Error(`--${name} must be a non-negative integer`);
   }
   return parsed;
+}
+
+function booleanArg(value: JsonValue, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error("boolean arguments must be true or false");
 }

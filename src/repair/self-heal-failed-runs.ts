@@ -3,7 +3,8 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runText } from "../command.js";
+import { spawnSync } from "node:child_process";
+import { resolveSpawnCommand, runText } from "../command.js";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
@@ -13,7 +14,7 @@ import {
   repoRoot,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
-import { ghErrorText, ghJson, ghSpawn, ghText } from "./github-cli.js";
+import { ghEnv, ghErrorText, ghJson, ghSpawn, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import {
@@ -31,6 +32,13 @@ import {
   type GateRestoreResult,
 } from "./self-heal-gate-restore.js";
 import { fetchWorkflowRunHistory } from "./workflow-run-history.js";
+import {
+  boundedRecoveryTimeoutMs,
+  isRepairWorkflowArtifactUnavailable,
+  readNewestRepairWorkflowRecoveryInputs,
+  resolveRepairWorkflowRetryMode,
+  type RepairWorkflowRecoveryInputs,
+} from "./workflow-recovery-inputs.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -43,6 +51,9 @@ const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
 const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+const WORKFLOW_INPUT_DOWNLOAD_TIMEOUT_MS = 60_000;
+const RECOVERY_SCAN_BUDGET_MS = 3 * 60_000;
+const MAX_RECOVERY_CANDIDATE_SCANS = 200;
 const preparedStateRevisions = new Set<string>();
 
 type GateState = {
@@ -95,7 +106,7 @@ if (requestedMode !== null && !REPAIR_MODES.has(requestedMode)) {
   throw new Error("--mode must be plan, execute, or autonomous");
 }
 
-const candidates = selectCandidates().slice(0, maxJobs);
+const candidates = selectCandidates();
 const summary: LooseRecord = {
   status: execute ? "dispatching" : "dry_run",
   repo,
@@ -135,10 +146,15 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
   source_state_revision: candidate.source_state_revision,
   source_job_sha256: candidate.source_job_sha256,
   immutable_job_key: candidate.immutable_job_key,
+  source_dispatch_key: candidate.source_dispatch_key,
   mode: candidate.mode,
-  runner,
-  execution_runner: executionRunner,
-  model,
+  runner: candidate.runner,
+  execution_runner: candidate.execution_runner,
+  planner_sandbox: candidate.planner_sandbox,
+  model: candidate.model,
+  dry_run: candidate.dry_run,
+  requeue: candidate.requeue,
+  requeue_depth: candidate.requeue_depth,
   workflow,
   repo,
   dispatched_at: new Date().toISOString(),
@@ -149,7 +165,7 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
 let primaryFailure: unknown = null;
 let cleanupRestoreFailures: GateCleanupFailure[] = [];
 try {
-  if (openExecuteWindow) {
+  if (openExecuteWindow && candidates.some(isWriteCandidate)) {
     openGate("CLAWSWEEPER_ALLOW_EXECUTE");
     openGate("CLAWSWEEPER_ALLOW_FIX_PR");
   } else {
@@ -237,12 +253,18 @@ function selectCandidates() {
     }
     const generation = runRecordGenerationKey(record, sourceJob);
     const current = latestByGeneration.get(generation);
-    if (!current || runSortKey(record) > runSortKey(current)) {
+    const recordSortKey = runSortKey(record);
+    const currentSortKey = current ? runSortKey(current) : Number.NEGATIVE_INFINITY;
+    if (
+      !current ||
+      recordSortKey > currentSortKey ||
+      (recordSortKey === currentSortKey && record.live_run_record === true)
+    ) {
       latestByGeneration.set(generation, record);
     }
   }
 
-  return [...latestByGeneration.values()]
+  const eligible = [...latestByGeneration.values()]
     .filter((record: JsonValue) => record.workflow_conclusion === "failure")
     .filter((record: JsonValue) => {
       const timestamp = recordTimestampMs(record);
@@ -257,74 +279,133 @@ function selectCandidates() {
       });
       return false;
     })
-    .map((record: JsonValue) => {
-      const sourceJob = String(record.source_job ?? "");
-      try {
-        const immutableJob = resolveRunRecordJob(record, sourceJob);
-        return {
-          ...record,
-          source_job: immutableJob.jobPath,
-          source_state_revision: immutableJob.stateRevision,
-          source_job_sha256: immutableJob.jobSha256,
-          immutable_job_key: jobContentGenerationKey(immutableJob.jobPath, immutableJob.jobSha256),
-          ...(immutableJob.legacyUnsealed ? { legacy_unsealed: true } : {}),
-          mode: retryMode({
-            legacyUnsealed: immutableJob.legacyUnsealed,
-            persistedMode:
-              immutableJob.effectiveMode ??
-              record.effective_mode ??
-              record.mode ??
-              immutableJob.job.frontmatter.mode,
-          }),
-        };
-      } catch (error) {
-        skippedCandidates.push({
-          reason: isMissingImmutableJobError(error)
-            ? "missing_job_file"
-            : "immutable_provenance_unavailable",
-          run_id: record.run_id ?? null,
-          source_job: sourceJob,
-          detail: error instanceof Error ? error.message : String(error),
-        });
-        return null;
+    .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
+  const boundedEligible = eligible.slice(0, MAX_RECOVERY_CANDIDATE_SCANS);
+  const recoveryDeadlineMs = Date.now() + RECOVERY_SCAN_BUDGET_MS;
+  const selected: LooseRecord[] = [];
+
+  for (const record of boundedEligible) {
+    if (selected.length >= maxJobs) break;
+    const sourceJob = String(record.source_job ?? "");
+    const recoveryTimeoutMs = boundedRecoveryTimeoutMs({
+      deadlineMs: recoveryDeadlineMs,
+      nowMs: Date.now(),
+      maxTimeoutMs: WORKFLOW_INPUT_DOWNLOAD_TIMEOUT_MS,
+    });
+    if (recoveryTimeoutMs === 0) {
+      skippedCandidates.push({
+        reason: "recovery_budget_exhausted",
+        run_id: record.run_id ?? null,
+        source_job: sourceJob,
+      });
+      break;
+    }
+
+    let recoveredInputs: RepairWorkflowRecoveryInputs | null = null;
+    try {
+      recoveredInputs = recoverWorkflowInputs(record, recoveryTimeoutMs);
+    } catch (error) {
+      skippedCandidates.push({
+        reason: "immutable_inputs_invalid",
+        run_id: record.run_id ?? null,
+        source_job: sourceJob,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+
+    let candidate: LooseRecord;
+    try {
+      const immutableJob = resolveRunRecordJob(record, sourceJob, recoveredInputs);
+      const plannerSandbox = String(
+        args["planner-sandbox"] ??
+          args.planner_sandbox ??
+          recoveredInputs?.planner_sandbox ??
+          "read-only",
+      );
+      if (!["read-only", "danger-full-access"].includes(plannerSandbox)) {
+        throw new Error(`unsupported planner sandbox: ${plannerSandbox}`);
       }
-    })
-    .filter((record: JsonValue) => record !== null)
-    .filter((record: JsonValue) => {
-      const activeRunIds = [
-        ...(activeJobGenerations.get(
-          activeJobGenerationKey(record.source_job, record.source_job_sha256),
-        ) ?? []),
-        ...(activeJobGenerations.get(String(record.source_job ?? "")) ?? []),
-      ].filter((runId, index, all) => all.indexOf(runId) === index);
-      if (activeRunIds.length === 0) return true;
+      const mode = immutableJob.legacyUnsealed
+        ? "plan"
+        : resolveRepairWorkflowRetryMode({
+            requestedMode,
+            recoveredMode: recoveredInputs?.effective_mode ?? immutableJob.effectiveMode ?? "plan",
+            fallbackMode: record.effective_mode ?? record.mode ?? immutableJob.job.frontmatter.mode,
+          });
+      candidate = {
+        ...record,
+        source_job: immutableJob.jobPath,
+        source_state_revision: immutableJob.stateRevision,
+        source_job_sha256: immutableJob.jobSha256,
+        immutable_job_key: jobContentGenerationKey(immutableJob.jobPath, immutableJob.jobSha256),
+        ...(immutableJob.legacyUnsealed ? { legacy_unsealed: true } : {}),
+        source_dispatch_key: recoveredInputs?.source_dispatch_key ?? null,
+        mode,
+        runner: String(args.runner ?? recoveredInputs?.runner ?? runner),
+        execution_runner: String(
+          args["execution-runner"] ??
+            args.execution_runner ??
+            recoveredInputs?.execution_runner ??
+            executionRunner,
+        ),
+        planner_sandbox: plannerSandbox,
+        model: String(args.model ?? recoveredInputs?.model ?? model),
+        dry_run: immutableJob.legacyUnsealed
+          ? true
+          : booleanArg(args["dry-run"] ?? args.dry_run, recoveredInputs?.dry_run ?? true),
+        requeue: recoveredInputs?.requeue ?? false,
+        requeue_depth: recoveredInputs?.requeue_depth ?? 0,
+      };
+    } catch (error) {
+      skippedCandidates.push({
+        reason: isMissingImmutableJobError(error)
+          ? "missing_job_file"
+          : "immutable_provenance_unavailable",
+        run_id: record.run_id ?? null,
+        source_job: sourceJob,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+
+    const activeRunIds = [
+      ...(activeJobGenerations.get(
+        activeJobGenerationKey(candidate.source_job, candidate.source_job_sha256),
+      ) ?? []),
+      ...(activeJobGenerations.get(String(candidate.source_job ?? "")) ?? []),
+    ].filter((runId, index, all) => all.indexOf(runId) === index);
+    if (activeRunIds.length > 0) {
       skippedCandidates.push({
         reason: "active_repair_run",
-        run_id: record.run_id ?? null,
-        source_job: record.source_job,
-        source_state_revision: record.source_state_revision,
-        source_job_sha256: record.source_job_sha256,
+        run_id: candidate.run_id ?? null,
+        source_job: candidate.source_job,
+        source_state_revision: candidate.source_state_revision,
+        source_job_sha256: candidate.source_job_sha256,
         active_run_ids: activeRunIds,
       });
-      return false;
-    })
-    .filter((record: JsonValue) => {
-      if (allowRepeat) return true;
-      const runId = String(record.run_id ?? "");
-      const generation = String(record.immutable_job_key ?? "");
-      if (runId && attemptedRunGenerations.has(`${runId}:${generation}`)) return false;
-      if ((attemptCountsByGeneration.get(generation) ?? 0) < maxAttemptsPerJob) return true;
-      skippedCandidates.push({
-        reason: "retry_limit_reached",
-        run_id: runId || null,
-        source_job: record.source_job,
-        source_state_revision: record.source_state_revision,
-        source_job_sha256: record.source_job_sha256,
-        attempts: attemptCountsByGeneration.get(generation) ?? 0,
-      });
-      return false;
-    })
-    .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
+      continue;
+    }
+
+    if (!allowRepeat) {
+      const runId = String(candidate.run_id ?? "");
+      const generation = String(candidate.immutable_job_key ?? "");
+      if (runId && attemptedRunGenerations.has(`${runId}:${generation}`)) continue;
+      if ((attemptCountsByGeneration.get(generation) ?? 0) >= maxAttemptsPerJob) {
+        skippedCandidates.push({
+          reason: "retry_limit_reached",
+          run_id: runId || null,
+          source_job: candidate.source_job,
+          source_state_revision: candidate.source_state_revision,
+          source_job_sha256: candidate.source_job_sha256,
+          attempts: attemptCountsByGeneration.get(generation) ?? 0,
+        });
+        continue;
+      }
+    }
+    selected.push(candidate);
+  }
+  return selected;
 }
 
 function runRecordGenerationKey(record: LooseRecord, sourceJob: string): string {
@@ -334,11 +415,25 @@ function runRecordGenerationKey(record: LooseRecord, sourceJob: string): string 
     : `${sourceJob}:unsealed`;
 }
 
-function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
+function resolveRunRecordJob(
+  record: LooseRecord,
+  sourceJob: string,
+  recoveredInputs: RepairWorkflowRecoveryInputs | null,
+) {
   const stateRevision = String(record.source_state_revision ?? "").trim();
   const jobSha256 = String(record.source_job_sha256 ?? "").trim();
+  if (recoveredInputs && recoveredInputs.source_job !== sourceJob) {
+    throw new Error("immutable workflow inputs conflict with the selected source job");
+  }
   if (stateRevision) {
     if (!STATE_REVISION.test(stateRevision)) throw new Error("state revision is malformed");
+    if (
+      recoveredInputs &&
+      "state_revision" in recoveredInputs &&
+      (recoveredInputs.state_revision !== stateRevision || recoveredInputs.job_sha256 !== jobSha256)
+    ) {
+      throw new Error("immutable workflow inputs conflict with published repair provenance");
+    }
     ensureHistoricalStateRevision(stateRevision);
     return {
       ...resolveStateJobIdentity({
@@ -352,15 +447,20 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
   }
   if (jobSha256) {
     if (!JOB_SHA256.test(jobSha256)) throw new Error("job SHA-256 is malformed");
-    const recovered = resolveRunRecoveryInputs(record.run_id, sourceJob, jobSha256);
-    ensureHistoricalStateRevision(recovered.stateRevision);
+    if (!recoveredInputs || !("state_revision" in recoveredInputs)) {
+      throw new Error("immutable recovery inputs do not include a state revision");
+    }
+    if (recoveredInputs.job_sha256 !== jobSha256) {
+      throw new Error("immutable recovery inputs conflict with the published job digest");
+    }
+    ensureHistoricalStateRevision(recoveredInputs.state_revision);
     return {
       ...resolveStateJobIdentity({
         jobPath: sourceJob,
-        stateRevision: recovered.stateRevision,
-        jobSha256: recovered.jobSha256,
+        stateRevision: recoveredInputs.state_revision,
+        jobSha256: recoveredInputs.job_sha256,
       }),
-      effectiveMode: recovered.effectiveMode,
+      effectiveMode: recoveredInputs.effective_mode,
       legacyUnsealed: false,
     };
   }
@@ -371,16 +471,20 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
   };
 }
 
-function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobSha256: string) {
-  const runId = String(runIdValue ?? "").trim();
-  if (!/^[1-9][0-9]*$/.test(runId)) {
-    throw new Error("run id is malformed for immutable recovery input lookup");
-  }
+function recoverWorkflowInputs(
+  record: LooseRecord,
+  timeoutMs: number,
+): RepairWorkflowRecoveryInputs | null {
+  const runId = String(record.run_id ?? "").trim();
+  if (!/^[1-9][0-9]*$/.test(runId)) return null;
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-self-heal-inputs-${runId}-`),
   );
   try {
-    const downloaded = ghSpawn(
+    const env = ghEnv();
+    const cwd = repoRoot();
+    const command = resolveSpawnCommand(
+      "gh",
       [
         "run",
         "download",
@@ -392,73 +496,33 @@ function resolveRunRecoveryInputs(runIdValue: JsonValue, sourceJob: string, jobS
         "--dir",
         artifactDir,
       ],
-      { cwd: repoRoot() },
+      { cwd, env },
     );
+    const downloaded = spawnSync(command.command, command.args, {
+      cwd,
+      encoding: "utf8",
+      env,
+      stdio: "pipe",
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+      ...(command.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    });
     if (downloaded.status !== 0) {
+      if (isRepairWorkflowArtifactUnavailable(downloaded.stderr, downloaded.stdout)) return null;
       throw new Error(
-        `cannot download immutable recovery inputs for run ${runId}: ${
-          downloaded.stderr || downloaded.stdout
+        `could not recover run ${runId} inputs: ${
+          downloaded.stderr ||
+          downloaded.stdout ||
+          downloaded.error?.message ||
+          "artifact unavailable"
         }`,
       );
     }
-    const inputs = fs
-      .globSync(path.join(artifactDir, "**", "workflow-inputs.json"))
-      .filter((file) => fs.lstatSync(file).isFile())
-      .map((file) => {
-        const bytes = fs.readFileSync(file);
-        if (bytes.length > 64 * 1024) {
-          throw new Error(`immutable recovery input artifact is oversized for run ${runId}`);
-        }
-        const input = JSON.parse(bytes.toString("utf8")) as LooseRecord;
-        const keys = Object.keys(input).sort();
-        if (
-          JSON.stringify(keys) !==
-          JSON.stringify([
-            "effective_mode",
-            "job_sha256",
-            "requested_mode",
-            "schema_version",
-            "source_job",
-            "state_revision",
-          ])
-        ) {
-          throw new Error(`immutable recovery inputs have unexpected fields for run ${runId}`);
-        }
-        return input;
-      })
-      .filter((input) => {
-        const requested = String(input.requested_mode ?? "").trim();
-        const effective = String(input.effective_mode ?? "").trim();
-        return (
-          input.schema_version === 1 &&
-          input.source_job === sourceJob &&
-          input.job_sha256 === jobSha256 &&
-          STATE_REVISION.test(String(input.state_revision ?? "")) &&
-          REPAIR_MODES.has(requested) &&
-          REPAIR_MODES.has(effective) &&
-          (effective === requested || effective === "plan")
-        );
-      });
-    if (inputs.length === 0) {
-      throw new Error(`immutable recovery inputs are unavailable for run ${runId}`);
+    const recovered = readNewestRepairWorkflowRecoveryInputs(artifactDir, runId);
+    if (recovered && recovered.source_job !== String(record.source_job ?? "")) {
+      throw new Error(`run ${runId} immutable inputs conflict with the selected source job`);
     }
-    const identities = new Set(
-      inputs.map((input) =>
-        JSON.stringify({
-          stateRevision: input.state_revision,
-          jobSha256: input.job_sha256,
-          effectiveMode: input.effective_mode,
-        }),
-      ),
-    );
-    if (identities.size !== 1) {
-      throw new Error(`immutable recovery inputs are ambiguous for run ${runId}`);
-    }
-    return {
-      stateRevision: String(inputs[0]!.state_revision),
-      jobSha256: String(inputs[0]!.job_sha256),
-      effectiveMode: String(inputs[0]!.effective_mode),
-    };
+    return recovered;
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
@@ -490,11 +554,19 @@ function dispatchCandidate(candidate: LooseRecord) {
     "-f",
     `mode=${candidate.mode}`,
     "-f",
-    `runner=${runner}`,
+    `runner=${candidate.runner}`,
     "-f",
-    `execution_runner=${executionRunner}`,
+    `execution_runner=${candidate.execution_runner}`,
     "-f",
-    `model=${model}`,
+    `planner_sandbox=${candidate.planner_sandbox}`,
+    "-f",
+    `model=${candidate.model}`,
+    "-f",
+    `dry_run=${candidate.dry_run}`,
+    "-f",
+    `requeue=${candidate.requeue}`,
+    "-f",
+    `requeue_depth=${candidate.requeue_depth}`,
   ];
   runRepairMutation(selfHealDispatchLifecycle(candidate), {
     kind: "repair_dispatch",
@@ -508,9 +580,13 @@ function dispatchCandidate(candidate: LooseRecord) {
       stateRevision: candidate.source_state_revision,
       jobSha256: candidate.source_job_sha256,
       mode: candidate.mode,
-      runner,
-      executionRunner,
-      model,
+      runner: candidate.runner,
+      executionRunner: candidate.execution_runner,
+      plannerSandbox: candidate.planner_sandbox,
+      model: candidate.model,
+      dryRun: candidate.dry_run,
+      requeue: candidate.requeue,
+      requeueDepth: candidate.requeue_depth,
     },
     operation: () => {
       const result = ghSpawn(commandArgs, { cwd: repoRoot() });
@@ -548,10 +624,7 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
 }
 
 function assertExecuteGateOpenIfNeeded(candidates: LooseRecord[]) {
-  if (
-    !candidates.some((candidate: JsonValue) => ["execute", "autonomous"].includes(candidate.mode))
-  )
-    return;
+  if (!candidates.some(isWriteCandidate)) return;
   const current = readExecuteGate();
   if (current !== "1") {
     throw new Error(
@@ -602,6 +675,7 @@ function liveRunRecords(cutoffMs: number) {
           workflow_created_at: run.createdAt ?? null,
           workflow_updated_at: run.updatedAt ?? null,
           run_url: run.url ?? null,
+          live_run_record: true,
         };
       })
       .filter(Boolean);
@@ -809,6 +883,13 @@ function summarizeCandidate(candidate: LooseRecord) {
     source_job_sha256: candidate.source_job_sha256,
     ...(candidate.legacy_unsealed === true ? { legacy_unsealed: true } : {}),
     mode: candidate.mode,
+    runner: candidate.runner,
+    execution_runner: candidate.execution_runner,
+    planner_sandbox: candidate.planner_sandbox,
+    model: candidate.model,
+    dry_run: candidate.dry_run,
+    requeue: candidate.requeue,
+    requeue_depth: candidate.requeue_depth,
     result_status: candidate.result_status,
     run_url: candidate.run_url,
   };
@@ -840,18 +921,17 @@ function jobContentGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): stri
   return `${pathText}:${digest}`;
 }
 
-function retryMode({
-  legacyUnsealed,
-  persistedMode,
-}: {
-  legacyUnsealed: boolean;
-  persistedMode: JsonValue;
-}): string {
-  if (legacyUnsealed) return "plan";
-  const mode = String(persistedMode ?? "").trim();
-  if (!REPAIR_MODES.has(mode)) throw new Error("persisted repair mode is malformed");
-  if (mode === "plan") return "plan";
-  return requestedMode ?? mode;
+function isWriteCandidate(candidate: LooseRecord): boolean {
+  return (
+    candidate.dry_run !== true && ["execute", "autonomous"].includes(String(candidate.mode ?? ""))
+  );
+}
+
+function booleanArg(value: JsonValue, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error("boolean arguments must be true or false");
 }
 
 function ensureHistoricalStateRevision(value: JsonValue): void {

@@ -148,6 +148,17 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   );
   assert.match(publish, /id: publish-action-ledger/);
   assert.match(publish, /id: publish-setup-pnpm\n\s+with:/);
+  assert.equal(
+    (
+      publish.match(/node dist\/repair\/execute-fix-attempt\.js "\$JOB_PATH" "\$RESULT_PATH"/g) ??
+      []
+    ).length,
+    2,
+  );
+  assert.doesNotMatch(
+    publish,
+    /node dist\/repair\/execute-fix-artifact\.js "\$JOB_PATH" "\$RESULT_PATH"[\s\\]*--publish-/,
+  );
   assert.match(publish, /Finalize publication repair action ledger/);
   assert.match(publish, /--repair-lane publish/);
   assert.match(publish, /Upload publication repair action ledger/);
@@ -234,6 +245,38 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     /\n  (authorize|report|mutate|validate|publish-repair-action-ledger):/,
   );
   assert.doesNotMatch(publisher, /resolve-run-artifact|allowPriorAttempts/);
+});
+
+test("repair worker persists complete retry inputs without trusting compatibility labels", () => {
+  const worker = readText(".github/workflows/repair-cluster-worker.yml");
+  const recovery = worker.slice(
+    worker.indexOf("- name: Persist immutable recovery inputs"),
+    worker.indexOf("- name: Upload immutable recovery inputs"),
+  );
+
+  for (const field of [
+    "source_job",
+    "source_dispatch_key",
+    "requested_mode",
+    "effective_mode",
+    "runner",
+    "execution_runner",
+    "planner_sandbox",
+    "model",
+    "dry_run",
+    "requeue",
+    "requeue_depth",
+  ]) {
+    assert.match(recovery, new RegExp(`\\b${field}${field === "requeue" ? "(?:,|:)" : ":"}`));
+  }
+  assert.match(recovery, /RUNNER_LABEL: blacksmith-4vcpu-ubuntu-2404/);
+  assert.match(recovery, /EXECUTION_RUNNER_LABEL: blacksmith-16vcpu-ubuntu-2404/);
+  assert.match(recovery, /PLANNER_SANDBOX: read-only/);
+  assert.match(recovery, /MODEL: internal/);
+  assert.doesNotMatch(recovery, /RUNNER_LABEL: \$\{\{ inputs\.runner \}\}/);
+  assert.doesNotMatch(recovery, /EXECUTION_RUNNER_LABEL: \$\{\{ inputs\.execution_runner \}\}/);
+  assert.doesNotMatch(recovery, /PLANNER_SANDBOX: \$\{\{ inputs\.planner_sandbox \}\}/);
+  assert.doesNotMatch(recovery, /MODEL: \$\{\{ inputs\.model \}\}/);
 });
 
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
@@ -346,6 +389,7 @@ test("commit review and notification workflows publish their operation receipts"
   const commit = readText(".github/workflows/commit-review.yml");
   const activity = readText(".github/workflows/github-activity.yml");
   const maintainer = readText(".github/workflows/maintainer-report-discord.yml");
+  const plan = commit.slice(commit.indexOf("\n  plan:"), commit.indexOf("\n  review:"));
   const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  publish:"));
   const publisher = commit.slice(commit.indexOf("\n  publish:"));
 
@@ -360,6 +404,12 @@ test("commit review and notification workflows publish their operation receipts"
     commit,
     /plan:\n\s+name: Plan commits\n\s+needs: receipt\n\s+if:.*needs\.receipt\.outputs\.proceed == 'true'/,
   );
+  assert.match(plan, /id: plan-action-ledger/);
+  assert.match(plan, /dist\/commit-sweeper\.js dispatch-continuation/);
+  assert.doesNotMatch(plan, /\n\s+gh workflow run commit-review\.yml/);
+  assert.match(plan, /Finalize deferred commit-plan action ledger/);
+  assert.match(plan, /Publish deferred commit-plan action ledger/);
+  assert.match(plan, /--expected-producer-job "\$GITHUB_JOB"/);
   assert.match(review, /setup-action-ledger/);
   assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
   assert.match(review, /--defer-workflow-completion/);

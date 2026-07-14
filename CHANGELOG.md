@@ -58,6 +58,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Preserved crawl-remote's reviewed `limits.cpu_ms` value through immutable
+  release packaging and post-transfer deployment verification.
+- Raised exact-review capacity from 48/44 global/per-target workers to 64/60, shortened unclaimed dispatch recovery from ten to six minutes, and coalesced terminal-run reconciliation bursts into one bounded aggregate claim scan.
 - Expanded exact-review backlog capacity while making background review yield, released exact-review leases before ledger publication, and aggregated healthy retry scans into one bounded ledger summary.
 - Accepted package-manager argument separators in the action-ledger CLI and
   allowed proven zero-command router runs to finish without empty publication.
@@ -103,6 +106,15 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Published crash-safe `workflow.attempt` and `repair.execute` receipts around
+  repair-cluster execution, terminalizing dangling child mutations before their
+  parent, terminating the complete credentialed execute process group before
+  timeout finalization, and allowing later observed outcomes to supersede stale
+  unknown state.
+- Preserved the repair worker's original replay-safe Action inputs in an early,
+  attempt-scoped artifact so bounded requeues and failed-run self-heal retries
+  reuse the actual effective mode, runners, sandbox, model, and dry-run state
+  instead of mutable workflow defaults.
 - Stopped narrow OpenClaw automerge repairs from chasing unrelated full-repository lint and typecheck failures.
 - Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.

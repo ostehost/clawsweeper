@@ -166,7 +166,7 @@ test("run-id requeue selects one latest complete producer cohort", () => {
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.source_state_revision, fixture.replacementRevision);
     assert.equal(summary.source_job_sha256, fixture.replacementDigest);
-    assert.equal(summary.mode, "autonomous");
+    assert.equal(summary.mode, "plan");
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -251,6 +251,38 @@ test("run-id requeue prefers a newer plan attempt over complete older durable pr
   }
 });
 
+test("run-id requeue replays current retry inputs without replacing sealed job provenance", () => {
+  const fixture = createFixture("current-retry-inputs", "910113");
+  try {
+    writeArtifactCohort(fixture, 2, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+    writeCurrentWorkflowInputs(fixture, 2, {
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+      runner: "original-runner",
+      executionRunner: "original-execution-runner",
+      model: "original-model",
+      dryRun: false,
+    });
+
+    const result = runRequeue(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.replacementRevision);
+    assert.equal(summary.source_job_sha256, fixture.replacementDigest);
+    assert.equal(summary.mode, "plan");
+    assert.equal(summary.runner, "original-runner");
+    assert.equal(summary.execution_runner, "original-execution-runner");
+    assert.equal(summary.model, "original-model");
+    assert.equal(summary.dry_run, false);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue uses complete published provenance after Actions artifacts expire", () => {
   const fixture = createFixture("published-expired", "910107");
   try {
@@ -266,7 +298,7 @@ test("run-id requeue uses complete published provenance after Actions artifacts 
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.source_state_revision, fixture.replacementRevision);
     assert.equal(summary.source_job_sha256, fixture.replacementDigest);
-    assert.equal(summary.mode, "autonomous");
+    assert.equal(summary.mode, "plan");
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -554,6 +586,47 @@ function writeWorkflowInputs(
         job_sha256: input.jobSha256,
         requested_mode: input.requestedMode,
         effective_mode: input.effectiveMode,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+function writeCurrentWorkflowInputs(
+  fixture: ReturnType<typeof createFixture>,
+  attempt: number,
+  input: {
+    requestedMode: "plan" | "execute" | "autonomous";
+    effectiveMode: "plan" | "execute" | "autonomous";
+    runner: string;
+    executionRunner: string;
+    model: string;
+    dryRun: boolean;
+  },
+): void {
+  const inputDir = path.join(
+    fixture.artifactFixture,
+    `clawsweeper-repair-inputs-${fixture.runId}-${attempt}`,
+    "recovery-inputs",
+  );
+  fs.mkdirSync(inputDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(inputDir, "workflow-inputs.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        source_job: fixture.jobPath,
+        source_dispatch_key: "original-dispatch",
+        requested_mode: input.requestedMode,
+        effective_mode: input.effectiveMode,
+        runner: input.runner,
+        execution_runner: input.executionRunner,
+        planner_sandbox: "read-only",
+        model: input.model,
+        dry_run: input.dryRun,
+        requeue: false,
+        requeue_depth: 0,
       },
       null,
       2,

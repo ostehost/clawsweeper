@@ -482,6 +482,7 @@ function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
       event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
       event.event_type === ACTION_EVENT_TYPES.reviewItem ||
       event.event_type === ACTION_EVENT_TYPES.reviewRetry ||
+      event.event_type === ACTION_EVENT_TYPES.repairExecute ||
       event.event_type === ACTION_EVENT_TYPES.applyBatch ||
       event.event_type === ACTION_EVENT_TYPES.applyAction) &&
       event.action.status === ACTION_EVENT_STATUSES.started)
@@ -502,35 +503,28 @@ function workflowActionEventIsMutationOutcome(event: ActionEvent): boolean {
     event.attributes?.completion_reason === "mutation_accepted" ||
     event.attributes?.completion_reason === "mutation_observed" ||
     event.attributes?.completion_reason === "mutation_rejected" ||
-    event.attributes?.completion_reason === "mutation_outcome_unknown"
+    event.attributes?.completion_reason === "mutation_outcome_unknown" ||
+    event.attributes?.completion_reason === "dispatch_outcome_unknown"
   );
 }
 
-function workflowActionUnresolvedUnknownMutation(
-  events: readonly ActionEvent[],
-): ActionEvent | undefined {
-  const unresolved = new Map<string, ActionEvent>();
-  let dispatchUnknown: ActionEvent | undefined;
+function latestWorkflowMutationOutcomes(events: readonly ActionEvent[]): ActionEvent[] {
+  const latestByIdempotencyKey = new Map<string, ActionEvent>();
   for (const event of [...events].sort(
     (left, right) =>
-      left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
+      left.phase_seq - right.phase_seq ||
+      left.recorded_at.localeCompare(right.recorded_at) ||
+      left.event_id.localeCompare(right.event_id),
   )) {
-    const completionReason = event.attributes?.completion_reason;
-    const key = event.idempotency_key_sha256;
-    if (completionReason === "mutation_observed") {
-      unresolved.delete(key);
-    } else if (completionReason === "mutation_outcome_unknown") {
-      unresolved.set(key, event);
-    } else if (completionReason === "dispatch_outcome_unknown") {
-      dispatchUnknown = event;
-    }
+    if (!workflowActionEventIsMutationOutcome(event)) continue;
+    latestByIdempotencyKey.set(event.idempotency_key_sha256, event);
   }
-  return [...unresolved.values(), ...(dispatchUnknown ? [dispatchUnknown] : [])]
-    .sort(
-      (left, right) =>
-        left.phase_seq - right.phase_seq || left.event_id.localeCompare(right.event_id),
-    )
-    .at(-1);
+  return [...latestByIdempotencyKey.values()].sort(
+    (left, right) =>
+      left.phase_seq - right.phase_seq ||
+      left.recorded_at.localeCompare(right.recorded_at) ||
+      left.event_id.localeCompare(right.event_id),
+  );
 }
 
 function workflowActionRecoveryPriority(event: ActionEvent): number {
@@ -727,8 +721,15 @@ export function interruptOpenWorkflowActionEvents(
         const relevantMutationEvents = aggregatesChildMutations
           ? mutationEvents
           : lifecycleMutations;
-        const unknownMutationOutcome =
-          workflowActionUnresolvedUnknownMutation(relevantMutationEvents);
+        const latestMutationOutcomes = latestWorkflowMutationOutcomes(relevantMutationEvents);
+        const unknownMutationOutcome = latestMutationOutcomes
+          .filter(
+            (event) =>
+              event.attributes?.completion_reason === "mutation_outcome_unknown" ||
+              event.attributes?.completion_reason === "dispatch_outcome_unknown",
+          )
+          .at(-1);
+        const latestMutationOutcome = latestMutationOutcomes.at(-1);
         const uncertainMutation = openUncertainMutation || unknownMutationOutcome !== undefined;
         const mutationOccurred =
           workflowActionEventIsUncertainMutationStart(start) ||
@@ -742,9 +743,11 @@ export function interruptOpenWorkflowActionEvents(
           openReceipt?.event_id ??
           (unknownMutationOutcome
             ? unknownMutationOutcome.event_id
-            : start.event_type === ACTION_EVENT_TYPES.applyAction && lifecycleMutation
-              ? lifecycleMutation.event_id
-              : (lifecycleOutcome?.event_id ?? start.event_id));
+            : latestMutationOutcome
+              ? latestMutationOutcome.event_id
+              : start.event_type === ACTION_EVENT_TYPES.applyAction && lifecycleMutation
+                ? lifecycleMutation.event_id
+                : (lifecycleOutcome?.event_id ?? start.event_id));
         const eventInput: ActionEventInput = {
           eventKey: actionEventKey("workflow.interrupted", {
             startEventId: start.event_id,

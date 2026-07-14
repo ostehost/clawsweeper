@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 
 import { REVIEW_CACHE_MAX_AGE_DAYS } from "./scheduler-policy.js";
-import { stableJson } from "./stable-json.js";
+import { stableJsonCodeUnit as stableJson } from "./stable-json.js";
 
-export const REVIEW_STRUCTURAL_CACHE_VERSION = 5;
+export const REVIEW_STRUCTURAL_CACHE_VERSION = 6;
 export const REVIEW_STRUCTURAL_CACHE_MAX_AGE_DAYS = REVIEW_CACHE_MAX_AGE_DAYS;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -734,6 +734,10 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function validTimestamp(value: string): boolean {
   return value.length > 0 && Number.isFinite(Date.parse(value));
 }
@@ -775,9 +779,9 @@ function normalizedActivities(
     }))
     .sort(
       (left, right) =>
-        left.id.localeCompare(right.id) ||
-        left.updatedAt.localeCompare(right.updatedAt) ||
-        String(left.author).localeCompare(String(right.author)),
+        compareCodeUnits(left.id, right.id) ||
+        compareCodeUnits(left.updatedAt, right.updatedAt) ||
+        compareCodeUnits(String(left.author), String(right.author)),
     );
 }
 
@@ -822,7 +826,7 @@ function sourceRevision(snapshot: ReviewStructuralSnapshot): string {
                   isResolved: thread.isResolved,
                   comments: normalizedActivities(thread.comments),
                 }))
-                .sort((left, right) => left.id.localeCompare(right.id)),
+                .sort((left, right) => compareCodeUnits(left.id, right.id)),
             },
     }),
   );
@@ -865,7 +869,7 @@ function contextRevision(snapshot: ReviewStructuralSnapshot): string {
                   isResolved: thread.isResolved,
                   comments: normalizedActivities(thread.comments),
                 }))
-                .sort((left, right) => left.id.localeCompare(right.id)),
+                .sort((left, right) => compareCodeUnits(left.id, right.id)),
             },
     }),
   );
@@ -905,7 +909,7 @@ export function reviewStructuralItemStateDigest(item: ReviewStructuralItemState)
       authorAssociation: comment.authorAssociation?.toUpperCase() ?? null,
       bodyDigest: comment.bodyDigest,
     }))
-    .sort((left, right) => stableJson(left).localeCompare(stableJson(right)));
+    .sort((left, right) => compareCodeUnits(stableJson(left), stableJson(right)));
   return sha256(
     stableJson({
       titleDigest: item.titleDigest,

@@ -48,6 +48,14 @@ on:
         required: true
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
+      planner_sandbox:
+        description: "Deprecated compatibility value; planning is always read-only"
+        required: false
+        default: read-only
+        type: choice
+        options:
+          - read-only
+          - danger-full-access
       model:
         description: "Deprecated compatibility value; the workflow uses its fixed internal model"
         required: true
@@ -294,11 +302,17 @@ jobs:
       - name: Persist immutable recovery inputs
         id: recovery_inputs
         env:
-          JOB_PATH: ${{ inputs.job }}
-          STATE_REVISION: ${{ steps.immutable-job.outputs.state_revision }}
-          JOB_SHA256: ${{ steps.immutable-job.outputs.job_sha256 }}
+          SOURCE_JOB: ${{ inputs.job }}
+          SOURCE_DISPATCH_KEY: ${{ inputs.dispatch_key }}
           LEGACY_UNSEALED: ${{ steps.immutable-job.outputs.legacy_unsealed }}
           REQUESTED_MODE: ${{ inputs.mode }}
+          RUNNER_LABEL: blacksmith-4vcpu-ubuntu-2404
+          EXECUTION_RUNNER_LABEL: blacksmith-16vcpu-ubuntu-2404
+          PLANNER_SANDBOX: read-only
+          MODEL: internal
+          DRY_RUN: ${{ inputs.dry_run }}
+          REQUEUE: ${{ inputs.requeue }}
+          REQUEUE_DEPTH: ${{ inputs.requeue_depth }}
         run: |
           set -euo pipefail
           case "$REQUESTED_MODE" in
@@ -319,13 +333,77 @@ jobs:
           mkdir -p .clawsweeper-repair/recovery-inputs
           EFFECTIVE_MODE="$effective_mode" node <<'NODE'
           const fs = require("node:fs");
+          const path = require("node:path");
+          const boolean = (name) => {
+            const value = process.env[name];
+            if (value === "true") return true;
+            if (value === "false") return false;
+            throw new Error(`${name} must be true or false`);
+          };
+          const bounded = (name, maxLength, allowEmpty = false) => {
+            const value = process.env[name] || "";
+            if (
+              (!allowEmpty && value.length === 0) ||
+              value !== value.trim() ||
+              value.length > maxLength ||
+              /[\u0000-\u001f\u007f]/.test(value)
+            ) {
+              throw new Error(`${name} is invalid`);
+            }
+            return value;
+          };
+          const sourceJob = process.env.SOURCE_JOB || "";
+          const normalizedJob = path.posix.normalize(sourceJob.replaceAll("\\", "/"));
+          if (
+            !normalizedJob.startsWith("jobs/") ||
+            !normalizedJob.endsWith(".md") ||
+            normalizedJob !== sourceJob
+          ) {
+            throw new Error("SOURCE_JOB must be a normalized relative jobs/... markdown path");
+          }
+          if (!["plan", "execute", "autonomous"].includes(process.env.REQUESTED_MODE || "")) {
+            throw new Error("REQUESTED_MODE is invalid");
+          }
+          if (!["plan", "execute", "autonomous"].includes(process.env.EFFECTIVE_MODE || "")) {
+            throw new Error("EFFECTIVE_MODE is invalid");
+          }
+          if (
+            process.env.EFFECTIVE_MODE !== process.env.REQUESTED_MODE &&
+            process.env.EFFECTIVE_MODE !== "plan"
+          ) {
+            throw new Error("EFFECTIVE_MODE must preserve or safely downgrade REQUESTED_MODE");
+          }
+          if (!['read-only', 'danger-full-access'].includes(process.env.PLANNER_SANDBOX || '')) {
+            throw new Error("PLANNER_SANDBOX is invalid");
+          }
+          bounded("SOURCE_DISPATCH_KEY", 256, true);
+          bounded("RUNNER_LABEL", 256);
+          bounded("EXECUTION_RUNNER_LABEL", 256);
+          bounded("MODEL", 128);
+          const requeue = boolean("REQUEUE");
+          const requeueDepth = Number(process.env.REQUEUE_DEPTH);
+          if (
+            !Number.isSafeInteger(requeueDepth) ||
+            requeueDepth < 0 ||
+            requeueDepth > 1 ||
+            (requeue && requeueDepth !== 1) ||
+            (!requeue && requeueDepth !== 0)
+          ) {
+            throw new Error("REQUEUE_DEPTH is outside the bounded workflow contract");
+          }
           const input = {
             schema_version: 1,
-            source_job: process.env.JOB_PATH,
-            state_revision: process.env.STATE_REVISION,
-            job_sha256: process.env.JOB_SHA256,
+            source_job: sourceJob,
+            source_dispatch_key: process.env.SOURCE_DISPATCH_KEY || "",
             requested_mode: process.env.REQUESTED_MODE,
             effective_mode: process.env.EFFECTIVE_MODE,
+            runner: process.env.RUNNER_LABEL,
+            execution_runner: process.env.EXECUTION_RUNNER_LABEL,
+            planner_sandbox: process.env.PLANNER_SANDBOX,
+            model: process.env.MODEL,
+            dry_run: boolean("DRY_RUN"),
+            requeue,
+            requeue_depth: requeueDepth,
           };
           fs.writeFileSync(
             ".clawsweeper-repair/recovery-inputs/workflow-inputs.json",
@@ -341,6 +419,7 @@ jobs:
           path: .clawsweeper-repair/recovery-inputs/workflow-inputs.json
           if-no-files-found: error
           retention-days: 90
+          include-hidden-files: true
 
       - name: Checkout immutable state job
         uses: actions/checkout@v7
@@ -1532,13 +1611,13 @@ jobs:
           if [ "${{ steps.publication_validation.outputs.mode }}" = "prepared" ]; then
             test "$CLAWSWEEPER_ALLOW_FIX_PR" = "1"
             env -u GH_TOKEN -u GITHUB_TOKEN -u TARGET_MUTATION_TOKEN \
-              node dist/repair/execute-fix-artifact.js "$JOB_PATH" "$RESULT_PATH" \
+              node dist/repair/execute-fix-attempt.js "$JOB_PATH" "$RESULT_PATH" \
               --prepared-dir .clawsweeper-prepared \
               --publish-prepared-publication
           else
             test -n "$TARGET_MUTATION_TOKEN"
             GH_TOKEN="$TARGET_MUTATION_TOKEN" \
-              node dist/repair/execute-fix-artifact.js "$JOB_PATH" "$RESULT_PATH" \
+              node dist/repair/execute-fix-attempt.js "$JOB_PATH" "$RESULT_PATH" \
               --publish-no-publication
           fi
 

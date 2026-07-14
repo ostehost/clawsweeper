@@ -19,12 +19,12 @@ on:
         default: "6"
         type: string
       runner:
-        description: "Runner label for retried cluster workers"
+        description: "Deprecated compatibility value; retries use a fixed trusted runner"
         required: true
         default: blacksmith-4vcpu-ubuntu-2404
         type: string
       execution_runner:
-        description: "Runner label for retried fix/apply execution work"
+        description: "Deprecated compatibility value; retries use a fixed trusted execution runner"
         required: true
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
@@ -96,8 +96,8 @@ jobs:
           SCHEDULE_EXECUTE: ${{ vars.CLAWSWEEPER_SELF_HEAL_EXECUTE || '0' }}
           MAX_JOBS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_jobs || vars.CLAWSWEEPER_SELF_HEAL_MAX_JOBS || '5' }}
           MAX_AGE_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_age_hours || vars.CLAWSWEEPER_SELF_HEAL_MAX_AGE_HOURS || '6' }}
-          RUNNER: blacksmith-4vcpu-ubuntu-2404
-          EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
+          CLAWSWEEPER_WORKER_RUNNER: blacksmith-4vcpu-ubuntu-2404
+          CLAWSWEEPER_EXECUTION_RUNNER: blacksmith-16vcpu-ubuntu-2404
         run: |
           set -euo pipefail
           execute="false"
@@ -106,7 +106,7 @@ jobs:
             execute="true"
           fi
 
-          args=(--max-jobs "$MAX_JOBS" --max-age-hours "$MAX_AGE_HOURS" --runner "$RUNNER" --execution-runner "$EXECUTION_RUNNER" --wait-for-capacity)
+          args=(--max-jobs "$MAX_JOBS" --max-age-hours "$MAX_AGE_HOURS" --wait-for-capacity)
           if [ "$execute" = "true" ]; then
             args+=(--execute)
           fi

@@ -6,9 +6,9 @@ import { createVirtualFileSystem, type FileSystem } from "typescript/unstable/fs
 import { API } from "typescript/unstable/sync";
 
 import { REVIEW_CACHE_MAX_AGE_DAYS } from "./scheduler-policy.js";
-import { stableJson } from "./stable-json.js";
+import { stableJsonCodeUnit as stableJson } from "./stable-json.js";
 
-export const REVIEW_SEMANTIC_CACHE_VERSION = 9;
+export const REVIEW_SEMANTIC_CACHE_VERSION = 10;
 export const REVIEW_SEMANTIC_CACHE_MAX_AGE_DAYS = REVIEW_CACHE_MAX_AGE_DAYS;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -182,6 +182,10 @@ interface FileSemanticResult {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -689,7 +693,7 @@ function semanticCode(input: ReviewSemanticInput): {
     compiler.close();
   }
   semanticFiles.sort((left, right) =>
-    String(asRecord(left).filename).localeCompare(String(asRecord(right).filename)),
+    compareCodeUnits(String(asRecord(left).filename), String(asRecord(right).filename)),
   );
   return { digest: sha256(stableJson(semanticFiles)), eligible: true, reason: "eligible" };
 }

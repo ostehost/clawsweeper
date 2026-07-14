@@ -26,6 +26,9 @@ test("repair requeue receipts remain stable but the isolated worker never recurs
     "dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle)",
   );
   const receiptIndex = source.indexOf("recordCommandRequeue(requeueLifecycle", dispatchIndex);
+  const executeJobStart = workflow.indexOf("\n  execute:");
+  const publishJobStart = workflow.indexOf("\n  publish:", executeJobStart);
+  const isolatedExecuteJob = workflow.slice(executeJobStart, publishJobStart);
 
   assert.ok(dispatchIndex >= 0);
   assert.ok(receiptIndex > dispatchIndex);
@@ -48,10 +51,56 @@ test("repair requeue receipts remain stable but the isolated worker never recurs
   assert.match(workflow, /execute:[\s\S]*?permissions:\n\s+actions: read/);
   assert.match(workflow, /JOB_PATH: \$\{\{ inputs\.job \}\}/);
   assert.doesNotMatch(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
-  assert.doesNotMatch(workflow, /^\s+REQUEUE_(?:MODE|DEPTH|RUNNER|EXECUTION_RUNNER|MODEL):/m);
+  assert.ok(executeJobStart >= 0);
+  assert.ok(publishJobStart > executeJobStart);
+  assert.doesNotMatch(
+    isolatedExecuteJob,
+    /^\s+REQUEUE_(?:MODE|DEPTH|RUNNER|EXECUTION_RUNNER|MODEL):/m,
+  );
   assert.doesNotMatch(workflow, /repair:requeue|requeue-job\.js/);
   assert.doesNotMatch(workflow, /repair-requeue action ledger/);
   assert.doesNotMatch(workflow, /count-requeue-required|--source-job-path/);
+});
+
+test("repair execution bounds isolated work and wraps publication attempts", () => {
+  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
+  const principal = readText("src/repair/trusted-principal.ts");
+  const executeJobStart = workflow.indexOf("\n  execute:");
+  const executeStart = workflow.indexOf(
+    "- name: Execute isolated fix preparation and stage exact publication",
+    executeJobStart,
+  );
+  const publishJobStart = workflow.indexOf("\n  publish:", executeStart);
+  const executeStep = workflow.slice(executeStart, publishJobStart);
+  const publishStep = workflow.slice(publishJobStart);
+
+  assert.ok(executeJobStart >= 0);
+  assert.ok(executeStart > executeJobStart);
+  assert.ok(publishJobStart > executeStart);
+  assert.match(executeStep, /trusted-principal-main\.js/);
+  assert.match(executeStep, /--timeout-ms 4200000/);
+  assert.match(executeStep, /execute-fix-artifact\.js[\s\S]*?--prepare-publication/);
+  assert.match(
+    publishStep,
+    /node dist\/repair\/execute-fix-attempt\.js "\$JOB_PATH" "\$RESULT_PATH"[\s\S]*?--publish-prepared-publication/,
+  );
+  assert.match(
+    publishStep,
+    /node dist\/repair\/execute-fix-attempt\.js "\$JOB_PATH" "\$RESULT_PATH"[\s\S]*?--publish-no-publication/,
+  );
+  assert.doesNotMatch(publishStep, /pnpm run repair:execute-fix-attempt/);
+
+  const commandStart = principal.indexOf("commandResult = spawnSync(setprivPath, setprivArgs");
+  const cleanupStart = principal.indexOf(
+    "terminateAndProvePrincipalEmpty(options.principalUid",
+    commandStart,
+  );
+  assert.ok(commandStart >= 0);
+  assert.ok(cleanupStart > commandStart);
+  assert.match(principal.slice(commandStart, cleanupStart), /timeout: options\.timeoutMs/);
+  assert.match(principal.slice(commandStart, cleanupStart), /killSignal: "SIGKILL"/);
+  assert.match(principal, /const EMPTY_PROCESS_PROOF_SCANS = 2/);
+  assert.match(principal.slice(cleanupStart), /kill\(pid, "SIGKILL"\)/);
 });
 
 test("exact review publishes post-ack status receipts in a second ledger", () => {
