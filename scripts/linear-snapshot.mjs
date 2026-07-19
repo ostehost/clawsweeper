@@ -155,6 +155,41 @@ export async function collectWorkspaceItems(source, options = {}) {
   return { items, teamsSeen };
 }
 
+/**
+ * Guards against silent visibility loss. A `--team` filter that matches no live team
+ * yields an empty snapshot that the downstream triage step would report as a healthy
+ * `TRIAGE_OK` board — hiding the fact that the requested scope never resolved. This
+ * fails loudly instead.
+ *
+ * Two conditions throw:
+ *   1. Any requested team key that never appears in `teamsSeen` (requested minus
+ *      scanned) — the caller asked for teams that do not exist or were not returned.
+ *   2. `teamsSeen` is empty even when no `--team` was requested — an all-teams sweep
+ *      that resolved zero teams is a fetch/auth/scope failure, not a clean board.
+ */
+export function assertTeamCoverage(collected, meta = {}) {
+  const teamsSeen = collected.teamsSeen ?? [];
+  const teamKeys = meta.teamKeys ?? [];
+  const scanned = new Set(teamsSeen);
+  const unmatched = teamKeys.filter((key) => !scanned.has(key));
+
+  if (unmatched.length > 0) {
+    throw new Error(
+      `--team filter matched no live team for: ${unmatched.join(", ")}. ` +
+        `Requested [${teamKeys.join(", ")}], scanned [${teamsSeen.join(", ")}]. ` +
+        `Refusing to emit an empty-scope snapshot that would triage as TRIAGE_OK.`,
+    );
+  }
+
+  if (teamsSeen.length === 0) {
+    throw new Error(
+      `No teams resolved from the Linear workspace (teamsScanned is empty). ` +
+        `An all-teams sweep that sees zero teams is a fetch/auth/scope failure, not a ` +
+        `healthy board. Refusing to emit an empty snapshot that would triage as TRIAGE_OK.`,
+    );
+  }
+}
+
 /** Wraps collected items in the snapshot envelope. The token is never included. */
 export function buildSnapshot(collected, meta = {}) {
   const { items, teamsSeen } = collected;
@@ -207,6 +242,7 @@ async function main() {
       updatedAfter: options.updatedAfter,
       pageSize: options.pageSize,
     });
+    assertTeamCoverage(collected, { teamKeys: options.teamKeys });
     snapshot = buildSnapshot(collected, {
       teamKeys: options.teamKeys,
       updatedAfter: options.updatedAfter,

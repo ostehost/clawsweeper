@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertTeamCoverage,
   buildSnapshot,
   collectWorkspaceItems,
   DEFAULT_KEYCHAIN_ACCOUNT,
@@ -229,6 +230,52 @@ test("collectWorkspaceItems threads updatedAfter and pageSize into the issue que
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.updatedAfter, "2026-06-01T00:00:00Z");
   assert.equal(calls[0]?.pageSize, 100);
+});
+
+// ---------------------------------------------------------------------------
+// assertTeamCoverage — fail loudly on empty-scope snapshots
+// ---------------------------------------------------------------------------
+
+test("assertTeamCoverage passes when every requested team was scanned", () => {
+  assert.doesNotThrow(() =>
+    assertTeamCoverage({ items: [], teamsSeen: ["PAR", "ENG"] }, { teamKeys: ["PAR", "ENG"] }),
+  );
+});
+
+test("assertTeamCoverage passes an all-teams sweep that resolved at least one team", () => {
+  assert.doesNotThrow(() => assertTeamCoverage({ items: [], teamsSeen: ["PAR"] }, {}));
+});
+
+test("assertTeamCoverage throws listing the unmatched --team keys (requested minus scanned)", () => {
+  assert.throws(
+    () => assertTeamCoverage({ items: [], teamsSeen: ["PAR"] }, { teamKeys: ["PAR", "GHOST"] }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /matched no live team for: GHOST/);
+      assert.doesNotMatch(message, /for: PAR/);
+      assert.match(message, /TRIAGE_OK/);
+      return true;
+    },
+  );
+});
+
+test("assertTeamCoverage throws when a --team filter matches no team at all", () => {
+  assert.throws(
+    () => assertTeamCoverage({ items: [], teamsSeen: [] }, { teamKeys: ["GHOST"] }),
+    /matched no live team for: GHOST/,
+  );
+});
+
+test("assertTeamCoverage flags an empty teamsSeen even when no --team was requested", () => {
+  assert.throws(
+    () => assertTeamCoverage({ items: [], teamsSeen: [] }, {}),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /No teams resolved from the Linear workspace/);
+      assert.match(message, /TRIAGE_OK/);
+      return true;
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
