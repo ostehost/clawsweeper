@@ -16,9 +16,11 @@ import {
   linearAnalysisEnv,
   makeGitShaVerifier,
   parseArgs,
+  resolveAnalysisRepo,
   repoInferenceItemFor,
   serializeUntrustedIssueData,
   toAnalyzerDecision,
+  writeAnalyzerRecord,
 } from "../scripts/linear-analyze.mjs";
 import { buildRepoCatalog } from "../dist/linear/repo-infer.js";
 import { repositoryProfileFor } from "../dist/repository-profiles.js";
@@ -126,9 +128,10 @@ function baseDeps(overrides = {}) {
 // ---------------------------------------------------------------------------
 
 test("parseArgs: --analyze OFF by default", () => {
-  const o = parseArgs(["--identifier", "PAR-1"]);
+  const o = parseArgs(["--identifier", "PAR-1", "--repo", "openclaw/clawhub"]);
   assert.equal(o.identifier, "PAR-1");
   assert.equal(o.analyze, false);
+  assert.equal(o.targetRepo, "openclaw/clawhub");
 });
 
 test("parseArgs: --analyze opt-in, --dry-run resets it, unknown rejected", () => {
@@ -260,6 +263,62 @@ test("loadPersistedAnalyzerFingerprint fails open to re-analysis for missing or 
   );
 });
 
+test("writeAnalyzerRecord noops when the canonical record is already byte-identical", () => {
+  let writes = 0;
+  const path = writeAnalyzerRecord(
+    {
+      recordPath: "records/openclaw-clawhub/items/PAR-42.md",
+      recordBody: "record-body\n",
+    },
+    {
+      existsSync: () => true,
+      readFileSync: () => "record-body\n",
+      mkdirSync: () => undefined,
+      writeFileSync: () => {
+        writes += 1;
+      },
+    },
+  );
+  assert.match(path, /records\/openclaw-clawhub\/items\/PAR-42\.md$/);
+  assert.equal(writes, 0);
+});
+
+test("writeAnalyzerRecord writes then requires byte-identical read-back", () => {
+  let persisted = "";
+  writeAnalyzerRecord(
+    {
+      recordPath: "records/openclaw-clawhub/items/PAR-42.md",
+      recordBody: "record-body\n",
+    },
+    {
+      existsSync: () => persisted !== "",
+      readFileSync: () => persisted,
+      mkdirSync: () => undefined,
+      writeFileSync: (_path, body) => {
+        persisted = body;
+      },
+    },
+  );
+  assert.equal(persisted, "record-body\n");
+
+  assert.throws(
+    () =>
+      writeAnalyzerRecord(
+        {
+          recordPath: "records/openclaw-clawhub/items/PAR-42.md",
+          recordBody: "expected\n",
+        },
+        {
+          existsSync: () => false,
+          readFileSync: () => "corrupt\n",
+          mkdirSync: () => undefined,
+          writeFileSync: () => undefined,
+        },
+      ),
+    /record read-back mismatch/,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // collectIssueUrls / buildHarnessInputs / buildAnalysisPrompt
 // ---------------------------------------------------------------------------
@@ -286,6 +345,57 @@ test("collectIssueUrls strips Markdown and sentence delimiters from GitHub URLs"
     "https://github.com/openclaw/openclaw",
     "https://github.com/openclaw/clawhub/issues/5",
   ]);
+});
+
+test("resolveAnalysisRepo accepts an explicit supported repo when the item has no repo signal", () => {
+  const inference = resolveAnalysisRepo(
+    { labels: ["bug"], title: "Fix helper transport", urls: [] },
+    CATALOG,
+    "openclaw/clawhub",
+  );
+  assert.deepEqual(inference, {
+    repo: "openclaw/clawhub",
+    via: "explicit",
+    reasons: ["operator-supplied target repository → openclaw/clawhub"],
+  });
+});
+
+test("resolveAnalysisRepo rejects an explicit repo that conflicts with issue evidence", () => {
+  const inference = resolveAnalysisRepo(
+    {
+      labels: [],
+      title: "Fix helper transport",
+      urls: ["https://github.com/openclaw/openclaw/issues/1"],
+    },
+    CATALOG,
+    "openclaw/clawhub",
+  );
+  assert.equal(inference.repo, null);
+  assert.match(inference.reasons.join("; "), /conflicts with issue repository signals/);
+});
+
+test("resolveAnalysisRepo rejects generic fallback repos that are not exact configured targets", () => {
+  const inference = resolveAnalysisRepo(
+    { labels: ["bug"], title: "Fix helper transport", urls: [] },
+    CATALOG,
+    "openclaw/not-configured",
+  );
+  assert.equal(inference.repo, null);
+  assert.match(inference.reasons.join("; "), /is not an exact configured target/);
+});
+
+test("resolveAnalysisRepo rejects URL and repository-label disagreement even when the URL matches", () => {
+  const inference = resolveAnalysisRepo(
+    {
+      labels: ["Symphony Daemon"],
+      title: "Fix helper transport",
+      urls: ["https://github.com/openclaw/clawhub/issues/1"],
+    },
+    CATALOG,
+    "openclaw/clawhub",
+  );
+  assert.equal(inference.repo, null);
+  assert.match(inference.reasons.join("; "), /conflicts with issue repository signals/);
 });
 
 test("buildHarnessInputs maps a Linear issue into a read-only Item with the numeric id", () => {
@@ -381,6 +491,19 @@ test("analyzeItem: ambiguous repo is skipped, never analyzed", async () => {
   assert.match(summary.skipped, /repo ambiguous/);
 });
 
+test("analyzeItem: explicit repo settles an otherwise ambiguous item", async () => {
+  const hydrated = makeHydrated();
+  hydrated.issue.labels = [{ id: "x", name: "bug" }];
+  const summary = await analyzeItem(
+    hydrated,
+    { nowIso: NOW, analyze: true, targetRepo: "openclaw/clawhub" },
+    baseDeps({ hydrated, repoInferenceItem: repoInferenceItemFor(hydrated) }),
+  );
+  assert.equal(summary.analyzed, true);
+  assert.equal(summary.repo, "openclaw/clawhub");
+  assert.equal(summary.via, "explicit");
+});
+
 test("analyzeItem: --analyze runs the model, derives closeLeaning, plans a comment, writes a record", async () => {
   const deps = baseDeps();
   const summary = await analyzeItem(makeHydrated(), { nowIso: NOW, analyze: true }, deps);
@@ -391,7 +514,10 @@ test("analyzeItem: --analyze runs the model, derives closeLeaning, plans a comme
   assert.ok(["create", "update"].includes(summary.planAction));
   assert.ok(summary.recordBody.includes("**Summary**"));
   assert.ok(summary.recordBody.startsWith("---\n"));
-  assert.equal(summary.recordPath, "records/linear-par/items/PAR-42.md");
+  assert.equal(summary.recordPath, "records/openclaw-clawhub/items/PAR-42.md");
+  assert.ok(summary.recordBody.includes('target_repo: "openclaw/clawhub"'));
+  assert.ok(summary.recordBody.includes('source_provider: "linear"'));
+  assert.ok(summary.recordBody.includes('source_id: "uuid-1"'));
 });
 
 test("analyzeItem: workspace admin or owner authorship disables close leaning", async () => {

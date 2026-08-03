@@ -340,6 +340,9 @@ export interface AnalyzerRecordFrontMatter {
   // Linear identity + drift fingerprint.
   identifier: string;
   url: string;
+  target_repo: string;
+  source_provider: string;
+  source_id: string;
   snapshot_hash: string;
   // Analyzer fingerprint.
   model_id: string;
@@ -375,6 +378,9 @@ export function serializeAnalyzerRecord(
     "review_policy",
     "identifier",
     "url",
+    "target_repo",
+    "source_provider",
+    "source_id",
     "snapshot_hash",
     "model_id",
     "analyzer_version",

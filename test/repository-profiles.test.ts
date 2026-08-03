@@ -3,6 +3,13 @@ import test from "node:test";
 
 import { REPOSITORY_PROFILES, repositoryProfileFor } from "../dist/repository-profiles.js";
 
+test("Symphony Daemon is an explicit review-only Linear target", () => {
+  const profile = repositoryProfileFor("ostehost/symphony-daemon");
+  assert.equal(profile.checkoutDir, "symphony-daemon");
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("OpenClaw allows unsponsored feature closes for issues only", () => {
   const profile = repositoryProfileFor("openclaw/openclaw");
   assert.equal(profile.applyCloseRules.issue?.includes("unsponsored_feature_request"), true);

@@ -56,6 +56,19 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "target_repo": "ostehost/symphony-daemon",
+      "display_name": "Symphony Daemon",
+      "checkout_dir": "symphony-daemon",
+      "prompt_note": "Use the Symphony Daemon source tree and current main branch. Linear issues may route implementation and review work here, but this profile never permits an automatic close, repair dispatch, publication, or workflow-state transition. Findings and guarded repair may be proposed for explicit maintainer approval. Treat parked or unpushed commits as unpublished evidence and keep the Linear item open for an explicit maintainer decision.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "npm",
+      "validation_commands": ["npm run typecheck", "npm test", "npm run build"],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [

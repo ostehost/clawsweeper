@@ -45,6 +45,31 @@ test("infer step1: unique GitHub URL wins outright", () => {
   if (r.repo !== null) assert.equal(r.via, "url");
 });
 
+test("infer fails closed when a GitHub URL conflicts with a known repository label", () => {
+  const r = inferTargetRepo(
+    item({
+      labels: ["Symphony Daemon"],
+      urls: ["https://github.com/openclaw/clawhub/issues/1"],
+    }),
+    CATALOG,
+  );
+  assert.equal(r.repo, null);
+  assert.match(r.reasons.join("; "), /conflicting repository signals/);
+});
+
+test("infer fails closed when a GitHub URL conflicts with a fallback-owner candidate", () => {
+  const r = inferTargetRepo(
+    item({
+      title: "OpenClaw worker regression",
+      labels: ["other-repo"],
+      urls: ["https://github.com/openclaw/clawhub/issues/1"],
+    }),
+    CATALOG,
+  );
+  assert.equal(r.repo, null);
+  assert.match(r.reasons.join("; "), /conflicting repository signals/);
+});
+
 test("infer step1: >=2 distinct GitHub URLs is ambiguous -> skip", () => {
   const r = inferTargetRepo(
     item({

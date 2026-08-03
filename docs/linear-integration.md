@@ -89,6 +89,20 @@ Inspect what an exact-item analysis would do without calling a model:
 pnpm linear:analyze -- --identifier PAR-244 --json
 ```
 
+When Linear has no unambiguous repository link or label, an operator or trusted
+workflow receipt may supply the configured target explicitly:
+
+```bash
+pnpm linear:analyze -- \
+  --identifier PAR-597 \
+  --repo ostehost/symphony-daemon \
+  --json
+```
+
+An explicit repository fills only a missing signal. It cannot override a
+conflicting GitHub URL, conflicting repository labels, an unsupported target, or
+any other ambiguous source evidence.
+
 Run the read-only model against the inferred local repository checkout:
 
 ```bash
@@ -105,7 +119,32 @@ one supported repository. Model output is validated with ClawSweeper's current
 decision schema, cited Git SHAs are re-verified by the host, and any close leaning
 is advisory only. Analysis does not write to Linear.
 
-## Review and Apply
+A completed model review writes one canonical-shaped record under the repository
+whose code was reviewed:
+
+```text
+records/<repository-slug>/items/<linear-identifier>.md
+```
+
+For example, a settled Symphony Daemon review for `PAR-597` is
+`records/ostehost-symphony-daemon/items/PAR-597.md`. Its front matter binds the
+decision to `target_repo`, Linear `source_provider`/`source_id`, the Linear
+snapshot hash, repository head, model, analyzer version, and review runtime. The
+body is the exact proposed marker-backed comment. A dry run writes no record.
+
+The local file is a review artifact, not yet proof of publication to the
+canonical Worker store. Canonical publication and read-back are separate apply
+work that must be added before unattended operation is claimed.
+
+## Separate Review and Apply Lanes
+
+Review and apply are separate authority lanes even where the current operator
+CLI shares planning helpers. Review owns model execution and record generation;
+it has no Linear write credential. Apply accepts an independently reviewed
+record/receipt, re-fetches Linear, and may synchronize only the one managed
+comment or one additive label operation authorized for that run. Repair and
+commit review remain separate ClawSweeper lanes and are not performed by these
+commands.
 
 First create and save a dry-run report for an exact issue, a list, a project, or
 a team:
@@ -171,9 +210,121 @@ age, and alert on missing delivery or Linear rate-limit failures.
 expectation evaluation for that operator integration. Creating or updating the
 actual cron remains an explicit deployment action.
 
+Linear webhooks are an optional low-latency trigger, not an authority or record
+store. Linear documents issue and issue-comment webhooks as retried HTTP POSTs;
+the receiver must authenticate the delivery, acknowledge quickly, deduplicate,
+and enqueue the same review lane used by scheduled/on-demand work. A webhook may
+never call apply directly.
+
+OAuth `actor=app` is required for bot-owned mutations so Linear attributes the
+managed comment to the application. Personal API-key reads remain suitable for
+operator inspection but cannot establish managed-comment ownership.
+
+## End-to-End Acceptance Requirements
+
+An end-to-end run is complete only when all applicable phases below have current
+receipts. Unit tests, a model transcript, a temporary JSON report, or a free-form
+operator comment alone is not an end-to-end result.
+
+### 1. Intake and snapshot
+
+- Fetch the exact Linear issue by durable UUID and human identifier.
+- Fully paginate comments, attachments, labels, team state, and creator identity;
+  fail closed on any truncated connection.
+- Canonically hash every source field that can change the decision or proposed
+  mutation.
+- Record the webhook delivery ID or operator invocation ID without treating it
+  as authority.
+- Replay of the same event must select the same source item and snapshot hash.
+
+### 2. Repository binding and review
+
+- Infer one configured repository from trusted issue evidence, or accept one
+  explicit repository from an authenticated workflow receipt.
+- Reject explicit/inferred conflicts and unsupported repositories.
+- Verify the checkout remote matches the target repository, the branch is
+  `main`, the worktree is clean, and local HEAD equals live canonical `main`.
+- Run the model without Linear, GitHub-write, or model-provider credentials in
+  its subprocess environment.
+- Validate output with ClawSweeper's decision schema and re-verify every cited
+  SHA as reachable from the reviewed head.
+- Maintainer-authored items must remain open regardless of model confidence.
+
+### 3. Durable record
+
+- Write exactly one `records/<repository-slug>/items/<identifier>.md` artifact.
+- Persist decision, close reason, confidence, evidence, proposed comment,
+  runtime/model metadata, source identity, target repository/head, and snapshot
+  hash.
+- Re-read and parse the persisted record; byte-identical reruns must noop or
+  replace the same path rather than create another record.
+- Publish to the canonical Worker store and read it back before claiming the
+  review is durable. A local file alone is insufficient.
+
+### 4. Comment plan and apply
+
+- Plan exactly one marker-backed comment using the durable Linear source UUID.
+- Reuse a comment only when both marker and stable app actor ID match.
+- Load independently approved `planHash` and `snapshotHash` values from the
+  durable review receipt.
+- Re-fetch immediately before mutation and reject source, plan, repository-head,
+  actor, or authorization drift.
+- Validate GraphQL `errors`, mutation `success`, returned IDs, and read-back
+  content; HTTP 200 alone is not success.
+- Rerunning the same approved review must update/noop the same comment ID and
+  must never stack a second ClawSweeper comment.
+
+### 5. Labels and state
+
+- Comment and label changes require separate snapshot/review/apply cycles.
+- Label changes are additive, preserve unrelated/concurrent labels, and fail
+  closed when the label connection is truncated.
+- Review never changes Linear workflow state, priority, cycle, or project.
+- A close/state proposal is limited to implemented, unreproducible, duplicate,
+  incoherent, or obviously stale items and remains blocked for maintainer-authored
+  or protected items. Any future state mutation needs its own apply lane.
+
+### 6. Repair and commit review
+
+- Repair consumes accepted finding IDs from the durable record and is bound to
+  the reviewed source revision.
+- Repair completion cannot mark review complete or edit Linear directly.
+- Commit review evaluates the exact repaired range, updates the same record
+  lineage, and proposes replacement content for the same managed comment.
+- A changed head, tree, issue snapshot, or PR body invalidates affected proof and
+  review approval.
+
+### 7. Failure recovery
+
+- Webhook redelivery, process restart, and duplicate operator invocation are
+  idempotent.
+- An ambiguous mutation result is never automatically retried; read-back decides
+  whether it landed.
+- Record-published/comment-failed and comment-landed/read-back-failed outcomes are
+  explicit, recoverable states with no false `applied` claim.
+- A rerun resumes from durable state and does not depend on temporary files or a
+  previous agent transcript.
+
+### Representative live proof
+
+Use one dedicated, non-production Linear issue tied to a configured disposable
+repository/branch. Exercise snapshot, review, record publication/read-back,
+comment create/read-back, unchanged rerun, comment update/read-back, injected
+snapshot drift rejection, wrong-actor marker rejection, ambiguous-mutation
+recovery, repair handoff, commit re-review, and final idempotent rerun. Comment,
+label, and any future state mutation tests require separate explicit operator
+approval and fresh snapshots.
+
 ## Boundaries
 
 This integration intentionally does not add a `TrackerProvider`, Linear webhook,
 Linear state machine, native Linear record store, or Linear automerge lane. Those
 would create a second production control plane and should be considered only
 after the sidecar has sustained operational evidence.
+
+Linear's real-time sync/API does not replace ClawSweeper records. Do not place
+snapshot hashes in issue descriptions or custom fields as the sole audit source,
+do not scrape free-form Symphony/operator comments as mutation authority, and do
+not map ClawSweeper routing labels to workflow statuses. Linear remains an intake
+and public-comment surface around ClawSweeper's existing review, apply, repair,
+and commit-review lanes.

@@ -5,7 +5,8 @@
  * --analyze OFF by default). It REUSES the existing pieces end-to-end; it adds no parallel
  * system, no new schema, no host-side git collector, no clawsweeper-state cache.
  *
- *   fetchIssueByIdentifier (read)  ->  inferTargetRepo (SKIP if ambiguous; never guess/default)
+ *   fetchIssueByIdentifier (read)  ->  inferTargetRepo or explicit configured --repo
+ *     (SKIP if ambiguous/conflicting; never guess/default)
  *     -> repositoryProfileFor().checkoutDir/promptNote/apply_close_rules
  *     -> [--analyze only] runCodex (sandbox:'read-only', model:'internal' so harness config
  *        governs; the MODEL runs read-only git blame/log/show, emits evidence{file,line,command,sha})
@@ -13,7 +14,7 @@
  *     -> deriveCloseLeaning (code-derived, advisory; forced false on any unverifiable sha)
  *     -> renderReviewContent(record, classification, {decision, closeLeaning})  [analyzer sections]
  *     -> buildItemPlan-style plan + authorize (comment gate)  [reused single-item plan]
- *     -> serializeAnalyzerRecord -> records/<workspaceSlug>/items/<key>.md   [audit, mirrors GitHub lane]
+ *     -> serializeAnalyzerRecord -> records/<repositorySlug>/items/<key>.md [audit, mirrors GitHub lane]
  *
  * Guardrails (all kept): --analyze OFF by default; eligible-only; gates default-closed;
  * classifier.proposesClose()===false; ONLY the comment gate may open (never close/state);
@@ -39,13 +40,18 @@ import {
   LinearItemSource,
   mapWorkspaceItem,
   needsReanalysis,
+  ownerRepoFromUrls,
   parseLinearIdentifier,
   planReviewCommentUpsert,
   reviewCommentMutationRequest,
   serializeAnalyzerRecord,
   verifyEvidenceShas,
 } from "../dist/linear/index.js";
-import { isAutoCloseAllowed, repositoryProfileFor } from "../dist/repository-profiles.js";
+import {
+  isAutoCloseAllowed,
+  normalizeRepo,
+  repositoryProfileFor,
+} from "../dist/repository-profiles.js";
 import { runAgentProcess } from "../dist/agent-runner.js";
 import { parseDecision } from "../dist/clawsweeper.js";
 import { codexEnv, codexLoginConfig } from "../dist/codex-env.js";
@@ -140,6 +146,7 @@ function runCodex(options) {
 export function parseArgs(argv) {
   const options = {
     identifier: "",
+    targetRepo: "",
     analyze: false,
     json: false,
     nowIso: undefined,
@@ -162,6 +169,9 @@ export function parseArgs(argv) {
       case "--identifier":
       case "--issue":
         options.identifier = requireValue(argv, ++index, arg);
+        break;
+      case "--repo":
+        options.targetRepo = requireValue(argv, ++index, arg);
         break;
       case "--analyze":
         options.analyze = true;
@@ -290,6 +300,82 @@ export function repoInferenceItemFor(hydrated) {
     title: hydrated.issue?.title ?? "",
     urls: collectIssueUrls(hydrated),
   };
+}
+
+/**
+ * Resolves the review target without guessing. An explicit operator/workflow repository may
+ * fill a genuinely absent issue signal, but it may never override conflicting URLs or labels.
+ */
+export function resolveAnalysisRepo(item, catalog, explicitRepo = "") {
+  const inferred = inferTargetRepo(item, catalog);
+  const requested = String(explicitRepo ?? "").trim();
+  if (requested === "") return inferred;
+
+  const normalized = normalizeRepo(requested);
+  if (!catalog.entries.some((entry) => entry.targetRepo === normalized)) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: [
+        `operator-supplied target repository ${normalized} is not an exact configured target — skip`,
+      ],
+    };
+  }
+
+  const normalizedLabels = item.labels.map((label) => label.trim().toLowerCase());
+  const signaledRepos = new Set(ownerRepoFromUrls(item.urls));
+  for (const entry of catalog.entries) {
+    if (
+      normalizedLabels.includes(entry.targetRepo) ||
+      normalizedLabels.includes(entry.checkoutDir) ||
+      normalizedLabels.includes(entry.displayName)
+    ) {
+      signaledRepos.add(entry.targetRepo);
+    }
+  }
+  const conflicts = [...signaledRepos].filter((repo) => repo !== normalized);
+  if (conflicts.length > 0) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: [
+        `operator-supplied target repository ${normalized} conflicts with issue repository signals ${conflicts.join(", ")} — skip`,
+      ],
+    };
+  }
+
+  if (inferred.repo !== null && inferred.repo !== normalized) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: [
+        `operator-supplied target repository ${normalized} conflicts with issue evidence ${inferred.repo} — skip`,
+      ],
+    };
+  }
+  if (
+    inferred.repo === null &&
+    !inferred.reasons.some((reason) => reason.includes("0 candidates"))
+  ) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: [
+        ...inferred.reasons,
+        `operator-supplied target repository ${normalized} cannot override ambiguous issue evidence — skip`,
+      ],
+    };
+  }
+  return {
+    repo: normalized,
+    via: "explicit",
+    reasons: [`operator-supplied target repository → ${normalized}`],
+  };
+}
+
+/** Canonical reviewed-item record path, organized by the repository whose code was reviewed. */
+export function analysisRecordPath(profile, identifier) {
+  return `records/${profile.slug}/items/${identifier}.md`;
 }
 
 /** Workspace admins and owners are treated as maintainer-authored. */
@@ -489,7 +575,11 @@ export async function analyzeItem(hydrated, options, deps) {
   }
 
   // Repo inference — SKIP on ambiguous; never guess, never DEFAULT_TARGET_REPO.
-  const inference = inferTargetRepo(deps.repoInferenceItem, deps.catalog);
+  const inference = resolveAnalysisRepo(
+    deps.repoInferenceItem,
+    deps.catalog,
+    options.targetRepo ?? "",
+  );
   if (inference.repo === null) {
     return { ...base, analyzed: false, skipped: `repo ambiguous: ${inference.reasons.join("; ")}` };
   }
@@ -497,6 +587,7 @@ export async function analyzeItem(hydrated, options, deps) {
   // repos, so this is safe. Honor per-repo apply_close_rules (openclaw/* never auto-close issues
   // except implemented_on_main).
   const profile = repositoryProfileFor(inference.repo);
+  const recordPath = analysisRecordPath(profile, record.identifier);
 
   const repoHead = deps.repoHead;
   const modelId = deps.modelId ?? "internal";
@@ -576,6 +667,9 @@ export async function analyzeItem(hydrated, options, deps) {
       review_policy: policy.routingLabel ?? policy.ruleId,
       identifier: record.identifier,
       url: record.url,
+      target_repo: profile.targetRepo,
+      source_provider: record.sourceProvider,
+      source_id: record.sourceId,
       snapshot_hash: record.snapshotHash,
       model_id: modelId,
       analyzer_version: ANALYZER_VERSION,
@@ -600,7 +694,7 @@ export async function analyzeItem(hydrated, options, deps) {
     planHash: plan.planHash,
     snapshotHash: record.snapshotHash,
     request,
-    recordPath: record.recordPath,
+    recordPath,
     recordBody,
     nowIso,
   };
@@ -610,9 +704,15 @@ export async function analyzeItem(hydrated, options, deps) {
 export function writeAnalyzerRecord(summary, deps = {}) {
   const write = deps.writeFileSync ?? writeFileSync;
   const mkdir = deps.mkdirSync ?? mkdirSync;
+  const exists = deps.existsSync ?? existsSync;
+  const read = deps.readFileSync ?? readFileSync;
   const path = join(ROOT, summary.recordPath);
+  if (exists(path) && read(path, "utf8") === summary.recordBody) return path;
   mkdir(dirname(path), { recursive: true });
   write(path, summary.recordBody, "utf8");
+  if (read(path, "utf8") !== summary.recordBody) {
+    throw new Error(`record read-back mismatch: ${summary.recordPath}`);
+  }
   return path;
 }
 
@@ -647,13 +747,16 @@ async function main() {
 
     const catalog = buildRepoCatalog(loadFallbackOwners());
     const repoInferenceItem = repoInferenceItemFor(hydrated);
-    const persistedFingerprint = loadPersistedAnalyzerFingerprint(
-      mapWorkspaceItem(hydrated).recordPath,
-    );
 
     // Resolve the checkout dir lazily — only when the repo is known and --analyze is on do we
     // touch git or the model. analyzeItem itself decides whether to call runModel.
-    const inference = inferTargetRepo(repoInferenceItem, catalog);
+    const inference = resolveAnalysisRepo(repoInferenceItem, catalog, options.targetRepo);
+    const persistedFingerprint =
+      inference.repo === null
+        ? undefined
+        : loadPersistedAnalyzerFingerprint(
+            analysisRecordPath(repositoryProfileFor(inference.repo), hydrated.issue.identifier),
+          );
     let runModelDeps = {};
     const preflightClassification = classifyAnalysisItem(hydrated, options);
     if (inference.repo !== null && options.analyze && preflightClassification.eligible) {
@@ -769,6 +872,8 @@ and persists an audit record. It NEVER closes and never mutates Linear state.
 
 Options:
   --identifier <KEY>         Linear identifier, e.g. PAR-244 (required)
+  --repo <owner/repo>        Explicit configured target when the item has no repo signal;
+                             never overrides conflicting issue evidence
   --analyze                  Run the read-only model (default: dry-run, no model call)
   --now <iso>                ISO 8601 "now" for staleness (default: current time)
   --stale-days <n>           Staleness threshold in days (default: ${DEFAULT_STALE_DAYS})

@@ -10,15 +10,9 @@
  *   cannot pick exactly one — the runner then SKIPS analysis rather than analyzing the wrong
  *   tree. Pure: no network, no clock, no filesystem.
  *
- * Precedence, first-hit wins:
- *   (1) An explicit GitHub URL in the attachments or body — owner/repo via the canonicalRef
- *       regex (schema line 389). A single unique owner/repo across all URLs wins outright.
- *       Two or more DISTINCT owner/repo URLs → AMBIGUOUS.
- *   (2) A label naming a known target_repo / checkout_dir / display_name from
- *       config/target-repositories.json (case-insensitive). One unique survivor wins.
- *   (3) A label or title owner token in the generic-fallback owners (e.g. openclaw, steipete)
- *       paired with a repo name that passes allow_repo_name_pattern. One unique survivor wins.
- *   Step-1 yields 0 URLs and >=2 distinct surviving candidates, OR 0 candidates → AMBIGUOUS.
+ * Signal strength selects the reported `via` value (URL, then known label, then fallback), but
+ * every repository-bearing signal must agree. Conflicting URLs, configured labels, or
+ * fallback-owner candidates are AMBIGUOUS; a stronger signal never hides a weaker conflict.
  */
 
 import { normalizeRepo, REPOSITORY_PROFILES } from "../repository-profiles.js";
@@ -161,17 +155,13 @@ function matchByFallbackOwner(item: RepoInferenceItem, catalog: RepoCatalog): st
 }
 
 /**
- * Infers the target_repo string. Precedence: URL → known-label → fallback-owner. Returns a
- * single repo or AMBIGUOUS (repo:null). Never guesses, never defaults. The runner must SKIP
- * analysis on AMBIGUOUS (and never call repositoryProfileFor, which throws on an unknown repo).
+ * Infers the target_repo string. URL → known-label → fallback-owner determines only the
+ * reported provenance after all signals agree. Returns a single repo or AMBIGUOUS (repo:null).
+ * Never guesses, never defaults. The runner must SKIP analysis on AMBIGUOUS.
  */
 export function inferTargetRepo(item: RepoInferenceItem, catalog: RepoCatalog): RepoInference {
-  const reasons: string[] = [];
-
-  // (1) Explicit GitHub URL — a single unique owner/repo wins outright.
   const urlRepos = ownerRepoFromUrls(item.urls);
-  if (urlRepos.length === 1) {
-    const repo = urlRepos[0] as string;
+  for (const repo of urlRepos) {
     if (!isSupportedRepo(repo, catalog)) {
       return {
         repo: null,
@@ -179,57 +169,44 @@ export function inferTargetRepo(item: RepoInferenceItem, catalog: RepoCatalog): 
         reasons: [`unsupported GitHub URL repository ${repo} — skip`],
       };
     }
+  }
+
+  const labelHits = distinctSurvivors(matchKnownByLabel(item, catalog));
+  const fallbackHits = distinctSurvivors(matchByFallbackOwner(item, catalog));
+  const candidates = distinctSurvivors([...urlRepos, ...labelHits, ...fallbackHits]);
+  if (candidates.length >= 2) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: [`conflicting repository signals [${candidates.join(", ")}] — ambiguous, skip`],
+    };
+  }
+  if (candidates.length === 0) {
+    return {
+      repo: null,
+      ambiguous: true,
+      reasons: ["no GitHub URL in attachments/body", "0 candidates — ambiguous, skip"],
+    };
+  }
+
+  const repo = candidates[0] as string;
+  if (urlRepos.includes(repo)) {
     return {
       repo,
       via: "url",
-      reasons: [`unique GitHub URL → ${repo}`],
+      reasons: [`all repository signals agree; unique GitHub URL → ${repo}`],
     };
   }
-  if (urlRepos.length >= 2) {
+  if (labelHits.includes(repo)) {
     return {
-      repo: null,
-      ambiguous: true,
-      reasons: [`>=2 distinct GitHub URLs [${urlRepos.join(", ")}] — ambiguous, skip`],
-    };
-  }
-  reasons.push("no GitHub URL in attachments/body");
-
-  // (2) Label naming a known target_repo / checkout_dir / display_name.
-  const labelHits = distinctSurvivors(matchKnownByLabel(item, catalog));
-  if (labelHits.length === 1) {
-    return {
-      repo: labelHits[0] as string,
+      repo,
       via: "label",
-      reasons: [...reasons, `known-repo label → ${labelHits[0]}`],
+      reasons: [`all repository signals agree; known-repo label → ${repo}`],
     };
   }
-  if (labelHits.length >= 2) {
-    return {
-      repo: null,
-      ambiguous: true,
-      reasons: [...reasons, `>=2 known-repo labels [${labelHits.join(", ")}] — ambiguous, skip`],
-    };
-  }
-
-  // (3) Fallback-owner token + allowed repo-name.
-  const fallbackHits = distinctSurvivors(matchByFallbackOwner(item, catalog));
-  if (fallbackHits.length === 1) {
-    return {
-      repo: fallbackHits[0] as string,
-      via: "fallback-owner",
-      reasons: [...reasons, `fallback-owner candidate → ${fallbackHits[0]}`],
-    };
-  }
-  if (fallbackHits.length >= 2) {
-    return {
-      repo: null,
-      ambiguous: true,
-      reasons: [
-        ...reasons,
-        `>=2 fallback-owner candidates [${fallbackHits.join(", ")}] — ambiguous, skip`,
-      ],
-    };
-  }
-
-  return { repo: null, ambiguous: true, reasons: [...reasons, "0 candidates — ambiguous, skip"] };
+  return {
+    repo,
+    via: "fallback-owner",
+    reasons: [`fallback-owner candidate → ${repo}`],
+  };
 }
