@@ -37,7 +37,6 @@ At a high level ClawSweeper:
 - automatically opens guarded implementation PRs for viable reviewed issues in
   eligible public `openclaw/*` and `steipete/*` projects outside
   `openclaw/openclaw` and `openclaw/clawhub`
-- can manually review selected code-bearing commits on target `main` branches
 - publishes canonical review records to the Cloudflare Worker, action ledgers
   and assets to R2, and the remaining operational state to
   `openclaw/clawsweeper-state`
@@ -77,6 +76,20 @@ decision. Reviews also persist a typed, proposal-only root-cause assessment with
 same-repository URLs and at most one evidence-backed canonical item; it does not
 dispatch repair, suppress jobs, mutate siblings, close, or merge. See
 [`docs/related-issue-discovery.md`](docs/related-issue-discovery.md).
+
+### Linear Sidecar Workflow
+
+An operator-run Linear sidecar provides workspace, team, project, and exact-item
+snapshots; deterministic review-only triage; optional read-only Codex analysis;
+and receipt-gated review comments and additive routing labels. Every command is
+dry-run by default. The sidecar never closes Linear issues and never changes
+their workflow state or priority.
+
+This is intentionally a CLI sidecar rather than a second native ClawSweeper
+provider. It reuses current repository profiles, the modular agent runner, the
+decision schema, and fail-closed mutation authority without reviving the removed
+fork lifecycle implementation. See
+[`docs/linear-integration.md`](docs/linear-integration.md) for the operator flow.
 
 For open issues with complete, current kept-open reviews, ClawSweeper also
 projects selected structured review conclusions into advisory GitHub labels for
