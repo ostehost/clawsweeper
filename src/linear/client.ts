@@ -117,6 +117,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
     variables: Record<string, unknown>,
   ): Promise<unknown> {
     let attempt = 0;
+    const isMutation = /^\s*mutation\b/i.test(query);
 
     while (true) {
       let response: Response;
@@ -132,7 +133,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
       } catch (networkError) {
         const err = networkError instanceof Error ? networkError : new Error(String(networkError));
         const linearErr = new LinearRequestError(networkErrorMessage(err));
-        if (attempt < maxRetries && shouldRetryLinear(linearErr)) {
+        if (!isMutation && attempt < maxRetries && shouldRetryLinear(linearErr)) {
           const kind = linearRetryKind(linearErr);
           await sleep(linearRetryWaitMs(kind, attempt, undefined, now()));
           attempt++;
@@ -163,7 +164,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
         const code = extractErrorCode(errors) ?? topLevelCode;
         const resetAtMs = parseResetHeader(response.headers);
         const err = new LinearRequestError(message, makeErrOpts(response.status, code, resetAtMs));
-        if (attempt < maxRetries && shouldRetryLinear(err)) {
+        if (!isMutation && attempt < maxRetries && shouldRetryLinear(err)) {
           const kind = linearRetryKind(err);
           await sleep(linearRetryWaitMs(kind, attempt, resetAtMs, now()));
           attempt++;
@@ -180,7 +181,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
         const code = extractErrorCode(errors);
         const resetAtMs = parseResetHeader(response.headers);
         const err = new LinearRequestError(message, makeErrOpts(response.status, code, resetAtMs));
-        if (attempt < maxRetries && shouldRetryLinear(err)) {
+        if (!isMutation && attempt < maxRetries && shouldRetryLinear(err)) {
           const kind = linearRetryKind(err);
           await sleep(linearRetryWaitMs(kind, attempt, resetAtMs, now()));
           attempt++;

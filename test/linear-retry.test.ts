@@ -266,6 +266,23 @@ test("createLinearTransport: retries Node fetch failures with transient cause co
   assert.deepEqual(sleepDelays, [2_000]);
 });
 
+test("createLinearTransport never retries a mutation after a transient network failure", async () => {
+  let callCount = 0;
+  const transport = createLinearTransport({
+    token: "fake-token",
+    endpoint: "https://fake.linear.app/graphql",
+    fetchImpl: (async () => {
+      callCount += 1;
+      throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+    }) as typeof fetch,
+    sleep: () => Promise.resolve(),
+    maxRetries: 3,
+  });
+
+  await assert.rejects(() => transport("mutation { commentCreate { success } }", {}));
+  assert.equal(callCount, 1);
+});
+
 test("createLinearTransport: non-retryable error (validation) throws without retry", async () => {
   let callCount = 0;
   const fakeFetch = async (_url: string, _init?: RequestInit): Promise<Response> => {
