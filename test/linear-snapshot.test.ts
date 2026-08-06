@@ -156,6 +156,16 @@ test("resolveToken trims and falls through whitespace-only env tokens to the key
   assert.equal(token, "lin_keychain");
 });
 
+test("resolveToken skips a blank API key before the secondary environment token", () => {
+  const token = resolveToken({
+    env: { LINEAR_API_KEY: "   ", LINEAR_TOKEN: " secondary-token " },
+    runKeychain: () => {
+      throw new Error("keychain should not be consulted when the secondary token is set");
+    },
+  });
+  assert.equal(token, "secondary-token");
+});
+
 test("resolveToken consults the keychain with the given service/account", () => {
   const seen: Array<[string, string]> = [];
   const token = resolveToken({

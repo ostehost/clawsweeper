@@ -21,6 +21,7 @@ import {
   makeGitShaVerifier,
   parseArgs,
   resolveLinearAnalysisModel,
+  resolveLinearAnalysisModelRevision,
   resolveAnalysisRepo,
   repoInferenceItemFor,
   serializeUntrustedIssueData,
@@ -145,6 +146,7 @@ function baseDeps(overrides = {}) {
     verifySha: () => true,
     runModel: async () => makeModelDecision(),
     modelId: "internal",
+    modelRevision: "test-model-revision-v1",
     ...overrides,
   };
 }
@@ -278,6 +280,26 @@ test("resolveLinearAnalysisModel preserves the trusted model across ignored user
         readFileSync: () => '[projects."/repo"]\nmodel = "nested-only"\n',
       }),
     /requires CLAWSWEEPER_INTERNAL_MODEL or a root model/,
+  );
+});
+
+test("resolveLinearAnalysisModelRevision requires an independent public-safe revision", () => {
+  assert.equal(
+    resolveLinearAnalysisModelRevision({
+      env: { CLAWSWEEPER_INTERNAL_MODEL_REVISION: " analysis-model-v2 " },
+    }),
+    "analysis-model-v2",
+  );
+  assert.throws(
+    () => resolveLinearAnalysisModelRevision({ env: {} }),
+    /requires a public-safe opaque CLAWSWEEPER_INTERNAL_MODEL_REVISION/u,
+  );
+  assert.throws(
+    () =>
+      resolveLinearAnalysisModelRevision({
+        env: { CLAWSWEEPER_INTERNAL_MODEL_REVISION: "private model name" },
+      }),
+    /requires a public-safe opaque/u,
   );
 });
 
@@ -422,6 +444,7 @@ snapshot_hash: "snap"
 analysis_prompt_hash: "prompt"
 repo_head: "headsha"
 model_id: "internal"
+model_revision: "revision-digest"
 analyzer_version: "linear-analyzer/3"
 ---
 `;
@@ -429,7 +452,7 @@ analyzer_version: "linear-analyzer/3"
     loadPersistedAnalyzerFingerprint("records/linear-par/items/PAR-42.md", {
       readFileSync: () => markdown,
     }),
-    "snapshot=snap;prompt=prompt;head=headsha;model=internal;analyzer=linear-analyzer/3",
+    "snapshot=snap;prompt=prompt;head=headsha;model=revision-digest;analyzer=linear-analyzer/3",
   );
 });
 
@@ -445,6 +468,26 @@ test("loadPersistedAnalyzerFingerprint fails open to re-analysis for missing or 
   assert.equal(
     loadPersistedAnalyzerFingerprint("partial", {
       readFileSync: () => 'snapshot_hash: "snap"\nrepo_head: "head"\n',
+    }),
+    undefined,
+  );
+});
+
+test("loadPersistedAnalyzerFingerprint ignores cache fields outside leading front matter", () => {
+  const legacy = `---
+snapshot_hash: "snap"
+analysis_prompt_hash: "prompt"
+repo_head: "headsha"
+model_id: "internal"
+analyzer_version: "linear-analyzer/3"
+---
+
+Model-authored body text must not supply cache metadata.
+model_revision: "current-public-revision"
+`;
+  assert.equal(
+    loadPersistedAnalyzerFingerprint("records/linear-par/items/PAR-42.md", {
+      readFileSync: () => legacy,
     }),
     undefined,
   );
@@ -719,6 +762,25 @@ test("analyzeItem: dry-run (analyze off) never calls the model and writes nothin
   assert.equal(summary.recordBody, undefined);
 });
 
+test("analyzeItem: dry-run does not substitute the public alias when model revision is unavailable", async () => {
+  const deps = baseDeps({ modelRevision: undefined });
+  const summary = await analyzeItem(makeHydrated(), { nowIso: NOW, analyze: false }, deps);
+  assert.equal(summary.analyzed, false);
+  assert.match(summary.skipped, /model revision unavailable/u);
+  assert.equal(summary.fingerprint, undefined);
+});
+
+test("analyzeItem: live analysis fails closed when model revision is unavailable", async () => {
+  await assert.rejects(
+    analyzeItem(
+      makeHydrated(),
+      { nowIso: NOW, analyze: true },
+      baseDeps({ modelRevision: undefined }),
+    ),
+    /requires a resolved model revision/u,
+  );
+});
+
 test("analyzeItem: ineligible (closed) item is skipped before repo inference", async () => {
   const closed = makeHydrated();
   closed.issue.stateType = "completed";
@@ -867,6 +929,33 @@ test("analyzeItem: unchanged fingerprint short-circuits re-analysis (idempotency
   assert.equal(called, false);
   assert.equal(second.analyzed, false);
   assert.match(second.skipped, /fingerprint unchanged/);
+});
+
+test("analyzeItem: a resolved-model revision change invalidates cached analysis", async () => {
+  const first = await analyzeItem(
+    makeHydrated(),
+    { nowIso: NOW, analyze: true },
+    baseDeps({ modelId: "internal", modelRevision: "model-revision-a" }),
+  );
+  let called = false;
+  const second = await analyzeItem(
+    makeHydrated(),
+    { nowIso: NOW, analyze: true },
+    baseDeps({
+      modelId: "internal",
+      modelRevision: "model-revision-b",
+      persistedFingerprint: first.fingerprint,
+      runModel: async () => {
+        called = true;
+        return makeModelDecision();
+      },
+    }),
+  );
+  assert.equal(called, true);
+  assert.equal(second.analyzed, true);
+  assert.notEqual(second.fingerprint, first.fingerprint);
+  assert.match(second.recordBody, /model_id: "internal"/u);
+  assert.match(second.recordBody, /model_revision: "model-revision-b"/u);
 });
 
 test("analyzeItem: changed bounded comment context invalidates the cached analysis", async () => {

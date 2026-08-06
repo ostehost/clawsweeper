@@ -339,6 +339,17 @@ test("resolveLinearToken: falls back to LINEAR_TOKEN env var", async () => {
   assert.equal(token, "token-fallback");
 });
 
+test("resolveLinearToken: skips blank credentials in documented precedence order", async () => {
+  const { resolveLinearToken } = await import("../dist/linear/client.js");
+  assert.equal(
+    resolveLinearToken({
+      token: "  ",
+      env: { LINEAR_API_KEY: "\t", LINEAR_TOKEN: " token-fallback " },
+    }),
+    "token-fallback",
+  );
+});
+
 test("resolveLinearToken: throws when no token available", async () => {
   const { resolveLinearToken } = await import("../dist/linear/client.js");
   assert.throws(() => resolveLinearToken({ env: {} }), /No Linear API token/);

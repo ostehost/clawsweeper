@@ -29,7 +29,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createLinearTransport, LinearItemSource } from "../dist/linear/index.js";
+import {
+  createLinearTransport,
+  firstNonBlankLinearToken,
+  LinearItemSource,
+} from "../dist/linear/index.js";
 
 /** Default macOS Keychain generic-password coordinates for the hub Linear key. */
 export const DEFAULT_KEYCHAIN_SERVICE = "openclaw-linear-api-key";
@@ -103,8 +107,8 @@ export function resolveToken(options = {}) {
   const account = options.account ?? DEFAULT_KEYCHAIN_ACCOUNT;
   const runKeychain = options.runKeychain ?? defaultKeychainLookup;
 
-  const envToken = env["LINEAR_API_KEY"] ?? env["LINEAR_TOKEN"];
-  if (envToken && envToken.trim() !== "") return envToken.trim();
+  const envToken = firstNonBlankLinearToken(env["LINEAR_API_KEY"], env["LINEAR_TOKEN"]);
+  if (envToken !== undefined) return envToken;
 
   const keychainToken = runKeychain(service, account);
   if (keychainToken && keychainToken.trim() !== "") return keychainToken.trim();

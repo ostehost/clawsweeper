@@ -575,6 +575,16 @@ test("resolveReadToken prefers env and never calls the keychain when env is set"
   assert.equal(token, "env-key");
 });
 
+test("resolveReadToken skips a blank API key before the secondary environment token", () => {
+  const token = resolveReadToken({
+    env: { LINEAR_API_KEY: "  ", LINEAR_TOKEN: " secondary-key " },
+    runKeychain: () => {
+      throw new Error("keychain must not be consulted when the secondary token is present");
+    },
+  });
+  assert.equal(token, "secondary-key");
+});
+
 test("resolveApproval loads approved plan and snapshot hashes from a saved dry-run receipt", () => {
   const planHash = "a".repeat(64);
   const snapshotHash = "b".repeat(64);

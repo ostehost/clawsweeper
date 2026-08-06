@@ -31,7 +31,12 @@ export {
   TEAMS_QUERY,
 } from "./queries.js";
 
-export { assertLinearReadDocument, createLinearTransport, resolveLinearToken } from "./client.js";
+export {
+  assertLinearReadDocument,
+  createLinearTransport,
+  firstNonBlankLinearToken,
+  resolveLinearToken,
+} from "./client.js";
 export type { LinearTransport, LinearTransportOptions, ResolveTokenOptions } from "./client.js";
 
 export { LinearItemSource, parseLinearIdentifier } from "./source.js";

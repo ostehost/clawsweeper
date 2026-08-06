@@ -183,6 +183,23 @@ export function resolveLinearAnalysisModel(options = {}) {
 }
 
 /**
+ * Resolve the public, operator-controlled cache revision independently of the private model
+ * name. Operators must change this value whenever the configured analysis model changes.
+ */
+export function resolveLinearAnalysisModelRevision(options = {}) {
+  const env = options.env ?? process.env;
+  const revision = String(
+    options.requestedRevision ?? env.CLAWSWEEPER_INTERNAL_MODEL_REVISION ?? "",
+  ).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(revision)) {
+    throw new Error(
+      "Linear analysis requires a public-safe opaque CLAWSWEEPER_INTERNAL_MODEL_REVISION",
+    );
+  }
+  return revision;
+}
+
+/**
  * Runs the current ClawSweeper agent boundary with the Linear-specific prompt.
  * The former monolithic `runCodex` export no longer exists on upstream main, so
  * the sidecar uses the same agent process, schema, credential stripping, and
@@ -345,7 +362,9 @@ export function loadFallbackOwners(deps = {}) {
 }
 
 function recordFrontMatterValue(markdown, key) {
-  const match = markdown.match(new RegExp(`^${key}:\\s*("(?:\\\\.|[^"\\\\])*")\\s*$`, "m"));
+  const frontMatter = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1];
+  if (frontMatter === undefined) return undefined;
+  const match = frontMatter.match(new RegExp(`^${key}:\\s*("(?:\\\\.|[^"\\\\])*")\\s*$`, "m"));
   if (!match?.[1]) return undefined;
   try {
     return String(JSON.parse(match[1]));
@@ -371,15 +390,16 @@ export function loadPersistedAnalyzerFingerprint(recordPath, deps = {}) {
   const promptHash = recordFrontMatterValue(markdown, "analysis_prompt_hash")?.trim();
   const repoHEAD = recordFrontMatterValue(markdown, "repo_head")?.trim();
   const modelId = recordFrontMatterValue(markdown, "model_id")?.trim();
+  const modelRevision = recordFrontMatterValue(markdown, "model_revision")?.trim();
   const analyzerVersion = recordFrontMatterValue(markdown, "analyzer_version")?.trim();
-  if (!snapshotHash || !promptHash || !repoHEAD || !modelId || !analyzerVersion) {
+  if (!snapshotHash || !promptHash || !repoHEAD || !modelId || !modelRevision || !analyzerVersion) {
     return undefined;
   }
   return analyzerFingerprint({
     snapshotHash,
     promptHash,
     repoHEAD,
-    modelId,
+    modelId: modelRevision,
     analyzerVersion,
   });
 }
@@ -818,12 +838,25 @@ export async function analyzeItem(hydrated, options, deps) {
 
   const repoHead = deps.repoHead;
   const modelId = deps.modelId ?? "internal";
+  const modelRevision = deps.modelRevision;
+  if (!modelRevision) {
+    if (options.analyze) {
+      throw new Error("Linear analysis requires a resolved model revision");
+    }
+    return {
+      ...base,
+      analyzed: false,
+      skipped: "dry-run (model revision unavailable; cache status not evaluated)",
+      repo: inference.repo,
+      via: inference.via,
+    };
+  }
   const promptHash = analysisPromptHash(hydrated, profile, repoHead);
   const fingerprint = analyzerFingerprint({
     snapshotHash: record.snapshotHash,
     promptHash,
     repoHEAD: repoHead,
-    modelId,
+    modelId: modelRevision,
     analyzerVersion: ANALYZER_VERSION,
   });
 
@@ -901,6 +934,7 @@ export async function analyzeItem(hydrated, options, deps) {
       snapshot_hash: record.snapshotHash,
       analysis_prompt_hash: promptHash,
       model_id: modelId,
+      model_revision: modelRevision,
       analyzer_version: ANALYZER_VERSION,
       repo_head: repoHead,
       close_leaning: String(closeLeaning.closeLeaning),
@@ -1003,8 +1037,10 @@ async function main() {
       const checkoutDir = join(options.checkoutsDir, profile.checkoutDir);
       const { head: repoHead } = assertAnalysisCheckout(checkoutDir, profile.targetRepo);
       const model = resolveLinearAnalysisModel();
+      const modelRevision = resolveLinearAnalysisModelRevision();
       runModelDeps = {
         repoHead,
+        modelRevision,
         verifySha: makeGitShaVerifier(checkoutDir, repoHead),
         runModel: async ({ profile: p, repoHead: head }) => {
           const { item, context, git } = buildHarnessInputs(hydrated, p, head);
@@ -1026,13 +1062,21 @@ async function main() {
         },
       };
     } else if (inference.repo !== null) {
-      // Dry-run still computes the fingerprint; supply a HEAD without calling the model.
+      // Dry-run still computes the fingerprint without calling the model. If trusted model
+      // configuration is unavailable, analyzeItem reports cache status as unavailable instead
+      // of comparing persisted digests with the public alias.
       const profile = repositoryProfileFor(inference.repo);
       const checkoutDir = join(options.checkoutsDir, profile.checkoutDir);
+      let modelRevision;
       try {
-        runModelDeps = { repoHead: readRepoHead(checkoutDir) };
+        modelRevision = resolveLinearAnalysisModelRevision();
       } catch {
-        runModelDeps = { repoHead: "unknown" };
+        modelRevision = undefined;
+      }
+      try {
+        runModelDeps = { repoHead: readRepoHead(checkoutDir), modelRevision };
+      } catch {
+        runModelDeps = { repoHead: "unknown", modelRevision };
       }
     }
 
@@ -1043,6 +1087,7 @@ async function main() {
       verifySha: runModelDeps.verifySha,
       runModel: runModelDeps.runModel,
       modelId: "internal",
+      modelRevision: runModelDeps.modelRevision,
       persistedFingerprint,
     });
 

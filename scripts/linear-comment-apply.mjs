@@ -39,6 +39,7 @@ import {
   classifyRecord,
   createLinearTransport,
   evaluateReviewPolicy,
+  firstNonBlankLinearToken,
   LinearItemSource,
   mapWorkspaceItem,
   parseLinearIdentifier,
@@ -261,8 +262,8 @@ export function resolveReadToken(options = {}) {
   const account = options.account ?? DEFAULT_KEYCHAIN_ACCOUNT;
   const runKeychain = options.runKeychain ?? defaultKeychainLookup;
 
-  const envToken = env["LINEAR_API_KEY"] ?? env["LINEAR_TOKEN"];
-  if (envToken && envToken.trim() !== "") return envToken.trim();
+  const envToken = firstNonBlankLinearToken(env["LINEAR_API_KEY"], env["LINEAR_TOKEN"]);
+  if (envToken !== undefined) return envToken;
 
   const keychainToken = runKeychain(READ_KEYCHAIN_SERVICE, account);
   if (keychainToken && keychainToken.trim() !== "") return keychainToken.trim();

@@ -17,9 +17,23 @@ export interface ResolveTokenOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/** Returns the first nonblank credential without exposing it through diagnostics. */
+export function firstNonBlankLinearToken(
+  ...candidates: Array<string | undefined>
+): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim() !== "") return candidate.trim();
+  }
+  return undefined;
+}
+
 export function resolveLinearToken(options?: ResolveTokenOptions): string {
   const env = options?.env ?? process.env;
-  const token = options?.token ?? env["LINEAR_API_KEY"] ?? env["LINEAR_TOKEN"];
+  const token = firstNonBlankLinearToken(
+    options?.token,
+    env["LINEAR_API_KEY"],
+    env["LINEAR_TOKEN"],
+  );
   if (!token) {
     throw new Error(
       "No Linear API token found. Set LINEAR_API_KEY or LINEAR_TOKEN in the environment.",

@@ -210,7 +210,7 @@ export interface AnalyzerFingerprintInput {
   snapshotHash: string; // record.snapshotHash (the live-Linear drift fingerprint)
   promptHash: string; // exact bounded prompt passed to the model
   repoHEAD: string; // the analyzed checkout's HEAD sha
-  modelId: string; // resolved model id (e.g. "internal" → harness config.toml governs)
+  modelId: string; // public-safe revision identity for the resolved model
   analyzerVersion: string; // ANALYZER_VERSION
 }
 
@@ -348,7 +348,8 @@ export interface AnalyzerRecordFrontMatter {
   snapshot_hash: string;
   analysis_prompt_hash: string;
   // Analyzer fingerprint.
-  model_id: string;
+  model_id: string; // public-safe alias
+  model_revision: string; // non-plaintext resolved-model cache identity
   analyzer_version: string;
   repo_head: string;
   close_leaning: string; // "true" | "false" — advisory
@@ -387,6 +388,7 @@ export function serializeAnalyzerRecord(
     "snapshot_hash",
     "analysis_prompt_hash",
     "model_id",
+    "model_revision",
     "analyzer_version",
     "repo_head",
     "close_leaning",
