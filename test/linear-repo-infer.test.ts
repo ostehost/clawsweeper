@@ -273,16 +273,49 @@ test("infer step2: two distinct known-repo labels is ambiguous -> skip", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Precedence (3): fallback-owner token + allowed repo name
+// Precedence (3): explicit fallback owner/repository label
 // ---------------------------------------------------------------------------
 
-test("infer step3: owner token in title + a plain repo-name label", () => {
-  const r = inferTargetRepo(
+test("infer step3: an explicit owner/repo fallback label resolves", () => {
+  const r = inferTargetRepo(item({ labels: ["openclaw/mywidget"] }), CATALOG);
+  assert.equal(r.repo, "openclaw/mywidget");
+  if (r.repo !== null) assert.equal(r.via, "fallback-owner");
+});
+
+test("infer step3: owner words cannot turn ordinary routing labels into repositories", () => {
+  for (const labels of [["bug"], ["needs-triage"], ["bug", "needs-triage"]]) {
+    const r = inferTargetRepo(item({ title: "OpenClaw worker regression", labels }), CATALOG);
+    assert.equal(r.repo, null, `expected ${labels.join(",")} to remain non-repository evidence`);
+  }
+});
+
+test("infer step3: a title owner plus plain name does not resolve without owner/repo label", () => {
+  const ambiguous = inferTargetRepo(
     item({ title: "steipete: fix the widget", labels: ["mywidget"] }),
     CATALOG,
   );
-  assert.equal(r.repo, "steipete/mywidget");
-  if (r.repo !== null) assert.equal(r.via, "fallback-owner");
+  assert.equal(ambiguous.repo, null);
+
+  const explicit = inferTargetRepo(item({ labels: ["steipete/mywidget"] }), CATALOG);
+  assert.equal(explicit.repo, "steipete/mywidget");
+  if (explicit.repo !== null) assert.equal(explicit.via, "fallback-owner");
+});
+
+test("infer step3: explicit fallback labels still honor owner allowlists and deny lists", () => {
+  const catalog = buildRepoCatalog([
+    {
+      owner: "openclaw",
+      allowRepoNamePattern: /^my[A-Za-z0-9_.-]+$/,
+      denyRepositories: ["openclaw/mysecret"],
+    },
+  ]);
+
+  assert.equal(
+    inferTargetRepo(item({ labels: ["openclaw/mywidget"] }), catalog).repo,
+    "openclaw/mywidget",
+  );
+  assert.equal(inferTargetRepo(item({ labels: ["openclaw/other"] }), catalog).repo, null);
+  assert.equal(inferTargetRepo(item({ labels: ["openclaw/mysecret"] }), catalog).repo, null);
 });
 
 // ---------------------------------------------------------------------------

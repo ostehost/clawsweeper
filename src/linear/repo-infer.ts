@@ -234,42 +234,24 @@ function matchKnownByLabel(item: RepoInferenceItem, catalog: RepoCatalog): strin
   return hits;
 }
 
-// Step 3 — a fallback-owner token (label or title word) + a repo-name candidate that passes
-// the owner's allow pattern. The repo-name candidate is taken from labels of the form
-// "owner/name" or a label that is a plain safe name paired with a present owner token.
+// Step 3 — an explicit "owner/name" label whose owner has a configured fallback rule and whose
+// repository name passes that rule. Title words and plain labels are deliberately not combined:
+// ordinary routing labels such as "bug" are not repository evidence.
 function matchByFallbackOwner(item: RepoInferenceItem, catalog: RepoCatalog): string[] {
   if (catalog.fallbackOwners.length === 0) return [];
-  const titleTokens = item.title
-    .toLowerCase()
-    .split(/[^A-Za-z0-9_.-]+/)
-    .filter((t) => t !== "");
   const labelTokens = item.labels.map((l) => l.trim().toLowerCase()).filter((l) => l !== "");
-  const tokens = new Set([...titleTokens, ...labelTokens]);
   const hits: string[] = [];
 
-  for (const rule of catalog.fallbackOwners) {
-    if (!tokens.has(rule.owner)) continue;
-    for (const label of labelTokens) {
-      const slash = label.indexOf("/");
-      if (slash > 0) {
-        const owner = label.slice(0, slash);
-        const name = label.slice(slash + 1);
-        const candidate = normalizeRepo(`${rule.owner}/${name}`);
-        if (
-          owner === rule.owner &&
-          rule.allowRepoNamePattern.test(name) &&
-          !isDeniedRepo(candidate, catalog)
-        ) {
-          hits.push(candidate);
-        }
-        continue;
-      }
-      const candidate = normalizeRepo(`${rule.owner}/${label}`);
-      if (
-        label !== rule.owner &&
-        rule.allowRepoNamePattern.test(label) &&
-        !isDeniedRepo(candidate, catalog)
-      ) {
+  for (const label of labelTokens) {
+    const slash = label.indexOf("/");
+    if (slash <= 0 || slash !== label.lastIndexOf("/")) continue;
+    const owner = label.slice(0, slash);
+    const name = label.slice(slash + 1);
+    const candidate = normalizeRepo(label);
+    for (const rule of catalog.fallbackOwners) {
+      if (owner !== rule.owner) continue;
+      rule.allowRepoNamePattern.lastIndex = 0;
+      if (rule.allowRepoNamePattern.test(name) && !isDeniedRepo(candidate, catalog)) {
         hits.push(candidate);
       }
     }
