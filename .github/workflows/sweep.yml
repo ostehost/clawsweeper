@@ -1089,6 +1089,7 @@ jobs:
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REVIEW_LEASE_OWNER: ${{ steps.reserve-exact-review-lease.outputs.owner }}
           REVIEW_LEASE_COMMENT_ID: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
+          SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction || '' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -1230,6 +1231,7 @@ jobs:
             --review-lease-comment-id "$REVIEW_LEASE_COMMENT_ID" \
             --shard-index 0 \
             --shard-count 1 \
+            --review-source-action "$SOURCE_ACTION" \
             "${additional_prompt_arg[@]}" &
           review_pid=$!
           review_pgid=$review_pid

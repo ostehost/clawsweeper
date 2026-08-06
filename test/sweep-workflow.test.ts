@@ -5524,6 +5524,11 @@ test("planned background reviews allow safe content-cache reuse without weakenin
     reviewJob,
     /--item-numbers "\$\{\{ matrix\.item_numbers \}\}" \\\n+\s+"\$\{planned_automatic_review_arg\[@\]\}"/,
   );
+  assert.match(
+    eventReviewJob,
+    /SOURCE_ACTION: \$\{\{ fromJSON\(steps\.claim-exact-review-queue\.outputs\.decision\)\.sourceAction \|\| '' \}\}/,
+  );
+  assert.match(eventReviewJob, /--review-source-action "\$SOURCE_ACTION"/);
   assert.doesNotMatch(eventReviewJob, /--planned-automatic-review/);
 });
 
