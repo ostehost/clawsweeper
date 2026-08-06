@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      graphql:
+        specifier: ^17.0.2
+        version: 17.0.2
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -427,6 +430,10 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  graphql@17.0.2:
+    resolution: {integrity: sha512-FRWbddMxfkjiB7z+aQDWIR+E34xo9I8c9mtK2RPv8PmMzKRvrdsreHL/Ui/TmwHJfhHChEtsFPyMHKI+xuarQQ==}
+    engines: {node: ^22.0.0 || ^24.0.0 || ^25.0.0 || >=26.0.0}
+
   oxfmt@0.58.0:
     resolution: {integrity: sha512-8feG/7NVEHDVwc1OUpP6Pks+TnaDFUw2jLLFIMi5bcmmwxAX2wBQvjSzj62RRTYBf2Op1Wt8xbkmagmPTR5ETg==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -671,6 +678,8 @@ snapshots:
 
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
+
+  graphql@17.0.2: {}
 
   oxfmt@0.58.0:
     dependencies:

@@ -31,6 +31,8 @@
     "linear:review": "node scripts/linear-review.mjs",
     "linear:analyze": "node scripts/linear-analyze.mjs",
     "linear:comment:dry-run": "node scripts/linear-comment-apply.mjs --json",
+    "linear:proof:readonly": "pnpm run build && node scripts/linear-proof-readonly.mjs",
+    "linear:test:schema": "pnpm run build && node scripts/linear-schema-conformance.mjs",
     "linear:review-apply": "node scripts/linear-review-apply.mjs",
     "linear:review-apply:dry-run": "node scripts/linear-review-apply.mjs --json",
     "repair:validate": "node dist/repair/validate-all.js",
@@ -128,6 +130,7 @@
     "repair:pr-intake": "node dist/repair/pr-repair-intake.js"
   },
   "dependencies": {
+    "graphql": "^17.0.2",
     "typescript": "^7.0.2",
     "yaml": "^2.9.0"
   },

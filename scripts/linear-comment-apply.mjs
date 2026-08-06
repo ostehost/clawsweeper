@@ -430,31 +430,6 @@ export async function buildItemPlan(source, options) {
   };
 }
 
-export const LINEAR_APPLICATION_INFO_QUERY = `
-  query ClawSweeperLinearApplicationInfo {
-    applicationInfo { id name }
-  }
-`;
-
-export async function assertLinearApplicationActor(transport, expectedAuthorId) {
-  const expected = String(expectedAuthorId ?? "").trim();
-  if (expected === "") {
-    throw new Error("reviewed Linear application actor id is required before mutation");
-  }
-  const data = await transport(LINEAR_APPLICATION_INFO_QUERY, {});
-  const actorId =
-    typeof data?.applicationInfo?.id === "string" ? data.applicationInfo.id.trim() : "";
-  if (actorId === "") {
-    throw new Error("authenticated Linear application actor could not be verified");
-  }
-  if (actorId !== expected) {
-    throw new Error(
-      `authenticated Linear application actor ${actorId} does not match reviewed actor ${expected}`,
-    );
-  }
-  return { id: actorId, name: String(data.applicationInfo.name ?? "") };
-}
-
 /** Rejects executable comment plans while preserving the planning contract. */
 export async function applyPlan(plan, _appCreds, _deps = {}) {
   if (plan.action === "noop") {

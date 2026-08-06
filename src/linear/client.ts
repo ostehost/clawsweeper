@@ -1,3 +1,5 @@
+import { Kind, OperationTypeNode, parse, type DefinitionNode } from "graphql";
+
 import {
   LinearRequestError,
   linearRetryKind,
@@ -36,6 +38,49 @@ export interface LinearTransportOptions {
 }
 
 const LINEAR_ENDPOINT = "https://api.linear.app/graphql";
+const LINEAR_READ_DOCUMENT_ERROR =
+  "Linear transport is read-only; exactly one valid GraphQL query operation is required; mutations are disabled";
+const MAX_LINEAR_DOCUMENT_TOKENS = 10_000;
+const MAX_LINEAR_DOCUMENT_CHARACTERS = 100_000;
+
+/**
+ * Enforces the transport's positive read-only contract before any network or retry work.
+ * Parser diagnostics are deliberately replaced with a fixed message so rejected documents
+ * and any private values embedded in them cannot escape through logs.
+ */
+export function assertLinearReadDocument(source: string): void {
+  // GraphQL's token budget does not count ignored commas, whitespace, BOMs, or comments.
+  // Bound the raw input as well so ignored input cannot force an unbounded parser scan.
+  if (typeof source !== "string" || source.length > MAX_LINEAR_DOCUMENT_CHARACTERS) {
+    throw new Error(LINEAR_READ_DOCUMENT_ERROR);
+  }
+
+  let definitions: readonly DefinitionNode[];
+  try {
+    definitions = parse(source, {
+      maxTokens: MAX_LINEAR_DOCUMENT_TOKENS,
+      noLocation: true,
+    }).definitions;
+  } catch {
+    throw new Error(LINEAR_READ_DOCUMENT_ERROR);
+  }
+
+  const operations = definitions.filter(
+    (definition) => definition.kind === Kind.OPERATION_DEFINITION,
+  );
+  const definitionsAreExecutable = definitions.every(
+    (definition) =>
+      definition.kind === Kind.OPERATION_DEFINITION || definition.kind === Kind.FRAGMENT_DEFINITION,
+  );
+
+  if (
+    !definitionsAreExecutable ||
+    operations.length !== 1 ||
+    operations[0]?.operation !== OperationTypeNode.QUERY
+  ) {
+    throw new Error(LINEAR_READ_DOCUMENT_ERROR);
+  }
+}
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -105,9 +150,7 @@ export function createLinearTransport(options?: LinearTransportOptions): LinearT
     query: string,
     variables: Record<string, unknown>,
   ): Promise<unknown> {
-    if (/^\s*mutation\b/i.test(query)) {
-      throw new Error("Linear transport is read-only; GraphQL mutations are disabled");
-    }
+    assertLinearReadDocument(query);
     let attempt = 0;
 
     while (true) {

@@ -23,8 +23,9 @@ boundaries.
 - Comment creation and updates are planning-only. `--apply` plus
   `OPENCLAW_NOTIFY_LINEAR=1` records apply intent but still reports
   `wouldWrite: false`. The sidecar contains no OAuth credential resolver or
-  token-minting implementation, and its Linear transport rejects GraphQL mutations
-  before network access.
+  token-minting implementation, and its Linear transport accepts exactly one
+  parsed GraphQL query operation before network access. Mutation, subscription,
+  mixed-operation, fragment-only, and malformed documents fail closed.
 - Existing marker comments are reused only when their stable Linear bot actor ID
   matches `LINEAR_APP_ACTOR_ID`; display names are never treated as ownership.
 - The expected actor ID remains part of the reviewed comment plan hash and
@@ -62,6 +63,40 @@ Read access is resolved in this order:
 No OAuth write credentials are configured or resolved by this sidecar. A future
 durably settled write lane must introduce and review its own isolated credential
 and transport boundary. Do not pass credentials on the command line.
+
+## Validation and Read-Only Proof
+
+The fast transport and mapper tests use handwritten deterministic responses for
+precise request, retry, and malformed-data assertions. A separate conformance
+command first rebuilds the tracked TypeScript, then downloads Linear's immutable production schema at commit
+`eabc85d0df87617b4647e56d2f236e60bc2ed117`, verifies its pinned SHA-256, and
+validates every production query plus each retained offline mutation document:
+
+```bash
+pnpm linear:test:schema
+```
+
+The final behavior proof also rebuilds the tracked TypeScript before loading the
+ignored `dist/` runtime. It uses one stable synthetic issue created normally in
+a dedicated non-production Linear workspace and reads that issue through the
+production transport and `LinearItemSource`, exercises the single-item proposal
+path, and runs the forbidden-document matrix through a sentinel fetch:
+
+```bash
+pnpm linear:proof:readonly -- \
+  --identifier <DEDICATED_NONPROD_ISSUE> \
+  --fixture-alias <PUBLIC_SAFE_ALIAS> \
+  --base-tip upstream/main \
+  --out .artifacts/linear-readonly-proof.json
+```
+
+The alias prevents the receipt from publishing either the real identifier or
+team key. The receipt records exact `head`, `tree`, `mergeBase`, and `baseTip`
+coordinates; pinned-schema and mapping assertions; live-read request count;
+proposal-only assertions; forbidden-case, rejection, fetch, and sleep counts;
+digests; and explicit limits. It never records headers, request/response bodies,
+titles, descriptions, comments, actor or project IDs, tokens, or endpoints.
+Repository-local output must be written below an ignored path.
 
 ## Read-Only Workflow
 

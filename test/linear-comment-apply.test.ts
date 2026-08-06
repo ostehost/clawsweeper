@@ -9,7 +9,6 @@ import {
 } from "../dist/linear/index.js";
 import {
   applyPlan,
-  assertLinearApplicationActor,
   buildItemPlan,
   assertReadBackConfirmed,
   readBackComment,
@@ -544,21 +543,6 @@ test("applyPlan rejects live comment creation before minting or mutation", async
     /live Linear comment creation is disabled until durable cross-process settlement exists/,
   );
   assert.equal(transportCalls, 0);
-});
-
-test("assertLinearApplicationActor rejects authenticated actor drift", async () => {
-  const queries: string[] = [];
-  const transport = async (query: string): Promise<unknown> => {
-    queries.push(query);
-    return { applicationInfo: { id: "different-app", name: "Different App" } };
-  };
-
-  await assert.rejects(
-    assertLinearApplicationActor(transport, "clawsweeper-app"),
-    /authenticated Linear application actor different-app does not match reviewed actor clawsweeper-app/,
-  );
-  assert.equal(queries.length, 1);
-  assert.match(queries[0], /applicationInfo/);
 });
 
 test("applyPlan does nothing (and mints no token) for a noop plan", async () => {
