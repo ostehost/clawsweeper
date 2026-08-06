@@ -16,6 +16,7 @@
     "codex:local:check": "node scripts/check-local-codex.mjs",
     "e2e:automerge": "pnpm run build:repair && node scripts/e2e/automerge.mjs",
     "e2e:automerge:container": "node scripts/e2e/automerge-container.mjs",
+    "e2e:linear:live": "node scripts/e2e/linear-live.mjs",
     "retry-failed-reviews": "node dist/clawsweeper.js retry-failed-reviews",
     "apply-artifacts": "node dist/clawsweeper.js apply-artifacts",
     "apply-decisions": "node dist/clawsweeper.js apply-decisions",

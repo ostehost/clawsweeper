@@ -7,6 +7,10 @@ import { buildSchema, parse, validate } from "graphql";
 
 import { COMMENT_CREATE_MUTATION, COMMENT_UPDATE_MUTATION } from "../dist/linear/comment.js";
 import {
+  ISSUE_CREATE_E2E_FIXTURE_MUTATION,
+  ISSUE_DELETE_E2E_FIXTURE_MUTATION,
+} from "./e2e/linear-live-fixture.mjs";
+import {
   ISSUE_BY_IDENTIFIER_QUERY,
   ISSUE_LABEL_CREATE_MUTATION,
   ISSUE_LABELS_QUERY,
@@ -40,6 +44,11 @@ export const RETAINED_LINEAR_MUTATION_DOCUMENTS = Object.freeze([
   { name: "COMMENT_UPDATE_MUTATION", source: COMMENT_UPDATE_MUTATION },
 ]);
 
+export const E2E_LINEAR_FIXTURE_MUTATION_DOCUMENTS = Object.freeze([
+  { name: "ISSUE_CREATE_E2E_FIXTURE_MUTATION", source: ISSUE_CREATE_E2E_FIXTURE_MUTATION },
+  { name: "ISSUE_DELETE_E2E_FIXTURE_MUTATION", source: ISSUE_DELETE_E2E_FIXTURE_MUTATION },
+]);
+
 export async function fetchPinnedLinearSchema(
   fetchImpl = fetch,
   signal = AbortSignal.timeout(LINEAR_SCHEMA_FETCH_TIMEOUT_MS),
@@ -62,6 +71,7 @@ export function validateProductionDocumentsAgainstSchema(schemaSource) {
   for (const document of [
     ...PRODUCTION_LINEAR_READ_DOCUMENTS,
     ...RETAINED_LINEAR_MUTATION_DOCUMENTS,
+    ...E2E_LINEAR_FIXTURE_MUTATION_DOCUMENTS,
   ]) {
     const errors = validate(schema, parse(document.source));
     if (errors.length > 0) {
@@ -77,6 +87,7 @@ export function validateProductionDocumentsAgainstSchema(schemaSource) {
     schemaBytes: bytes,
     readDocumentCount: PRODUCTION_LINEAR_READ_DOCUMENTS.length,
     retainedMutationDocumentCount: RETAINED_LINEAR_MUTATION_DOCUMENTS.length,
+    e2eFixtureMutationDocumentCount: E2E_LINEAR_FIXTURE_MUTATION_DOCUMENTS.length,
     allDocumentsValid: true,
   };
 }

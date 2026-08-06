@@ -70,17 +70,17 @@ The fast transport and mapper tests use handwritten deterministic responses for
 precise request, retry, and malformed-data assertions. A separate conformance
 command first rebuilds the tracked TypeScript, then downloads Linear's immutable production schema at commit
 `eabc85d0df87617b4647e56d2f236e60bc2ed117`, verifies its pinned SHA-256, and
-validates every production query plus each retained offline mutation document:
+validates every production query, each retained offline mutation document, and
+the two fixed E2E fixture mutation documents:
 
 ```bash
 pnpm linear:test:schema
 ```
 
-The final behavior proof also rebuilds the tracked TypeScript before loading the
-ignored `dist/` runtime. It uses one stable synthetic issue created normally in
-a dedicated non-production Linear workspace and reads that issue through the
-production transport and `LinearItemSource`, exercises the single-item proposal
-path, and runs the forbidden-document matrix through a sentinel fetch:
+The inner behavior proof also rebuilds the tracked TypeScript before loading the
+ignored `dist/` runtime. It reads one caller-supplied issue through the production
+transport and `LinearItemSource`, exercises the single-item proposal path, and
+runs the forbidden-document matrix through a sentinel fetch:
 
 ```bash
 pnpm linear:proof:readonly -- \
@@ -97,6 +97,54 @@ proposal-only assertions; forbidden-case, rejection, fetch, and sleep counts;
 digests; and explicit limits. It never records headers, request/response bodies,
 titles, descriptions, comments, actor or project IDs, tokens, or endpoints.
 Repository-local output must be written below an ignored path.
+
+For portable real-API proof, an operator can instead use the explicit live E2E
+wrapper. The wrapper requires a caller-owned team UUID and two distinct,
+team-scoped personal keys: a setup key with Create issues plus Write/Delete
+authority, and a read-only key. Credentials are accepted only through the
+environment and never through argv:
+
+```bash
+LINEAR_E2E_SETUP_API_KEY=<team-scoped-setup-key> \
+LINEAR_E2E_READ_API_KEY=<team-scoped-read-key> \
+pnpm e2e:linear:live -- \
+  --team-id <CALLER_OWNED_TEAM_UUID> \
+  --fixture-alias <PUBLIC_SAFE_ALIAS> \
+  --base-tip upstream/main \
+  --output test-results/linear-live
+```
+
+`e2e:linear:live` is operator-only and is not part of `pnpm check` or pull-request
+CI. Its bootstrap captures and removes the two credentials from its environment,
+then rebuilds with a strict credential-free environment before loading the proof
+runtime. Its `readonly-issue-v1` fixture creates one harmless issue in its final form,
+without a project or labels. The inner child receives only the read credential
+and uses the same query-only production proof. In `finally`, the harness calls
+`issueDelete` for exactly the UUID returned by creation and verifies through the
+ordinary non-archived read query that the issue left the active workspace. Linear
+retains trashed issues for recovery for 30 days, so this is not permanent erasure.
+
+The ignored output separates `fixtureHarness` create/delete counts from
+`subjectUnderTest`, whose mutation count must remain zero. It contains only a
+public allowlisted receipt and bounded step statuses. Immediately after creation,
+the harness writes the private UUID and identifier to a mode-0600 recovery record
+under `<output>/private/`; it removes that record only after verified cleanup.
+Before creation, that record durably stores the explicit team UUID and a unique
+correlation UUID also embedded in the fixture title, so a lost create response is
+distinguishable from another run. After a successful response, an atomic,
+durably flushed rename replaces it with the exact returned UUID and identifier.
+The live harness is POSIX-only because Windows mode bits cannot enforce the
+recovery record's required owner-only access. SIGINT and SIGTERM receive
+best-effort cleanup. SIGKILL, a process crash, network
+loss, or a lost create response can still leave an active or recoverable fixture
+requiring operator handling. Raw provider responses, credentials, team UUIDs,
+issue identifiers, titles, and descriptions are not public artifacts.
+
+The live scenario proves one issue in one team. It does not prove optional
+project/label relationships, OAuth, webhooks, scheduling, broad workspace
+behavior, write recovery, Worker/R2 publication, deployment, merge safety, or
+OpenClaw Bay behavior. OpenClaw Bay is unaffected because this operator harness
+does not publish status to or add actions to the observer-only Bay surface.
 
 ## Read-Only Workflow
 

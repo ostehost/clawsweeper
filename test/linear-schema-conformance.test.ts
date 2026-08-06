@@ -38,6 +38,7 @@ test(
       schemaBytes: LINEAR_SCHEMA_BYTES,
       readDocumentCount: 5,
       retainedMutationDocumentCount: 4,
+      e2eFixtureMutationDocumentCount: 2,
       allDocumentsValid: true,
     });
   },

@@ -21,6 +21,14 @@ import { runLinearSchemaConformance } from "./linear-schema-conformance.mjs";
 
 export const READONLY_PROOF_COMMAND_VERSION = "1";
 
+export const READONLY_PROOF_LIMITS = Object.freeze([
+  "Proves one dedicated issue read through the production transport, source mapper, and proposal path.",
+  "Proves the deterministic forbidden-document matrix is rejected before fetch, retry, or sleep.",
+  "Does not prove scheduler or webhook operation, broad workspace coverage, write recovery, OAuth, comments, labels, workflow or priority mutation, Worker/R2 publication, deployment, merge safety, or OpenClaw Bay behavior.",
+  "The read-only subject under test attempts no live mutation; an outer E2E fixture harness may separately report setup and cleanup mutations.",
+  "artifactSha256 covers the canonical receipt fields excluding artifactSha256.",
+]);
+
 export const FORBIDDEN_LINEAR_DOCUMENTS = Object.freeze([
   { name: "bare mutation", source: "mutation Forbidden { issueUpdate { success } }" },
   {
@@ -244,13 +252,7 @@ export async function runReadonlyProof(options, deps = {}) {
       oauthTokenMintUsed: false,
     },
     forbiddenBoundary,
-    limits: [
-      "Proves one dedicated issue read through the production transport, source mapper, and proposal path.",
-      "Proves the deterministic forbidden-document matrix is rejected before fetch, retry, or sleep.",
-      "Does not prove scheduler or webhook operation, broad workspace coverage, write recovery, OAuth, comments, labels, workflow or priority mutation, Worker/R2 publication, deployment, merge safety, or OpenClaw Bay behavior.",
-      "No live mutation is attempted; zero forbidden transport invocation is the mutation-boundary proof.",
-      "artifactSha256 covers the canonical receipt fields excluding artifactSha256.",
-    ],
+    limits: READONLY_PROOF_LIMITS,
   };
   const artifactSha256 = sha256(JSON.stringify(coreReceipt));
   return { ...coreReceipt, artifactSha256 };
@@ -270,7 +272,7 @@ function gitValue(args) {
   }).trim();
 }
 
-function resolveGitMetadata(baseRef) {
+export function resolveGitMetadata(baseRef) {
   const trackedStatus = gitValue(["status", "--porcelain=v1", "--untracked-files=no"]);
   if (trackedStatus !== "") {
     throw new Error("proof requires a clean tracked worktree at the exact committed head");
@@ -331,7 +333,7 @@ function assertGitMetadata(metadata) {
   }
 }
 
-function assertNode24() {
+export function assertNode24() {
   const major = Number(process.versions.node.split(".")[0]);
   if (!Number.isInteger(major) || major < 24) {
     throw new Error("Linear read-only proof requires Node 24 or newer");

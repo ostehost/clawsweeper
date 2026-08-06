@@ -47,6 +47,7 @@ const SCHEMA_CONFORMANCE = {
   schemaBytes: 1_270_042,
   readDocumentCount: 5,
   retainedMutationDocumentCount: 4,
+  e2eFixtureMutationDocumentCount: 2,
   allDocumentsValid: true,
 };
 
