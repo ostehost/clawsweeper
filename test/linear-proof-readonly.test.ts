@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
   runReadonlyProof,
   writePublicReceipt,
 } from "../scripts/linear-proof-readonly.mjs";
+import { assertPrivateOutputDestination } from "../scripts/linear-private-output.mjs";
 
 test("proof package commands build the tracked TypeScript before loading dist", () => {
   const packageJson = JSON.parse(
@@ -32,6 +33,25 @@ test("proof output containment rejects an in-repository name beginning with two 
     () => assertSafeOutputPath("..proof/receipt.json"),
     /must be under an ignored path/,
   );
+  assert.throws(
+    () => assertSafeOutputPath("snapshot.json"),
+    /inside the repository must be under an ignored path/u,
+  );
+});
+
+test("private output validation rejects dangling symlinks and non-file destinations", () => {
+  const root = mkdtempSync(join(tmpdir(), "linear-private-output-"));
+  try {
+    const dangling = join(root, "dangling.json");
+    symlinkSync(join(root, "missing.json"), dangling);
+    assert.throws(() => assertSafeOutputPath(dangling), /must not be a symlink/u);
+    assert.throws(
+      () => assertPrivateOutputDestination(root),
+      /destination must be a regular file/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 const GIT_COORDINATES = {

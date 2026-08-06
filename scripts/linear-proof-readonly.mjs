@@ -2,8 +2,8 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -18,6 +18,9 @@ import {
   summarize,
 } from "./linear-comment-apply.mjs";
 import { runLinearSchemaConformance } from "./linear-schema-conformance.mjs";
+import { assertSafeOutputPath } from "./linear-private-output.mjs";
+
+export { assertSafeOutputPath };
 
 export const READONLY_PROOF_COMMAND_VERSION = "1";
 
@@ -285,37 +288,6 @@ export function resolveGitMetadata(baseRef) {
     mergeBase: gitValue(["merge-base", head, baseTip]),
     baseTip,
   };
-}
-
-function resolvePhysicalPath(path) {
-  const tail = [];
-  let cursor = resolve(path);
-  while (!existsSync(cursor)) {
-    const parent = dirname(cursor);
-    if (parent === cursor) break;
-    tail.unshift(basename(cursor));
-    cursor = parent;
-  }
-  return join(realpathSync(cursor), ...tail);
-}
-
-export function assertSafeOutputPath(path) {
-  const repoRoot = realpathSync(gitValue(["rev-parse", "--show-toplevel"]));
-  const absolutePath = resolvePhysicalPath(path);
-  const relativePath = relative(repoRoot, absolutePath);
-  const outsideRepository =
-    relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath);
-  if (!outsideRepository) {
-    try {
-      execFileSync("git", ["check-ignore", "-q", "--", relativePath], {
-        cwd: repoRoot,
-        stdio: "ignore",
-      });
-    } catch {
-      throw new Error("proof output inside the repository must be under an ignored path");
-    }
-  }
-  return absolutePath;
 }
 
 function assertGitMetadata(metadata) {

@@ -121,13 +121,37 @@ test("parseArgs rejects unknown args, missing values, and non-positive page size
 test("writeSnapshotFile creates the documented output parent before writing", () => {
   const calls: unknown[][] = [];
   writeSnapshotFile(".artifacts/linear-snapshot.json", '{"ok":true}', {
+    assertSafeOutputPath: (path: string) => path,
+    assertPrivateOutputDestination: () => false,
+    chmodSync: (...args: unknown[]) => calls.push(["chmod", ...args]),
     mkdirSync: (...args: unknown[]) => calls.push(["mkdir", ...args]),
     writeFileSync: (...args: unknown[]) => calls.push(["write", ...args]),
   });
   assert.deepEqual(calls, [
-    ["mkdir", ".artifacts", { recursive: true }],
-    ["write", ".artifacts/linear-snapshot.json", '{"ok":true}\n', "utf8"],
+    ["mkdir", ".artifacts", { recursive: true, mode: 0o700 }],
+    [
+      "write",
+      ".artifacts/linear-snapshot.json",
+      '{"ok":true}\n',
+      { encoding: "utf8", mode: 0o600 },
+    ],
+    ["chmod", ".artifacts/linear-snapshot.json", 0o600],
   ]);
+});
+
+test("writeSnapshotFile makes an existing destination private before replacing it", () => {
+  const calls: unknown[][] = [];
+  writeSnapshotFile(".artifacts/linear-snapshot.json", '{"ok":true}', {
+    assertSafeOutputPath: (path: string) => path,
+    assertPrivateOutputDestination: () => true,
+    chmodSync: (...args: unknown[]) => calls.push(["chmod", ...args]),
+    mkdirSync: () => undefined,
+    writeFileSync: (...args: unknown[]) => calls.push(["write", ...args]),
+  });
+  assert.deepEqual(
+    calls.map((call) => call[0]),
+    ["chmod", "write", "chmod"],
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -499,15 +499,18 @@ model_revision: "current-public-revision"
 
 test("writeAnalyzerRecord noops when the local proposal is already byte-identical", () => {
   let writes = 0;
+  const modes: number[] = [];
   const path = writeAnalyzerRecord(
     {
       recordPath: "records/openclaw-clawhub/items/PAR-42.md",
       recordBody: "record-body\n",
     },
     {
-      existsSync: () => true,
+      assertSafeOutputPath: (path: string) => path,
+      assertPrivateOutputDestination: () => true,
       readFileSync: () => "record-body\n",
       mkdirSync: () => undefined,
+      chmodSync: (_path: string, mode: number) => modes.push(mode),
       writeFileSync: () => {
         writes += 1;
       },
@@ -515,6 +518,7 @@ test("writeAnalyzerRecord noops when the local proposal is already byte-identica
   );
   assert.match(path, /records\/openclaw-clawhub\/items\/PAR-42\.md$/);
   assert.equal(writes, 0);
+  assert.deepEqual(modes, [0o600]);
 });
 
 test("writeAnalyzerRecord writes then requires byte-identical read-back", () => {
@@ -525,9 +529,11 @@ test("writeAnalyzerRecord writes then requires byte-identical read-back", () => 
       recordBody: "record-body\n",
     },
     {
-      existsSync: () => persisted !== "",
+      assertSafeOutputPath: (path: string) => path,
+      assertPrivateOutputDestination: () => persisted !== "",
       readFileSync: () => persisted,
       mkdirSync: () => undefined,
+      chmodSync: () => undefined,
       writeFileSync: (_path, body) => {
         persisted = body;
       },
@@ -543,14 +549,40 @@ test("writeAnalyzerRecord writes then requires byte-identical read-back", () => 
           recordBody: "expected\n",
         },
         {
-          existsSync: () => false,
+          assertSafeOutputPath: (path: string) => path,
+          assertPrivateOutputDestination: () => false,
           readFileSync: () => "corrupt\n",
           mkdirSync: () => undefined,
+          chmodSync: () => undefined,
           writeFileSync: () => undefined,
         },
       ),
     /record read-back mismatch/,
   );
+});
+
+test("writeAnalyzerRecord makes an existing destination private before replacing it", () => {
+  const calls: string[] = [];
+  let persisted = "old-record\n";
+  writeAnalyzerRecord(
+    {
+      recordPath: "records/openclaw-clawhub/items/PAR-42.md",
+      recordBody: "new-record\n",
+    },
+    {
+      assertSafeOutputPath: (path: string) => path,
+      assertPrivateOutputDestination: () => true,
+      readFileSync: () => persisted,
+      mkdirSync: () => undefined,
+      chmodSync: () => calls.push("chmod"),
+      writeFileSync: (_path, body) => {
+        calls.push("write");
+        persisted = String(body);
+      },
+    },
+  );
+  assert.deepEqual(calls, ["chmod", "write", "chmod"]);
+  assert.equal(persisted, "new-record\n");
 });
 
 // ---------------------------------------------------------------------------

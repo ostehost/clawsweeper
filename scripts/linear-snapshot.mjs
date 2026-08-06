@@ -25,7 +25,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +34,7 @@ import {
   firstNonBlankLinearToken,
   LinearItemSource,
 } from "../dist/linear/index.js";
+import { assertPrivateOutputDestination, assertSafeOutputPath } from "./linear-private-output.mjs";
 
 /** Default macOS Keychain generic-password coordinates for the hub Linear key. */
 export const DEFAULT_KEYCHAIN_SERVICE = "openclaw-linear-api-key";
@@ -43,10 +44,18 @@ export const DEFAULT_KEYCHAIN_ACCOUNT = "partnerai-config";
 export const SNAPSHOT_SCHEMA = "linear_workspace_snapshot_v1";
 
 export function writeSnapshotFile(path, serialized, deps = {}) {
+  const assertOutputPath = deps.assertSafeOutputPath ?? assertSafeOutputPath;
+  const assertDestination = deps.assertPrivateOutputDestination ?? assertPrivateOutputDestination;
+  const chmod = deps.chmodSync ?? chmodSync;
   const mkdir = deps.mkdirSync ?? mkdirSync;
   const write = deps.writeFileSync ?? writeFileSync;
-  mkdir(dirname(path), { recursive: true });
-  write(path, serialized + "\n", "utf8");
+  const safePath = assertOutputPath(path);
+  const destinationExists = assertDestination(safePath);
+  mkdir(dirname(safePath), { recursive: true, mode: 0o700 });
+  if (destinationExists) chmod(safePath, 0o600);
+  write(safePath, serialized + "\n", { encoding: "utf8", mode: 0o600 });
+  chmod(safePath, 0o600);
+  return safePath;
 }
 
 export function parseArgs(argv) {
@@ -304,7 +313,7 @@ Options:
   --team <KEY>               Restrict to this team key (repeatable; default: all teams)
   --updated-after <iso>      Only issues updated after this ISO 8601 timestamp
   --page-size <n>            GraphQL page size (default: source default of 250)
-  --out <path>              Write snapshot to a file instead of stdout
+  --out <path>              Write mode-0600 snapshot (repository paths must be ignored)
   --keychain-service <s>     Keychain service for the token (default: ${DEFAULT_KEYCHAIN_SERVICE})
   --keychain-account <a>     Keychain account for the token (default: ${DEFAULT_KEYCHAIN_ACCOUNT})
   --help, -h                 Show this help message
@@ -313,7 +322,7 @@ Auth: LINEAR_API_KEY or LINEAR_TOKEN in the environment, else the macOS Keychain
 generic password (service ${DEFAULT_KEYCHAIN_SERVICE}, account ${DEFAULT_KEYCHAIN_ACCOUNT}).
 
 Examples:
-  node scripts/linear-snapshot.mjs --team PAR --out snapshot.json
+  node scripts/linear-snapshot.mjs --team PAR --out .artifacts/linear-snapshot.json
   node scripts/linear-snapshot.mjs --team PAR | node scripts/linear-triage.mjs --review-only --json
   node scripts/linear-snapshot.mjs --updated-after 2026-06-01T00:00:00Z --team PAR`;
 }

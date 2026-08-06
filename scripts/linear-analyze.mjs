@@ -25,7 +25,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,6 +63,7 @@ import {
   resolveReadToken,
   DEFAULT_KEYCHAIN_ACCOUNT,
 } from "./linear-comment-apply.mjs";
+import { assertPrivateOutputDestination, assertSafeOutputPath } from "./linear-private-output.mjs";
 
 const DEFAULT_STALE_DAYS = 60;
 const DEFAULT_REASONING_EFFORT = "high";
@@ -962,14 +963,22 @@ export async function analyzeItem(hydrated, options, deps) {
 
 /** Writes and reads back the local sidecar proposal. This does not publish canonical state. */
 export function writeAnalyzerRecord(summary, deps = {}) {
+  const assertOutputPath = deps.assertSafeOutputPath ?? assertSafeOutputPath;
+  const assertDestination = deps.assertPrivateOutputDestination ?? assertPrivateOutputDestination;
   const write = deps.writeFileSync ?? writeFileSync;
   const mkdir = deps.mkdirSync ?? mkdirSync;
-  const exists = deps.existsSync ?? existsSync;
   const read = deps.readFileSync ?? readFileSync;
-  const path = join(ROOT, summary.recordPath);
-  if (exists(path) && read(path, "utf8") === summary.recordBody) return path;
-  mkdir(dirname(path), { recursive: true });
-  write(path, summary.recordBody, "utf8");
+  const chmod = deps.chmodSync ?? chmodSync;
+  const path = assertOutputPath(join(ROOT, summary.recordPath));
+  const destinationExists = assertDestination(path);
+  if (destinationExists && read(path, "utf8") === summary.recordBody) {
+    chmod(path, 0o600);
+    return path;
+  }
+  mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  if (destinationExists) chmod(path, 0o600);
+  write(path, summary.recordBody, { encoding: "utf8", mode: 0o600 });
+  chmod(path, 0o600);
   if (read(path, "utf8") !== summary.recordBody) {
     throw new Error(`record read-back mismatch: ${summary.recordPath}`);
   }
