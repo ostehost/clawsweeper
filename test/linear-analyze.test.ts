@@ -281,7 +281,7 @@ test("resolveLinearAnalysisModel preserves the trusted model across ignored user
   );
 });
 
-test("makeGitShaVerifier accepts only commits reachable from the analyzed main", () => {
+test("makeGitShaVerifier accepts only commits reachable from the analyzed revision", () => {
   const calls = [];
   const verify = makeGitShaVerifier("/repo", "main-sha", {
     execFileSync: (_command, args) => {
@@ -295,7 +295,7 @@ test("makeGitShaVerifier accepts only commits reachable from the analyzed main",
   assert.deepEqual(calls[1], ["merge-base", "--is-ancestor", "full-candidate", "main-sha"]);
 });
 
-test("assertAnalysisCheckout requires clean main at the live canonical remote tip", () => {
+test("assertAnalysisCheckout requires the clean live canonical remote default-branch tip", () => {
   const head = "a".repeat(40);
   const execFileSync = (_command, args) => {
     const key = args.join(" ");
@@ -303,6 +303,9 @@ test("assertAnalysisCheckout requires clean main at the live canonical remote ti
     if (key === "status --porcelain") return "";
     if (key === "rev-parse HEAD") return `${head}\n`;
     if (key === "remote get-url upstream") return "https://github.com/openclaw/example.git\n";
+    if (key === "ls-remote --symref upstream HEAD") {
+      return `ref: refs/heads/main\tHEAD\n${head}\tHEAD\n`;
+    }
     if (key === "ls-remote upstream refs/heads/main") return `${head}\trefs/heads/main\n`;
     throw new Error(`unexpected git ${key}`);
   };
@@ -310,11 +313,75 @@ test("assertAnalysisCheckout requires clean main at the live canonical remote ti
   assert.deepEqual(assertAnalysisCheckout("/repo", "openclaw/example", { execFileSync }), {
     head,
     remote: "upstream",
+    branch: "main",
   });
 
   assert.throws(
     () => assertAnalysisCheckout("/repo", "openclaw/other", { execFileSync }),
     /does not match inferred repository openclaw\/other/,
+  );
+});
+
+test("assertAnalysisCheckout accepts a non-main canonical default branch", () => {
+  const head = "b".repeat(40);
+  const execFileSync = (_command, args) => {
+    const key = args.join(" ");
+    if (key === "symbolic-ref --short HEAD") return "stable\n";
+    if (key === "status --porcelain") return "";
+    if (key === "rev-parse HEAD") return `${head}\n`;
+    if (key === "remote get-url upstream") throw new Error("no upstream");
+    if (key === "remote get-url origin") return "git@github.com:openclaw/example.git\n";
+    if (key === "ls-remote --symref origin HEAD") {
+      return `ref: refs/heads/stable\tHEAD\n${head}\tHEAD\n`;
+    }
+    if (key === "ls-remote origin refs/heads/stable") {
+      return `${head}\trefs/heads/stable\n`;
+    }
+    throw new Error(`unexpected git ${key}`);
+  };
+
+  assert.deepEqual(assertAnalysisCheckout("/repo", "openclaw/example", { execFileSync }), {
+    head,
+    remote: "origin",
+    branch: "stable",
+  });
+});
+
+test("assertAnalysisCheckout rejects a checkout off the canonical default branch", () => {
+  const head = "c".repeat(40);
+  const execFileSync = (_command, args) => {
+    const key = args.join(" ");
+    if (key === "symbolic-ref --short HEAD") return "main\n";
+    if (key === "status --porcelain") return "";
+    if (key === "rev-parse HEAD") return `${head}\n`;
+    if (key === "remote get-url upstream") return "https://github.com/openclaw/example.git\n";
+    if (key === "ls-remote --symref upstream HEAD") {
+      return `ref: refs/heads/stable\tHEAD\n${head}\tHEAD\n`;
+    }
+    throw new Error(`unexpected git ${key}`);
+  };
+
+  assert.throws(
+    () => assertAnalysisCheckout("/repo", "openclaw/example", { execFileSync }),
+    /must be on upstream default branch stable, got main/,
+  );
+});
+
+test("assertAnalysisCheckout fails closed when the remote default branch is unavailable", () => {
+  const head = "d".repeat(40);
+  const execFileSync = (_command, args) => {
+    const key = args.join(" ");
+    if (key === "symbolic-ref --short HEAD") return "main\n";
+    if (key === "status --porcelain") return "";
+    if (key === "rev-parse HEAD") return `${head}\n`;
+    if (key === "remote get-url upstream") return "https://github.com/openclaw/example.git\n";
+    if (key === "ls-remote --symref upstream HEAD") return `${head}\tHEAD\n`;
+    throw new Error(`unexpected git ${key}`);
+  };
+
+  assert.throws(
+    () => assertAnalysisCheckout("/repo", "openclaw/example", { execFileSync }),
+    /could not resolve upstream default branch for analysis/,
   );
 });
 
