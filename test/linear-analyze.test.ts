@@ -18,10 +18,10 @@ import {
   LINEAR_ANALYSIS_PERMISSION_PROFILE,
   linearAnalysisCodexArgs,
   linearAnalysisEnv,
+  linearAnalysisModelRevision,
   makeGitShaVerifier,
   parseArgs,
   resolveLinearAnalysisModel,
-  resolveLinearAnalysisModelRevision,
   resolveAnalysisRepo,
   repoInferenceItemFor,
   serializeUntrustedIssueData,
@@ -283,23 +283,27 @@ test("resolveLinearAnalysisModel preserves the trusted model across ignored user
   );
 });
 
-test("resolveLinearAnalysisModelRevision requires an independent public-safe revision", () => {
-  assert.equal(
-    resolveLinearAnalysisModelRevision({
-      env: { CLAWSWEEPER_INTERNAL_MODEL_REVISION: " analysis-model-v2 " },
-    }),
-    "analysis-model-v2",
+test("linearAnalysisModelRevision binds model changes without exposing model or credential", () => {
+  const credential = "linear-read-credential-for-tests";
+  const first = linearAnalysisModelRevision("private-model-a", credential);
+  const repeated = linearAnalysisModelRevision(" private-model-a ", ` ${credential} `);
+  const changedModel = linearAnalysisModelRevision("private-model-b", credential);
+  const changedCredential = linearAnalysisModelRevision(
+    "private-model-a",
+    "different-linear-read-credential",
+  );
+  assert.match(first, /^[0-9a-f]{64}$/u);
+  assert.equal(repeated, first);
+  assert.notEqual(changedModel, first);
+  assert.notEqual(changedCredential, first);
+  assert.doesNotMatch(first, /private-model|linear-read/u);
+  assert.throws(
+    () => linearAnalysisModelRevision("private-model-a", "short"),
+    /requires a resolved model and read credential/u,
   );
   assert.throws(
-    () => resolveLinearAnalysisModelRevision({ env: {} }),
-    /requires a public-safe opaque CLAWSWEEPER_INTERNAL_MODEL_REVISION/u,
-  );
-  assert.throws(
-    () =>
-      resolveLinearAnalysisModelRevision({
-        env: { CLAWSWEEPER_INTERNAL_MODEL_REVISION: "private model name" },
-      }),
-    /requires a public-safe opaque/u,
+    () => linearAnalysisModelRevision("", credential),
+    /requires a resolved model and read credential/u,
   );
 });
 

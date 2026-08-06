@@ -200,14 +200,14 @@ any other ambiguous source evidence.
 Run the read-only model against the inferred local repository checkout:
 
 ```bash
-CLAWSWEEPER_INTERNAL_MODEL_REVISION=analysis-model-v1 \
-  pnpm linear:analyze -- --identifier PAR-244 --analyze --json
+pnpm linear:analyze -- --identifier PAR-244 --analyze --json
 ```
 
-`CLAWSWEEPER_INTERNAL_MODEL_REVISION` is a public-safe opaque cache revision,
-not the private model name. Change it whenever the configured model changes. A
-dry run without this revision remains read-only but reports cache status as
-unavailable instead of comparing against the public `internal` alias.
+The persisted model revision is a public HMAC identity derived in-process from
+the resolved private model and the already-required Linear read credential. It
+changes automatically when either rotates without publishing either value. A
+dry run that cannot resolve both inputs remains read-only but reports cache
+status as unavailable instead of comparing against the public `internal` alias.
 
 Analysis fails closed unless that checkout is clean, on `main`, and exactly at
 the live canonical remote's `main` tip. Close-leaning advice additionally

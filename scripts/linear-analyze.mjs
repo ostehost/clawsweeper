@@ -24,7 +24,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -182,21 +182,17 @@ export function resolveLinearAnalysisModel(options = {}) {
   );
 }
 
-/**
- * Resolve the public, operator-controlled cache revision independently of the private model
- * name. Operators must change this value whenever the configured analysis model changes.
- */
-export function resolveLinearAnalysisModelRevision(options = {}) {
-  const env = options.env ?? process.env;
-  const revision = String(
-    options.requestedRevision ?? env.CLAWSWEEPER_INTERNAL_MODEL_REVISION ?? "",
-  ).trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(revision)) {
-    throw new Error(
-      "Linear analysis requires a public-safe opaque CLAWSWEEPER_INTERNAL_MODEL_REVISION",
-    );
+/** Derives a public cache identity without persisting or exposing the private model name. */
+export function linearAnalysisModelRevision(model, readCredential) {
+  const normalizedModel = String(model ?? "").trim();
+  const key = String(readCredential ?? "").trim();
+  if (normalizedModel === "" || key.length < 16) {
+    throw new Error("Linear analysis requires a resolved model and read credential");
   }
-  return revision;
+  return createHmac("sha256", key)
+    .update("clawsweeper-linear-analysis-model\0")
+    .update(normalizedModel)
+    .digest("hex");
 }
 
 /**
@@ -1037,7 +1033,7 @@ async function main() {
       const checkoutDir = join(options.checkoutsDir, profile.checkoutDir);
       const { head: repoHead } = assertAnalysisCheckout(checkoutDir, profile.targetRepo);
       const model = resolveLinearAnalysisModel();
-      const modelRevision = resolveLinearAnalysisModelRevision();
+      const modelRevision = linearAnalysisModelRevision(model, readToken);
       runModelDeps = {
         repoHead,
         modelRevision,
@@ -1069,7 +1065,7 @@ async function main() {
       const checkoutDir = join(options.checkoutsDir, profile.checkoutDir);
       let modelRevision;
       try {
-        modelRevision = resolveLinearAnalysisModelRevision();
+        modelRevision = linearAnalysisModelRevision(resolveLinearAnalysisModel(), readToken);
       } catch {
         modelRevision = undefined;
       }
