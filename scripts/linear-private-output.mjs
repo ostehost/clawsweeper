@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /** POSIX mode bits are the privacy boundary for these operator-owned artifacts. */
@@ -82,5 +82,39 @@ export function assertPrivateOutputDestination(path, deps = {}) {
   if (!stat.isFile()) {
     throw new Error("private Linear output destination must be a regular file");
   }
+  return true;
+}
+
+/** Returns whether a private workspace exists, rejecting links and non-directories. */
+export function assertPrivateOutputDirectory(path, deps = {}) {
+  const lstat = deps.lstatSync ?? lstatSync;
+  let stat;
+  try {
+    stat = lstat(path);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!stat.isDirectory()) {
+    throw new Error("private Linear output workspace must be a directory");
+  }
+  return true;
+}
+
+/** Removes one intermediate output name without following links or recursing into directories. */
+export function removePrivateOutputFile(path, deps = {}) {
+  const lstat = deps.lstatSync ?? lstatSync;
+  const unlink = deps.unlinkSync ?? unlinkSync;
+  let stat;
+  try {
+    stat = lstat(path);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (stat.isDirectory()) {
+    throw new Error("private Linear intermediate output must not be a directory");
+  }
+  unlink(path);
   return true;
 }

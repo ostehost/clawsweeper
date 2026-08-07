@@ -25,6 +25,7 @@ import {
   resolveLinearAnalysisModel,
   resolveAnalysisRepo,
   repoInferenceItemFor,
+  runLinearAnalysisCodex,
   serializeUntrustedIssueData,
   toAnalyzerDecision,
   writeAnalyzerRecord,
@@ -315,6 +316,146 @@ test("assertLinearAnalysisOutputPlatform rejects Windows model runs but permits 
     () => assertLinearAnalysisOutputPlatform({ analyze: true }, "win32"),
     /Windows is unsupported/u,
   );
+});
+
+test("runLinearAnalysisCodex protects and removes its intermediate decision", () => {
+  const calls: Array<[string, unknown?]> = [];
+  let directoryExists = false;
+  let outputExists = false;
+  const decision = makeModelDecision();
+  const result = runLinearAnalysisCodex(
+    {
+      item: { number: 42 },
+      outputKey: "PAR-42",
+      prompt: "review",
+      model: "configured-model",
+      openclawDir: "/repo",
+      reasoningEffort: "high",
+      timeoutMs: 1_000,
+      workDir: "/private/linear-analyze",
+    },
+    {
+      assertSafeOutputPath: (path: string) => path,
+      assertPrivateOutputDirectory: () => directoryExists,
+      mkdirSync: (path: string, options: unknown) => {
+        calls.push(["mkdir", { path, options }]);
+        directoryExists = true;
+      },
+      chmodSync: (path: string, mode: number) => calls.push(["chmod", { path, mode }]),
+      assertPrivateOutputDestination: () => outputExists,
+      runAgentProcess: (options: { codexExtraArgs: string[] }) => {
+        calls.push(["run", options.codexExtraArgs]);
+        outputExists = true;
+        return { status: 0 };
+      },
+      readFileSync: () => JSON.stringify(decision),
+      parseDecision: (value: unknown) => value,
+      removePrivateOutputFile: (path: string) => {
+        calls.push(["remove", path]);
+        outputExists = false;
+        return true;
+      },
+    },
+  );
+
+  assert.deepEqual(result, decision);
+  assert.equal(outputExists, false);
+  assert.deepEqual(calls[0], [
+    "mkdir",
+    { path: "/private/linear-analyze", options: { recursive: true, mode: 0o700 } },
+  ]);
+  assert.ok(
+    calls.some(
+      ([name, detail]) =>
+        name === "chmod" &&
+        (detail as { path: string; mode: number }).path === "/private/linear-analyze" &&
+        (detail as { path: string; mode: number }).mode === 0o700,
+    ),
+  );
+  assert.ok(
+    calls.some(
+      ([name, detail]) =>
+        name === "chmod" &&
+        (detail as { path: string; mode: number }).path.endsWith("/PAR-42.json") &&
+        (detail as { path: string; mode: number }).mode === 0o600,
+    ),
+  );
+  assert.deepEqual(calls.at(-1), ["remove", "/private/linear-analyze/PAR-42.json"]);
+});
+
+test("runLinearAnalysisCodex removes intermediate output after model failure", () => {
+  let removed = false;
+  assert.throws(
+    () =>
+      runLinearAnalysisCodex(
+        {
+          item: { number: 42 },
+          outputKey: "PAR-42",
+          prompt: "review",
+          model: "configured-model",
+          openclawDir: "/repo",
+          reasoningEffort: "high",
+          timeoutMs: 1_000,
+          workDir: "/private/linear-analyze",
+        },
+        {
+          assertSafeOutputPath: (path: string) => path,
+          assertPrivateOutputDirectory: () => true,
+          chmodSync: () => undefined,
+          assertPrivateOutputDestination: () => false,
+          runAgentProcess: () => ({ status: 1 }),
+          removePrivateOutputFile: () => {
+            removed = true;
+            return true;
+          },
+        },
+      ),
+    /Linear Codex analysis failed: exit 1/u,
+  );
+  assert.equal(removed, true);
+});
+
+test("runLinearAnalysisCodex rejects unsafe model output before reading and still cleans it", () => {
+  let destinationChecks = 0;
+  let read = false;
+  let removed = false;
+  assert.throws(
+    () =>
+      runLinearAnalysisCodex(
+        {
+          item: { number: 42 },
+          outputKey: "PAR-42",
+          prompt: "review",
+          model: "configured-model",
+          openclawDir: "/repo",
+          reasoningEffort: "high",
+          timeoutMs: 1_000,
+          workDir: "/private/linear-analyze",
+        },
+        {
+          assertSafeOutputPath: (path: string) => path,
+          assertPrivateOutputDirectory: () => true,
+          chmodSync: () => undefined,
+          assertPrivateOutputDestination: () => {
+            destinationChecks += 1;
+            if (destinationChecks === 1) return false;
+            throw new Error("private Linear output destination must be a regular file");
+          },
+          runAgentProcess: () => ({ status: 0 }),
+          readFileSync: () => {
+            read = true;
+            return "{}";
+          },
+          removePrivateOutputFile: () => {
+            removed = true;
+            return true;
+          },
+        },
+      ),
+    /destination must be a regular file/u,
+  );
+  assert.equal(read, false);
+  assert.equal(removed, true);
 });
 
 test("makeGitShaVerifier accepts only commits reachable from the analyzed revision", () => {

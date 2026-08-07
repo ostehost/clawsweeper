@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,11 @@ import {
   runReadonlyProof,
   writePublicReceipt,
 } from "../scripts/linear-proof-readonly.mjs";
-import { assertPrivateOutputDestination } from "../scripts/linear-private-output.mjs";
+import {
+  assertPrivateOutputDestination,
+  assertPrivateOutputDirectory,
+  removePrivateOutputFile,
+} from "../scripts/linear-private-output.mjs";
 
 test("proof package commands build the tracked TypeScript before loading dist", () => {
   const packageJson = JSON.parse(
@@ -48,6 +52,29 @@ test("private output validation rejects dangling symlinks and non-file destinati
     assert.throws(
       () => assertPrivateOutputDestination(root),
       /destination must be a regular file/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private output workspace validation and cleanup never follow symlinks", () => {
+  const root = mkdtempSync(join(tmpdir(), "linear-private-workspace-"));
+  try {
+    const target = join(root, "target.json");
+    const link = join(root, "decision.json");
+    writeFileSync(target, "private\n");
+    symlinkSync(target, link);
+
+    assert.equal(assertPrivateOutputDirectory(root), true);
+    assert.throws(() => assertPrivateOutputDirectory(link), /workspace must be a directory/u);
+    assert.equal(removePrivateOutputFile(link), true);
+    assert.equal(existsSync(link), false);
+    assert.equal(readFileSync(target, "utf8"), "private\n");
+    assert.equal(removePrivateOutputFile(join(root, "missing.json")), false);
+    assert.throws(
+      () => removePrivateOutputFile(root),
+      /intermediate output must not be a directory/u,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -217,7 +217,10 @@ the live canonical remote's `main` tip. Close-leaning advice additionally
 requires at least one cited commit reachable from that revision. The Codex
 subprocess receives neither Linear read tokens nor Linear OAuth credentials,
 and its generated commands cannot read the operator's home or Codex credential
-store. Policy-protected items are skipped before model execution.
+store. Its intermediate decision is created beneath a mode-`0700` private
+workspace, validated as a regular file, tightened to mode `0600`, and removed
+after parsing or failure. Policy-protected items are skipped before model
+execution.
 
 Repository inference fails closed when links and labels do not identify exactly
 one supported repository. Model output is validated with ClawSweeper's current

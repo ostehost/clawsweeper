@@ -25,7 +25,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,8 +66,10 @@ import {
 } from "./linear-comment-apply.mjs";
 import {
   assertPrivateOutputDestination,
+  assertPrivateOutputDirectory,
   assertPrivateOutputPlatform,
   assertSafeOutputPath,
+  removePrivateOutputFile,
 } from "./linear-private-output.mjs";
 
 const DEFAULT_STALE_DAYS = 60;
@@ -234,32 +236,56 @@ export function serializeUntrustedIssueData(value) {
   );
 }
 
-function runCodex(options) {
-  mkdirSync(options.workDir, { recursive: true });
-  const outputKey = analysisOutputKey(options.outputKey ?? options.item.number);
-  const outputPath = join(options.workDir, `${outputKey}.json`);
-  if (existsSync(outputPath)) unlinkSync(outputPath);
+export function runLinearAnalysisCodex(options, deps = {}) {
+  const assertOutputPath = deps.assertSafeOutputPath ?? assertSafeOutputPath;
+  const assertDirectory = deps.assertPrivateOutputDirectory ?? assertPrivateOutputDirectory;
+  const assertDestination = deps.assertPrivateOutputDestination ?? assertPrivateOutputDestination;
+  const removeOutput = deps.removePrivateOutputFile ?? removePrivateOutputFile;
+  const mkdir = deps.mkdirSync ?? mkdirSync;
+  const chmod = deps.chmodSync ?? chmodSync;
+  const read = deps.readFileSync ?? readFileSync;
+  const runAgent = deps.runAgentProcess ?? runAgentProcess;
+  const parse = deps.parseDecision ?? parseDecision;
 
-  const result = runAgentProcess({
-    label: `linear-review-${options.item.number}`,
-    prompt: options.prompt,
-    model: options.model,
-    reasoningEffort: options.reasoningEffort,
-    cwd: options.openclawDir,
-    env: linearAnalysisEnv(),
-    timeoutMs: options.timeoutMs,
-    codexExtraArgs: linearAnalysisCodexArgs({
-      model: options.model,
-      openclawDir: options.openclawDir,
-      outputPath,
-    }),
-  });
-
-  if (result.error || result.status !== 0 || !existsSync(outputPath)) {
-    const detail = result.error?.message ?? `exit ${result.status ?? "unknown"}`;
-    throw new Error(`Linear Codex analysis failed: ${detail}`);
+  const workDir = assertOutputPath(options.workDir);
+  if (!assertDirectory(workDir)) mkdir(workDir, { recursive: true, mode: 0o700 });
+  if (!assertDirectory(workDir)) {
+    throw new Error("private Linear output workspace was not created");
   }
-  return parseDecision(JSON.parse(readFileSync(outputPath, "utf8").trim()), options.item);
+  chmod(workDir, 0o700);
+
+  const outputKey = analysisOutputKey(options.outputKey ?? options.item.number);
+  const outputPath = join(workDir, `${outputKey}.json`);
+  if (assertDestination(outputPath)) {
+    chmod(outputPath, 0o600);
+    removeOutput(outputPath);
+  }
+
+  try {
+    const result = runAgent({
+      label: `linear-review-${options.item.number}`,
+      prompt: options.prompt,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+      cwd: options.openclawDir,
+      env: linearAnalysisEnv(),
+      timeoutMs: options.timeoutMs,
+      codexExtraArgs: linearAnalysisCodexArgs({
+        model: options.model,
+        openclawDir: options.openclawDir,
+        outputPath,
+      }),
+    });
+
+    if (result.error || result.status !== 0 || !assertDestination(outputPath)) {
+      const detail = result.error?.message ?? `exit ${result.status ?? "unknown"}`;
+      throw new Error(`Linear Codex analysis failed: ${detail}`);
+    }
+    chmod(outputPath, 0o600);
+    return parse(JSON.parse(read(outputPath, "utf8").trim()), options.item);
+  } finally {
+    removeOutput(outputPath);
+  }
 }
 
 export function parseArgs(argv) {
@@ -1072,7 +1098,7 @@ async function main() {
         runModel: async ({ profile: p, repoHead: head }) => {
           const { item, context, git } = buildHarnessInputs(hydrated, p, head);
           const prompt = buildAnalysisPrompt(hydrated, p, git.mainSha || head);
-          const decision = runCodex({
+          const decision = runLinearAnalysisCodex({
             item,
             outputKey: hydrated.issue.identifier,
             context,
