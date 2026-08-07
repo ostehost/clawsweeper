@@ -34,8 +34,11 @@ test("test runner expands named targets with sorted de-duplicated files", () => 
     "test/z.test.ts",
     "test/a.test.ts",
     "test/repair/b.test.ts",
+    "src/repair/z.test.ts",
+    "src/repair/fix-prompt-builder.test.ts",
     "dist/repair/z.test.js",
     "dist/repair/fix-prompt-builder.test.js",
+    "dist/repair/stale.test.js",
   ]);
   try {
     assert.deepEqual(resolveTestFiles("unit", root), ["test/a.test.ts", "test/z.test.ts"]);

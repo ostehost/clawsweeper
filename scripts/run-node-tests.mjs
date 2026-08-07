@@ -16,8 +16,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { globSync } from "node:fs";
+import { existsSync, globSync } from "node:fs";
 import { availableParallelism, devNull } from "node:os";
+import { join } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
@@ -123,7 +124,15 @@ export function resolveTestFiles(target, cwd = process.cwd()) {
   const patterns = TARGET_PATTERNS[target];
   if (!patterns) throw new Error(`Unknown test target: ${target}.`);
 
-  return [...new Set(patterns.flatMap((pattern) => globSync(pattern, { cwd })))].sort();
+  return [...new Set(patterns.flatMap((pattern) => globSync(pattern, { cwd })))]
+    .filter((file) => hasCurrentTestSource(file, cwd))
+    .sort();
+}
+
+function hasCurrentTestSource(file, cwd) {
+  if (!file.startsWith("dist/repair/") || !file.endsWith(".test.js")) return true;
+  const source = `src/repair/${file.slice("dist/repair/".length, -".js".length)}.ts`;
+  return existsSync(join(cwd, source));
 }
 
 export async function runNodeTests({
