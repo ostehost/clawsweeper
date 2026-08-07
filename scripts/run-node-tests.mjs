@@ -17,7 +17,7 @@
 
 import { spawn } from "node:child_process";
 import { globSync } from "node:fs";
-import { availableParallelism } from "node:os";
+import { availableParallelism, devNull } from "node:os";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
@@ -133,6 +133,7 @@ export async function runNodeTests({
   cwd = process.cwd(),
   spawnProcess = spawn,
   signalSource = process,
+  environment = process.env,
 } = {}) {
   const files = resolveTestFiles(target, cwd);
   if (files.length === 0) {
@@ -145,7 +146,16 @@ export async function runNodeTests({
   const child = spawnProcess(
     process.execPath,
     ["--test", `--test-concurrency=${concurrency}`, ...nodeArguments, ...files],
-    { cwd, stdio: "inherit" },
+    {
+      cwd,
+      stdio: "inherit",
+      env: {
+        ...environment,
+        // Git-backed fixtures must not execute developer-global hooks. They
+        // retain repository-local configuration and .git/hooks behavior.
+        GIT_CONFIG_GLOBAL: devNull,
+      },
+    },
   );
 
   return new Promise((resolve, reject) => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import {
@@ -131,7 +131,12 @@ test("test runner fails clearly when a target has no files", async () => {
 test("test runner preserves child arguments, exit codes, and terminating signals", async () => {
   const root = createFixture(["test/a.test.ts"]);
   const signalSource = new EventEmitter();
-  const spawned: { command?: string; arguments?: string[]; killed?: NodeJS.Signals } = {};
+  const spawned: {
+    command?: string;
+    arguments?: string[];
+    options?: { env?: NodeJS.ProcessEnv };
+    killed?: NodeJS.Signals;
+  } = {};
   const child = new EventEmitter() as EventEmitter & { kill(signal: NodeJS.Signals): boolean };
   child.kill = (signal) => {
     spawned.killed = signal;
@@ -144,9 +149,11 @@ test("test runner preserves child arguments, exit codes, and terminating signals
       concurrency: 4,
       cwd: root,
       signalSource,
-      spawnProcess(command: string, arguments_: string[]) {
+      environment: { PATH: "/fixture/bin", GIT_CONFIG_GLOBAL: "/unsafe/global/config" },
+      spawnProcess(command: string, arguments_: string[], options: { env?: NodeJS.ProcessEnv }) {
         spawned.command = command;
         spawned.arguments = arguments_;
+        spawned.options = options;
         queueMicrotask(() => child.emit("exit", 23, null));
         return child;
       },
@@ -154,6 +161,8 @@ test("test runner preserves child arguments, exit codes, and terminating signals
     assert.deepEqual(await exitPromise, { code: 23, signal: null });
     assert.equal(spawned.command, process.execPath);
     assert.deepEqual(spawned.arguments, ["--test", "--test-concurrency=4", "test/a.test.ts"]);
+    assert.equal(spawned.options?.env?.PATH, "/fixture/bin");
+    assert.equal(spawned.options?.env?.GIT_CONFIG_GLOBAL, devNull);
 
     const signalPromise = runNodeTests({
       target: "unit",
