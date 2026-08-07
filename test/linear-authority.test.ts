@@ -13,7 +13,6 @@ import {
   REVIEW_ONLY_GATES,
 } from "../dist/linear/authority.js";
 import type {
-  CloseEvidence,
   DriftFingerprint,
   MutationGates,
   MutationKind,
@@ -37,9 +36,6 @@ function allOpen(): MutationGates {
   return resolveGates({
     comment: true,
     labelWrite: true,
-    stateChange: true,
-    priorityChange: true,
-    close: true,
   });
 }
 
@@ -53,16 +49,6 @@ function makeRequest(overrides: Partial<MutationRequest> = {}): MutationRequest 
   };
 }
 
-function makeCloseEvidence(overrides: Partial<CloseEvidence> = {}): CloseEvidence {
-  return {
-    decision: "close",
-    closeReason: "implemented_on_main",
-    confidence: "high",
-    summary: "Shipped in main at abc123; behavior verified.",
-    ...overrides,
-  };
-}
-
 // ---------------------------------------------------------------------------
 // resolveGates / REVIEW_ONLY_GATES — safety gates default closed
 // ---------------------------------------------------------------------------
@@ -71,9 +57,6 @@ test("REVIEW_ONLY_GATES has every gate closed", () => {
   assert.deepEqual(REVIEW_ONLY_GATES, {
     comment: false,
     labelWrite: false,
-    stateChange: false,
-    priorityChange: false,
-    close: false,
   });
 });
 
@@ -85,21 +68,17 @@ test("resolveGates opens only the gates explicitly set to true", () => {
   const gates = resolveGates({ comment: true });
   assert.equal(gates.comment, true);
   assert.equal(gates.labelWrite, false);
-  assert.equal(gates.stateChange, false);
-  assert.equal(gates.priorityChange, false);
-  assert.equal(gates.close, false);
 });
 
 test("resolveGates treats false / undefined as closed (disabling one never opens another)", () => {
-  const gates = resolveGates({ comment: false, labelWrite: undefined, close: true });
+  const gates = resolveGates({ comment: false, labelWrite: undefined });
   assert.equal(gates.comment, false);
   assert.equal(gates.labelWrite, false);
-  assert.equal(gates.close, true);
 });
 
 test("resolveGates does not mutate REVIEW_ONLY_GATES", () => {
-  resolveGates({ close: true });
-  assert.equal(REVIEW_ONLY_GATES.close, false);
+  resolveGates({ comment: true });
+  assert.equal(REVIEW_ONLY_GATES.comment, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -110,12 +89,19 @@ test("gateForKind maps each mutation kind to its governing gate", () => {
   const expected: Record<MutationKind, keyof MutationGates> = {
     "comment-upsert": "comment",
     "label-add": "labelWrite",
-    "state-change": "stateChange",
-    "priority-change": "priorityChange",
-    close: "close",
   };
   for (const [kind, gate] of Object.entries(expected)) {
     assert.equal(gateForKind(kind as MutationKind), gate);
+  }
+});
+
+test("unsupported lifecycle mutation kinds fail closed at the authority boundary", () => {
+  for (const kind of ["state-change", "priority-change", "close"]) {
+    assert.throws(() => gateForKind(kind as MutationKind), /unsupported Linear mutation kind/u);
+    assert.throws(
+      () => authorizeMutation(makeRequest({ kind: kind as MutationKind }), allOpen(), CLEAN_DRIFT),
+      /unsupported Linear mutation kind/u,
+    );
   }
 });
 
@@ -155,18 +141,18 @@ test("open gate with matching fingerprints authorizes a comment upsert", () => {
   assert.ok(auth.reasons[0]?.startsWith("authorized:"));
 });
 
-test("each gate independently governs its kind: opening comment does not authorize a state-change", () => {
+test("each gate independently governs its kind: opening comment does not authorize labels", () => {
   const gates = resolveGates({ comment: true });
-  const auth = authorizeMutation(makeRequest({ kind: "state-change" }), gates, CLEAN_DRIFT);
+  const auth = authorizeMutation(
+    makeRequest({
+      kind: "label-add",
+      labelChange: { existing: ["bug"], additions: ["triage"], proposed: ["bug", "triage"] },
+    }),
+    gates,
+    CLEAN_DRIFT,
+  );
   assert.equal(auth.allowed, false);
-  assert.equal(auth.gate, "stateChange");
-});
-
-test("priority-change is authorized through the priorityChange gate", () => {
-  const gates = resolveGates({ priorityChange: true });
-  const auth = authorizeMutation(makeRequest({ kind: "priority-change" }), gates, CLEAN_DRIFT);
-  assert.equal(auth.allowed, true);
-  assert.equal(auth.gate, "priorityChange");
+  assert.equal(auth.gate, "labelWrite");
 });
 
 // ---------------------------------------------------------------------------
@@ -265,73 +251,6 @@ test("label-add union check is order-independent", () => {
   assert.equal(auth.allowed, true);
 });
 
-// ---------------------------------------------------------------------------
-// authorizeMutation — close requires concrete evidence
-// ---------------------------------------------------------------------------
-
-test("close with concrete evidence and an open gate is authorized", () => {
-  const req = makeRequest({ kind: "close", close: makeCloseEvidence() });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, true);
-  assert.equal(auth.gate, "close");
-});
-
-test("close without evidence is denied", () => {
-  const auth = authorizeMutation(makeRequest({ kind: "close" }), allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("close requires CloseEvidence")));
-});
-
-test("close of a maintainer-authored issue is denied", () => {
-  const req = makeRequest({
-    kind: "close",
-    maintainerAuthored: true,
-    close: makeCloseEvidence(),
-  });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("maintainer-authored")));
-});
-
-test('close with decision "keep_open" is denied', () => {
-  const req = makeRequest({
-    kind: "close",
-    close: makeCloseEvidence({ decision: "keep_open" }),
-  });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes('must be "close"')));
-});
-
-test('close with closeReason "none" is denied (no evidence)', () => {
-  const req = makeRequest({
-    kind: "close",
-    close: makeCloseEvidence({ closeReason: "none" }),
-  });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("not a concrete evidence-bearing reason")));
-});
-
-test("close with an empty summary is denied", () => {
-  const req = makeRequest({
-    kind: "close",
-    close: makeCloseEvidence({ summary: "   " }),
-  });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, false);
-  assert.ok(auth.reasons.some((r) => r.includes("summary must be non-empty")));
-});
-
-test("stale_insufficient_info is an evidence-bearing close reason", () => {
-  const req = makeRequest({
-    kind: "close",
-    close: makeCloseEvidence({ closeReason: "stale_insufficient_info", confidence: "low" }),
-  });
-  const auth = authorizeMutation(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(auth.allowed, true);
-});
-
 test('EVIDENCE_CLOSE_REASONS contains the taxonomy reasons but excludes "none"', () => {
   const schema = JSON.parse(
     readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url), "utf8"),
@@ -358,7 +277,6 @@ test("buildMutationReceipt records the verdict, both fingerprints, and no drift 
   assert.equal(receipt.planHash, PLAN);
   assert.equal(receipt.approvedPlanHash, PLAN);
   assert.equal(receipt.driftDetected, false);
-  assert.equal(receipt.closeReason, null);
 });
 
 test("buildMutationReceipt flags drift and carries the denial reasons", () => {
@@ -367,15 +285,6 @@ test("buildMutationReceipt flags drift and carries the denial reasons", () => {
   assert.equal(receipt.allowed, false);
   assert.equal(receipt.driftDetected, true);
   assert.ok(receipt.reasons.some((r) => r.includes("snapshot drift")));
-});
-
-test("buildMutationReceipt records the closeReason for a close request", () => {
-  const req = makeRequest({
-    kind: "close",
-    close: makeCloseEvidence({ closeReason: "duplicate_or_superseded" }),
-  });
-  const receipt = buildMutationReceipt(req, allOpen(), CLEAN_DRIFT);
-  assert.equal(receipt.closeReason, "duplicate_or_superseded");
 });
 
 test("buildMutationReceipt carries only hashes, keys, and reasons (no secret-shaped fields)", () => {
@@ -391,7 +300,12 @@ test("buildMutationReceipt carries only hashes, keys, and reasons (no secret-sha
 test("authorizeMutations authorizes each request with its own drift fingerprint", () => {
   const requests: MutationRequest[] = [
     makeRequest({ key: "ENG-1", kind: "comment-upsert" }),
-    makeRequest({ key: "ENG-2", kind: "state-change", snapshotHash: "snap-2" }),
+    makeRequest({
+      key: "ENG-2",
+      kind: "label-add",
+      snapshotHash: "snap-2",
+      labelChange: { existing: ["bug"], additions: ["triage"], proposed: ["bug", "triage"] },
+    }),
   ];
   const driftFor = (r: MutationRequest): DriftFingerprint => ({
     liveSnapshotHash: r.snapshotHash,
@@ -401,7 +315,7 @@ test("authorizeMutations authorizes each request with its own drift fingerprint"
   assert.equal(results.length, 2);
   assert.equal(results[0]?.allowed, true);
   assert.equal(results[1]?.allowed, true);
-  assert.equal(results[1]?.gate, "stateChange");
+  assert.equal(results[1]?.gate, "labelWrite");
 });
 
 // ---------------------------------------------------------------------------

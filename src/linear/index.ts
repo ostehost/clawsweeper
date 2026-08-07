@@ -95,7 +95,6 @@ export { classifyRecord, classifyRecords, proposesClose } from "./classifier.js"
 export type {
   CloseConfidence,
   CloseDecision,
-  CloseEvidence,
   CloseReason,
   DriftFingerprint,
   LabelChange,

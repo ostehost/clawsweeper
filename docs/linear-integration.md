@@ -248,6 +248,12 @@ The local file is a review artifact, not yet proof of publication to the
 canonical Worker store. Canonical publication and read-back are separate apply
 work that must be added before unattended operation is claimed.
 
+The Linear authority contract represents only marker-backed comment proposals
+and governed label reconciliation. It deliberately exposes no state, priority,
+or close mutation kind or gate; lifecycle authority would require a separate
+design binding destination state, item kind, repository policy, confidence, and
+evidence.
+
 ## Separate Review and Proposal Lanes
 
 Review and proposal validation are separate authority lanes even where the

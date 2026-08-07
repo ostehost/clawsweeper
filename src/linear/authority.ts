@@ -11,11 +11,12 @@
  *   (never Codex, never a review run) holds the short-lived token that applies.
  *
  * Safety gates default closed:
- *   Every write capability — comment post, label write, state change, priority change,
- *   close — is independently gated and defaults to false. `resolveGates` always starts
- *   from REVIEW_ONLY_GATES (all closed) and opens only the gates explicitly set to
- *   `true`, so disabling one gate can never open another, and an empty or omitted
- *   config is review-only. A mutation whose gate is closed is denied.
+ *   The only represented capabilities are the two proposal surfaces implemented by this
+ *   sidecar: marker-backed comment upsert and governed label reconciliation. Each defaults
+ *   to false. Unsupported state, priority, and close mutations are deliberately absent, so
+ *   a future executor cannot authorize them through an underspecified generic request.
+ *   `resolveGates` always starts from REVIEW_ONLY_GATES (all closed) and opens only gates
+ *   explicitly set to `true`.
  *
  * Drift-fingerprint receipts:
  *   Apply is gated behind the existing snapshotHash / planHash contract. A mutation is
@@ -24,12 +25,11 @@
  *   equals the operator-approved plan hash. `MutationReceipt` is the audit trail; it
  *   carries hashes, keys, and reasons — never secrets or tokens.
  *
- * Never close without concrete evidence:
- *   Closing a Linear issue requires a `decision: "close"` evidence record whose
- *   closeReason is one of ClawSweeper's decision-taxonomy reasons (never "none").
- *   Maintainer-authored issues are never closeable. A close must be requested as kind
- *   "close" (not as a generic "state-change" into a terminal state) so the evidence
- *   gate applies.
+ * No lifecycle authority:
+ *   Advisory close reasoning uses ClawSweeper's decision taxonomy below, but this module
+ *   exposes no state-change or close mutation kind or gate. Adding lifecycle authority
+ *   requires a separately reviewed request contract that binds destination state, item
+ *   kind, repository policy, confidence, and evidence.
  *
  * Label writes merge, never replace:
  *   Linear's issueUpdate replaces the full labelIds array. A "label-add" request must
@@ -42,41 +42,33 @@ import type { RepositoryCloseReason } from "../repository-profiles.js";
 
 export type MutationKind =
   | "comment-upsert" // post/edit the durable marker-keyed review comment
-  | "label-add" // additive label write (read-merge-write the union)
-  | "state-change" // non-close workflow state transition
-  | "priority-change" // triage priority write
-  | "close"; // close the issue (requires concrete decision-taxonomy evidence)
+  | "label-add"; // governed label reconciliation (read-merge-write the full set)
 
 /** Independent, default-closed write gates. One boolean per write capability. */
 export interface MutationGates {
   comment: boolean; // marker-keyed review-comment capability
-  labelWrite: boolean; // additive label writes
-  stateChange: boolean; // non-close state transitions
-  priorityChange: boolean; // priority writes
-  close: boolean; // close-with-evidence
+  labelWrite: boolean; // governed label reconciliation
 }
 
 /** The review-only baseline: every gate closed. `resolveGates` starts from this. */
 export const REVIEW_ONLY_GATES: MutationGates = {
   comment: false,
   labelWrite: false,
-  stateChange: false,
-  priorityChange: false,
-  close: false,
 };
 
 // Each mutation kind is governed by exactly one gate.
 const GATE_FOR_KIND: Record<MutationKind, keyof MutationGates> = {
   "comment-upsert": "comment",
   "label-add": "labelWrite",
-  "state-change": "stateChange",
-  "priority-change": "priorityChange",
-  close: "close",
 };
 
 /** Returns the gate key that governs a mutation kind. */
 export function gateForKind(kind: MutationKind): keyof MutationGates {
-  return GATE_FOR_KIND[kind];
+  const gate = GATE_FOR_KIND[kind];
+  if (gate === undefined) {
+    throw new Error("unsupported Linear mutation kind");
+  }
+  return gate;
 }
 
 /**
@@ -90,9 +82,6 @@ export function resolveGates(overrides?: Partial<MutationGates>): MutationGates 
   return {
     comment: o.comment === true,
     labelWrite: o.labelWrite === true,
-    stateChange: o.stateChange === true,
-    priorityChange: o.priorityChange === true,
-    close: o.close === true,
   };
 }
 
@@ -125,14 +114,6 @@ export const EVIDENCE_CLOSE_REASONS: ReadonlySet<CloseReason> = new Set<CloseRea
   "stale_insufficient_info",
 ]);
 
-/** Evidence required to authorize a close, matching the decision taxonomy. */
-export interface CloseEvidence {
-  decision: CloseDecision; // must be "close"
-  closeReason: CloseReason; // must be evidence-bearing (in EVIDENCE_CLOSE_REASONS)
-  confidence: CloseConfidence; // recorded on the receipt for audit
-  summary: string; // human-readable rationale; must be non-empty
-}
-
 /** Label write: the existing set, safe removals, additions, and the full proposed set. */
 export interface LabelChange {
   existing: string[]; // label names currently on the issue
@@ -147,9 +128,7 @@ export interface MutationRequest {
   key: string; // issue identifier (e.g. "PAR-215") — for receipts and reasons
   snapshotHash: string; // record snapshotHash the plan was computed against
   planHash: string; // deterministic hash of the proposed plan
-  maintainerAuthored?: boolean; // issue authored by a maintainer (blocks close)
   labelChange?: LabelChange; // required for kind "label-add"
-  close?: CloseEvidence; // required for kind "close"
 }
 
 /** Apply-time receipt inputs: the live fingerprint and the operator-approved plan. */
@@ -179,7 +158,6 @@ export interface MutationReceipt {
   planHash: string; // proposed plan hash
   approvedPlanHash: string; // operator-approved plan hash
   driftDetected: boolean; // snapshotHash !== liveSnapshotHash
-  closeReason: CloseReason | null; // present only for close requests
 }
 
 /**
@@ -255,32 +233,6 @@ function checkLabelChange(change: LabelChange | undefined): string[] {
   return blocks;
 }
 
-// Returns blocking reasons for a close request; empty when the evidence is sufficient.
-function checkCloseEvidence(
-  evidence: CloseEvidence | undefined,
-  maintainerAuthored: boolean,
-): string[] {
-  if (evidence === undefined) {
-    return ["close requires CloseEvidence with a concrete decision-taxonomy reason"];
-  }
-  const blocks: string[] = [];
-  if (maintainerAuthored) {
-    blocks.push("issue is maintainer-authored — never eligible for auto-close");
-  }
-  if (evidence.decision !== "close") {
-    blocks.push(`close evidence decision is "${evidence.decision}" — must be "close"`);
-  }
-  if (!EVIDENCE_CLOSE_REASONS.has(evidence.closeReason)) {
-    blocks.push(
-      `closeReason "${evidence.closeReason}" is not a concrete evidence-bearing reason — closing without evidence is prohibited`,
-    );
-  }
-  if (evidence.summary.trim().length === 0) {
-    blocks.push("close evidence summary must be non-empty");
-  }
-  return blocks;
-}
-
 /**
  * Authorizes a single mutation request against the resolved gates and the apply-time
  * drift fingerprint. Pure and offline. Collects every blocking reason so the receipt is
@@ -290,8 +242,7 @@ function checkCloseEvidence(
  *   1. Safety gate — the governing gate must be open (default closed → denied).
  *   2. Snapshot drift — the plan's snapshotHash must equal the live snapshot hash.
  *   3. Plan hash — the request's planHash must equal the operator-approved plan hash.
- *   4. Kind invariants — label-add must be a valid additive union; close must carry
- *      concrete decision-taxonomy evidence and the issue must not be maintainer-authored.
+ *   4. Kind invariants — label-add must be a valid governed reconciliation.
  */
 export function authorizeMutation(
   request: MutationRequest,
@@ -321,8 +272,6 @@ export function authorizeMutation(
 
   if (request.kind === "label-add") {
     blocks.push(...checkLabelChange(request.labelChange));
-  } else if (request.kind === "close") {
-    blocks.push(...checkCloseEvidence(request.close, request.maintainerAuthored === true));
   }
 
   const allowed = blocks.length === 0;
@@ -369,6 +318,5 @@ export function buildMutationReceipt(
     planHash: request.planHash,
     approvedPlanHash: drift.approvedPlanHash,
     driftDetected: request.snapshotHash !== drift.liveSnapshotHash,
-    closeReason: request.close ? request.close.closeReason : null,
   };
 }

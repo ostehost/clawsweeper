@@ -19,9 +19,9 @@
  *     evidence[] item shape, reproductionStatus/reproductionAssessment, changeSummary,
  *     workReason/bestSolution, rootCauseCluster). No new schema is coined.
  *   - closeLeaning is the ONLY new bit, and it is CODE-DERIVED, advisory, and NEVER a schema
- *     field / CloseEvidence / a close mutation. It composes authority.EVIDENCE_CLOSE_REASONS
- *     + repository-profiles.isAutoCloseAllowed; the close gate stays default-closed and only
- *     the comment gate may ever open.
+ *     field or mutation. It composes authority.EVIDENCE_CLOSE_REASONS with
+ *     repository-profiles.isAutoCloseAllowed. The authority layer deliberately exposes no
+ *     state or close mutation kind; only proposal gates exist.
  *   - The review sections follow docs/pr-review-comments.md (the ISSUE "**Next step**" heading,
  *     not the PR "Next step before merge"); the body is rendered from the cached deterministic
  *     Decision so comment.planHashFor noops on an unchanged re-plan.
@@ -143,8 +143,8 @@ export interface CloseLeaning {
 }
 
 /**
- * The code-derived, advisory closeLeaning predicate. NEVER a schema field, NEVER a
- * CloseEvidence, NEVER a close/state mutation — it is a hint a maintainer reads.
+ * The code-derived, advisory closeLeaning predicate. NEVER a schema field and NEVER a
+ * close/state mutation — it is a hint a maintainer reads.
  *
  *   closeLeaning :=
  *        decision === "close"
@@ -155,8 +155,8 @@ export interface CloseLeaning {
  *     && shaVerification.allVerified         // any unverifiable cited sha forces false
  *
  * For Linear issues this is true only when closeReason === "implemented_on_main", even when
- * the underlying repository profile permits broader issue close reasons. The close gate stays
- * default-closed; this never opens it.
+ * the underlying repository profile permits broader issue close reasons. No Linear lifecycle
+ * authority exists; this remains review-only advice.
  */
 export function deriveCloseLeaning(input: CloseLeaningInput): CloseLeaning {
   const { decision, profile, kind, maintainerAuthored, shaVerification } = input;
