@@ -144,6 +144,7 @@ export type {
 } from "./comment.js";
 
 export {
+  assertReviewCommentMarkerOwnership,
   COMMENT_CREATE_MUTATION,
   COMMENT_UPDATE_MUTATION,
   findReviewComments,

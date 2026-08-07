@@ -44,6 +44,7 @@ import {
   needsReanalysis,
   ownerRepoFromUrls,
   parseLinearIdentifier,
+  assertReviewCommentMarkerOwnership,
   planReviewCommentUpsert,
   reviewCommentMutationRequest,
   serializeAnalyzerRecord,
@@ -63,7 +64,11 @@ import {
   resolveReadToken,
   DEFAULT_KEYCHAIN_ACCOUNT,
 } from "./linear-comment-apply.mjs";
-import { assertPrivateOutputDestination, assertSafeOutputPath } from "./linear-private-output.mjs";
+import {
+  assertPrivateOutputDestination,
+  assertPrivateOutputPlatform,
+  assertSafeOutputPath,
+} from "./linear-private-output.mjs";
 
 const DEFAULT_STALE_DAYS = 60;
 const DEFAULT_REASONING_EFFORT = "high";
@@ -194,6 +199,11 @@ export function linearAnalysisModelRevision(model, readCredential) {
     .update("clawsweeper-linear-analysis-model\0")
     .update(normalizedModel)
     .digest("hex");
+}
+
+/** Rejects unsupported private artifact platforms before any credential, API, or model work. */
+export function assertLinearAnalysisOutputPlatform(options, platform = process.platform) {
+  if (options?.analyze) assertPrivateOutputPlatform(platform);
 }
 
 /**
@@ -881,6 +891,9 @@ export async function analyzeItem(hydrated, options, deps) {
     };
   }
 
+  const expectedAuthorId = options.expectedAuthorId ?? process.env.LINEAR_APP_ACTOR_ID ?? null;
+  assertReviewCommentMarkerOwnership(record.id, hydrated.comments ?? [], expectedAuthorId);
+
   // IMPURE: run the read-only model. `runModel` returns a parsed harness Decision.
   const decision = await deps.runModel({ profile, repoHead });
   const analyzerDecision = toAnalyzerDecision(decision);
@@ -905,7 +918,7 @@ export async function analyzeItem(hydrated, options, deps) {
     key: record.key,
     content,
     existingComments: hydrated.comments ?? [],
-    expectedAuthorId: options.expectedAuthorId ?? process.env.LINEAR_APP_ACTOR_ID ?? null,
+    expectedAuthorId,
   });
   const request = reviewCommentMutationRequest(plan, record.snapshotHash);
 
@@ -963,12 +976,14 @@ export async function analyzeItem(hydrated, options, deps) {
 
 /** Writes and reads back the local sidecar proposal. This does not publish canonical state. */
 export function writeAnalyzerRecord(summary, deps = {}) {
+  const assertPlatform = deps.assertPrivateOutputPlatform ?? assertPrivateOutputPlatform;
   const assertOutputPath = deps.assertSafeOutputPath ?? assertSafeOutputPath;
   const assertDestination = deps.assertPrivateOutputDestination ?? assertPrivateOutputDestination;
   const write = deps.writeFileSync ?? writeFileSync;
   const mkdir = deps.mkdirSync ?? mkdirSync;
   const read = deps.readFileSync ?? readFileSync;
   const chmod = deps.chmodSync ?? chmodSync;
+  assertPlatform(deps.platform ?? process.platform);
   const path = assertOutputPath(join(ROOT, summary.recordPath));
   const destinationExists = assertDestination(path);
   if (destinationExists && read(path, "utf8") === summary.recordBody) {
@@ -1002,6 +1017,13 @@ async function main() {
   if (options.identifier === "") {
     console.error("--identifier is required");
     process.exitCode = 2;
+    return;
+  }
+  try {
+    assertLinearAnalysisOutputPlatform(options);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
     return;
   }
 

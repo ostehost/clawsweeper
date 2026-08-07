@@ -5,6 +5,7 @@ import {
   analysisRecordPath,
   analysisOutputKey,
   analyzeItem,
+  assertLinearAnalysisOutputPlatform,
   assertAnalysisCheckout,
   buildAnalysisPrompt,
   buildHarnessInputs,
@@ -307,6 +308,15 @@ test("linearAnalysisModelRevision binds model changes without exposing model or 
   );
 });
 
+test("assertLinearAnalysisOutputPlatform rejects Windows model runs but permits dry runs", () => {
+  assert.doesNotThrow(() => assertLinearAnalysisOutputPlatform({ analyze: false }, "win32"));
+  assert.doesNotThrow(() => assertLinearAnalysisOutputPlatform({ analyze: true }, "darwin"));
+  assert.throws(
+    () => assertLinearAnalysisOutputPlatform({ analyze: true }, "win32"),
+    /Windows is unsupported/u,
+  );
+});
+
 test("makeGitShaVerifier accepts only commits reachable from the analyzed revision", () => {
   const calls = [];
   const verify = makeGitShaVerifier("/repo", "main-sha", {
@@ -585,6 +595,28 @@ test("writeAnalyzerRecord makes an existing destination private before replacing
   assert.equal(persisted, "new-record\n");
 });
 
+test("writeAnalyzerRecord rejects Windows before touching private output", () => {
+  let touched = false;
+  assert.throws(
+    () =>
+      writeAnalyzerRecord(
+        {
+          recordPath: "records/openclaw-clawhub/items/PAR-42.md",
+          recordBody: "record-body\n",
+        },
+        {
+          platform: "win32",
+          assertSafeOutputPath: (path: string) => {
+            touched = true;
+            return path;
+          },
+        },
+      ),
+    /Windows is unsupported/u,
+  );
+  assert.equal(touched, false);
+});
+
 // ---------------------------------------------------------------------------
 // collectIssueUrls / buildHarnessInputs / buildAnalysisPrompt
 // ---------------------------------------------------------------------------
@@ -815,6 +847,36 @@ test("analyzeItem: live analysis fails closed when model revision is unavailable
     ),
     /requires a resolved model revision/u,
   );
+});
+
+test("analyzeItem: marker ownership fails closed before model execution", async () => {
+  const hydrated = makeHydrated({
+    comments: [
+      {
+        id: "spoofed-marker",
+        body: "<!-- clawsweeper-review:uuid-1 -->\n\nspoofed",
+        authorId: "other-actor",
+        authorName: "Other",
+      },
+    ],
+  });
+  let called = false;
+  await assert.rejects(
+    analyzeItem(
+      hydrated,
+      { nowIso: NOW, analyze: true, expectedAuthorId: "clawsweeper-actor" },
+      baseDeps({
+        hydrated,
+        repoInferenceItem: repoInferenceItemFor(hydrated),
+        runModel: async () => {
+          called = true;
+          return makeModelDecision();
+        },
+      }),
+    ),
+    /marker comment exists but is not owned by expected actor clawsweeper-actor/u,
+  );
+  assert.equal(called, false);
 });
 
 test("analyzeItem: ineligible (closed) item is skipped before repo inference", async () => {

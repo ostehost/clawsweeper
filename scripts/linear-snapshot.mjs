@@ -34,7 +34,11 @@ import {
   firstNonBlankLinearToken,
   LinearItemSource,
 } from "../dist/linear/index.js";
-import { assertPrivateOutputDestination, assertSafeOutputPath } from "./linear-private-output.mjs";
+import {
+  assertPrivateOutputDestination,
+  assertPrivateOutputPlatform,
+  assertSafeOutputPath,
+} from "./linear-private-output.mjs";
 
 /** Default macOS Keychain generic-password coordinates for the hub Linear key. */
 export const DEFAULT_KEYCHAIN_SERVICE = "openclaw-linear-api-key";
@@ -43,12 +47,19 @@ export const DEFAULT_KEYCHAIN_ACCOUNT = "partnerai-config";
 /** Snapshot schema tag, mirroring the `*_v1` convention of the sibling skills. */
 export const SNAPSHOT_SCHEMA = "linear_workspace_snapshot_v1";
 
+/** Rejects unsupported private artifact platforms before any credential or API work. */
+export function assertSnapshotOutputPlatform(outputPath, platform = process.platform) {
+  if (outputPath) assertPrivateOutputPlatform(platform);
+}
+
 export function writeSnapshotFile(path, serialized, deps = {}) {
+  const assertPlatform = deps.assertPrivateOutputPlatform ?? assertPrivateOutputPlatform;
   const assertOutputPath = deps.assertSafeOutputPath ?? assertSafeOutputPath;
   const assertDestination = deps.assertPrivateOutputDestination ?? assertPrivateOutputDestination;
   const chmod = deps.chmodSync ?? chmodSync;
   const mkdir = deps.mkdirSync ?? mkdirSync;
   const write = deps.writeFileSync ?? writeFileSync;
+  assertPlatform(deps.platform ?? process.platform);
   const safePath = assertOutputPath(path);
   const destinationExists = assertDestination(safePath);
   mkdir(dirname(safePath), { recursive: true, mode: 0o700 });
@@ -245,6 +256,14 @@ async function main() {
     return;
   }
 
+  try {
+    assertSnapshotOutputPlatform(options.out);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+    return;
+  }
+
   let token;
   try {
     token = resolveToken({ service: options.keychainService, account: options.keychainAccount });
@@ -276,10 +295,15 @@ async function main() {
 
   const serialized = JSON.stringify(snapshot, null, 2);
   if (options.out) {
-    writeSnapshotFile(options.out, serialized);
-    console.error(
-      `wrote ${snapshot.source.itemCount} item(s) from team(s) [${snapshot.source.teamsScanned.join(", ")}] to ${options.out}`,
-    );
+    try {
+      writeSnapshotFile(options.out, serialized);
+      console.error(
+        `wrote ${snapshot.source.itemCount} item(s) from team(s) [${snapshot.source.teamsScanned.join(", ")}] to ${options.out}`,
+      );
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
   } else {
     // JSON on stdout so the snapshot pipes straight into linear-triage.mjs;
     // progress goes to stderr to keep stdout a clean JSON stream.

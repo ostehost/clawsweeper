@@ -155,6 +155,9 @@ pnpm linear:snapshot -- --team PAR --out .artifacts/linear-snapshot.json
 pnpm linear:snapshot -- --out .artifacts/linear-workspace.json
 ```
 
+Saved snapshots use POSIX owner-only file permissions and are therefore unsupported on Windows;
+on Windows, stream the snapshot to standard output instead of passing `--out`.
+
 A requested `--team` that matches no team is an error. This prevents an empty
 snapshot from being reported as a successful triage.
 
@@ -234,6 +237,9 @@ matter binds the decision to `target_repo`, Linear `source_provider`/`source_id`
 the Linear snapshot hash, repository head, model, analyzer version, and review
 runtime. The body is the exact proposed marker-backed comment. A dry run writes
 no record.
+
+Model-backed analysis records also require POSIX owner-only file permissions, so `--analyze`
+is unsupported on Windows. Read-only analysis dry runs remain available there.
 
 The local file is a review artifact, not yet proof of publication to the
 canonical Worker store. Canonical publication and read-back are separate apply

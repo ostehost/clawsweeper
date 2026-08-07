@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertReviewCommentMarkerOwnership,
   findReviewComments,
   hasReviewMarker,
   planReviewCommentUpsert,
@@ -114,6 +115,21 @@ test("findReviewComments isolates by issueId: issue-A marker not found for issue
   const bodyA = renderReviewCommentBody(ISSUE_A, CONTENT);
   const comments = [makeComment("c1", bodyA)];
   assert.deepEqual(findReviewComments(ISSUE_B, comments, "actor-1"), []);
+});
+
+test("assertReviewCommentMarkerOwnership fails closed without the configured marker owner", () => {
+  const body = renderReviewCommentBody(ISSUE_A, CONTENT);
+  const comments = [makeComment("c1", body, "actor-1")];
+  assert.throws(
+    () => assertReviewCommentMarkerOwnership(ISSUE_A, comments, null),
+    /expectedAuthorId is required/u,
+  );
+  assert.throws(
+    () => assertReviewCommentMarkerOwnership(ISSUE_A, comments, "actor-other"),
+    /not owned by expected actor actor-other/u,
+  );
+  assert.equal(assertReviewCommentMarkerOwnership(ISSUE_A, comments, " actor-1 "), "actor-1");
+  assert.equal(assertReviewCommentMarkerOwnership(ISSUE_A, [], null), "");
 });
 
 // ---------------------------------------------------------------------------

@@ -103,6 +103,34 @@ export function findReviewComments(
   );
 }
 
+/**
+ * Fails closed when a durable marker is already present but cannot be attributed to the
+ * configured application actor. Callers that perform expensive work before planning an upsert
+ * can use this as a side-effect-free preflight.
+ */
+export function assertReviewCommentMarkerOwnership(
+  issueId: string,
+  existingComments: LinearComment[],
+  expectedAuthorIdInput?: string | null,
+): string {
+  const expectedAuthorId = expectedAuthorIdInput?.trim() ?? "";
+  const markerComments = existingComments.filter((comment) =>
+    hasReviewMarker(comment.body, issueId),
+  );
+  if (markerComments.length > 0 && expectedAuthorId === "") {
+    throw new Error("expectedAuthorId is required to reuse an existing marker comment");
+  }
+  if (
+    markerComments.length > 0 &&
+    findReviewComments(issueId, existingComments, expectedAuthorId).length === 0
+  ) {
+    throw new Error(
+      `marker comment exists but is not owned by expected actor ${expectedAuthorId} — refusing to create a duplicate`,
+    );
+  }
+  return expectedAuthorId;
+}
+
 // Deterministic sha256 over a canonical object; mirrors linearReviewSnapshotHash in record.ts.
 function planHashFor(
   action: ReviewCommentAction,
@@ -133,19 +161,12 @@ export function planReviewCommentUpsert(input: ReviewCommentUpsertInput): Review
   const { issueId, key, content, existingComments } = input;
   const marker = linearReviewMarker(issueId);
   const body = renderReviewCommentBody(issueId, content);
-  const markerComments = existingComments.filter((comment) =>
-    hasReviewMarker(comment.body, issueId),
+  const expectedAuthorId = assertReviewCommentMarkerOwnership(
+    issueId,
+    existingComments,
+    input.expectedAuthorId,
   );
-  const expectedAuthorId = input.expectedAuthorId?.trim() ?? "";
-  if (markerComments.length > 0 && expectedAuthorId === "") {
-    throw new Error("expectedAuthorId is required to reuse an existing marker comment");
-  }
   const matches = findReviewComments(issueId, existingComments, expectedAuthorId);
-  if (markerComments.length > 0 && matches.length === 0) {
-    throw new Error(
-      `marker comment exists but is not owned by expected actor ${expectedAuthorId} — refusing to create a duplicate`,
-    );
-  }
 
   let action: ReviewCommentAction;
   let targetCommentId: string | null;

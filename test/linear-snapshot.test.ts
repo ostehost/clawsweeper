@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertSnapshotOutputPlatform,
   assertTeamCoverage,
   buildSnapshot,
   collectWorkspaceItems,
@@ -118,6 +119,15 @@ test("parseArgs rejects unknown args, missing values, and non-positive page size
   assert.throws(() => parseArgs(["--page-size", "x"]), /--page-size must be a positive integer/);
 });
 
+test("assertSnapshotOutputPlatform rejects only Windows file output", () => {
+  assert.doesNotThrow(() => assertSnapshotOutputPlatform("", "win32"));
+  assert.doesNotThrow(() => assertSnapshotOutputPlatform("snapshot.json", "linux"));
+  assert.throws(
+    () => assertSnapshotOutputPlatform("snapshot.json", "win32"),
+    /Windows is unsupported/u,
+  );
+});
+
 test("writeSnapshotFile creates the documented output parent before writing", () => {
   const calls: unknown[][] = [];
   writeSnapshotFile(".artifacts/linear-snapshot.json", '{"ok":true}', {
@@ -152,6 +162,22 @@ test("writeSnapshotFile makes an existing destination private before replacing i
     calls.map((call) => call[0]),
     ["chmod", "write", "chmod"],
   );
+});
+
+test("writeSnapshotFile rejects Windows before touching private output", () => {
+  let touched = false;
+  assert.throws(
+    () =>
+      writeSnapshotFile("snapshot.json", '{"ok":true}', {
+        platform: "win32",
+        assertSafeOutputPath: (path: string) => {
+          touched = true;
+          return path;
+        },
+      }),
+    /Windows is unsupported/u,
+  );
+  assert.equal(touched, false);
 });
 
 // ---------------------------------------------------------------------------

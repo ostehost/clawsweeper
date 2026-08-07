@@ -2,6 +2,15 @@ import { execFileSync } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+/** POSIX mode bits are the privacy boundary for these operator-owned artifacts. */
+export function assertPrivateOutputPlatform(platform = process.platform) {
+  if (platform === "win32") {
+    throw new Error(
+      "private Linear output files require POSIX owner-only permissions; Windows is unsupported",
+    );
+  }
+}
+
 function resolvePhysicalPath(path) {
   const tail = [];
   let cursor = resolve(path);
