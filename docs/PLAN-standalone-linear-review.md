@@ -1,14 +1,16 @@
 # Standalone Linear Review CLI — Project Plan
 
-Status: reviewed final; destination resolved 2026-08-09 — Linear Project `Linear Review` (team PAR, label Developer Tooling, slugId `564df4804c1e`, no cycle: team cycles disabled); apply still gated on committed provenance + approved live dry-run receipt  
+Status: reviewed final; destination resolved 2026-08-09 — Linear Project `Linear Review` (team PAR, label Developer Tooling, slugId `564df4804c1e`, explicit no-cycle: team cycles disabled); artifacts committed, apply gated only on the operator-approved live dry-run receipt  
 Date: 2026-08-09  
 Working name: `linear-review`  
 Extraction source: `ostehost/clawsweeper` at `1ada0983efee3f48f97fe0a99d20a402b345db11`  
 Machine intake: `docs/linear-review-intake.json`
 
-This draft is not contained in the extraction source commit. Before live intake,
-commit the reviewed artifacts, replace the intake's draft provenance with that
-exact commit, regenerate the plan, and review the committed range.
+The intake's `currentHead` records the extraction-source revision
+(`1ada0983efee3f48f97fe0a99d20a402b345db11`) that the reviewed content derives
+from. An artifact cannot name its own carrier commit, so the committed carrier
+revision of these files is recorded externally in the import approval packet,
+receipts, and import index rather than inside this document or the intake.
 
 ## Decision
 
@@ -426,7 +428,7 @@ coverage, an adversarial security verdict, and a successful dynamic live proof.
 | LRV-017 | Publish installation, security, schema, and troubleshooting docs   | LRV-016                            |
 | LRV-018 | Add hermetic packed-binary end-to-end and extraction-parity tests  | LRV-009, LRV-013, LRV-015, LRV-016 |
 | LRV-019 | Complete adversarial security review and negative-capability proof | LRV-012, LRV-015, LRV-018          |
-| LRV-020 | Run the dynamic live Linear create/read/review/cleanup proof       | LRV-018, LRV-019                   |
+| LRV-020 | Run the dynamic live Linear create/read/review/cleanup proof       | LRV-014, LRV-018, LRV-019          |
 
 ### Group 4 — Qualification and release
 
