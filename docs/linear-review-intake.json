@@ -1,0 +1,539 @@
+{
+  "schema": "linear_import_work_units_v1",
+  "sourceRepo": "ostehost/clawsweeper",
+  "currentHead": "UNCOMMITTED DRAFT based on 1ada0983efee3f48f97fe0a99d20a402b345db11",
+  "generatedAt": "2026-08-09T20:28:29Z",
+  "updatedAt": "2026-08-09T21:06:37Z",
+  "timezone": "America/New_York",
+  "linearIntake": {
+    "batch": "standalone-linear-review-final-draft-2026-08-09",
+    "targetTeam": "PAR",
+    "targetProject": "Linear Review",
+    "targetProjectId": "f85226a8-3083-4eb6-8dc0-c86c4e2771cb",
+    "targetProjectSlugId": "564df4804c1e",
+    "cycle": "none — explicit no-cycle decision: team PartnerAI (PAR) has cycles disabled (verified live 2026-08-09)",
+    "destinationStatus": "resolved_2026-08-09_project_created_via_create-linear-project.sh",
+    "authorityStatus": "blocked_pending_named_project_owner_approval",
+    "priorityMap": {
+      "P0": "ship-blocker",
+      "P1": "high",
+      "P2": "medium",
+      "P3": "low"
+    },
+    "defaultLabels": [],
+    "importPolicy": {
+      "requiredWorkItemCount": 25,
+      "importPolishItems": false,
+      "polishItemCount": 0,
+      "requireExplicitDestinationBeforeLiveOperations": true,
+      "requireCommittedReviewedSourceBeforeLiveOperations": true
+    },
+    "optionalNotImportedByDefault": [
+      {
+        "key": "LRV-901",
+        "title": "Add explicitly bounded multi-issue review input",
+        "priority": "P3",
+        "entryCriteria": "Operators provide repeated evidence that exact-item invocation is the dominant bottleneck and approve a finite-list-only charter.",
+        "reason": "Defer until exact-item use demonstrates a real need; this must remain a finite explicit list rather than a workspace sweep."
+      },
+      {
+        "key": "LRV-902",
+        "title": "Add OAuth read authentication",
+        "priority": "P3",
+        "entryCriteria": "A supported distribution to third-party workspaces is approved with an OAuth owner, support model, and privacy review.",
+        "reason": "Defer until the tool is intentionally distributed for use by other workspaces and the OAuth ownership/support model is approved."
+      },
+      {
+        "key": "LRV-903",
+        "title": "Add a signed webhook trigger and hosted receiver",
+        "priority": "P3",
+        "entryCriteria": "Measured operator demand justifies a hosted service and an owner accepts its signature, replay, queue, availability, and privacy duties.",
+        "reason": "Defer until operators need low-latency hosted execution; requires a separate service, replay, signature, queue, and availability charter."
+      },
+      {
+        "key": "LRV-904",
+        "title": "Design a Linear mutation and settlement RFC",
+        "priority": "P3",
+        "entryCriteria": "A concrete operator write workflow is sponsored and independently approved as a new product/security boundary.",
+        "reason": "Any write capability is a new product and trust boundary requiring explicit idempotency, authorization, settlement, read-back, and recovery design."
+      },
+      {
+        "key": "LRV-905",
+        "title": "Add additional review-provider adapters",
+        "priority": "P3",
+        "entryCriteria": "A second provider is approved with real usage, compatible isolation capabilities, and a named maintainer.",
+        "reason": "Defer provider abstraction until a second real provider is approved and the single Codex adapter has stable operational evidence."
+      }
+    ]
+  },
+  "workItems": [
+    {
+      "key": "LRV-001",
+      "title": "Approve the product charter, support matrix, and read-only threat model",
+      "priority": "P1",
+      "lane": "Group 0 - Charter and bootstrap",
+      "description": "Define the exact-item user workflow, trust zones, remote and local read-only meanings, supported platforms, ownership, success measures, and proof contract before implementation begins.",
+      "acceptanceCriteria": [
+        "An approved ADR names the user, one-sentence purpose, exact v1 workflow, owner, runtime, supported platforms, and success measures.",
+        "The ADR distinguishes remote read-only behavior, repository-read-only behavior, permitted private local artifacts, and the development-only fixture mutation harness.",
+        "The threat model covers GraphQL mutation escape, credential exfiltration, redirects, prompt injection, malicious repositories, model network/write escape, pagination drift, unsafe paths, output leakage, dependency compromise, and cleanup failure.",
+        "A pre-scaffold feasibility spike pins the exact Codex CLI/version and authentication source and proves provider authentication can be separated from model-generated command environments on every initial platform.",
+        "The ADR enumerates which Linear fields, repository content, and tool output leave the machine; records provider retention, training, and telemetry terms; and defines explicit first-run operator consent.",
+        "Every threat has a mitigation and executable verification or an explicit accepted limit.",
+        "The ADR states why OpenClaw Bay is unaffected and why the project is not an official OpenClaw package without sponsorship."
+      ],
+      "dependencies": []
+    },
+    {
+      "key": "LRV-002",
+      "title": "Freeze the product name, CLI, configuration, output, and exit contracts",
+      "priority": "P1",
+      "lane": "Group 0 - Charter and bootstrap",
+      "description": "Specify the independent product identity and stable automation interface before scaffolding makes accidental syntax, naming, or compatibility commitments permanent.",
+      "acceptanceCriteria": [
+        "The specification fixes the repository, package, and binary working names and avoids implying official OpenClaw sponsorship.",
+        "The review flow accepts a TEAM-NUMBER or canonical Linear URL plus an explicit absolute repository path and expected owner/name.",
+        "Help, version, doctor, JSON, human output, stdout/stderr, TTY, NO_COLOR, quiet/verbose, timeout, and Ctrl-C behavior are specified.",
+        "Exit zero means a review completed even when findings exist; stable nonzero codes cover usage, authentication, Linear, repository, model, validation, timeout, and interruption failures.",
+        "No secret is accepted in argv or plaintext configuration, and the versioned JSON compatibility policy includes golden examples."
+      ],
+      "dependencies": ["LRV-001 product charter and threat model must be approved first"]
+    },
+    {
+      "key": "LRV-003",
+      "title": "Create the extraction, provenance, licensing, and parity manifest",
+      "priority": "P2",
+      "lane": "Group 0 - Charter and bootstrap",
+      "description": "Classify every relevant Linear module, script, schema, fixture, test, and ClawSweeper dependency as port, rewrite, fixture-only, or exclude, with retained behavior and attribution recorded.",
+      "acceptanceCriteria": [
+        "The manifest covers every src/linear module, Linear script, schema, live fixture, documentation file, package script, and focused test.",
+        "Each retained behavior maps to an existing test or a named standalone replacement test.",
+        "The target runtime dependency graph contains no ClawSweeper import, repository profile, close policy, decision schema, agent runner, Worker/R2, repair, or Bay dependency.",
+        "Mutation, comment, label, scheduler, workspace sweep, and lifecycle code is explicitly excluded from the production package.",
+        "ClawSweeper and Linear schema license notices, exact source commits, source paths, and future divergence ownership are recorded."
+      ],
+      "dependencies": [
+        "LRV-001 product boundary and provenance requirements must be approved first"
+      ]
+    },
+    {
+      "key": "LRV-004",
+      "title": "Verify project provisioning and freeze bootstrap receipts",
+      "priority": "P2",
+      "lane": "Group 0 - Charter and bootstrap",
+      "description": "After the empty repository and Linear project are created outside this intake, verify the selected minimal or full-fleet bootstrap, freeze its receipts, and establish the independent contributor-owned baseline without treating the ClawSweeper fork as the product boundary.",
+      "acceptanceCriteria": [
+        "The pre-intake receipt records the approved name, namespace, visibility, license, emoji, team, project label, purpose, ownership, and whether full PartnerAI fleet onboarding was selected.",
+        "The GitHub repository and Linear project/resource are read back by stable identity; any selected registry, generated workflow, workspace manifest, UI pin, launcher, and ledger joins are verified through their sanctioned paths.",
+        "External project creation receipts record real identities without secrets and any generated keychain account is documented as unused by the runtime.",
+        "The initial project has no inherited ClawSweeper workflows, schedules, GitHub App secrets, Worker/R2 state, or dashboard deployment.",
+        "The project passes its selected bootstrap identity gates, records manual UI-only setup, and treats fleet registration as operator infrastructure rather than OpenClaw product sponsorship."
+      ],
+      "dependencies": [
+        "LRV-002 product name, namespace, and interface contract must be frozen",
+        "LRV-003 extraction and licensing manifest must identify the source boundary"
+      ]
+    },
+    {
+      "key": "LRV-005",
+      "title": "Scaffold the standalone package, CI, and packed-artifact gates",
+      "priority": "P1",
+      "lane": "Group 1 - Query-only foundation",
+      "description": "Establish an independent Node 24 TypeScript package, executable, test harness, quality gates, and release-safe build that never reads ClawSweeper at runtime or build time.",
+      "acceptanceCriteria": [
+        "A clean Node 24 and pnpm install can build, typecheck, lint, format-check, unit-test, and pack the project.",
+        "The package declares a real bin entry and the packed tarball installs in a clean temporary project where help and version work.",
+        "ESM, strict TypeScript, node:test, node:util.parseArgs, oxlint, and oxfmt conventions are pinned and documented.",
+        "Production dependencies are minimal, lockfile-pinned, license-audited, and contain no unapproved install scripts.",
+        "No build, test, or runtime step imports ClawSweeper dist, configuration, repository profiles, or hidden home-directory paths."
+      ],
+      "dependencies": ["LRV-004 repository and Linear project must exist"]
+    },
+    {
+      "key": "LRV-006",
+      "title": "Define the canonical Linear issue snapshot and source envelope",
+      "priority": "P1",
+      "lane": "Group 1 - Query-only foundation",
+      "description": "Create small standalone source types and canonical serialization that bind the complete Linear input without prematurely owning advisory model semantics or carrying ClawSweeper mutation and lifecycle types.",
+      "acceptanceCriteria": [
+        "The issue schema covers stable workspace and issue identities, title, description, creator, team, project, state, priority, labels, fully hydrated comments within hard bounds, attachment metadata, timestamps, and pagination.",
+        "The source envelope distinguishes complete provider hydration from deterministic model-context selection; source bound exhaustion fails instead of producing a partial snapshot.",
+        "Canonical serialization and hashing are deterministic across key order and supported platforms and cover the complete hydrated source plus every context-selection omission.",
+        "The schema contains no advisory disposition, mutation request, apply authorization, managed-comment ownership, or action-taken claim; LRV-011 owns review semantics and LRV-014 owns proof receipts.",
+        "Valid, malformed, missing, oversized, and forward-compatibility fixtures pass matching TypeScript and JSON-schema validation tests."
+      ],
+      "dependencies": [
+        "LRV-002 CLI and compatibility contract must define the external envelopes",
+        "LRV-005 package and schema tooling must exist"
+      ]
+    },
+    {
+      "key": "LRV-007",
+      "title": "Extract the query-only Linear transport, authentication, retry, and cancellation layer",
+      "priority": "P1",
+      "lane": "Group 1 - Query-only foundation",
+      "description": "Build the narrow authenticated Linear data plane with a fixed endpoint, approved private query documents, positive GraphQL query enforcement, bounded retry, timeout, and cancellation.",
+      "acceptanceCriteria": [
+        "Exactly one parsed GraphQL query operation is required before network, retry, or sleep; mutation, subscription, mixed, malformed, fragment-only, multi-operation, and oversized documents fail with a constant redacted error.",
+        "The production endpoint is fixed to https://api.linear.app/graphql, redirects are rejected, and no CLI endpoint override or public generic execute(document) API exists.",
+        "Credentials are environment-only and never appear in errors, verbose output, snapshots, receipts, child environments, or request diagnostics; multiple nonblank credential variables fail as ambiguous rather than silently selecting one.",
+        "HTTP, partial GraphQL errors, throttling, transient failures, timeout, retry-after, reset, jitter, and AbortSignal behavior have deterministic bounded tests.",
+        "Non-retryable failures attempt once and cancellation interrupts both fetch and backoff promptly."
+      ],
+      "dependencies": [
+        "LRV-005 standalone package and test harness must exist",
+        "LRV-006 source and error contracts must be defined"
+      ]
+    },
+    {
+      "key": "LRV-008",
+      "title": "Implement exact-issue hydration and drift-safe snapshotting",
+      "priority": "P1",
+      "lane": "Group 1 - Query-only foundation",
+      "description": "Fetch exactly one Linear issue and its decision-relevant source with strict runtime parsing, complete-or-fail pagination within hard bounds, canonical hashing, and no workspace list surface.",
+      "acceptanceCriteria": [
+        "TEAM-NUMBER and canonical Linear URLs normalize to one canonical identifier; malformed or cross-host URLs fail before network.",
+        "Every required scalar, enum, timestamp, identifier, and connection is validated from untyped provider data and partial GraphQL errors fail the operation.",
+        "The fetched issue is bound to the returned stable workspace ID, team ID/key, issue UUID, and normalized identifier so a credential or alias cannot silently select a different workspace subject.",
+        "Comments and other decision-relevant connections are fully hydrated within published hard bounds; any page or item bound exhaustion fails before snapshot creation, while attachment bodies and arbitrary URLs are never fetched.",
+        "Missing or repeated cursors, duplicate nodes, mid-pagination issue drift, bounded-page exhaustion, zero matches, and multiple matches have deterministic tests.",
+        "The canonical snapshot hash changes for every hydrated source field; only the later model-context projection may truncate and its omissions are separately hashed and reported.",
+        "No workspace, team, project, stale-triage, or batch-list command is exported in version 1."
+      ],
+      "dependencies": [
+        "LRV-006 canonical issue schema must be frozen",
+        "LRV-007 query-only transport must be available"
+      ]
+    },
+    {
+      "key": "LRV-009",
+      "title": "Enforce negative mutation capability as a build invariant",
+      "priority": "P1",
+      "lane": "Group 1 - Query-only foundation",
+      "description": "Make read-only behavior an auditable source, schema, packed-artifact, and runtime invariant rather than a convention or CLI default.",
+      "acceptanceCriteria": [
+        "Every production query is name/hash allowlisted and validates against a checksum-pinned immutable Linear schema source.",
+        "A forbidden-document matrix proves zero fetch, retry, and sleep calls for comments, BOMs, ignored tokens, mutation, subscription, mixed, fragment-only, malformed, and oversized cases.",
+        "CI parses source and the packed artifact and fails on production mutation documents, write credential resolvers, apply flags, mutation clients, or generic GraphQL execution surfaces.",
+        "An exact-item integration test records the observed operation names and proves they are all approved queries.",
+        "The published exception process requires a new product/security charter rather than an ordinary feature change."
+      ],
+      "dependencies": [
+        "LRV-007 transport boundary must be implemented",
+        "LRV-008 complete exact-item query set must be known"
+      ]
+    },
+    {
+      "key": "LRV-010",
+      "title": "Implement explicit repository identity and immutable revision preflight",
+      "priority": "P1",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Bind review evidence to one caller-selected local Git repository and exact revision without inference, remote mutation, hidden checkout conventions, or GitHub API access.",
+      "acceptanceCriteria": [
+        "The absolute repository path is canonicalized, must resolve to a git worktree, and has defined tested symlink and path-escape behavior.",
+        "The preflight records canonical remote owner/name, HEAD, tree, branch or detached state, dirty state, shallow state, and the configured comparison base.",
+        "Remote mismatch, any dirty worktree, missing or unverifiable base, shallow history, and unsupported state fail version 1 before model execution.",
+        "No issue-derived URL, label, title, or description may select the repository; a conflicting issue signal may only block with an explanation.",
+        "Preflight uses argument-array git commands with bounded output and performs no clone, fetch, pull, checkout, reset, worktree creation, credential-helper, or repository write."
+      ],
+      "dependencies": [
+        "LRV-005 standalone git test harness must exist",
+        "LRV-006 source envelope must provide the issue identity bound to this repository input"
+      ]
+    },
+    {
+      "key": "LRV-011",
+      "title": "Define the standalone advisory review protocol and bounded prompt",
+      "priority": "P1",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Replace ClawSweeper profiles, close policy, and apply language with one versioned advisory protocol over a bounded issue snapshot and explicit repository context.",
+      "acceptanceCriteria": [
+        "The versioned result schema separates disposition (actionable, no_action, needs_human, uncertain) from reason (not_present, present_at_reviewed_revision, needs_information, product_direction, repository_mismatch, unclear) and defines confidence, summary, evidence, next step, and limits.",
+        "Issue title, description, comments, labels, attachment metadata, and repository files are clearly serialized as untrusted data and cannot change system instructions or permissions.",
+        "Provider hydration is complete-or-fail; only the derived model context may truncate, and every omitted category/count is deterministic, hashed, and visible in prompt metadata and result.",
+        "The protocol requests no mutation, comment body, label/state plan, repair dispatch, close execution, or managed lifecycle action.",
+        "Golden prompts cover actionable bugs, behavior present at the reviewed revision, needs-information, product decisions, wrong-repository input, malicious instructions, long history, and no-findings cases."
+      ],
+      "dependencies": [
+        "LRV-008 canonical issue input must be available",
+        "LRV-010 repository identity and context boundary must be defined"
+      ]
+    },
+    {
+      "key": "LRV-012",
+      "title": "Build the isolated Codex runner and credential firewall",
+      "priority": "P1",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Run the single approved version 1 analyzer with repository-read-only tools while preventing Linear, write, network, and ambient user configuration from reaching model-generated commands.",
+      "acceptanceCriteria": [
+        "The exact supported Codex CLI version, invocation, authentication source, and required sandbox/output-schema capabilities are pinned and verified by a secret-free doctor command.",
+        "The child environment is allowlisted and excludes Linear, GitHub-write, package-registry, cloud, SSH-agent, keychain, and unrelated host credentials.",
+        "Model-generated commands can read only the target repository and minimal runtime paths, cannot write any mounted path, and cannot access network.",
+        "The runner ignores user MCP, web, tool, and model overrides; uses a versioned output schema; sends the prompt through stdin; and bounds stdout, stderr, runtime, and cancellation.",
+        "The model process receives only the minimum approved provider authentication, while generated command environments receive no provider or Linear credentials.",
+        "Fake-runner tests prove environment scrubbing, sandbox selection, timeout, cancellation, output bounds, and cleanup without a live model call."
+      ],
+      "dependencies": [
+        "LRV-010 repository sandbox inputs must be known",
+        "LRV-011 prompt and output protocol must be frozen"
+      ]
+    },
+    {
+      "key": "LRV-013",
+      "title": "Validate model output and re-verify every evidence claim",
+      "priority": "P1",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Treat model output as untrusted and let deterministic host code mechanically validate cited commit, path, line, excerpt, and command coordinates without claiming that they semantically prove the model judgment.",
+      "acceptanceCriteria": [
+        "Malformed, oversized, unknown-version, and semantically inconsistent model output is rejected with stable non-echoing errors.",
+        "Every cited path resolves inside the real repository, the file and line exist at the recorded revision, the excerpt matches, and cited commits are reachable from the recorded head.",
+        "These checks mechanically validate coordinates, not the semantic claim; unsupported coordinates cannot produce high confidence or present-at-reviewed-revision advice and are reported explicitly.",
+        "The result binds issue snapshot hash, repository head/tree/dirty state, prompt hash, output-schema hash, analyzer version, public provider/model identity, and evidence-validation status.",
+        "Model-reported commands and host-observed commands are distinct fields; identical normalized inputs and a deterministic fake analyzer produce byte-identical substantive output with remoteWritesAttempted=false."
+      ],
+      "dependencies": [
+        "LRV-008 canonical issue snapshot must exist",
+        "LRV-011 review result contract must be defined",
+        "LRV-012 isolated runner must produce schema-bound output"
+      ]
+    },
+    {
+      "key": "LRV-014",
+      "title": "Implement development-only recovery artifacts and public proof receipts",
+      "priority": "P2",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Keep the production CLI persistence-free while giving development proofs atomic private recovery records and a separate allowlisted public receipt format.",
+      "acceptanceCriteria": [
+        "The production review command has no output-file option and persists no issue or model content; human and JSON results remain stdout-only.",
+        "Development recovery and receipt writes are atomic, reject symlinks, dangling links, directories, and special files, use owner-only or platform-equivalent access, and never target the reviewed repository.",
+        "Private recovery data and public receipts use separate schemas; public receipts omit identifiers, team keys, content, local paths, tokens, endpoints, raw model output, and private model names.",
+        "Failed or interrupted proof writes leave no artifact falsely claiming completion, and cleanup/replacement behavior is race-aware and tested.",
+        "Every checksum defines its canonical covered fields and is described as a checksum rather than a signature; unsupported proof-artifact platforms fail closed without weakening the runtime CLI."
+      ],
+      "dependencies": [
+        "LRV-006 stable source identity and digest fields must be defined",
+        "LRV-013 validated review results must be available"
+      ]
+    },
+    {
+      "key": "LRV-015",
+      "title": "Wire the exact-item review command end to end",
+      "priority": "P1",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Compose argument parsing, Linear read, repository preflight, prompt construction, model review, evidence verification, and result emission into the packed executable without adding a dry-run/apply distinction.",
+      "acceptanceCriteria": [
+        "The command executes the specified stage order and never silently changes issue, repository, revision, provider, or output scope.",
+        "Failures stop downstream work: usage/auth failure does not touch git or model, source failure does not run the model, and repository preflight failure does not analyze.",
+        "A completed run emits one schema-valid result and no diagnostics on stdout; the runtime persists no issue, prompt, model, or receipt artifact.",
+        "Captured traffic contains only allowlisted Linear queries and declared model control traffic; model-generated commands have no traffic.",
+        "The npm-packed executable passes success, not-found, auth, malformed-source, repository, bad-model-output, timeout, and interruption tests."
+      ],
+      "dependencies": [
+        "LRV-009 negative mutation capability gate must pass",
+        "LRV-010 repository preflight must be implemented",
+        "LRV-013 result and evidence validation must be implemented"
+      ]
+    },
+    {
+      "key": "LRV-016",
+      "title": "Complete human and JSON output, diagnostics, and signal UX",
+      "priority": "P2",
+      "lane": "Group 2 - Repository and review engine",
+      "description": "Make the CLI understandable to operators and stable in scripts, with clear separation of source facts, mechanically validated coordinates, advisory recommendations, warnings, limits, and diagnostics.",
+      "acceptanceCriteria": [
+        "Human output clearly separates source facts, mechanically validated evidence coordinates, unverified semantic judgment, advisory result, recommended next step, omissions, and proof limits.",
+        "JSON mode emits exactly one versioned value on stdout; progress and diagnostics use stderr and never expose secrets or raw provider bodies.",
+        "TTY behavior, quiet/verbose, NO_COLOR, TERM=dumb, Unicode, narrow terminals, and piped output match the frozen contract.",
+        "Help works in every supported argument position, version uses stdout, and missing input prints concise usage without waiting for stdin.",
+        "SIGINT promptly cancels outstanding work, uses the documented exit code, and leaves no partial complete artifact."
+      ],
+      "dependencies": [
+        "LRV-002 external CLI and output contract must be frozen",
+        "LRV-015 integrated command must exist"
+      ]
+    },
+    {
+      "key": "LRV-017",
+      "title": "Publish installation, security, schema, and troubleshooting documentation",
+      "priority": "P2",
+      "lane": "Group 3 - Product proof and documentation",
+      "description": "Provide complete operator documentation for safe clean installation and exact-item review without consulting ClawSweeper or exposing credentials.",
+      "acceptanceCriteria": [
+        "Docs cover supported platforms/runtime, install, upgrade, uninstall, environment credential setup, doctor, first review, JSON automation, exit codes, output privacy, and Ctrl-C.",
+        "The query-only guarantee, development-only fixture mutation exception, model data flow, provider privacy implications, and every global scope exclusion are explicit.",
+        "Documentation states that a personal API key may still possess write authority and that the approved-operation transport, not the token label, is the runtime mutation-prevention boundary unless provider-enforced read scope is used.",
+        "Troubleshooting covers auth, rate limits, schema drift, incomplete provider data, dirty or mismatched repositories, Codex version/auth, sandbox failures, timeouts, and proof recovery records.",
+        "JSON schemas, compatibility policy, data retention, security reporting, provenance, and proof limits are linked from help and README.",
+        "Every documented command is exercised in clean-install smoke tests using fixtures when a live call is inappropriate."
+      ],
+      "dependencies": ["LRV-016 final CLI behavior and diagnostics must be stable"]
+    },
+    {
+      "key": "LRV-018",
+      "title": "Add hermetic packed-binary end-to-end and extraction-parity tests",
+      "priority": "P1",
+      "lane": "Group 3 - Product proof and documentation",
+      "description": "Exercise the packed binary with an external development-only fetch interceptor, deterministic model runner, and disposable git repository, preserving intended behavior without shipping endpoint or provider overrides.",
+      "acceptanceCriteria": [
+        "Hermetic scenarios cover no findings, actionable, present-at-reviewed-revision, needs-information, product decision, wrong repository, prompt injection, pagination, drift, retry, malformed data, dirty repo, remote mismatch, invalid path/line/SHA evidence, timeout, and interruption.",
+        "A Node preload or equivalent external test harness replaces fetch before the installed CLI loads, lives outside the tarball, and CI proves the production package contains no endpoint override or arbitrary provider seam.",
+        "The harness asserts zero Linear mutation attempts, zero model-command network, and zero target-repository writes.",
+        "Selected upstream fixtures produce equivalent canonical source facts or every intentional difference is approved and documented.",
+        "Tests install and run the packed artifact from outside both source repositories and with no ambient ClawSweeper configuration.",
+        "No fixture contains live credentials, private production issue content, or a real operator path."
+      ],
+      "dependencies": [
+        "LRV-009 packed negative-capability gate must exist",
+        "LRV-013 host validation must be implemented",
+        "LRV-015 end-to-end command must be wired",
+        "LRV-016 stable output and error UX must be implemented"
+      ]
+    },
+    {
+      "key": "LRV-019",
+      "title": "Complete adversarial security review and packaged negative-capability proof",
+      "priority": "P1",
+      "lane": "Group 3 - Product proof and documentation",
+      "description": "Independently attack the GraphQL boundary, parsers, sandbox, environment, repository mount, filesystem output, redaction, evidence validation, dependencies, and final tarball.",
+      "acceptanceCriteria": [
+        "Fuzzing covers GraphQL ignored tokens/comments/BOMs, identifiers, URLs, provider JSON, cursors, paths, model JSON, ANSI/OSC controls, delimiters, and oversized inputs.",
+        "Hostile issue and repository content cannot alter permissions, read protected environment values, invoke network, write the repository, or escape output validation.",
+        "The packed artifact is audited for mutation documents, generic executors, write credential names, apply flags, unexpected files, source maps, postinstall hooks, undeclared executables, and ClawSweeper imports.",
+        "The proof records rejection, fetch, retry, sleep, network, filesystem-write, output, and cleanup observations with explicit limits.",
+        "All P1/P2 security findings are fixed or remain release-blocking; the final committed head receives a fresh review."
+      ],
+      "dependencies": [
+        "LRV-012 model sandbox and credential firewall must be implemented",
+        "LRV-015 complete command surface must exist",
+        "LRV-018 packed-binary hermetic harness must exist"
+      ]
+    },
+    {
+      "key": "LRV-020",
+      "title": "Run the dynamic live Linear create, read, review, and cleanup proof",
+      "priority": "P1",
+      "lane": "Group 3 - Product proof and documentation",
+      "description": "Use caller-owned, separately scoped setup/read credentials to create one ephemeral non-production Linear issue, review it with the packed query-only CLI against a disposable repository, then clean up and verify the exact fixture.",
+      "acceptanceCriteria": [
+        "Credentials and caller-owned team UUID are environment/operator inputs and are absent from source, argv, build environments, public artifacts, and model-generated command environments.",
+        "An exclusive lease and pre-create durable recovery record contain workspace/team identity, run ID, timestamp, unique correlation UUID/title, and recovery command before creation; a bounded correlation lookup recovers create-success/response-loss outcomes before retry.",
+        "The packed subject performs an actual Linear read, actual model review, and host evidence validation with only the read credential; every observed subject operation is an approved query and subject mutation count is zero.",
+        "A separately callable idempotent cleanup command trashes exactly the recovered or returned UUID in finally and verifies that it is absent from active issue reads; cleanup failure makes the whole proof fail and preserves actionable recovery evidence.",
+        "The public-safe receipt records head, tree, base, package checksum, runtime/provider identifiers, fixture alias, schema/protocol versions, query and mutation observations separated by harness/subject, repository before/after state, receipt checksum, and explicit limits.",
+        "The receipt distinguishes subject and cleanup verdicts, states that Linear trash is recoverable rather than permanent erasure, and any current-head, contract, package, or proof-affecting change invalidates and reruns the proof."
+      ],
+      "dependencies": [
+        "LRV-014 proof recovery and public receipt handling must be implemented",
+        "LRV-018 packed-binary end-to-end harness must pass",
+        "LRV-019 adversarial security findings must be resolved"
+      ]
+    },
+    {
+      "key": "LRV-021",
+      "title": "Qualify supported platforms, installation paths, and resource limits",
+      "priority": "P2",
+      "lane": "Group 4 - Qualification and release",
+      "description": "Validate the actual packed CLI and exact external Codex dependency on the approved OS/runtime matrix and publish enforceable limits without weakening sandbox guarantees to claim portability.",
+      "acceptanceCriteria": [
+        "Clean packed installs, doctor checks, hermetic reviews, and one real runner smoke pass on every platform/runtime approved by LRV-001, with Crabbox/Testbox provider and ID evidence where required.",
+        "Native Windows or WSL2 is claimed only if the Codex authentication and model sandbox contracts are equivalent; otherwise unsupported platforms fail clearly while supported stdout-only paths remain honest.",
+        "Tests cover spaces and Unicode in paths, non-TTY execution, supported shells, proxy/certificate environment treatment, and available signal behavior.",
+        "Maximum document, provider response, pagination, prompt, model output, artifact, timeout, memory, and subprocess-output limits are documented and enforced.",
+        "A maximum-size deterministic fixture completes within the approved time/memory budget without silent truncation."
+      ],
+      "dependencies": [
+        "LRV-016 stable CLI and output behavior must be complete",
+        "LRV-018 packed hermetic tests must exist",
+        "LRV-019 security proof must define platform-sensitive guarantees"
+      ]
+    },
+    {
+      "key": "LRV-022",
+      "title": "Run private beta and freeze the version 1 compatibility contract",
+      "priority": "P1",
+      "lane": "Group 4 - Qualification and release",
+      "description": "Validate clean-install operator usability and freeze command, JSON, security, redaction, support, and proof contracts only after real behavior and platform evidence exist.",
+      "acceptanceCriteria": [
+        "At least two representative operator scenarios complete from a clean install using only published documentation.",
+        "Every beta defect is classified and no unresolved P1/P2 correctness, security, install, privacy, or contract defect remains.",
+        "Command syntax, exit codes, JSON schemas, redaction, platform list, credential precedence, read-only exclusions, and proof limits are frozen for version 1.",
+        "Any head, contract, documentation, or package change invalidating the live proof triggers affected proof and review again.",
+        "Before release, a named owner roster, supported-version and schema-update policy, security contact, credential-incident procedure, release cadence, support path, and rollback runbook are approved without adding deferred features."
+      ],
+      "dependencies": [
+        "LRV-017 operator documentation must be complete",
+        "LRV-020 dynamic live proof must pass on the release candidate",
+        "LRV-021 platform and installation matrix must be qualified"
+      ]
+    },
+    {
+      "key": "LRV-023",
+      "title": "Publish and verify the provenance-backed version 1 package",
+      "priority": "P1",
+      "lane": "Group 4 - Qualification and release",
+      "description": "Build, publish, install, verify, and rollback-test the first standalone release from the exact reviewed tag and minimal audited file set.",
+      "acceptanceCriteria": [
+        "The release artifact is built once from the reviewed tag and includes provenance, checksums, license/NOTICE, source-attribution manifest, changelog, SBOM, and only the documented files.",
+        "The exact tarball bytes and checksum from LRV-020 are published without rebuild, or the exact downloaded registry tarball receives a fresh live subject proof before release is declared complete.",
+        "Registry install, version, help, hermetic review, schema validation, and public receipt verification pass against the exact published artifact.",
+        "Release notes state the query-only guarantee, supported platforms, compatibility contract, model/privacy behavior, known limits, and all version 1 exclusions.",
+        "No fixture setup credential code, mutation document, postinstall script, ClawSweeper runtime dependency, or private artifact is in the published package.",
+        "Rollback/yank/deprecation procedures are rehearsed without deleting prior releases or user data, and release checksums are independently read back."
+      ],
+      "dependencies": [
+        "LRV-019 final packaged security proof must be clean",
+        "LRV-020 current release-candidate live proof must pass",
+        "LRV-021 supported platform matrix must pass",
+        "LRV-022 version 1 compatibility contract and release decision must be approved"
+      ]
+    },
+    {
+      "key": "LRV-024",
+      "title": "Archive the extraction source and retire the active forked sidecar",
+      "priority": "P2",
+      "lane": "Group 5 - Fork disposition and maintenance",
+      "description": "After the standalone package is proven and released, preserve fixed source refs and stop maintaining the ClawSweeper fork as a second product or canonical implementation.",
+      "acceptanceCriteria": [
+        "Immutable full-SHA archive refs preserve the closed https://github.com/openclaw/clawsweeper/pull/1039 head, hardened extraction source head, receipts, provenance manifest, and migration decisions before any fork disposition.",
+        "An immediate maintenance freeze stops feature development on the fork; a later separately approved decision chooses GitHub archive or non-destructive main re-anchoring without deleting refs or force-updating implicitly.",
+        "Documentation points operators to the standalone package and does not imply the embedded Linear copy is canonical or upstream-supported.",
+        "No upstream ClawSweeper apply, repair, automerge, sweep, dashboard, or OpenClaw Bay workflow is changed by this cleanup.",
+        "The standalone project retains no runtime import, submodule, shared package, or hidden source-tree dependency on the fork."
+      ],
+      "dependencies": ["LRV-023 standalone version 1 package must be published and verified"]
+    },
+    {
+      "key": "LRV-025",
+      "title": "Operate post-release compatibility, security, and release maintenance",
+      "priority": "P2",
+      "lane": "Group 5 - Fork disposition and maintenance",
+      "description": "Operate and test the pre-release ownership, schema, dependency, security, incident, and release policies after general availability without weakening the query-only contract.",
+      "acceptanceCriteria": [
+        "A compatibility job validates allowlisted queries against the pinned and current Linear schema and opens a reviewable failure without modifying Linear or auto-merging security-sensitive changes.",
+        "Dependency/runtime updates run full packed negative-capability and hermetic proof, with live proof required for relevant provider, model, or transport changes.",
+        "The pre-release owner roster, supported-version policy, security reporting path, release cadence, schema-pin process, deprecation policy, and credential-incident runbook are exercised and updated from operational evidence.",
+        "Incident exercises distinguish provider outage, schema drift, model outage, sandbox regression, leaked credential, unsafe artifact, and suspected write-boundary regression.",
+        "A post-release review records defects, support load, proof health, and evidence for or against each deferred charter without enabling telemetry."
+      ],
+      "dependencies": [
+        "LRV-023 version 1 package must be released",
+        "LRV-024 fork ownership and canonical-source disposition must be complete"
+      ]
+    }
+  ],
+  "polishItems": [],
+  "superseded": [
+    {
+      "key": "PR-1039",
+      "reason": "https://github.com/openclaw/clawsweeper/pull/1039 was closed upstream; the standalone project replaces the rejected in-repository sidecar product boundary rather than reopening it."
+    },
+    {
+      "key": "FULL-FORK",
+      "reason": "Maintaining an independent ClawSweeper distribution solely for Linear is rejected because its inherited platform and upstream churn are unrelated to the product value."
+    },
+    {
+      "key": "WHOLESALE-PORT",
+      "reason": "Copying all current Linear files is rejected because mutation, lifecycle, scheduler, record, repository-profile, and ClawSweeper runtime couplings remain present."
+    }
+  ]
+}
