@@ -8,9 +8,11 @@ Machine intake: `docs/linear-review-intake.json`
 
 The intake's `currentHead` records the extraction-source revision
 (`1ada0983efee3f48f97fe0a99d20a402b345db11`) that the reviewed content derives
-from. An artifact cannot name its own carrier commit, so the committed carrier
-revision of these files is recorded externally in the import approval packet,
-receipts, and import index rather than inside this document or the intake.
+from. An artifact cannot name its own carrier commit, so the carrier commit,
+Git blob ID, and source-file SHA-256 are recorded in the external import
+approval packet and retained verification bundle. Generated `linear-ingest`
+receipts and import-index entries bind the source SHA-256 and plan hash; they do
+not independently encode the carrier commit.
 
 ## Decision
 
@@ -492,9 +494,10 @@ requires observed operator demand and a fresh product/security charter.
    the `linear-review` runtime.
 3. Import LRV-001–LRV-025 only after that destination exists. LRV-004 verifies
    the already-created bootstrap state; it no longer creates its own container.
-4. Commit these reviewed artifacts, replace draft provenance with the exact
-   commit, and replace `TODO` with the exact team/project and either an explicit
-   cycle or an explicit no-cycle decision.
+4. Commit these reviewed artifacts while keeping `currentHead` pinned to the
+   extraction-source revision. Record the carrier commit, Git blob ID, and
+   source-file SHA-256 externally, and replace `TODO` with the exact
+   team/project and either an explicit cycle or an explicit no-cycle decision.
 5. Use `linear-ingest` as the only issue-create path: regenerate `plan`, run
    `preflight`, create any approved dependencies through their separate receipt
    gate, then run a fresh live `dry-run`.
