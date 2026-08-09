@@ -1,9 +1,9 @@
 # Standalone Linear Review CLI — Project Plan
 
-Status: reviewed final; destination resolved 2026-08-09 — Linear Project `Linear Review` (team PAR, label Developer Tooling, slugId `564df4804c1e`, explicit no-cycle: team cycles disabled); artifacts committed, apply gated only on the operator-approved live dry-run receipt  
-Date: 2026-08-09  
-Working name: `linear-review`  
-Extraction source: `ostehost/clawsweeper` at `1ada0983efee3f48f97fe0a99d20a402b345db11`  
+Status: reviewed final; destination resolved 2026-08-09 — Linear Project `Linear Review` (team PAR, label Developer Tooling, slugId `564df4804c1e`, explicit no-cycle: team cycles disabled); artifacts committed, apply gated only on the operator-approved live dry-run receipt
+Date: 2026-08-09
+Working name: `linear-review`
+Extraction source: `ostehost/clawsweeper` at `1ada0983efee3f48f97fe0a99d20a402b345db11`
 Machine intake: `docs/linear-review-intake.json`
 
 The intake's `currentHead` records the extraction-source revision
@@ -501,8 +501,9 @@ requires observed operator demand and a fresh product/security charter.
 5. Use `linear-ingest` as the only issue-create path: regenerate `plan`, run
    `preflight`, create any approved dependencies through their separate receipt
    gate, then run a fresh live `dry-run`.
-6. Have the project owner named in LRV-001 authorize the exact batch,
-   destination, plan hash, and live dry-run receipt.
+6. Have the governance-authorized operator for this batch authorize the exact
+   destination, plan hash, and live dry-run receipt. This import approval is
+   separate from the long-term project owner that LRV-001 must name.
 7. Run approved-receipt `apply`, then `read-back` and retain the import index.
    Verify every issue identifier, URL, priority, dependency, and project/cycle
    binding.

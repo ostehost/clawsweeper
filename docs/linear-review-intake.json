@@ -2,9 +2,9 @@
   "schema": "linear_import_work_units_v1",
   "sourceRepo": "ostehost/clawsweeper",
   "currentHead": "1ada0983efee3f48f97fe0a99d20a402b345db11",
-  "provenanceNote": "currentHead is the extraction-source revision of ostehost/clawsweeper that this intake was derived from. The committed carrier revision of this artifact cannot name itself; it is recorded externally in the import approval packet, receipts, and import index.",
+  "provenanceNote": "currentHead is the extraction-source revision of ostehost/clawsweeper that this intake was derived from. The external approval packet records the carrier commit, Git blob IDs, and file SHA-256 values. Generated plans, receipts, and import-index entries bind the source bytes by source hash and do not independently encode the carrier commit.",
   "generatedAt": "2026-08-09T20:28:29Z",
-  "updatedAt": "2026-08-09T21:32:00Z",
+  "updatedAt": "2026-08-09T21:36:48Z",
   "timezone": "America/New_York",
   "linearIntake": {
     "batch": "standalone-linear-review-final-draft-2026-08-09",
@@ -15,7 +15,7 @@
     "cycle": null,
     "cycleDecision": "explicit no-cycle: team PartnerAI (PAR) has cycles disabled (verified live 2026-08-09)",
     "destinationStatus": "resolved_2026-08-09_project_created_via_create-linear-project.sh",
-    "authorityStatus": "blocked_pending_named_project_owner_approval",
+    "authorityStatus": "blocked_pending_governance_authorized_operator_approval",
     "priorityMap": {
       "P0": "ship-blocker",
       "P1": "high",
