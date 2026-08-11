@@ -35,7 +35,8 @@
         "triage-dashboard.md",
         "related-issue-discovery.md",
         "spam-scanner.md",
-        "local-clawsweeper-skill.md"
+        "local-clawsweeper-skill.md",
+        "linear-integration.md"
       ]
     },
     {
@@ -62,6 +63,11 @@
       "path": "repair/containment-validation-todo.md",
       "lifecycle": "historical",
       "banner": "This is historical decision evidence, not current operator guidance."
+    },
+    {
+      "path": "PLAN-standalone-linear-review.md",
+      "lifecycle": "proposed",
+      "banner": "This is a project plan for a standalone extraction, not current operator guidance."
     },
     {
       "prefix": "proof/",
