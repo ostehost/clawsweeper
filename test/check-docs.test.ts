@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -797,5 +797,21 @@ test("checks prompt and agent-skill instruction roots", () => {
     const findings = checkDocumentation(root);
     assert.ok(findings.some((finding) => finding.file === "prompts/example.md"));
     assert.ok(findings.some((finding) => finding.file === ".agents/skills/example/SKILL.md"));
+  });
+});
+
+test("does not re-check a symlinked markdown alias against the alias directory", () => {
+  withFixture((root) => {
+    writeFileSync(join(root, "AGENTS.md"), "[Guide](docs/guide.md#operation)\n");
+    mkdirSync(join(root, ".agents/rules"), { recursive: true });
+    // The shim that exposes AGENTS.md to agent runtimes expecting
+    // .agents/rules/. Following it would resolve the target's repository-root
+    // relative links against .agents/rules/ and report them as missing.
+    symlinkSync("../../AGENTS.md", join(root, ".agents/rules/project.md"));
+    const findings = checkDocumentation(root);
+    assert.deepEqual(
+      findings.filter((finding) => finding.file === ".agents/rules/project.md"),
+      [],
+    );
   });
 });

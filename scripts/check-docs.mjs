@@ -628,7 +628,12 @@ function collectMarkdownFiles(root, inventory) {
         MARKDOWN_ROOTS.some(
           (markdownRoot) => entry === markdownRoot || entry.startsWith(`${markdownRoot}/`),
         ) &&
-        fs.statSync(path.join(root, entry)).isFile(),
+        // lstat, not stat: a symlinked markdown alias (for example the
+        // .agents/rules shim pointing at AGENTS.md) is not an independent
+        // document. Its target is already checked at its real path, and
+        // re-checking it here would resolve the target's relative links
+        // against the alias directory instead of the repository root.
+        fs.lstatSync(path.join(root, entry)).isFile(),
     )
     .sort();
 }
