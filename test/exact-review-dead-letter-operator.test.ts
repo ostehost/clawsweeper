@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
@@ -60,6 +61,18 @@ test("automatic dead-letter reconciliation is scheduled, bounded, and least priv
   assert.equal(scheduled.on.workflow_dispatch.inputs.execute.default, false);
   assert.equal(scheduled.on.workflow_dispatch.inputs.max_targets.default, "100");
   assert.equal(scheduled.on.workflow_dispatch.inputs.max_recoveries.default, "10");
+  const deadline = scheduled.jobs.reconcile.steps.find(
+    (candidate) => candidate.name === "Establish reconciliation deadline",
+  );
+  assert.match(deadline.run, /EXACT_REVIEW_RECONCILE_DEADLINE_MS/);
+  assert.match(deadline.run, /13 \* 60 \* 1000/);
+  assert.match(deadline.run, /GITHUB_ENV/);
+  assert.ok(
+    scheduled.jobs.reconcile.steps.indexOf(deadline) <
+      scheduled.jobs.reconcile.steps.findIndex((candidate) =>
+        candidate.uses?.startsWith("actions/checkout@"),
+      ),
+  );
   const step = scheduled.jobs.reconcile.steps.find(
     (candidate) => candidate.name === "Reconcile closed, duplicate, and recoverable dead letters",
   );
@@ -67,13 +80,390 @@ test("automatic dead-letter reconciliation is scheduled, bounded, and least priv
   assert.equal(scheduled.jobs.reconcile.env.CLAWSWEEPER_WEBHOOK_SECRET, undefined);
   assert.match(step.run, /--max-targets "\$MAX_TARGETS"/);
   assert.match(step.run, /--max-recoveries "\$MAX_RECOVERIES"/);
-  assert.match(step.run, /\/api\/health/);
-  assert.match(step.run, /\.deployment_sha/);
-  assert.match(step.run, /live_deploy_sha.*expected_deploy_sha/);
-  assert.match(step.run, /git fetch --no-tags --depth=1 origin "\$live_deploy_sha"/);
-  assert.match(step.run, /dashboard\/exact-review-queue\.ts/);
-  assert.match(step.run, /live_guard_blob.*expected_guard_blob/);
+  const guard = scheduled.jobs.reconcile.steps.find(
+    (candidate) => candidate.name === "Verify live recovery guards",
+  );
+  assert.match(guard.run, /\/api\/health/);
+  assert.match(guard.run, /\.deployment_sha/);
+  assert.match(guard.run, /live_deploy_sha.*expected_deploy_sha/);
+  assert.match(guard.run, /git fetch --no-tags --depth=1 origin "\$live_deploy_sha"/);
+  assert.match(guard.run, /dashboard\/exact-review-queue\.ts/);
+  assert.match(guard.run, /live_guard_blob.*expected_guard_blob/);
+  const parked = scheduled.jobs.reconcile.steps.find(
+    (candidate) => candidate.name === "Reconcile terminal and open parked reviews",
+  );
+  assert.equal(
+    parked.env.CLAWSWEEPER_WEBHOOK_SECRET,
+    "${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}",
+  );
+  assert.equal(parked.env.GITHUB_TOKEN, "${{ github.token }}");
+  assert.match(parked.run, /--action reconcile-parked/);
+  assert.match(parked.run, /--max-targets "\$MAX_TARGETS"/);
+  assert.match(parked.run, /--max-recoveries 5/);
+  assert.match(parked.run, /parked-reviews\.json/);
+  const upload = scheduled.jobs.reconcile.steps.find(
+    (candidate) => candidate.name === "Upload sanitized inventory",
+  );
+  assert.match(upload.with.path, /inventory\.json/);
+  assert.match(upload.with.path, /parked-reviews\.json/);
   assert.doesNotMatch(source, /dead-letters\/replay/);
+});
+
+test("parked review reconciliation plans by default and executes terminal resolve plus open recovery", async () => {
+  const secret = "test-parked-review-reconcile";
+  const mutations = [];
+  let queuePressure = "idle";
+  const parkedRows = [
+    parkedRow("openclaw/repo#1", "openclaw/repo", 1, 1_000),
+    parkedRow("openclaw/repo#2", "openclaw/repo", 2, 2_000),
+    parkedRow("gone/repo#3", "gone/repo", 3, 3_000),
+    {
+      ...parkedRow("openclaw/repo#4", "openclaw/repo", 4, 4_000),
+      excluded_reason: "command_context",
+    },
+    parkedRow("openclaw/repo#5", "openclaw/repo", 5, 5_000),
+  ];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    if (request.url === "/api/exact-review-queue") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          pressure: {
+            status: queuePressure,
+            active: queuePressure === "idle" ? 0 : 128,
+            capacity: 128,
+          },
+        }),
+      );
+      return;
+    }
+    if (
+      request.url === "/repos/openclaw/repo/issues/1" ||
+      request.url === "/repos/openclaw/repo/issues/5"
+    ) {
+      const number = Number(request.url.split("/").at(-1));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          node_id: `ISSUE_${number}`,
+          state: "open",
+          number,
+          repository_url: "https://api.github.com/repos/openclaw/repo",
+        }),
+      );
+      return;
+    }
+    if (request.url === "/repos/openclaw/repo/issues/2") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          node_id: "ISSUE_2",
+          state: "closed",
+          number: 2,
+          repository_url: "https://api.github.com/repos/openclaw/repo",
+        }),
+      );
+      return;
+    }
+    if (request.url === "/repos/gone/repo/issues/3" || request.url === "/repos/gone/repo") {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ message: "Not Found" }));
+      return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    const payload = JSON.parse(body);
+    if (request.url?.endsWith("/parked-reviews/list")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, parked_reviews: parkedRows, next_cursor: null }));
+      return;
+    }
+    mutations.push({ url: request.url, payload });
+    response.writeHead(200, { "content-type": "application/json" });
+    if (request.url?.endsWith("/recover-fresh")) {
+      response.end(
+        JSON.stringify({
+          ok: true,
+          recovered: payload.items.length,
+          deduped: 0,
+          skipped: 0,
+        }),
+      );
+    } else {
+      response.end(JSON.stringify({ ok: true, resolved: payload.items.length, skipped: 0 }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const directory = await mkdtemp(join(tmpdir(), "clawsweeper-parked-reconcile-"));
+  try {
+    const common = [
+      "--action",
+      "reconcile-parked",
+      "--max-targets",
+      "100",
+      "--max-recoveries",
+      "1",
+    ];
+    const planned = await runOperator(
+      [...common, "--output", join(directory, "planned.json")],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+    );
+    assert.equal(planned.code, 0, planned.stderr);
+    assert.deepEqual(JSON.parse(planned.stdout), {
+      action: "reconcile-parked",
+      dry_run: true,
+      inventory_complete: true,
+      queue_pressure: "idle",
+      inspected_targets: 4,
+      terminal_targets: 2,
+      repository_gone_targets: 1,
+      resolved_targets: 2,
+      open_targets: 2,
+      recovered_targets: 1,
+      skipped_targets: 2,
+      skip_reasons: { recovery_cap: 1 },
+      skip_samples: [],
+    });
+    assert.equal(mutations.length, 0);
+
+    const executed = await runOperator(
+      [...common, "--execute", "--output", join(directory, "executed.json")],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+    );
+    assert.equal(executed.code, 0, executed.stderr);
+    assert.deepEqual(JSON.parse(executed.stdout), {
+      action: "reconcile-parked",
+      dry_run: false,
+      inventory_complete: true,
+      queue_pressure: "idle",
+      inspected_targets: 4,
+      terminal_targets: 2,
+      repository_gone_targets: 1,
+      resolved_targets: 2,
+      open_targets: 2,
+      recovered_targets: 1,
+      skipped_targets: 2,
+      skip_reasons: { recovery_cap: 1 },
+      skip_samples: [],
+    });
+    assert.equal(mutations.filter((entry) => entry.url?.endsWith("/resolve")).length, 2);
+    const recovery = mutations.find((entry) => entry.url?.endsWith("/recover-fresh"));
+    assert.deepEqual(recovery.payload.items, [
+      { item_key: "openclaw/repo#1", revision: 1, updated_at_ms: 1_000 },
+    ]);
+    assert.match(recovery.payload.idempotency_key, /^parked-reconcile:[a-f0-9]{64}$/);
+
+    queuePressure = "saturated";
+    const pressureDeferred = await runOperator(
+      [
+        "--action",
+        "reconcile-parked",
+        "--max-targets",
+        "100",
+        "--max-recoveries",
+        "5",
+        "--output",
+        join(directory, "pressure-deferred.json"),
+      ],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+    );
+    assert.equal(pressureDeferred.code, 0, pressureDeferred.stderr);
+    assert.deepEqual(JSON.parse(pressureDeferred.stdout).skip_reasons, {
+      recovery_deferred_pressure: 2,
+    });
+    assert.equal(JSON.parse(pressureDeferred.stdout).skipped_targets, 3);
+
+    const artifact = JSON.parse(await readFile(join(directory, "executed.json"), "utf8"));
+    assert.deepEqual(artifact.summary, {
+      rows: 5,
+      by_reason: { review_retry_exhausted: 5 },
+    });
+    assert.equal(
+      artifact.parked_reviews.find((row) => row.item_key === "openclaw/repo#4").excluded_reason,
+      "command_context",
+    );
+    assert.equal(JSON.stringify(artifact).includes("test-parked-review-reconcile"), false);
+
+    const overCap = await runOperator(
+      ["--action", "reconcile-parked", "--max-recoveries", "6"],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+    );
+    assert.equal(overCap.code, 1);
+    assert.match(overCap.stderr, /between 0 and 5 for reconcile-parked/);
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("parked review reconciliation reports bounded HTTP and timeout skip diagnostics", async () => {
+  const secret = "test-parked-review-skip-reasons";
+  const parkedRows = [
+    parkedRow("openclaw/repo#1", "openclaw/repo", 1, 1_000),
+    parkedRow("openclaw/repo#2", "openclaw/repo", 2, 2_000),
+    parkedRow("openclaw/repo#3", "openclaw/repo", 3, 3_000),
+    parkedRow("openclaw/repo#4", "openclaw/repo", 4, 4_000),
+  ];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    if (request.url === "/api/exact-review-queue") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ pressure: { status: "idle", active: 0, capacity: 128 } }));
+      return;
+    }
+    if (request.url === "/repos/openclaw/repo/issues/1") {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ message: "Resource not accessible by integration" }));
+      return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    assert.ok(request.url?.endsWith("/parked-reviews/list"));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, parked_reviews: parkedRows, next_cursor: null }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const directory = await mkdtemp(join(tmpdir(), "clawsweeper-parked-skip-reasons-"));
+  try {
+    const preloadPath = join(directory, "timeout-fetch.mjs");
+    await writeFile(
+      preloadPath,
+      `const nativeFetch = globalThis.fetch;\n` +
+        `globalThis.fetch = (input, init) => /\\/issues\\/[2-4]$/.test(String(input))\n` +
+        `  ? Promise.reject(new DOMException("The operation was aborted due to timeout", "TimeoutError"))\n` +
+        `  : nativeFetch(input, init);\n`,
+      "utf8",
+    );
+    const result = await runOperator(
+      [
+        "--action",
+        "reconcile-parked",
+        "--max-targets",
+        "100",
+        "--output",
+        join(directory, "inventory.json"),
+      ],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+      { NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual(summary.skip_reasons, { http_403: 1, timeout: 3 });
+    assert.deepEqual(summary.skip_samples, [
+      {
+        target: "openclaw/repo#1",
+        reason: "parked review target check failed for openclaw/repo#1 with 403",
+      },
+      {
+        target: "openclaw/repo#2",
+        reason: "The operation was aborted due to timeout",
+      },
+      {
+        target: "openclaw/repo#3",
+        reason: "The operation was aborted due to timeout",
+      },
+    ]);
+    assert.equal(summary.inspected_targets, 4);
+    assert.equal(summary.skipped_targets, 4);
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("parked review reconciliation stops safely at the workflow deadline", async () => {
+  const secret = "test-parked-review-deadline";
+  const parkedRows = [
+    parkedRow("openclaw/repo#1", "openclaw/repo", 1, 1_000),
+    parkedRow("openclaw/repo#2", "openclaw/repo", 2, 2_000),
+    parkedRow("openclaw/repo#3", "openclaw/repo", 3, 3_000),
+  ];
+  let mutations = 0;
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    if (request.url === "/api/exact-review-queue") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ pressure: { status: "idle", active: 0, capacity: 128 } }));
+      return;
+    }
+    if (request.url?.startsWith("/repos/openclaw/repo/issues/")) {
+      const timer = setTimeout(() => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ node_id: "ISSUE_DELAYED", state: "open", number: 1 }));
+      }, 5_000);
+      response.once("close", () => clearTimeout(timer));
+      return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    if (request.url?.endsWith("/parked-reviews/list")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, parked_reviews: parkedRows, next_cursor: null }));
+      return;
+    }
+    mutations += 1;
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "unexpected_mutation" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const directory = await mkdtemp(join(tmpdir(), "clawsweeper-parked-deadline-"));
+  try {
+    const startedAt = Date.now();
+    const result = await runOperator(
+      [
+        "--action",
+        "reconcile-parked",
+        "--execute",
+        "--max-targets",
+        "100",
+        "--output",
+        join(directory, "deadline.json"),
+      ],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+      { EXACT_REVIEW_RECONCILE_DEADLINE_MS: String(Date.now() + 1_000) },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(Date.now() - startedAt < 2_500);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      action: "reconcile-parked",
+      dry_run: false,
+      inventory_complete: true,
+      queue_pressure: "idle",
+      inspected_targets: 1,
+      terminal_targets: 0,
+      repository_gone_targets: 0,
+      resolved_targets: 0,
+      open_targets: 0,
+      recovered_targets: 0,
+      skipped_targets: 3,
+      skip_reasons: {},
+      skip_samples: [],
+      deadline_reached: true,
+    });
+    assert.equal(mutations, 0);
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("automatic reconciliation resolves terminal rows and recovers one fresh review per target", async () => {
@@ -206,6 +596,8 @@ test("automatic reconciliation resolves terminal rows and recovers one fresh rev
       duplicate_rows: 1,
       active_review_rows: 0,
       skipped_targets: 1,
+      skip_reasons: {},
+      skip_samples: [],
     });
     const recovery = mutations.filter((entry) => entry.url?.endsWith("/recover-fresh"));
     assert.equal(recovery.length, 1);
@@ -280,8 +672,10 @@ test("automatic reconciliation skips fresh recovery under pressure and enforces 
       secret,
     );
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout).queue_pressure, "saturated");
-    assert.equal(JSON.parse(result.stdout).recovered_targets, 0);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.queue_pressure, "saturated");
+    assert.equal(summary.recovered_targets, 0);
+    assert.deepEqual(summary.skip_reasons, { recovery_deferred_pressure: 1 });
     assert.equal(recoveries, 0);
     for (const [flag, value] of [
       ["--max-targets", "0"],
@@ -681,6 +1075,7 @@ test("active and capped targets are counted only once across blocked inventory r
     const summary = JSON.parse(scenario.first.stdout);
     assert.equal(summary.recovered_targets, 1);
     assert.equal(summary.skipped_targets, 2);
+    assert.deepEqual(summary.skip_reasons, active ? {} : { recovery_cap: 1 });
     assert.equal(scenario.inventoryRequests, 2);
   }
 });
@@ -1961,6 +2356,94 @@ test("inaccessible canonical targets cannot starve independently invalid dead le
   assert.equal(JSON.parse(scenario.first.stdout).invalid_rows, 1);
 });
 
+test("serial canonical discovery attributes a failure only to the target that threw", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/first#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/second#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/third#3"),
+    ],
+    failedRepository: "first",
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/first#1",
+      reason: "live target check failed for openclaw/first#1 (403)",
+    },
+    {
+      target: "openclaw/second#2",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+    {
+      target: "openclaw/third#3",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 3);
+  assert.equal(scenario.restRequests, 1);
+  assert.equal(scenario.recoveries.length, 0);
+  assert.equal(scenario.resolutions.length, 0);
+});
+
+test("serial recovery revalidation attributes a failure only to the target that threw", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/repo#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/repo#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/repo#3"),
+    ],
+    failTargetOnInspection: 1,
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/repo#1",
+      reason: "live target check failed for openclaw/repo#1 (403)",
+    },
+    {
+      target: "openclaw/repo#2",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+    {
+      target: "openclaw/repo#3",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 3);
+  assert.equal(scenario.restRequests, 4);
+  assert.equal(scenario.recoveries.length, 0);
+  assert.equal(scenario.resolutions.length, 0);
+});
+
 test("automatic recovery refuses a pull request whose current head has advanced", async () => {
   const item = row(
     "stale",
@@ -2019,6 +2502,7 @@ async function automaticReconcileScenario(options) {
   let inventoryRequests = 0;
   let graphqlRequests = 0;
   let restRequests = 0;
+  const restRequestsByNumber = new Map();
   let duplicateFailurePending = options.failFirstDuplicateCleanup === true;
   let duplicateSkipsRemaining =
     options.skipDuplicateCleanupCount ?? Number(options.skipFirstDuplicateCleanup === true);
@@ -2086,6 +2570,7 @@ async function automaticReconcileScenario(options) {
     if (request.url?.startsWith("/repos/")) {
       restRequests += 1;
       const number = Number(request.url.split("/").at(-1));
+      restRequestsByNumber.set(number, (restRequestsByNumber.get(number) || 0) + 1);
       if (request.url.includes("/pulls/")) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
@@ -2104,9 +2589,10 @@ async function automaticReconcileScenario(options) {
       if (
         (options.failedRepository &&
           request.url.includes(`/${options.failedRepository}/issues/`)) ||
+        (options.failTargetOnInspection === number && restRequestsByNumber.get(number) >= 2) ||
         (options.failTargetAfterCleanup === number && resolutions.length >= 2)
       ) {
-        response.writeHead(503, { "content-type": "application/json" });
+        response.writeHead(options.failedStatus ?? 503, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "temporary" }));
         return;
       }
@@ -2589,7 +3075,23 @@ function row(
   };
 }
 
-function runOperator(args, queueUrl, secret) {
+function parkedRow(itemKey, targetRepo, itemNumber, updatedAtMs) {
+  return {
+    item_key: itemKey,
+    revision: 1,
+    target_repo: targetRepo,
+    item_number: itemNumber,
+    item_kind: "issue",
+    parked_reason: "review_retry_exhausted",
+    parked_recovery_attempts: 3,
+    first_failed_at: "2026-08-09T00:00:00.000Z",
+    last_failure_reason: "review_retry_exhausted",
+    updated_at: new Date(updatedAtMs).toISOString(),
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+function runOperator(args, queueUrl, secret, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -2601,6 +3103,7 @@ function runOperator(args, queueUrl, secret) {
           CLAWSWEEPER_WEBHOOK_SECRET: secret,
           GITHUB_API_URL: queueUrl,
           GITHUB_TOKEN: "test-github-token",
+          ...extraEnv,
         },
         stdio: ["ignore", "pipe", "pipe"],
       },

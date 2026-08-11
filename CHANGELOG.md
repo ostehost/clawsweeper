@@ -41,6 +41,10 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Hosted webhook 🦞👀 receipts now dedupe per pull request across `opened` and `ready_for_review`, so back-to-back webhook actions keep one receipt instead of posting near-identical duplicates. (#1084)
+- The target dispatcher no longer double-posts pull request receipt acknowledgements when `opened` and `ready_for_review` fire seconds apart: the ack step now waits and rechecks for any existing marker immediately before posting. (#1083)
+- Restored pull request 🦞👀 receipt comments by granting fast-ack tokens `pull_requests: write`. (#1082)
+- Scoped GitHub App tokens to their named repositories via the documented `repositories` parameter. (#1082)
 - Legacy reports with canonical proof or rating keys outside the apparent leading front-matter block now fail closed, with a read-only workflow to inventory affected canonical records. (#1049)
 - Prevented model-authored report prose and body-shaped front matter from spoofing proof or rating sections, keeping unproven external pull requests in human review instead of routing them into automated repair. (#951)
 
@@ -180,6 +184,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Codex subprocess containment now actually suppresses target `.pnpmfile.cjs` execution: pnpm 11 only honors `npm_config_*` environment settings, so the previously used `PNPM_CONFIG_IGNORE_PNPMFILE` spelling was inert and a target repository's pnpmfile could run arbitrary code during repair installs.
 - Reconcile observers now start only for review titles they can classify, so queue-backed `Review exact item` and support runs no longer consume runner slots merely to report `skipped`; a new hourly janitor also cancels runs stuck in `queued` for over 24 hours before they decay into uncancellable zombies.
 - Deployment runs waiting for human approval no longer count as runner-queue congestion in operational health: a forgotten approval gate had pinned `oldest_queued_minutes` at eight-plus days and held work-execution status away from healthy; approval-gated runs now report separately (count and oldest age) in the API and the execution alert.
 - Terminal command acknowledgements whose status comment was deleted (or never existed) now complete as a durable `missing_status_comment` skip instead of requeueing the finalization driver forever every ~20 minutes.

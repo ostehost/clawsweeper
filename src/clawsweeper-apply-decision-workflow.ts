@@ -85,6 +85,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     applyPrCloseCoverageProofBlockedReport,
     applyProtectedLabelReason,
     applyRuntimeBudgetYieldResults,
+    beginIssueLabelMutationBatch,
     cleanupSupersededReviewPlaceholderComments,
     closeReasonApplyAgeSkipReason,
     closeReasonEnabled,
@@ -101,12 +102,14 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     defaultItemsDir,
     defaultPlansDir,
     deleteOwnedDedicatedReviewStartLease,
+    discardIssueLabelMutationBatch,
     duplicateCanonicalPullRequestBlockReason,
     ensureDir,
     exactEventReviewLeaseDisposition,
     fetchItem,
     fetchReviewedPrActivityCursor,
     finishApplyMutationAttempt,
+    flushIssueLabelMutationBatch,
     freshPullRequestReviewHead,
     frontMatterStringArray,
     frontMatterValue,
@@ -129,6 +132,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     markedReviewCommentBody,
     mutationErrorMessage,
     normalizeAuthorAssociation,
+    normalizeLabelName,
     openClosingPullRequestApplyReason,
     orderedApplyItemNumbers,
     pairCloseKey,
@@ -139,6 +143,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     recordApplyActionEvents,
     recordApplyActionLedgerItemResults,
     recordApplyMutationBoundary,
+    resetGuardReadCache,
     removeCurrentCursorTraceItem,
     removeIssueLabel,
     renderReviewCommentFromReport,
@@ -452,6 +457,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     // oxfmt-ignore
     for (const entry of fileEntries) {
       releaseActiveApplyMutationLease();
+      resetGuardReadCache();
       const file = entry.name;
       const path = entry.path;
       if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
@@ -469,10 +475,89 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       let applyItemFailed = false;
       let currentApplyMutationGuard: (() => string | null) | null = null;
       let recordApplyMutationGuardReason: ((reason: string) => boolean) | null = null;
+      let issueLabelBatchActive = false;
+      let preserveGuardReadCacheAfterMutation = false;
+      let mutationGuardBoundaryCached = false;
+      let mutationGuardBoundaryReason: string | null = null;
+      let currentApplyMutationBoundaryBlockReason = (): string | null => null;
+      let deferredSelfMutationReceipt = false;
+      let publishedIssueLabelMutation = false;
+      let rememberSelfMutationUpdatedAt = (): void => {};
+      let reconcileSkippedIssueLabelAdditions = (_labels: readonly string[]): void => {};
+      let refreshRenderedReviewComment = (): void => {};
+      let restoreDiscardedIssueLabelState = (): void => {};
+      const rememberPublishedLabelSync = (): void => {
+        if (dryRun) return;
+        publishedIssueLabelMutation = true;
+        markdown = replaceFrontMatterValue(markdown, "labels_synced_at", new Date().toISOString());
+      };
+      const rememberLabelMutationUpdatedAt = (): void => {
+        if (issueLabelBatchActive) deferredSelfMutationReceipt = true;
+        else {
+          rememberPublishedLabelSync();
+          rememberSelfMutationUpdatedAt();
+        }
+      };
       const previousApplyMutationRunner = dependencies.activeApplyMutationRunner;
+      const resetMutationGuardBoundary = (): void => {
+        mutationGuardBoundaryCached = false;
+        mutationGuardBoundaryReason = null;
+        resetGuardReadCache();
+      };
+      const rememberLabelMutationResult = (confirmed: boolean): void => {
+        if (confirmed) rememberPublishedLabelSync();
+        rememberSelfMutationUpdatedAt();
+        deferredSelfMutationReceipt = false;
+        resetMutationGuardBoundary();
+      };
+      const flushIssueLabelBatch = (rememberMutation = true): boolean => {
+        if (!issueLabelBatchActive) return false;
+        try {
+          resetMutationGuardBoundary();
+          const result = flushIssueLabelMutationBatch(
+            number,
+            resetMutationGuardBoundary,
+            rememberLabelMutationResult,
+          );
+          if (result.skippedAdditions.length > 0) {
+            reconcileSkippedIssueLabelAdditions(result.skippedAdditions);
+            refreshRenderedReviewComment();
+          }
+          if (result.itemMutationPublished && rememberMutation && deferredSelfMutationReceipt) {
+            rememberSelfMutationUpdatedAt();
+            deferredSelfMutationReceipt = false;
+          }
+          return result.itemMutationPublished;
+        } catch (error) {
+          if (error instanceof ApplyMutationReviewGuardError) {
+            restoreDiscardedIssueLabelState();
+          }
+          throw error;
+        } finally {
+          issueLabelBatchActive = false;
+        }
+      };
+      const discardIssueLabelBatch = (): void => {
+        if (!issueLabelBatchActive) return;
+        try {
+          discardIssueLabelMutationBatch(number);
+          restoreDiscardedIssueLabelState();
+        } finally {
+          issueLabelBatchActive = false;
+        }
+      };
+      const writeReportAfterDiscardingIssueLabelBatch = (
+        reportPath: string,
+        nextMarkdown: string,
+      ): void => {
+        markdown = nextMarkdown;
+        discardIssueLabelBatch();
+        writeReportMarkdown(reportPath, markdown);
+      };
       try {
       const markMutationObserved = (): void => {
         if (dryRun) return;
+        if (!preserveGuardReadCacheAfterMutation) resetMutationGuardBoundary();
         activeApplyItem = { repo, number, mutationOccurred: true };
         mutationByItem.set(`${repo}#${number}`, true);
       };
@@ -510,7 +595,18 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             attempt,
             outcome: mutated ? "accepted" : "rejected",
           });
-          if (mutated) recordMutation(outcomeEventId);
+          if (mutated) {
+            recordMutation(outcomeEventId);
+            if (
+              preserveGuardReadCacheAfterMutation &&
+              /^(?:label_create|label_upsert):/.test(options.identity)
+            ) {
+              // Repository label-definition writes do not change the item. Do
+              // not let their earlier item-freshness read cover the later
+              // combined issue-label publication.
+              resetMutationGuardBoundary();
+            }
+          }
           return result;
         } catch (error) {
           const rejected =
@@ -569,6 +665,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         renameSync(path, closedPath);
       };
       const markApplyChecked = (subjectState: DecisionPacketSubjectState = "open"): void => {
+        discardIssueLabelBatch();
         markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
         if (!dryRun) writeReportMarkdown(path, markdown, subjectState);
       };
@@ -736,6 +833,25 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       let clawSweeperLabelsChanged = false;
       let issueAdvisoryLabelsChanged = false;
       const selfMutationItemReceipts: ApplySelfMutationItemReceipt[] = [];
+      reconcileSkippedIssueLabelAdditions = (labels): void => {
+        const skipped = new Set(labels.map((label) => normalizeLabelName(label)));
+        item.labels = item.labels.filter((label) => !skipped.has(normalizeLabelName(label)));
+        markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+        const before = new Set(reportLabelsBeforeApply.map((label) => normalizeLabelName(label)));
+        const after = new Set(item.labels.map((label) => normalizeLabelName(label)));
+        const changedKeys = new Set(
+          [...before, ...after].filter((key) => before.has(key) !== after.has(key)),
+        );
+        clawSweeperLabelsChanged = changedKeys.size > 0;
+        if (!clawSweeperLabelsChanged) issueAdvisoryLabelsChanged = false;
+      };
+      restoreDiscardedIssueLabelState = (): void => {
+        item.labels = [...previousLabels];
+        markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(reportLabelsBeforeApply));
+        clawSweeperLabelsChanged = false;
+        issueAdvisoryLabelsChanged = false;
+        deferredSelfMutationReceipt = false;
+      };
       const currentItemContext = (): ItemContext => {
         currentContext ??= collectItemContext(item, {
           fullTimelineForRelations: true,
@@ -863,7 +979,18 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           activeApplyMutationLease = lease;
         },
       });
-      currentApplyMutationGuard = currentApplyMutationLeaseBlockReason;
+      currentApplyMutationBoundaryBlockReason = (): string | null => {
+        if (preserveGuardReadCacheAfterMutation && mutationGuardBoundaryCached) {
+          return mutationGuardBoundaryReason;
+        }
+        const reason = currentApplyMutationLeaseBlockReason();
+        if (preserveGuardReadCacheAfterMutation) {
+          mutationGuardBoundaryCached = true;
+          mutationGuardBoundaryReason = reason;
+        }
+        return reason;
+      };
+      currentApplyMutationGuard = currentApplyMutationBoundaryBlockReason;
       let existingReviewComment: Record<string, unknown> | undefined;
       const pendingStaleCanonicalCommentReason = staleCanonicalCommentSyncPending
         ? staleCanonicalCommentSyncPendingReason(markdown)
@@ -907,7 +1034,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           staleCanonicalCommentSyncPending = next.staleCanonicalCommentSyncPending;
         },
         shouldProbeClosedState,
-        writeReportMarkdown,
+        writeReportMarkdown: writeReportAfterDiscardingIssueLabelBatch,
       });
       const {
         applyCanonicalCommentSyncGuard,
@@ -922,7 +1049,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       const initialCanonicalCommentSyncGuard = applyCanonicalCommentSyncGuard();
       if (initialCanonicalCommentSyncGuard.stopApply) break;
       if (initialCanonicalCommentSyncGuard.skipCurrentItem) continue;
-      const rememberSelfMutationUpdatedAt = (): void => {
+      rememberSelfMutationUpdatedAt = (): void => {
         if (dryRun) return;
         const automationItem = fetchItem(number).item;
         const automationItemUpdatedAt = automationItem.updatedAt;
@@ -975,12 +1102,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         currentStaleVersionBugBlockReason,
       } = candidateGuards;
       const recordRuntimeBudgetYield = (reason: string): void => {
-        if (clawSweeperLabelsChanged && !dryRun) {
-          markdown = replaceFrontMatterValue(
-            markdown,
-            "labels_synced_at",
-            new Date().toISOString(),
-          );
+        discardIssueLabelBatch();
+        if (clawSweeperLabelsChanged && !dryRun && !issueLabelBatchActive) {
           writeReportMarkdown(path, markdown);
         }
         removeCurrentCursorTraceItem(examinedItemNumbers, number);
@@ -1263,7 +1386,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         results,
         setMarkdown: (next) => { markdown = next; },
         setProcessedCount: (next) => { processedCount = next; },
-        writeReportMarkdown,
+        writeReportMarkdown: writeReportAfterDiscardingIssueLabelBatch,
       });
       const stalePrReviewHead =
         state === "open" && item.kind === "pull_request"
@@ -1349,6 +1472,12 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           continue;
         }
       }
+      if (state === "open" && exactEventPublication && !dryRun) {
+        beginIssueLabelMutationBatch(number);
+        issueLabelBatchActive = true;
+        preserveGuardReadCacheAfterMutation = true;
+        resetMutationGuardBoundary();
+      }
       if (state === "open" && item.kind === "pull_request") {
         const pullRequestLabels = syncApplyPullRequestLabels(dependencies, {
           currentItemContext,
@@ -1368,7 +1497,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       }
       markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
       if (clawSweeperLabelsChanged && !dryRun) {
-        rememberSelfMutationUpdatedAt();
+        rememberLabelMutationUpdatedAt();
       }
       if (
         state === "open" &&
@@ -1553,7 +1682,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         number,
         onMutation: recordMutation,
         recordReviewLeaseSkip,
-        rememberSelfMutationUpdatedAt,
+        rememberSelfMutationUpdatedAt: rememberLabelMutationUpdatedAt,
         renderOptions,
         reportLabelsBeforeApply,
         setMarkdown: (value) => { markdown = value; },
@@ -1563,10 +1692,18 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       currentClosingPullRequests = reportLabelSync.currentClosingPullRequests;
       issueAdvisoryLabelsChanged = reportLabelSync.issueAdvisoryLabelsChanged;
       markdown = reportLabelSync.markdown;
+      if (publishedIssueLabelMutation && !issueLabelBatchActive && !dryRun) {
+        markdown = replaceFrontMatterValue(markdown, "labels_synced_at", new Date().toISOString());
+      }
       if (reportLabelSync.stopApply) break;
       if (reportLabelSync.skipCurrentItem) continue;
       reviewComment = renderCurrentReviewComment();
       markedReviewComment = markedReviewCommentForApply(reviewComment);
+      refreshRenderedReviewComment = (): void => {
+        renderOptions.publishedLabels = [...item.labels];
+        reviewComment = renderCurrentReviewComment();
+        markedReviewComment = markedReviewCommentForApply(reviewComment);
+      };
       if (isCloseProposal && item.kind === "issue") {
         currentClosingPullRequests ??= closingPullRequestsForIssue(number);
         const openClosingPullRequestReason = openClosingPullRequestApplyReason(
@@ -1727,9 +1864,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           continue;
         }
       }
-      if (clawSweeperLabelsChanged && !dryRun) {
-        markdown = replaceFrontMatterValue(markdown, "labels_synced_at", new Date().toISOString());
-      }
       const labelSyncReason = issueAdvisoryLabelsChanged
         ? dryRun
           ? "dry-run: would sync advisory issue labels"
@@ -1781,6 +1915,48 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           });
         }
       }
+      if (
+        !closeBlockedForCommentSync &&
+        !needsReviewCommentBodySync &&
+        (!isCloseProposal || syncCommentsOnly)
+      ) {
+        const markedReviewCommentBeforeLabelFlush = markedReviewComment;
+        flushIssueLabelBatch();
+        if (markedReviewComment !== markedReviewCommentBeforeLabelFlush) {
+          reviewCommentHash = reviewCommentBodyDigest(markedReviewComment);
+          existingReviewCommentMatches = commentBodyMatches(
+            existingReviewComment,
+            markedReviewComment,
+            { allowApplyCloseActionUpgrade },
+          );
+          needsReviewCommentBodySync = !existingReviewComment || !existingReviewCommentMatches;
+          needsReviewCommentHashSync = !reviewCommentHashMatches(
+            existingReviewComment,
+            markedReviewComment,
+            frontMatterValue(markdown, "review_comment_sha256"),
+            reviewCommentHash,
+            { allowApplyCloseActionUpgrade },
+          );
+          needsReviewCommentReferenceSync =
+            /^(?:none|unknown)?$/.test(frontMatterValue(markdown, "review_comment_id") ?? "") ||
+            /^(?:none|unknown)?$/.test(frontMatterValue(markdown, "review_comment_url") ?? "");
+          needsReviewCommentSync = shouldSyncReviewComment({
+            syncCommentsOnly,
+            isCloseProposal,
+            commentSyncMinAgeDays,
+            reviewCommentSyncedAt: frontMatterValue(markdown, "review_comment_synced_at"),
+            reviewCommentVerifiedAt: frontMatterValue(markdown, "review_comment_checked_at"),
+            reviewedAt: frontMatterValue(markdown, "reviewed_at"),
+            lastFullReviewAt: frontMatterValue(markdown, "last_full_review_at"),
+            guardedReviewedAt: guarded ? frontMatterValue(markdown, "apply_checked_at") : undefined,
+            hasExistingReviewComment: Boolean(existingReviewComment),
+            needsReviewCommentBodySync,
+            needsReviewCommentHashSync,
+            needsReviewCommentReferenceSync,
+            forceReviewCommentBodySync: true,
+          });
+        }
+      }
       if (needsReviewCommentSync) {
         const staleSyncReason = needsReviewCommentBodySync ? staleReviewCommentReason : null;
         if (staleSyncReason) {
@@ -1789,7 +1965,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             "apply_checked_at",
             new Date().toISOString(),
           );
-          if (!dryRun) writeReportMarkdown(path, markdown);
+          if (!dryRun) writeReportAfterDiscardingIssueLabelBatch(path, markdown);
           results.push({
             number,
             action: "skipped_stale_review_comment_sync",
@@ -1820,7 +1996,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             const preLeaseCanonicalGuard = applyCanonicalCommentSyncGuard(true);
             if (preLeaseCanonicalGuard.stopApply) break;
             if (preLeaseCanonicalGuard.skipCurrentItem) continue;
-            const mutationLeaseBlockReason = currentApplyMutationLeaseBlockReason();
+            const mutationLeaseBlockReason = currentApplyMutationBoundaryBlockReason();
             if (mutationLeaseBlockReason) {
               if (recordReviewLeaseSkip(mutationLeaseBlockReason, false)) break;
               continue;
@@ -1852,7 +2028,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 "apply_checked_at",
                 new Date().toISOString(),
               );
-              writeReportMarkdown(path, markdown);
+              writeReportAfterDiscardingIssueLabelBatch(path, markdown);
               results.push({
                 number,
                 action: "skipped_stale_review_comment_sync",
@@ -1878,6 +2054,24 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 break;
               continue;
             }
+            const delayIssueLabelBatchForRecoveryCleanup = Boolean(
+              exactEventPublication &&
+              complete &&
+              item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL),
+            );
+            const flushIssueLabelBatchForDurableComment = (): void => {
+              const labelMutationPublished = flushIssueLabelBatch(false);
+              preserveGuardReadCacheAfterMutation = false;
+              resetMutationGuardBoundary();
+              if (labelMutationPublished && deferredSelfMutationReceipt) {
+                rememberSelfMutationUpdatedAt();
+                deferredSelfMutationReceipt = false;
+                resetMutationGuardBoundary();
+              }
+            };
+            if (!delayIssueLabelBatchForRecoveryCleanup) {
+              flushIssueLabelBatchForDurableComment();
+            }
             try {
               syncedComment = upsertReviewComment(
                 number,
@@ -1885,7 +2079,43 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 existingReviewComment,
               );
               rememberSelfMutationUpdatedAt();
+              deferredSelfMutationReceipt = false;
               syncReasons.push("updated durable Codex review comment");
+              if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
+                try {
+                  clearResolvedReviewRecoveryLabel({
+                    number,
+                    labels: item.labels,
+                    complete,
+                    removeLabel: removeIssueLabel,
+                    onMutation: recordMutation,
+                  });
+                  markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+                  if (issueLabelBatchActive) {
+                    clawSweeperLabelsChanged = true;
+                    rememberLabelMutationUpdatedAt();
+                  } else {
+                    markdown = replaceFrontMatterValue(
+                      markdown,
+                      "labels_synced_at",
+                      new Date().toISOString(),
+                    );
+                    rememberSelfMutationUpdatedAt();
+                  }
+                  syncReasons.push("cleared resolved review recovery label");
+                } catch (error) {
+                  if (error instanceof GitHubRuntimeBudgetError || error instanceof GitHubRateLimitError)
+                    throw error;
+                  console.error(
+                    `[apply] could not clear resolved review recovery label for #${number}: ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
+                  );
+                }
+              }
+              if (delayIssueLabelBatchForRecoveryCleanup) {
+                flushIssueLabelBatchForDurableComment();
+              }
               // The durable review comment is now published, so stale "review
               // started" placeholders from failed earlier attempts are clutter.
               const placeholderKeepCommentIds = new Set<number>();
@@ -1905,33 +2135,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 comments: latestLeaseState.comments,
                 keepCommentIds: placeholderKeepCommentIds,
               });
-              if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
-                try {
-                  clearResolvedReviewRecoveryLabel({
-                    number,
-                    labels: item.labels,
-                    complete,
-                    removeLabel: removeIssueLabel,
-                    onMutation: recordMutation,
-                  });
-                  markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
-                  markdown = replaceFrontMatterValue(
-                    markdown,
-                    "labels_synced_at",
-                    new Date().toISOString(),
-                  );
-                  rememberSelfMutationUpdatedAt();
-                  syncReasons.push("cleared resolved review recovery label");
-                } catch (error) {
-                  if (error instanceof GitHubRuntimeBudgetError || error instanceof GitHubRateLimitError)
-                    throw error;
-                  console.error(
-                    `[apply] could not clear resolved review recovery label for #${number}: ${
-                      error instanceof Error ? error.message : String(error)
-                    }`,
-                  );
-                }
-              }
             } catch (error) {
               const commentAuthError = isGitHubRequiresAuthenticationError(error);
               if (!commentAuthError && !isLockedConversationCommentError(error)) throw error;
@@ -1962,7 +2165,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         if (staleCanonicalCommentSyncPending) {
           markdown = completeStaleCanonicalCommentSyncReport(markdown);
         }
-        if (!dryRun) writeReportMarkdown(path, markdown);
+        if (!isCloseProposal || syncCommentsOnly) flushIssueLabelBatch();
+        if (!dryRun && !issueLabelBatchActive) writeReportMarkdown(path, markdown);
         results.push({
           number,
           action: closeBlockedForCommentSync?.actionTaken ?? "review_comment_synced",
@@ -1978,6 +2182,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       }
       if (closeBlockedForCommentSync) {
         if (!needsReviewCommentSync) {
+          discardIssueLabelBatch();
           if (staleCanonicalCommentSyncPending) {
             markdown = completeStaleCanonicalCommentSyncReport(markdown);
           }
@@ -2019,6 +2224,9 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         if (!isCloseProposal && attemptedPullRequestClosePromotion) markApplyChecked();
         continue;
       }
+      flushIssueLabelBatch();
+      preserveGuardReadCacheAfterMutation = false;
+      resetMutationGuardBoundary();
       const appliedCloseReason = closeReason;
       const closeFlow = executeApplyClose(dependencies, {
         applyCloseReasons,
@@ -2028,7 +2236,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         closeLimitReached: closedCount >= limit,
         closeReason: appliedCloseReason,
         closedDir,
-        currentApplyMutationLeaseBlockReason,
+        currentApplyMutationLeaseBlockReason: currentApplyMutationBoundaryBlockReason,
         currentAuthorPrBudgetApplyGate,
         currentObsoleteFixPrBlockReason,
         currentPrCloseCoverageProofGateBlock,
@@ -2074,6 +2282,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       continue;
       } catch (error) {
         if (error instanceof ApplyMutationReviewGuardError && recordApplyMutationGuardReason) {
+          discardIssueLabelBatch();
           if (recordApplyMutationGuardReason(error.message)) break;
           continue;
         }
@@ -2084,6 +2293,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         }
         throw error;
       } finally {
+        discardIssueLabelBatch();
         releaseActiveApplyMutationLease();
         dependencies.activeApplyMutationRunner = previousApplyMutationRunner;
         if (!applyItemFailed) {

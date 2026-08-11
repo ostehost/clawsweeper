@@ -536,12 +536,18 @@ const applyGuards = createApplyGuards({
   unsponsoredFeatureAgeSkipReason,
   unsponsoredFeatureCloseEnabled: () => unsponsoredFeatureCloseEnabled(),
 });
+const { resetGuardReadCache } = applyGuards;
 export const {
   abandonedPrAgeSkipReason,
   issueRecentHumanCommentBlockReasonFromComments,
   stalledUnprovenPrAgeSkipReason,
-  stalledUnprovenProofRequestBlockReason,
 } = applyGuards;
+export function stalledUnprovenProofRequestBlockReason(
+  ...args: Parameters<typeof applyGuards.stalledUnprovenProofRequestBlockReason>
+): ReturnType<typeof applyGuards.stalledUnprovenProofRequestBlockReason> {
+  resetGuardReadCache();
+  return applyGuards.stalledUnprovenProofRequestBlockReason(...args);
+}
 const { prAutoCloseExemptDecisionReason, prAutoCloseExemptLabel } = applyGuards;
 
 const contextHydration = createContextHydration({
@@ -799,6 +805,13 @@ const regressionProvenanceVerifier = createRegressionProvenanceVerifier({
       `repos/${repo}/pulls/${number}`,
       "-H",
       "Accept: application/vnd.github+json",
+    ]),
+  fetchPullDiff: (repo, number) =>
+    run("gh", [
+      "api",
+      `repos/${repo}/pulls/${number}`,
+      "-H",
+      "Accept: application/vnd.github.v3.diff",
     ]),
   runGit: (args, options) => run("git", args, options),
 });

@@ -1,4 +1,5 @@
 export const OPERATIONAL_QUEUE_DEGRADED_MS = 30 * 60 * 1000;
+export const OPERATIONAL_QUEUE_ZOMBIE_MS = 24 * 60 * 60 * 1000;
 export const OPERATIONAL_RUNNING_STALLED_MS = 150 * 60 * 1000;
 export const HEALTH_HISTORY_SAMPLE_MS = 5 * 60 * 1000;
 export const HEALTH_HISTORY_RETENTION_DAYS = 7;
@@ -24,6 +25,8 @@ export type OperationalHealth = {
   queued_over_threshold: number;
   queued_threshold_minutes: number;
   oldest_queued_minutes: number;
+  zombie_queued_runs: number;
+  oldest_zombie_queued_minutes: number;
   approval_gated_runs: number;
   oldest_approval_gated_minutes: number;
   running_runs: number;
@@ -50,6 +53,14 @@ export type ExactReviewHistorySample = {
   collection_ok: boolean;
   review?: ExactReviewLaneHistorySample;
   publication?: ExactReviewLaneHistorySample;
+  handoff?: ExactReviewHandoffHistorySample;
+};
+
+export type ExactReviewHandoffHistorySample = {
+  status: "idle" | "healthy" | "degraded" | "stalled";
+  pending: number;
+  dispatching: number;
+  leased: number;
 };
 
 export type ExactReviewLaneHistorySample = {
@@ -94,11 +105,18 @@ export function summarizeOperationalHealth(
     // the authoritative execution timestamp is present.
     .map((run) => ageMs(run.run_started_at || run.created_at, now));
   const validQueuedAges = queuedAges.filter((age): age is number => age !== null);
+  // Normal queue waits are measured in minutes. Seventeen production runs are
+  // stranded past 24 hours (three from Jul 13/17 and fourteen from one Aug 7
+  // incident), and both cancel and force-cancel return HTTP 500 for every one.
+  // Excluding those unremediable zombies is the only way to keep live queue
+  // pressure observable without pinning operational health indefinitely.
+  const zombieQueuedAges = validQueuedAges.filter((age) => age > OPERATIONAL_QUEUE_ZOMBIE_MS);
+  const liveQueuedAges = validQueuedAges.filter((age) => age <= OPERATIONAL_QUEUE_ZOMBIE_MS);
   const validRunningAges = runningAges.filter((age): age is number => age !== null);
   const hasCompleteAges =
     validQueuedAges.length === queuedRuns.length && validRunningAges.length === runningRuns.length;
   const complete = telemetryComplete && hasCompleteAges;
-  const queuedOverThreshold = validQueuedAges.filter(
+  const queuedOverThreshold = liveQueuedAges.filter(
     (age) => age >= OPERATIONAL_QUEUE_DEGRADED_MS,
   ).length;
   const runningOverThreshold = validRunningAges.filter(
@@ -118,7 +136,9 @@ export function summarizeOperationalHealth(
     queued_runs: queuedRuns.length,
     queued_over_threshold: queuedOverThreshold,
     queued_threshold_minutes: OPERATIONAL_QUEUE_DEGRADED_MS / 60_000,
-    oldest_queued_minutes: oldestMinutes(validQueuedAges),
+    oldest_queued_minutes: oldestMinutes(liveQueuedAges),
+    zombie_queued_runs: zombieQueuedAges.length,
+    oldest_zombie_queued_minutes: oldestMinutes(zombieQueuedAges),
     approval_gated_runs: approvalGatedRuns.length,
     oldest_approval_gated_minutes: oldestMinutes(
       approvalGatedRuns
@@ -222,14 +242,17 @@ export function stateWriterHistorySample(value: unknown): StateWriterHistorySamp
 }
 
 export function exactReviewHistorySample(value: unknown): ExactReviewHistorySample {
-  const lanes = objectValue(objectValue(value).lanes);
+  const queue = objectValue(value);
+  const lanes = objectValue(queue.lanes);
   const review = queueLaneHistorySample(lanes.review, true);
   const publication = queueLaneHistorySample(lanes.publication, false);
   if (!review || !publication) return { collection_ok: false };
+  const handoff = queueHandoffHistorySample(queue.handoff_health);
   return {
     collection_ok: true,
     review,
     publication,
+    ...(handoff ? { handoff } : {}),
   };
 }
 
@@ -242,10 +265,46 @@ function normalizeExactReviewHistorySample(value: unknown): ExactReviewHistorySa
   const review = storedLaneHistorySample(sample.review, true);
   const publication = storedLaneHistorySample(sample.publication, false);
   if (!review || !publication) return null;
+  const handoff = storedHandoffHistorySample(sample.handoff);
+  if (sample.handoff !== undefined && !handoff) return null;
   return {
     collection_ok: true,
     review,
     publication,
+    ...(handoff ? { handoff } : {}),
+  };
+}
+
+function queueHandoffHistorySample(value: unknown): ExactReviewHandoffHistorySample | null {
+  const handoff = objectValue(value);
+  const phases = objectValue(handoff.phases);
+  return handoffHistorySample({
+    status: handoff.status,
+    pending: objectValue(phases.pending).count,
+    dispatching: objectValue(phases.dispatching).count,
+    leased: objectValue(phases.leased).count,
+  });
+}
+
+function storedHandoffHistorySample(value: unknown): ExactReviewHandoffHistorySample | null {
+  if (value === undefined) return null;
+  return handoffHistorySample(objectValue(value));
+}
+
+function handoffHistorySample(
+  value: Record<string, unknown>,
+): ExactReviewHandoffHistorySample | null {
+  const status = String(value.status || "");
+  const pending = nonNegativeInteger(value.pending);
+  const dispatching = nonNegativeInteger(value.dispatching);
+  const leased = nonNegativeInteger(value.leased);
+  if (!["idle", "healthy", "degraded", "stalled"].includes(status)) return null;
+  if (pending === null || dispatching === null || leased === null) return null;
+  return {
+    status: status as ExactReviewHandoffHistorySample["status"],
+    pending,
+    dispatching,
+    leased,
   };
 }
 

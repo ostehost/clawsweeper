@@ -13,6 +13,7 @@ import worker, {
   automaticIssueWork,
   ExactReviewQueue,
   exactReviewEffectiveLeaseExpiresAt,
+  exactReviewJitteredDelayMs,
   exactReviewPublicationCapacity,
   exactReviewPublicationCapacityForState,
   exactReviewQueueAdmittedItems,
@@ -45,6 +46,36 @@ import { ExactReviewLifecycleTelemetryStore } from "../dashboard/exact-review-li
 import { LIVE_ACTIVITY_SOURCE_LIMIT, liveActivityBaySnapshot } from "../dashboard/live-activity.ts";
 import { captureCanonicalRecordBaseline } from "../dist/repair/canonical-record-baseline.js";
 import { publishMainWithStateAppend } from "../dist/repair/publish-main.js";
+
+function seededRandom(seed: number) {
+  let value = seed >>> 0;
+  return () => {
+    value += 0x6d2b79f5;
+    let mixed = value;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+test("exact-review retry jitter stays within every parked recovery ladder band", () => {
+  const random = seededRandom(0xc1a05);
+  for (const delay of [5, 10, 20].map((minutes) => minutes * 60_000)) {
+    for (let sample = 0; sample < 1_000; sample += 1) {
+      const jittered = exactReviewJitteredDelayMs(delay, random);
+      assert.ok(jittered >= delay * 0.75);
+      assert.ok(jittered <= delay * 1.5);
+    }
+    assert.equal(
+      exactReviewJitteredDelayMs(delay, () => 0),
+      delay * 0.75,
+    );
+    assert.equal(
+      exactReviewJitteredDelayMs(delay, () => 1),
+      delay * 1.5,
+    );
+  }
+});
 
 test("exact-review queue defaults to all 128 global workers", () => {
   assert.equal(exactReviewQueueCapacity({}), 128);
@@ -172,8 +203,11 @@ test("production doubles exact review claims and canonical publication batches",
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_SIZE = "8"/);
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT = "8"/);
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS = "5000"/);
-  assert.match(wrangler, /EXACT_REVIEW_TARGET_RATE_PER_HOUR = "450"/);
-  assert.match(wrangler, /EXACT_REVIEW_TARGET_BURST = "120"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT = "8"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT = "32"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT = "40"/);
+  assert.match(wrangler, /EXACT_REVIEW_TARGET_RATE_PER_HOUR = "300"/);
+  assert.match(wrangler, /EXACT_REVIEW_TARGET_BURST = "30"/);
   assert.match(wrangler, /EXACT_REVIEW_PENDING_SOFT_LIMIT = "600"/);
 });
 
@@ -1030,7 +1064,7 @@ test("lifecycle telemetry counts durable terminal coverage without treating ackn
   assert.equal(JSON.stringify(summary).includes("openclaw/openclaw"), false);
 });
 
-test("full exact-review admission preserves production verdict publication capacity", () => {
+test("full review admission does not inflate staged publication capacity", () => {
   const state = {
     items: Object.fromEntries(
       Array.from({ length: 128 }, (_, index) => {
@@ -1043,14 +1077,14 @@ test("full exact-review admission preserves production verdict publication capac
     exactReviewPublicationCapacityForState(
       {
         EXACT_REVIEW_ACTIONS_BUDGET: "194",
-        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "50",
-        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "50",
-        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "50",
+        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "8",
+        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "32",
+        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "40",
       },
       state,
       Date.now(),
     ),
-    50,
+    32,
   );
 });
 
@@ -1119,6 +1153,243 @@ test("exact-review source authority sequence survives queue restarts", async () 
   });
 });
 
+test("branch authority shares the target App circuit and collapses same-owner retries", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  let now = 4_000_000;
+  const resetAt = now + 90_000;
+  Date.now = () => now;
+  const storage = new MemoryDurableStorage();
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  );
+  let openclawInstallationTokens = 0;
+  let openclawRepositoryReads = 0;
+  let openclawPullReads = 0;
+  let otherRepositoryReads = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      openclawInstallationTokens += 1;
+      return jsonResponse({ token: "openclaw-token" });
+    }
+    if (url.pathname === "/app/installations/456/access_tokens") {
+      return jsonResponse({ token: "other-token" });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw") {
+      openclawRepositoryReads += 1;
+      if (openclawRepositoryReads === 1) {
+        return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+          status: 403,
+          headers: {
+            "content-type": "application/json",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(resetAt / 1_000),
+          },
+        });
+      }
+      return jsonResponse({ default_branch: "trunk" });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/pulls/903") {
+      openclawPullReads += 1;
+      return jsonResponse({ head: { sha: "d".repeat(40) } });
+    }
+    if (url.pathname === "/repos/other/repo") {
+      otherRepositoryReads += 1;
+      return jsonResponse({ default_branch: "stable" });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const branchReservation = (
+    deliveryId: string,
+    targetRepo: string,
+    itemNumber: number,
+    installationId: number,
+  ) =>
+    queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/branch-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: deliveryId,
+          installation_id: installationId,
+          decision: {
+            targetRepo,
+            itemNumber,
+            itemKind: "issue",
+            sourceEvent: "issues",
+            sourceAction: "legacy_dispatch",
+            supersedesInProgress: false,
+          },
+        }),
+      }),
+    );
+
+  try {
+    for (const [deliveryId, targetRepo, itemNumber, installationId] of [
+      ["a-openclaw", "openclaw/openclaw", 900, 123],
+      ["b-openclaw", "openclaw/openclaw", 901, 123],
+      ["c-other", "other/repo", 902, 456],
+    ] as const) {
+      const response = await branchReservation(deliveryId, targetRepo, itemNumber, installationId);
+      assert.equal(response.status, 202);
+    }
+    const sourceResponse = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/source-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: "d-source-openclaw",
+          installation_id: 123,
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            targetBranch: "trunk",
+            itemNumber: 903,
+            itemKind: "pull_request",
+            sourceEvent: "pull_request",
+            sourceAction: "synchronize",
+            supersedesInProgress: true,
+            sourceHeadSha: "d".repeat(40),
+          },
+        }),
+      }),
+    );
+    assert.equal(sourceResponse.status, 200);
+
+    await queue.alarm();
+
+    assert.equal(openclawInstallationTokens, 1);
+    assert.equal(openclawRepositoryReads, 1);
+    assert.equal(openclawPullReads, 0);
+    assert.equal(otherRepositoryReads, 1);
+    assert.deepEqual(
+      {
+        first: storage.rawGet("exact-review-branch-authority-reservation:v1:a-openclaw"),
+        second: storage.rawGet("exact-review-branch-authority-reservation:v1:b-openclaw"),
+        source: storage.rawGet("exact-review-source-authority-reservation:v1:d-source-openclaw"),
+      },
+      {
+        first: {
+          deliveryId: "a-openclaw",
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            itemNumber: 900,
+            itemKind: "issue",
+            sourceEvent: "issues",
+            sourceAction: "legacy_dispatch",
+            supersedesInProgress: false,
+          },
+          installationId: 123,
+          sourceAuthorityRequired: false,
+          attempts: 1,
+          nextAttemptAt: resetAt,
+        },
+        second: {
+          deliveryId: "b-openclaw",
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            itemNumber: 901,
+            itemKind: "issue",
+            sourceEvent: "issues",
+            sourceAction: "legacy_dispatch",
+            supersedesInProgress: false,
+          },
+          installationId: 123,
+          sourceAuthorityRequired: false,
+          attempts: 0,
+          nextAttemptAt: resetAt,
+        },
+        source: {
+          deliveryId: "d-source-openclaw",
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            targetBranch: "trunk",
+            itemNumber: 903,
+            itemKind: "pull_request",
+            sourceEvent: "pull_request",
+            sourceAction: "synchronize",
+            supersedesInProgress: true,
+            sourceHeadSha: "d".repeat(40),
+            sourceAuthoritySeq: 1,
+          },
+          installationId: 123,
+          sourceAuthoritySeq: 1,
+          attempts: 0,
+          nextAttemptAt: resetAt,
+        },
+      },
+    );
+    const throttled = (await storage.get("exact-review-queue")) as {
+      dispatcher: {
+        githubCredentialCircuits: Record<
+          string,
+          { retryAt: number; provenance: string; authoritative: boolean }
+        >;
+        githubRequestMetrics: { counters: Record<string, number> };
+      };
+      items: Record<string, { decision: { targetBranch: string } }>;
+    };
+    assert.deepEqual(throttled.dispatcher.githubCredentialCircuits["target_app:openclaw"], {
+      scope: "target_app",
+      targetOwner: "openclaw",
+      observedAt: now,
+      retryAt: resetAt,
+      provenance: "rate_limit_reset",
+      authoritative: true,
+      poolKey: "target_app:openclaw",
+    });
+    assert.equal(
+      throttled.dispatcher.githubRequestMetrics.counters[
+        "target_app:item_metadata:read:skipped_by_circuit:first"
+      ],
+      2,
+    );
+    assert.equal(throttled.items["other/repo#902"].decision.targetBranch, "stable");
+    const stats = (await (
+      await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json()) as {
+      lanes: {
+        review: { authority_pending: Record<string, number> };
+        publication: { credential_circuits: Array<{ pool: string; affected_pending: number }> };
+      };
+    };
+    assert.deepEqual(stats.lanes.review.authority_pending, {
+      total: 3,
+      branch_resolution: 2,
+      source_verification: 1,
+    });
+    assert.equal(
+      stats.lanes.publication.credential_circuits.find(
+        (circuit) => circuit.pool === "target_app:openclaw",
+      )?.affected_pending,
+      3,
+    );
+
+    now = resetAt;
+    await queue.alarm();
+    const recovered = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { decision: { targetBranch: string } }>;
+    };
+    assert.equal(recovered.items["openclaw/openclaw#900"].decision.targetBranch, "trunk");
+    assert.equal(recovered.items["openclaw/openclaw#901"].decision.targetBranch, "trunk");
+    assert.equal(recovered.items["openclaw/openclaw#903"].decision.targetBranch, "trunk");
+    assert.equal(openclawRepositoryReads, 3);
+    assert.equal(openclawPullReads, 1);
+    assert.equal(storage.rawHas("exact-review-branch-authority-reservation:v1:a-openclaw"), false);
+    assert.equal(storage.rawHas("exact-review-branch-authority-reservation:v1:b-openclaw"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  }
+});
+
 test("exact-review queue durably coalesces concurrent unchanged pull request edits", async () => {
   const storage = new MemoryDurableStorage();
   const queue = new ExactReviewQueue({ storage }, {});
@@ -1162,9 +1433,20 @@ test("exact-review queue durably coalesces concurrent unchanged pull request edi
       }
     >;
   };
-  assert.equal(state.items["Steipete/Nameplate#750"].revision, 1);
-  assert.equal(state.items["Steipete/Nameplate#750"].decision.sourceAuthoritySeq, 1);
-  assert.deepEqual(state.items["Steipete/Nameplate#750"].sourceAuthorityWatermark, {
+  // Either concurrent delivery may win the enqueue race; the stored item keeps
+  // the winner's repo casing (seq 1 sent "Steipete/Nameplate", seq 2 lowercase)
+  // while the loser dedupes case-insensitively and the watermark ends at the
+  // maximum sequence in both orders.
+  const queued = responses.find((response) => response.queued === true);
+  const storedKeys = Object.keys(state.items).filter(
+    (key) => key.toLowerCase() === "steipete/nameplate#750",
+  );
+  assert.deepEqual(storedKeys, [queued?.item_key]);
+  const item = state.items[storedKeys[0]];
+  const winnerAuthoritySeq = storedKeys[0] === "Steipete/Nameplate#750" ? 1 : 2;
+  assert.equal(item.revision, 1);
+  assert.equal(item.decision.sourceAuthoritySeq, winnerAuthoritySeq);
+  assert.deepEqual(item.sourceAuthorityWatermark, {
     sequence: 2,
     updatedAt: "2026-07-25T09:00:00Z",
   });
@@ -1545,6 +1827,19 @@ test("exact-review publication scales bounded capacity with ready backlog", () =
     }),
     16,
   );
+  assert.equal(
+    exactReviewPublicationCapacity(
+      {
+        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "8",
+        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "32",
+        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "40",
+      },
+      400,
+      0,
+      16,
+    ),
+    16,
+  );
 });
 
 test("exact-review publication admission applies the hysteresis controller demand target", async () => {
@@ -1585,6 +1880,71 @@ test("exact-review publication admission applies the hysteresis controller deman
     assert.equal(stats.lanes.publication.pending, 50);
     assert.equal(stats.lanes.publication.capacity_control.demand_capacity, 32);
     assert.equal(stats.lanes.publication.capacity, 32);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("exact-review publication controller adopts the staged base after a fixed-policy downgrade", async () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-08-10T09:00:00.000Z");
+  Date.now = () => now;
+  try {
+    const storage = new MemoryDurableStorage();
+    const items: Record<string, ReturnType<typeof leasedExactReviewPublicationItem>> = {};
+    for (let index = 0; index < 50; index += 1) {
+      const item = leasedExactReviewPublicationItem(20_000 + index, String(200_000 + index));
+      item.state = "pending";
+      item.createdAt = now - 60_000;
+      item.updatedAt = now - 60_000;
+      items[item.key] = item;
+    }
+    await storage.put("exact-review-queue", { deliveries: {}, items });
+    await storage.put("exact-review-publication-control:v1", {
+      capacityCeiling: 50,
+      demandCapacity: 50,
+      cooldownUntil: 0,
+      recoverySuccesses: 0,
+      demandSamples: 0,
+      demandTier: 0,
+      lastDemandSampleAt: now,
+      lastScaleAt: now,
+    });
+    const queue = new ExactReviewQueue(
+      { storage },
+      {
+        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "8",
+        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "32",
+        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "40",
+      },
+    );
+
+    const stats = await (
+      await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json();
+    assert.equal(stats.lanes.publication.pending, 50);
+    assert.deepEqual(stats.lanes.publication.capacity_control, {
+      mode: "adaptive",
+      minimum: 8,
+      base: 32,
+      maximum: 40,
+      ceiling: 40,
+      demand_capacity: 32,
+      demand_samples: 0,
+      demand_tier: 0,
+      last_scale_at: new Date(now).toISOString(),
+      cooldown_until: null,
+      recovery_successes: 0,
+      last_failure_at: null,
+      last_failure_kind: null,
+    });
+    assert.equal(stats.lanes.publication.capacity, 32);
+    const persisted = (await storage.get("exact-review-publication-control:v1")) as {
+      capacityCeiling: number;
+      demandCapacity: number;
+    };
+    assert.equal(persisted.capacityCeiling, 40);
+    assert.equal(persisted.demandCapacity, 32);
   } finally {
     Date.now = originalNow;
   }
@@ -1680,6 +2040,50 @@ test("exact-review queue bypasses debounce for commands and publications", async
     assert.equal(stats.lanes.review.enqueued_total, 1);
     assert.equal(stats.lanes.review.flow.last_15_minutes.arrival_rate_per_hour, 4);
     assert.equal(stats.lanes.publication.enqueued_total, 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("exact-review queue bypasses debounce only for fresh pull request openings", async () => {
+  const originalNow = Date.now;
+  let now = 2_500_000;
+  Date.now = () => now;
+  try {
+    const storage = new MemoryDurableStorage();
+    const queue = new ExactReviewQueue(
+      { storage },
+      {
+        EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "90000",
+        EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS: "180000",
+      },
+    );
+    await queue.fetch(buildExactReviewQueueRequest("fresh-opened", 753, "opened", "pull_request"));
+    await queue.fetch(
+      buildExactReviewQueueRequest("fresh-ready", 754, "ready_for_review", "pull_request"),
+    );
+    await queue.fetch(
+      buildExactReviewQueueRequest("fresh-synchronize", 755, "synchronize", "pull_request"),
+    );
+    await queue.fetch(
+      buildExactReviewQueueRequest("scheduled-unchanged", 756, "scheduled_normal_backfill"),
+    );
+    await queue.fetch(buildExactReviewQueueRequest("existing-organic", 757, "opened"));
+
+    let state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { nextAttemptAt: number; revision: number }>;
+    };
+    assert.equal(state.items["openclaw/gogcli#753"].nextAttemptAt, now);
+    assert.equal(state.items["openclaw/gogcli#754"].nextAttemptAt, now);
+    assert.equal(state.items["openclaw/gogcli#755"].nextAttemptAt, now + 90_000);
+    assert.equal(state.items["openclaw/gogcli#756"].nextAttemptAt, now);
+    assert.equal(state.items["openclaw/gogcli#757"].nextAttemptAt, now + 90_000);
+
+    now += 1_000;
+    await queue.fetch(buildExactReviewQueueRequest("existing-coalesced", 757, "edited"));
+    state = (await storage.get("exact-review-queue")) as typeof state;
+    assert.equal(state.items["openclaw/gogcli#757"].revision, 2);
+    assert.equal(state.items["openclaw/gogcli#757"].nextAttemptAt, now + 90_000);
   } finally {
     Date.now = originalNow;
   }
@@ -3609,6 +4013,65 @@ test("fresh dead-letter recovery is available only through the signed internal r
   });
 });
 
+test("parked review inventory and mutations require the operator signature", async () => {
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-token-placeholder",
+    EXACT_REVIEW_OPERATOR_SECRET: "operator-token-placeholder",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const requests = [
+    { path: "list", payload: { limit: 5 } },
+    {
+      path: "resolve",
+      payload: {
+        items: [{ item_key: "openclaw/gogcli#1", revision: 1, updated_at_ms: 1 }],
+        note: "terminal target",
+      },
+    },
+    {
+      path: "recover-fresh",
+      payload: {
+        items: [{ item_key: "openclaw/gogcli#1", revision: 1, updated_at_ms: 1 }],
+        idempotency_key: "parked-reconcile:test",
+      },
+    },
+  ];
+  for (const { path, payload } of requests) {
+    const body = JSON.stringify(payload);
+    const url = `https://clawsweeper.openclaw.ai/internal/exact-review/parked-reviews/${path}`;
+    assert.equal((await worker.fetch(new Request(url, { method: "POST", body }), env)).status, 401);
+    const sharedSignature = `sha256=${createHmac("sha256", "test-token-placeholder").update(body).digest("hex")}`;
+    assert.equal(
+      (
+        await worker.fetch(
+          new Request(url, {
+            method: "POST",
+            headers: { "x-clawsweeper-exact-review-signature": sharedSignature },
+            body,
+          }),
+          env,
+        )
+      ).status,
+      401,
+    );
+    const operatorSignature = `sha256=${createHmac("sha256", "operator-token-placeholder").update(body).digest("hex")}`;
+    assert.equal(
+      (
+        await worker.fetch(
+          new Request(url, {
+            method: "POST",
+            headers: { "x-clawsweeper-exact-review-signature": operatorSignature },
+            body,
+          }),
+          env,
+        )
+      ).status,
+      200,
+    );
+  }
+});
+
 test("direct publication endpoint authenticates, dedupes, and returns a structured 413", async () => {
   const storage = new MemoryDurableStorage();
   const leased = leasedExactReviewQueueItem(701, "7010");
@@ -3667,6 +4130,32 @@ test("direct publication endpoint authenticates, dedupes, and returns a structur
     error: "direct_publication_source_sha_required",
     fallback_required: true,
   });
+  const urlCredentials = ["alice", "hunter2"].join(":");
+  const credentialPath = `https://${urlCredentials}@example.invalid/GITHUB_TOKEN=ghp_${"a".repeat(24)}`;
+  const invalidPlanBody = JSON.stringify({
+    ...payload,
+    operations: [{ ...payload.operations[0], path: credentialPath }],
+  });
+  const invalidPlanSignature = `sha256=${createHmac("sha256", "test-secret").update(invalidPlanBody).digest("hex")}`;
+  const invalidPlan = await worker.fetch(
+    new Request(url, {
+      method: "POST",
+      headers: { "x-clawsweeper-exact-review-signature": invalidPlanSignature },
+      body: invalidPlanBody,
+    }),
+    env,
+  );
+  assert.equal(invalidPlan.status, 400);
+  const invalidPlanResponse = (await invalidPlan.json()) as {
+    error: string;
+    fallback_required: boolean;
+    detail: string;
+  };
+  assert.equal(invalidPlanResponse.error, "invalid_direct_publication_plan");
+  assert.equal(invalidPlanResponse.fallback_required, true);
+  assert.match(invalidPlanResponse.detail, /^invalid bounded state mutation path: /);
+  assert.match(invalidPlanResponse.detail, /\[REDACTED\]/);
+  assert.doesNotMatch(invalidPlanResponse.detail, /alice|hunter2|ghp_[A-Za-z0-9_]+/);
   for (const expected of [
     { accepted: true, deduped: false },
     { accepted: false, deduped: true },
@@ -4022,6 +4511,131 @@ test("direct publication endpoint authenticates, dedupes, and returns a structur
     max_bytes: 4 * 1024 * 1024,
     fallback_required: true,
   });
+});
+
+test("direct publication keeps GitHub casing while using lowercase canonical record slugs", async () => {
+  const fixtures = [
+    {
+      targetRepo: "steipete/CodexBar",
+      inputRepoSlug: "steipete-CodexBar",
+      repoSlug: "steipete-codexbar",
+      itemNumber: 2831,
+    },
+    {
+      targetRepo: "openclaw/Peekaboo",
+      inputRepoSlug: "openclaw-peekaboo",
+      repoSlug: "openclaw-peekaboo",
+      itemNumber: 364,
+    },
+  ] as const;
+  const storage = new MemoryDurableStorage();
+  const items: Record<string, ReturnType<typeof leasedExactReviewQueueItem>> = {};
+  for (const fixture of fixtures) {
+    const leased = leasedExactReviewQueueItem(fixture.itemNumber, String(fixture.itemNumber));
+    leased.key = `${fixture.targetRepo}#${fixture.itemNumber}`;
+    leased.decision.targetRepo = fixture.targetRepo;
+    leased.leaseDecision.targetRepo = fixture.targetRepo;
+    leased.revision = 4;
+    leased.leaseRevision = 4;
+    leased.claimGeneration = 2;
+    leased.admissionDeliveryId = `mixed-case-direct:${fixture.itemNumber}`;
+    items[leased.key] = leased;
+  }
+  await storage.put("exact-review-queue", { deliveries: {}, items });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "mixed-case-direct-secret",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const url = "https://clawsweeper.openclaw.ai/internal/exact-review/publication-results";
+
+  for (const fixture of fixtures) {
+    const canonicalTargetKey = `${fixture.targetRepo}#${fixture.itemNumber}`;
+    const content = `mixed-case direct publication for ${canonicalTargetKey}\n`;
+    const payload = {
+      canonicalTargetKey,
+      fenceKey: canonicalTargetKey,
+      revision: 4,
+      sourceSha: "c".repeat(40),
+      identity: {
+        canonicalTargetKey,
+        fenceKey: canonicalTargetKey,
+        revision: 4,
+        claimGeneration: 2,
+      },
+      operations: [
+        {
+          path: `records/${fixture.inputRepoSlug}/items/${fixture.itemNumber}.md`,
+          deleted: false,
+          mode: "100644",
+          bytes: Buffer.byteLength(content),
+          contentBase64: Buffer.from(content).toString("base64"),
+        },
+      ],
+      totalBytes: Buffer.byteLength(content),
+      lifecycle: { kind: "router" },
+    };
+    const body = JSON.stringify(payload);
+    const signature = `sha256=${createHmac("sha256", env.CLAWSWEEPER_WEBHOOK_SECRET).update(body).digest("hex")}`;
+    for (const expected of [
+      { accepted: true, deduped: false },
+      { accepted: false, deduped: true },
+    ]) {
+      const response = await worker.fetch(
+        new Request(url, {
+          method: "POST",
+          headers: { "x-clawsweeper-exact-review-signature": signature },
+          body,
+        }),
+        env,
+      );
+      assert.equal(response.status, 202);
+      assert.deepEqual(await response.json(), {
+        ok: true,
+        ...expected,
+        superseded: false,
+        superseded_revisions: [],
+        canonical_target_key: canonicalTargetKey,
+        fence_key: canonicalTargetKey,
+        state_commit_sha: "do-revision:4",
+      });
+    }
+
+    const canonical = await (
+      await queue.fetch(
+        new Request(`https://queue/records/${fixture.repoSlug}/items/${fixture.itemNumber}`, {
+          method: "GET",
+        }),
+      )
+    ).json();
+    assert.equal(canonical.content, content);
+    assert.equal(canonical.revision, 4);
+    if (fixture.inputRepoSlug !== fixture.repoSlug) {
+      assert.equal(
+        (
+          await queue.fetch(
+            new Request(
+              `https://queue/records/${fixture.inputRepoSlug}/items/${fixture.itemNumber}`,
+              { method: "GET" },
+            ),
+          )
+        ).status,
+        404,
+      );
+    }
+  }
+
+  const [parallelNamespaceRows] = Array.from(
+    storage.sql.exec(
+      `SELECT
+         (SELECT COUNT(*) FROM exact_review_canonical_records
+           WHERE repo_slug = 'steipete-CodexBar') AS canonical_count,
+         (SELECT COUNT(*) FROM exact_review_record_export_index
+           WHERE repo_slug = 'steipete-CodexBar') AS export_count`,
+    ),
+  );
+  assert.equal(parallelNamespaceRows?.canonical_count, 0);
+  assert.equal(parallelNamespaceRows?.export_count, 0);
 });
 
 test("fetching a stale publication batch records a durable superseded telemetry outcome", async () => {
@@ -5681,6 +6295,48 @@ test("authenticated fanout cursors round-trip through durable storage", async ()
     EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
   };
   assert.deepEqual(await (await worker.fetch(request("GET"), env)).json(), written);
+});
+
+test("placeholder recovery cursor survives queue reconstruction", async () => {
+  const storage = new MemoryDurableStorage();
+  const secret = "placeholder-cursor-secret";
+  const mode = "review-placeholder-0123456789abcdef-closed";
+  const path = `/internal/state/cursors/${mode}`;
+  let queue = new ExactReviewQueue({ storage }, {});
+  let env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const request = (method: "GET" | "PUT", payload?: unknown) => {
+    const body = method === "PUT" ? JSON.stringify(payload) : "";
+    return new Request(`https://clawsweeper.openclaw.ai${path}`, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+      },
+      ...(method === "PUT" ? { body } : {}),
+    });
+  };
+
+  const written = await worker.fetch(
+    request("PUT", { next_cursor: 120, expected_revision: 0 }),
+    env,
+  );
+  assert.equal(written.status, 202);
+
+  queue = new ExactReviewQueue({ storage }, {});
+  env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  assert.deepEqual(await (await worker.fetch(request("GET"), env)).json(), {
+    ok: true,
+    mode,
+    next_cursor: 120,
+    revision: 1,
+    updated_at: (await written.clone().json()).updated_at,
+  });
 });
 
 test("Worker lifecycle projection permits one command acknowledgement after durable routing", async () => {
@@ -9329,9 +9985,9 @@ test("issue triage exposes impact-group controls without changing PR proof triag
   const proofHtml = await proofPage.text();
   assert.match(issueHtml, /id="routing-group"/);
   assert.match(issueHtml, /Impact group/);
-  assert.match(issueHtml, /href="\/bay-demo">OpenClaw Bay/);
-  assert.match(proofHtml, /href="\/bay-demo">OpenClaw Bay/);
-  assert.match(await overviewPage.text(), /href="\/bay-demo">OpenClaw Bay/);
+  assert.match(issueHtml, /href="\/bay">OpenClaw Bay/);
+  assert.match(proofHtml, /href="\/bay">OpenClaw Bay/);
+  assert.match(await overviewPage.text(), /href="\/bay">OpenClaw Bay/);
   assert.doesNotMatch(proofHtml, /id="routing-group"/);
 });
 
@@ -9348,8 +10004,8 @@ test("dashboard health identifies the deployed revision", async () => {
   assert.equal(response.headers.get("cache-control"), "no-store");
 });
 
-test("OpenClaw Bay is a public, indexable, hardened route", async () => {
-  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/bay-demo"), {});
+test("OpenClaw Bay is a public, indexable, hardened canonical route", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/bay"), {});
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
   assert.equal(response.headers.get("cache-control"), "no-store");
@@ -9364,24 +10020,26 @@ test("OpenClaw Bay is a public, indexable, hardened route", async () => {
   assert.match(body, /<title>OpenClaw Bay · ClawSweeper<\/title>/);
   assert.doesNotMatch(body, /<meta name="robots"/);
   assert.doesNotMatch(body, /Experimental demo/);
-  assert.match(body, /href="\/bay-demo" aria-current="page"/);
+  assert.match(body, /href="\/bay" aria-current="page"/);
   assert.match(body, /Where's my crustacean\?/);
   assert.match(body, /20 distinct terminal items per tide/);
   assert.match(body, /Master Sweeper/);
   assert.match(body, /id="bay-control-board"/);
   assert.match(body, /Review admission/);
   assert.match(body, /Result publication/);
+  assert.match(body, /renderBayPublicationQuotaContext/);
+  assert.match(body, /credential_circuits/);
+  assert.match(body, /github_request_metrics/);
+  assert.match(body, /credential-blocked/);
   assert.match(body, /State writer/);
   assert.match(body, /Queue handoff/);
   assert.doesNotMatch(body, /Recent durable events/);
   assert.doesNotMatch(body, /function bayRecentPublicationEvents/);
   assert.match(body, /id="durable-lifecycle-kanban"/);
   assert.match(body, /Durable lifecycle Kanban/);
-  assert.match(body, /id="live-activity-panel"/);
-  assert.match(body, /Transient signals only/);
-  assert.match(body, /class="live-activity hero-live-activity"/);
-  assert.match(body, /fetch\("\/api\/live-activity-bay"/);
-  assert.match(body, /never create, move, count, or complete a durable lifecycle card/);
+  assert.doesNotMatch(body, /Live activity/i);
+  assert.doesNotMatch(body, /live-activity/);
+  assert.doesNotMatch(body, /fetch\("\/api\/live-activity-bay"/);
   assert.match(body, /function durableSnapshot/);
   assert.match(body, /fetch\("\/api\/durable-lifecycle-bay"/);
   assert.match(body, /durableLifecycleLoading/);
@@ -9392,23 +10050,11 @@ test("OpenClaw Bay is a public, indexable, hardened route", async () => {
     body,
     /No counts or cards are shown until a complete, fresh projection is available/,
   );
-  assert.match(
-    body,
-    /Transient signals only; they never create, move, count, or complete a durable lifecycle card/,
-  );
   const durableScriptStart = body.indexOf("function durableSnapshot");
   const durableScriptEnd = body.indexOf("function hash", durableScriptStart);
   assert.ok(durableScriptStart > 0 && durableScriptEnd > durableScriptStart);
   const durableScript = body.slice(durableScriptStart, durableScriptEnd);
   assert.doesNotMatch(durableScript, /\/api\/status|workers|current_step|stageFor/);
-  const liveScriptStart = body.indexOf("function liveActivitySnapshot");
-  const liveScriptEnd = body.indexOf("function hash", liveScriptStart);
-  assert.ok(liveScriptStart > 0 && liveScriptEnd > liveScriptStart);
-  const liveScript = body.slice(liveScriptStart, liveScriptEnd);
-  assert.doesNotMatch(
-    liveScript,
-    /durable-lifecycle-bay|durableLifecycle|stageFor|\/api\/status|workers|current_step/,
-  );
   assert.match(body, /function durableNoSensitiveFields/);
   assert.doesNotMatch(durableScript, /JSON\.stringify\(card\|\|\{\}\)/);
   assert.match(body, /function loadBayHistory/);
@@ -9420,6 +10066,14 @@ test("OpenClaw Bay is a public, indexable, hardened route", async () => {
   assert.match(body, /data-bay-history-range="24h"/);
   assert.match(body, /data-bay-history-range="7d"/);
   assert.match(body, /bay-control-axis-label/);
+  assert.match(body, /function bayHandoffHistory/);
+  assert.match(body, /function bayHandoffSparkline/);
+  assert.match(body, /bay-handoff-line pending/);
+  assert.match(body, /Pending, dispatching, and leased queue handoffs/);
+  assert.match(body, /oldest pending/);
+  assert.match(body, /handoff\.message\|\|handoff\.reason/);
+  assert.match(body, /Handoff telemetry is unavailable in this snapshot/);
+  assert.match(body, /\["pending","dispatching","leased"\]\.every/);
   assert.match(body, /api\/health-history\?range="\+encodeURIComponent\(range\)/);
   assert.match(body, /function expandQueue/);
   assert.match(body, /function queueProjectionStage/);
@@ -9673,7 +10327,17 @@ test("OpenClaw Bay is a public, indexable, hardened route", async () => {
   assert.equal(confirmingContext.result[0].stage, "completed");
   assert.equal(Object.keys(confirmingContext.state.confirmingOutcomes).length, 0);
 
-  for (const path of ["/bay", "/bay.html", "/bay-demo.html"]) {
+  const legacy = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/bay-demo?repo=openclaw%2Fopenclaw&q=review"),
+    {},
+  );
+  assert.equal(legacy.status, 308);
+  assert.equal(
+    legacy.headers.get("location"),
+    "https://clawsweeper.openclaw.ai/bay?repo=openclaw%2Fopenclaw&q=review",
+  );
+
+  for (const path of ["/bay.html", "/bay-demo.html", "/not-a-dashboard-route"]) {
     const missing = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${path}`), {});
     assert.equal(missing.status, 404, `${path} should remain unpublished`);
   }
@@ -9681,7 +10345,7 @@ test("OpenClaw Bay is a public, indexable, hardened route", async () => {
   for (const path of ["/", "/triage", "/pr-proof-triage"]) {
     const page = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${path}`), {});
     const pageBody = await page.text();
-    assert.match(pageBody, /href="\/bay-demo">OpenClaw Bay/);
+    assert.match(pageBody, /href="\/bay">OpenClaw Bay/);
     if (path === "/") assert.match(pageBody, /setInterval\(load, 15000\)/);
   }
 });
@@ -10535,6 +11199,8 @@ class MemorySqlStorage {
 class MemoryDurableStorage {
   private values = new Map<string, unknown>();
   private putCounts = new Map<string, number>();
+  private getHistory: string[] = [];
+  private listHistory: Array<{ options: Record<string, unknown>; keys: string[] }> = [];
   private putFailure: { key: string; error: Error } | undefined;
   private deleteFailure: { key: string; error: Error } | undefined;
   private alarmAt: number | null = null;
@@ -10560,6 +11226,7 @@ class MemoryDurableStorage {
   }
 
   async get(key: string, options?: { noCache?: boolean }) {
+    this.getHistory.push(key);
     if (key === "exact-review-queue" && this.sql.hasNormalizedQueue() && !options?.noCache) {
       return this.sql.readNormalizedQueue();
     }
@@ -10611,8 +11278,26 @@ class MemoryDurableStorage {
     return this.deleteRawSync(key);
   }
 
-  async list() {
-    return new Map(this.values);
+  async list(
+    options: {
+      prefix?: string;
+      start?: string;
+      startAfter?: string;
+      end?: string;
+      limit?: number;
+      reverse?: boolean;
+    } = {},
+  ) {
+    let entries = [...this.values.entries()]
+      .filter(([key]) => !options.prefix || key.startsWith(options.prefix))
+      .filter(([key]) => !options.start || key >= options.start)
+      .filter(([key]) => !options.startAfter || key > options.startAfter)
+      .filter(([key]) => !options.end || key < options.end)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    if (options.reverse) entries.reverse();
+    if (options.limit !== undefined) entries = entries.slice(0, options.limit);
+    this.listHistory.push({ options: { ...options }, keys: entries.map(([key]) => key) });
+    return new Map(entries);
   }
 
   async getAlarm() {
@@ -10645,6 +11330,20 @@ class MemoryDurableStorage {
 
   rawPut(key: string, value: unknown) {
     this.values.set(key, structuredClone(value));
+  }
+
+  listedKeys(prefix: string) {
+    return this.listHistory
+      .filter((call) => call.options.prefix === prefix)
+      .flatMap((call) => call.keys);
+  }
+
+  fetchedKeys(prefix: string) {
+    return this.getHistory.filter((key) => key.startsWith(prefix));
+  }
+
+  resetGetHistory() {
+    this.getHistory = [];
   }
 
   private throwPutFailure(key: string) {
@@ -11468,6 +12167,139 @@ test("automerge metric events use isolated durable keys and aggregate through th
   assert.equal(metrics.summary.merged_sessions, 2);
 });
 
+test("automerge metrics retain bounded pre-window context for spanning sessions", async () => {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const namespace = new MemoryDurableNamespace(store);
+  const now = Date.now();
+  const prefix = "automerge-product-metrics:v1:time:";
+  const spanningActivationAt = new Date(now - 7 * 60 * 60_000).toISOString();
+  const spanningRepairAt = new Date(now - 5 * 60 * 60_000).toISOString();
+  const spanningTerminalAt = new Date(now - 60 * 60_000).toISOString();
+  const preWindowActivationAt = new Date(now - 9 * 60 * 60_000).toISOString();
+  const preWindowTerminalAt = new Date(now - 7 * 60 * 60_000).toISOString();
+  const outsideContextAt = new Date(now - 9 * 24 * 60 * 60_000).toISOString();
+  const outsideContextKey = `${prefix}${outsideContextAt}:outside-context`;
+  storage.rawPut(outsideContextKey, {
+    value: "{not-json",
+    expires_at: now + 60_000,
+  });
+  const rows = [
+    {
+      event_id: "spanning-activation",
+      session_id: "openclaw/openclaw#42:spanning",
+      repository: "openclaw/openclaw",
+      item_number: 42,
+      policy_version: "immediate-v1",
+      phase: "activated",
+      occurred_at: spanningActivationAt,
+    },
+    {
+      event_id: "spanning-repair",
+      session_id: "openclaw/openclaw#42:spanning",
+      repository: "openclaw/openclaw",
+      item_number: 42,
+      policy_version: "immediate-v1",
+      phase: "repair_completed",
+      base_sync: true,
+      occurred_at: spanningRepairAt,
+    },
+    {
+      event_id: "spanning-terminal",
+      session_id: "openclaw/openclaw#42:spanning",
+      repository: "openclaw/openclaw",
+      item_number: 42,
+      policy_version: "immediate-v1",
+      phase: "terminal",
+      outcome: "merged",
+      occurred_at: spanningTerminalAt,
+    },
+    {
+      event_id: "pre-window-activation",
+      session_id: "openclaw/openclaw#43:pre-window",
+      repository: "openclaw/openclaw",
+      item_number: 43,
+      policy_version: "immediate-v1",
+      phase: "activated",
+      occurred_at: preWindowActivationAt,
+    },
+    {
+      event_id: "pre-window-terminal",
+      session_id: "openclaw/openclaw#43:pre-window",
+      repository: "openclaw/openclaw",
+      item_number: 43,
+      policy_version: "immediate-v1",
+      phase: "terminal",
+      outcome: "merged",
+      occurred_at: preWindowTerminalAt,
+    },
+  ];
+  const rowKeys = rows.map((event) => `${prefix}${event.occurred_at}:${event.event_id}`);
+  for (const [index, event] of rows.entries()) {
+    storage.rawPut(rowKeys[index]!, {
+      value: JSON.stringify(event),
+      expires_at: now + 60_000,
+    });
+  }
+
+  const response = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/api/automerge-metrics?range=6h"),
+    { STATUS_STORE: namespace },
+  );
+  const metrics = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(metrics.summary.terminal_sessions, 1);
+  assert.equal(metrics.summary.merged_sessions, 1);
+  assert.equal(metrics.summary.command_to_merge_p50_ms, 6 * 60 * 60_000);
+  assert.equal(metrics.summary.base_sync_p50, 1);
+  assert.equal(metrics.sessions[0]?.repairs, 1);
+  assert.equal(metrics.sessions[0]?.activation_missing, false);
+  assert.deepEqual(storage.listedKeys(prefix), [...rowKeys].sort());
+  assert.equal(storage.listedKeys(prefix).includes(outsideContextKey), false);
+});
+
+function applyObservation(options: {
+  repo?: string;
+  runId: string;
+  occurredAt: string;
+  outcome?: "in_progress" | "success";
+  closed?: number | null;
+}) {
+  return {
+    schema_version: 1,
+    repo: options.repo ?? "openclaw/openclaw",
+    run_id: options.runId,
+    run_attempt: 1,
+    occurred_at: options.occurredAt,
+    started_at: options.occurredAt,
+    lifecycle_started: true,
+    outcome: options.outcome ?? "success",
+    run_url: `https://github.com/openclaw/clawsweeper/actions/runs/${options.runId}`,
+    queue: {
+      active: 0,
+      capacity: 1,
+      ready: 0,
+      backoff: 0,
+      dispatching: 0,
+      leased: 0,
+      oldest_ready_age_seconds: null,
+      oldest_backoff_age_seconds: null,
+      oldest_lease_age_seconds: null,
+    },
+    arrivals: 1,
+    results: {
+      applied: options.closed ?? 0,
+      closed: options.closed ?? 0,
+      superseded: 0,
+      retried: 0,
+      dead_lettered: 0,
+    },
+    lease: { wait_ms: 0, hold_ms: 0 },
+    observed_failure_kinds: [],
+    failures: [],
+  };
+}
+
 test("apply observability accepts signed durable events and exposes the API summary", async () => {
   const storage = new MemoryDurableStorage();
   const store = new StatusStore({ storage });
@@ -11635,6 +12467,74 @@ test("apply observability accepts signed durable events and exposes the API summ
     ["openclaw/openclaw", "openclaw/clawhub"],
   );
   assert.equal(withClawhub.telemetry_complete, true);
+});
+
+test("apply observability merges bucketed writes with legacy rows without double counting", async () => {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const namespace = new MemoryDurableNamespace(store);
+  const now = Date.now();
+  const legacyAt = new Date(now - 2 * 60 * 60_000).toISOString();
+  const replacementAt = new Date(now - 60 * 60_000).toISOString();
+  const secondAt = new Date(now - 30 * 60_000).toISOString();
+  storage.rawPut("apply-observability:openclaw%2Fopenclaw:100:1", {
+    value: JSON.stringify(
+      applyObservation({ runId: "100", occurredAt: legacyAt, outcome: "in_progress" }),
+    ),
+    expires_at: now + 60_000,
+  });
+  for (const event of [
+    applyObservation({ runId: "100", occurredAt: replacementAt, closed: 3 }),
+    applyObservation({ runId: "101", occurredAt: secondAt, closed: 2 }),
+  ]) {
+    const accepted = await store.fetch(
+      new Request("https://clawsweeper-status-store/apply-observability", {
+        method: "POST",
+        body: JSON.stringify({ event }),
+      }),
+    );
+    assert.equal(accepted.status, 200);
+  }
+
+  const response = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/api/apply-observability?range=24h"),
+    { STATUS_STORE: namespace, APPLY_TARGET_REPOS: "openclaw/openclaw" },
+  );
+  const summary = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(summary.event_count, 2);
+  assert.equal(summary.totals.closed, 5);
+});
+
+test("apply observability stores a UTC-boundary replay exactly once", async () => {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const namespace = new MemoryDurableNamespace(store);
+  const midnight = new Date();
+  midnight.setUTCHours(0, 0, 0, 0);
+  const event = applyObservation({ runId: "102", occurredAt: midnight.toISOString(), closed: 1 });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const accepted = await store.fetch(
+      new Request("https://clawsweeper-status-store/apply-observability", {
+        method: "POST",
+        body: JSON.stringify({ event }),
+      }),
+    );
+    assert.equal(accepted.status, 200);
+  }
+  storage.resetGetHistory();
+
+  const response = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/api/apply-observability?range=24h"),
+    { STATUS_STORE: namespace, APPLY_TARGET_REPOS: "openclaw/openclaw" },
+  );
+  const summary = await response.json();
+  assert.equal(summary.event_count, 1);
+  assert.equal(summary.totals.closed, 1);
+  assert.ok(storage.fetchedKeys("apply-observability:day:").length <= 2);
+  const bucketKey = `apply-observability:day:${midnight.toISOString().slice(0, 10)}:openclaw%2Fopenclaw`;
+  const bucket = storage.rawGet(bucketKey) as { value: string };
+  assert.equal(JSON.parse(bucket.value).length, 1);
 });
 
 test("dashboard durable status store persists, expires, and prepends events", async () => {
@@ -12280,7 +13180,11 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
 });
 
 test("exact-review queue resolves a closed item before dispatch", async () => {
-  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "closed" }));
+  const harness = createExactReviewAdmissionHarness(
+    (_targetRepo, itemNumber) =>
+      jsonResponse({ state: itemNumber === 113_347 ? "open" : "closed" }),
+    { dispatch: () => jsonResponse({ message: "temporary failure" }, { status: 500 }) },
+  );
   try {
     assert.equal(
       (await harness.queue.fetch(buildExactReviewQueueRequest("terminal-item", 597, "opened")))
@@ -13450,6 +14354,40 @@ test("exact-review batch terminal probe resets for a later departure", async () 
     assert.equal(item.items.length, 0);
   } finally {
     Date.now = originalNow;
+    harness.restore();
+  }
+});
+
+test("exact-review batch alarm avoids redundant full queue hydrations", async () => {
+  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "open" }), {
+    publicationBatching: true,
+    captureBatchDispatch: true,
+  });
+  try {
+    const enqueue = buildExactReviewQueueRequest(
+      "hydration-count",
+      9232,
+      "exact_review_artifact_publish",
+      "issue",
+      "openclaw/gogcli",
+      exactReviewPublicationOverrides(9232, "92320"),
+    );
+    assert.equal((await harness.queue.fetch(enqueue)).status, 202);
+
+    const exec = harness.storage.sql.exec.bind(harness.storage.sql);
+    let fullStateReads = 0;
+    harness.storage.sql.exec = (query: string, ...bindings: unknown[]) => {
+      if (/\bSELECT item_key, item_json FROM exact_review_queue_items\b/.test(query)) {
+        fullStateReads += 1;
+      }
+      return exec(query, ...bindings);
+    };
+
+    await harness.queue.alarm();
+
+    assert.equal(harness.batchDispatches, 1);
+    assert.equal(fullStateReads, 5);
+  } finally {
     harness.restore();
   }
 });
@@ -15483,9 +16421,9 @@ test("exact-review review retries park at the attempt ceiling and recover after 
     );
 
     const due = (await storage.get("exact-review-queue")) as {
-      items: Record<string, { updatedAt: number }>;
+      items: Record<string, { parkedRecoveryAt?: number; updatedAt: number }>;
     };
-    due.items[itemKey].updatedAt = Date.now() - 6 * 60_000;
+    due.items[itemKey].parkedRecoveryAt = due.items[itemKey].updatedAt;
     await storage.put("exact-review-queue", due);
     await queue.alarm();
     assert.equal(dispatched.length, 9);
@@ -15499,34 +16437,720 @@ test("exact-review review retries park at the attempt ceiling and recover after 
   }
 });
 
+test("exact-review parking spreads a same-tick cohort across persisted recovery timestamps", async () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-08-08T12:00:00.000Z");
+  Date.now = () => now;
+  try {
+    const storage = new MemoryDurableStorage();
+    const items = Object.fromEntries(
+      Array.from({ length: 12 }, (_, index) => {
+        const item = leasedExactReviewQueueItem(120_000 + index, `12000${index}`);
+        item.attempts = 7;
+        item.reviewFailureAttempts = 7;
+        return [item.key, item];
+      }),
+    );
+    await storage.put("exact-review-queue", { deliveries: {}, items });
+    const queue = new ExactReviewQueue({ storage }, {}, seededRandom(0x5eed));
+
+    for (const item of Object.values(items)) {
+      const response = await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            lease_id: item.leaseId,
+            item_key: item.key,
+            lease_revision: item.leaseRevision,
+            claim_generation: item.claimGeneration,
+            run_id: item.claimedRunId,
+            run_attempt: item.claimedRunAttempt,
+            outcome: "failure",
+          }),
+        }),
+      );
+      assert.equal(response.status, 200);
+    }
+
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { state: string; parkedRecoveryAt?: number }>;
+    };
+    const recoveryTimes = Object.values(state.items).map((item) => {
+      assert.equal(item.state, "parked");
+      assert.ok(Number(item.parkedRecoveryAt) >= now + 3.75 * 60_000);
+      assert.ok(Number(item.parkedRecoveryAt) <= now + 7.5 * 60_000);
+      return Number(item.parkedRecoveryAt);
+    });
+    assert.ok(new Set(recoveryTimes).size > 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("exact-review automatic parked recovery remains bounded", async () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-08-10T15:00:00.000Z");
+  Date.now = () => now;
   const storage = new MemoryDurableStorage();
   const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
-  await queue.fetch(buildExactReviewQueueRequest("bounded-parked-recovery", 113_342, "opened"));
+  try {
+    await queue.fetch(buildExactReviewQueueRequest("bounded-parked-recovery", 113_342, "opened"));
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        {
+          state: string;
+          parkedReason?: string;
+          parkedRecoveryAttempts?: number;
+          parkedTerminalCheckedAt?: number;
+          updatedAt: number;
+        }
+      >;
+    };
+    const item = state.items["openclaw/gogcli#113342"];
+    item.state = "parked";
+    item.parkedReason = "review_retry_exhausted";
+    item.parkedRecoveryAttempts = 3;
+    item.updatedAt = now - 24 * 60 * 60_000;
+    await storage.put("exact-review-queue", state);
+    await storage.deleteAlarm();
+
+    await queue.alarm();
+
+    const retained = (await storage.get("exact-review-queue")) as typeof state;
+    assert.equal(retained.items["openclaw/gogcli#113342"].state, "parked");
+    assert.equal(retained.items["openclaw/gogcli#113342"].parkedRecoveryAttempts, 3);
+    const nextAlarm = Number(await storage.getAlarm());
+    assert.ok(nextAlarm > now);
+    assert.ok(nextAlarm <= now + 5 * 60_000);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("exact-review queue removes a terminal target after parked recovery is exhausted", async () => {
+  const originalNow = Date.now;
+  let now = Date.parse("2026-08-10T15:30:00.000Z");
+  Date.now = () => now;
+  let workflowChecks = 0;
+  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "closed" }), {
+    workflow: () =>
+      ++workflowChecks <= 2
+        ? jsonResponse({ state: "active" })
+        : jsonResponse({ message: "temporary failure" }, { status: 500 }),
+  });
+  try {
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("terminal-exhausted-parked", 113_343, "opened"),
+    );
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("second-terminal-exhausted-parked", 113_346, "opened"),
+    );
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("third-terminal-exhausted-parked", 113_348, "opened"),
+    );
+    const state = (await harness.storage.get("exact-review-queue")) as {
+      dispatcher?: { parkedTerminalCheckedAt?: number };
+      items: Record<
+        string,
+        {
+          state: string;
+          parkedReason?: string;
+          parkedRecoveryAttempts?: number;
+          parkedTerminalCheckedAt?: number;
+        }
+      >;
+    };
+    const item = state.items["openclaw/gogcli#113343"];
+    item.state = "parked";
+    item.parkedReason = "review_retry_exhausted";
+    item.parkedRecoveryAttempts = 3;
+    item.parkedTerminalCheckedAt = now - 10 * 60_000;
+    const second = state.items["openclaw/gogcli#113346"];
+    second.state = "parked";
+    second.parkedReason = "review_retry_exhausted";
+    second.parkedRecoveryAttempts = 3;
+    second.parkedTerminalCheckedAt = now - 9 * 60_000;
+    const third = state.items["openclaw/gogcli#113348"];
+    third.state = "parked";
+    third.parkedReason = "review_retry_exhausted";
+    third.parkedRecoveryAttempts = 3;
+    third.parkedTerminalCheckedAt = now - 8 * 60_000;
+    await harness.storage.put("exact-review-queue", state);
+
+    await harness.queue.alarm();
+
+    const reconciled = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(reconciled.items["openclaw/gogcli#113343"], undefined);
+    assert.equal(reconciled.items["openclaw/gogcli#113346"].state, "parked");
+    assert.equal(reconciled.dispatcher?.parkedTerminalCheckedAt, now);
+    assert.equal(await harness.storage.getAlarm(), now + 5 * 60_000);
+    assert.equal(harness.dispatched.length, 0);
+    const stats = await (
+      await harness.queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json();
+    assert.equal(stats.lanes.review.parked, 2);
+    assert.equal(stats.lanes.review.completed_total, 1);
+
+    now += 5 * 60_000;
+    await harness.storage.deleteAlarm();
+    await harness.queue.alarm();
+    const secondReconciled = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(secondReconciled.items["openclaw/gogcli#113346"], undefined);
+    assert.equal(secondReconciled.items["openclaw/gogcli#113348"].state, "parked");
+    assert.equal(secondReconciled.dispatcher?.parkedTerminalCheckedAt, now);
+    assert.equal(await harness.storage.getAlarm(), now + 5 * 60_000);
+
+    const terminalCheckedAt = now;
+    now += 5 * 60_000;
+    await harness.storage.deleteAlarm();
+    await harness.queue.alarm();
+    const failedPreflight = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(failedPreflight.dispatcher?.parkedTerminalCheckedAt, terminalCheckedAt);
+    assert.ok(Number(await harness.storage.getAlarm()) > now);
+  } finally {
+    Date.now = originalNow;
+    harness.restore();
+  }
+});
+
+test("exact-review queue retains open exhausted parked work and schedules another terminal check", async () => {
+  const originalNow = Date.now;
+  let now = Date.parse("2026-08-10T16:00:00.000Z");
+  Date.now = () => now;
+  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "open" }));
+  try {
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("open-exhausted-parked", 113_344, "opened"),
+    );
+    now += 1;
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("second-open-exhausted-parked", 113_345, "opened"),
+    );
+    const state = (await harness.storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        {
+          state: string;
+          attempts: number;
+          parkedReason?: string;
+          parkedRecoveryAttempts?: number;
+          parkedTerminalCheckedAt?: number;
+        }
+      >;
+    };
+    const item = state.items["openclaw/gogcli#113344"];
+    item.state = "parked";
+    item.attempts = 8;
+    item.parkedReason = "review_retry_exhausted";
+    item.parkedRecoveryAttempts = 3;
+    const second = state.items["openclaw/gogcli#113345"];
+    second.state = "parked";
+    second.attempts = 8;
+    second.parkedReason = "review_retry_exhausted";
+    second.parkedRecoveryAttempts = 3;
+    await harness.storage.put("exact-review-queue", state);
+
+    await harness.queue.alarm();
+
+    const retained = (await harness.storage.get("exact-review-queue")) as typeof state;
+    const checked = retained.items["openclaw/gogcli#113344"];
+    assert.equal(checked.state, "parked");
+    assert.equal(checked.attempts, 8);
+    assert.equal(checked.parkedRecoveryAttempts, 3);
+    assert.equal(checked.parkedTerminalCheckedAt, now);
+    assert.equal(retained.items["openclaw/gogcli#113345"].parkedTerminalCheckedAt, undefined);
+    assert.equal(harness.dispatched.length, 0);
+    assert.equal(await harness.storage.getAlarm(), now + 5 * 60_000);
+    assert.equal(
+      exactReviewQueueNextWakeAt(
+        {
+          ...retained,
+          dispatcher: { state: "blocked", checkedAt: now, retryAt: now + 10 * 60_000 },
+        } as never,
+        now,
+      ),
+      now + 10 * 60_000,
+    );
+
+    now += 4 * 60_000;
+    await harness.queue.alarm();
+    const notDue = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(
+      notDue.items["openclaw/gogcli#113344"].parkedTerminalCheckedAt,
+      checked.parkedTerminalCheckedAt,
+    );
+    assert.equal(notDue.items["openclaw/gogcli#113345"].parkedTerminalCheckedAt, undefined);
+
+    now += 60_000;
+    await harness.queue.alarm();
+    const rotated = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(rotated.items["openclaw/gogcli#113345"].parkedTerminalCheckedAt, now);
+  } finally {
+    Date.now = originalNow;
+    harness.restore();
+  }
+});
+
+test("failed parked terminal check does not block healthy pending review dispatch", async () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-08-10T16:30:00.000Z");
+  Date.now = () => now;
+  const harness = createExactReviewAdmissionHarness((_targetRepo, itemNumber) =>
+    itemNumber === 113_350
+      ? jsonResponse({ message: "temporary GitHub outage" }, { status: 503 })
+      : jsonResponse({ state: "open" }),
+  );
+  try {
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("unavailable-exhausted-parked", 113_350, "opened"),
+    );
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("healthy-pending-review", 113_351, "opened"),
+    );
+    const state = (await harness.storage.get("exact-review-queue")) as {
+      dispatcher?: { state?: string; reason?: string; parkedTerminalCheckedAt?: number };
+      items: Record<
+        string,
+        {
+          state: string;
+          attempts: number;
+          parkedReason?: string;
+          parkedRecoveryAttempts?: number;
+          parkedTerminalCheckedAt?: number;
+        }
+      >;
+    };
+    const parked = state.items["openclaw/gogcli#113350"];
+    parked.state = "parked";
+    parked.attempts = 8;
+    parked.parkedReason = "review_retry_exhausted";
+    parked.parkedRecoveryAttempts = 3;
+    await harness.storage.put("exact-review-queue", state);
+
+    await harness.queue.alarm();
+
+    const checked = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(checked.dispatcher?.state, "active");
+    assert.equal(checked.dispatcher?.reason, undefined);
+    assert.equal(checked.dispatcher?.parkedTerminalCheckedAt, now);
+    assert.equal(checked.items["openclaw/gogcli#113350"].state, "parked");
+    assert.equal(checked.items["openclaw/gogcli#113350"].attempts, 8);
+    assert.equal(checked.items["openclaw/gogcli#113350"].parkedTerminalCheckedAt, now);
+    assert.equal(checked.items["openclaw/gogcli#113351"].state, "dispatching");
+    assert.equal(harness.dispatched.length, 1);
+  } finally {
+    Date.now = originalNow;
+    harness.restore();
+  }
+});
+
+test("exact-review queue removes a terminal dispatch rejection after parked recovery is exhausted", async () => {
+  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "closed" }));
+  try {
+    await harness.queue.fetch(
+      buildExactReviewQueueRequest("terminal-exhausted-dispatch-rejection", 113_349, "opened"),
+    );
+    const state = (await harness.storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        {
+          state: string;
+          parkedReason?: string;
+          parkedRecoveryAttempts?: number;
+        }
+      >;
+    };
+    const item = state.items["openclaw/gogcli#113349"];
+    item.state = "parked";
+    item.parkedReason = "dispatch_rejected";
+    item.parkedRecoveryAttempts = 3;
+    await harness.storage.put("exact-review-queue", state);
+
+    await harness.queue.alarm();
+
+    const reconciled = (await harness.storage.get("exact-review-queue")) as typeof state;
+    assert.equal(reconciled.items["openclaw/gogcli#113349"], undefined);
+    assert.equal(harness.dispatched.length, 0);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("parked review operator routes paginate, resolve, and recover idempotently within caps", async () => {
+  const storage = new MemoryDurableStorage();
+  const now = Date.parse("2026-08-10T12:00:00.000Z");
+  const items = Object.fromEntries(
+    Array.from({ length: 8 }, (_, index) => {
+      const item = leasedExactReviewQueueItem(114_000 + index, `91400${index}`);
+      item.state = "parked";
+      item.parkedReason = index === 7 ? "dead_letter_capacity" : "review_retry_exhausted";
+      item.parkedRecoveryAttempts = index === 6 ? 2 : 3;
+      item.parkedRecoveryAt = undefined;
+      item.attempts = 8;
+      item.reviewFailureAttempts = 8;
+      item.firstFailureAt = now - 60_000;
+      item.updatedAt = now + index;
+      return [item.key, item];
+    }),
+  );
+  await storage.put("exact-review-queue", { deliveries: {}, items });
+  const queue = new ExactReviewQueue(
+    { storage },
+    { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0", EXACT_REVIEW_QUEUE_MAX_CONCURRENT: "10" },
+  );
+
+  const first = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 2 }),
+      }),
+    )
+  ).json();
+  assert.equal(first.parked_reviews.length, 2);
+  const all = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50 }),
+      }),
+    )
+  ).json();
+  assert.equal(all.parked_reviews.length, 6);
+  assert.equal(
+    all.parked_reviews.some((item) => item.item_key === "openclaw/openclaw#114006"),
+    false,
+  );
+  assert.equal(
+    all.parked_reviews.some((item) => item.item_key === "openclaw/openclaw#114007"),
+    false,
+  );
+  assert.equal(first.parked_reviews[0].item_key, "openclaw/openclaw#114000");
+  assert.deepEqual(
+    Object.keys(first.parked_reviews[0]).sort(),
+    [
+      "first_failed_at",
+      "item_key",
+      "item_kind",
+      "last_failure_reason",
+      "parked_reason",
+      "parked_recovery_attempts",
+      "revision",
+      "target_repo",
+      "item_number",
+      "updated_at",
+      "updated_at_ms",
+    ].sort(),
+  );
+  assert.equal(first.parked_reviews[0].parked_recovery_attempts, 3);
+  assert.equal(first.parked_reviews[0].last_failure_reason, "review_retry_exhausted");
+  assert.equal(first.next_cursor, "openclaw/openclaw#114001");
+
+  const second = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 2, cursor: first.next_cursor }),
+      }),
+    )
+  ).json();
+  assert.deepEqual(
+    second.parked_reviews.map((item) => item.item_key),
+    ["openclaw/openclaw#114002", "openclaw/openclaw#114003"],
+  );
+
+  const ineligible = [6, 7].map((index) => ({
+    item_key: `openclaw/openclaw#${114_000 + index}`,
+    revision: 1,
+    updated_at_ms: now + index,
+  }));
+  const earlyResolve = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({ items: ineligible, note: "must remain parked" }),
+    }),
+  );
+  assert.deepEqual(await earlyResolve.json(), { ok: true, resolved: 0, skipped: 2 });
+  const earlyRecover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: ineligible,
+        idempotency_key: "parked-reconcile:ineligible",
+      }),
+    }),
+  );
+  assert.deepEqual(await earlyRecover.json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 0,
+    skipped: 2,
+  });
+  const guarded = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      { state: string; parkedRecoveryAttempts?: number; parkedReason?: string }
+    >;
+  };
+  assert.equal(guarded.items["openclaw/openclaw#114006"].state, "parked");
+  assert.equal(guarded.items["openclaw/openclaw#114006"].parkedRecoveryAttempts, 2);
+  assert.equal(guarded.items["openclaw/openclaw#114007"].state, "parked");
+  assert.equal(guarded.items["openclaw/openclaw#114007"].parkedReason, "dead_letter_capacity");
+
+  const terminal = first.parked_reviews[0];
+  const resolved = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({
+        items: [
+          {
+            item_key: terminal.item_key,
+            revision: terminal.revision,
+            updated_at_ms: terminal.updated_at_ms,
+          },
+        ],
+        note: "automatic reconciliation: terminal test target",
+      }),
+    }),
+  );
+  assert.deepEqual(await resolved.json(), { ok: true, resolved: 1, skipped: 0 });
+
+  const recoverable = first.parked_reviews[1];
+  const recoveryPayload = {
+    items: [
+      {
+        item_key: recoverable.item_key,
+        revision: recoverable.revision,
+        updated_at_ms: recoverable.updated_at_ms,
+      },
+    ],
+    idempotency_key: "parked-reconcile:test:114001",
+  };
+  const observed = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { updatedAt: number }>;
+  };
+  observed.items[recoverable.item_key].updatedAt += 5 * 60_000;
+  await storage.put("exact-review-queue", observed);
+  const recover = () =>
+    queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+        method: "POST",
+        body: JSON.stringify(recoveryPayload),
+      }),
+    );
+  assert.deepEqual(await (await recover()).json(), {
+    ok: true,
+    recovered: 1,
+    deduped: 0,
+    skipped: 0,
+  });
+  assert.deepEqual(await (await recover()).json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 1,
+    skipped: 0,
+  });
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<
       string,
       {
         state: string;
+        attempts: number;
+        reviewFailureAttempts?: number;
         parkedReason?: string;
         parkedRecoveryAttempts?: number;
-        updatedAt: number;
       }
     >;
   };
-  const item = state.items["openclaw/gogcli#113342"];
-  item.state = "parked";
-  item.parkedReason = "review_retry_exhausted";
-  item.parkedRecoveryAttempts = 3;
-  item.updatedAt = Date.now() - 24 * 60 * 60_000;
-  await storage.put("exact-review-queue", state);
+  assert.equal(state.items[terminal.item_key], undefined);
+  assert.equal(state.items[recoverable.item_key].state, "pending");
+  assert.equal(state.items[recoverable.item_key].attempts, 0);
+  assert.equal(state.items[recoverable.item_key].reviewFailureAttempts, 0);
+  assert.equal(state.items[recoverable.item_key].parkedReason, undefined);
+  assert.equal(state.items[recoverable.item_key].parkedRecoveryAttempts, 0);
 
-  await queue.alarm();
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+          method: "POST",
+          body: JSON.stringify({ limit: 51 }),
+        }),
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+          method: "POST",
+          body: JSON.stringify({
+            items: second.parked_reviews
+              .concat([
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114004",
+                  updated_at_ms: now + 4,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114005",
+                  updated_at_ms: now + 5,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114006",
+                  updated_at_ms: now + 6,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114007",
+                  updated_at_ms: now + 7,
+                },
+              ])
+              .map((item) => ({
+                item_key: item.item_key,
+                revision: item.revision,
+                updated_at_ms: item.updated_at_ms,
+              })),
+            idempotency_key: "parked-reconcile:over-cap",
+          }),
+        }),
+      )
+    ).status,
+    400,
+  );
+});
 
-  const retained = (await storage.get("exact-review-queue")) as typeof state;
-  assert.equal(retained.items["openclaw/gogcli#113342"].state, "parked");
-  assert.equal(retained.items["openclaw/gogcli#113342"].parkedRecoveryAttempts, 3);
-  assert.equal(await storage.getAlarm(), null);
+test("parked review operator routes flag and refuse both command-context variants", async () => {
+  const storage = new MemoryDurableStorage();
+  const now = Date.parse("2026-08-10T12:30:00.000Z");
+  const ordinary = leasedExactReviewQueueItem(114_020, "914020");
+  const markerOnly = leasedExactReviewQueueItem(114_021, "914021");
+  const commentOnly = leasedExactReviewQueueItem(114_022, "914022");
+  for (const item of [ordinary, markerOnly, commentOnly]) {
+    item.state = "parked";
+    item.parkedReason = "review_retry_exhausted";
+    item.parkedRecoveryAttempts = 3;
+    item.parkedRecoveryAt = undefined;
+    item.attempts = 8;
+    item.reviewFailureAttempts = 8;
+    item.updatedAt = now;
+  }
+  markerOnly.decision.commandStatusMarker =
+    "<!-- clawsweeper-command-status:114021:re_review:parked -->";
+  commentOnly.decision.statusCommentId = 914_022;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      [ordinary.key]: ordinary,
+      [markerOnly.key]: markerOnly,
+      [commentOnly.key]: commentOnly,
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
+
+  const inventory = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50 }),
+      }),
+    )
+  ).json();
+  assert.equal(inventory.parked_reviews.length, 3);
+  const ordinaryRow = inventory.parked_reviews.find((row) => row.item_key === ordinary.key);
+  const commandRows = [markerOnly, commentOnly].map((command) =>
+    inventory.parked_reviews.find((row) => row.item_key === command.key),
+  );
+  assert.equal(ordinaryRow.excluded_reason, undefined);
+  assert.deepEqual(
+    commandRows.map((row) => row.excluded_reason),
+    ["command_context", "command_context"],
+  );
+  const commandMutations = commandRows.map((row) => ({
+    item_key: row.item_key,
+    revision: row.revision,
+    updated_at_ms: row.updated_at_ms,
+  }));
+
+  const resolve = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({
+        items: commandMutations,
+        note: "must remain parked for command acknowledgement",
+      }),
+    }),
+  );
+  assert.deepEqual(await resolve.json(), { ok: true, resolved: 0, skipped: 2 });
+  const recover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: commandMutations,
+        idempotency_key: "parked-reconcile:command-context",
+      }),
+    }),
+  );
+  assert.deepEqual(await recover.json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 0,
+    skipped: 2,
+  });
+
+  const ordinaryRecover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: [
+          {
+            item_key: ordinaryRow.item_key,
+            revision: ordinaryRow.revision,
+            updated_at_ms: ordinaryRow.updated_at_ms,
+          },
+        ],
+        idempotency_key: "parked-reconcile:ordinary",
+      }),
+    }),
+  );
+  assert.deepEqual(await ordinaryRecover.json(), {
+    ok: true,
+    recovered: 1,
+    deduped: 0,
+    skipped: 0,
+  });
+
+  const after = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        revision: number;
+        attempts: number;
+        parkedReason?: string;
+        parkedRecoveryAttempts?: number;
+        decision: { commandStatusMarker?: string; statusCommentId?: number };
+      }
+    >;
+  };
+  assert.equal(after.items[ordinary.key].state, "pending");
+  assert.equal(after.items[ordinary.key].parkedRecoveryAttempts, 0);
+  for (const [index, command] of [markerOnly, commentOnly].entries()) {
+    assert.equal(after.items[command.key].state, "parked");
+    assert.equal(after.items[command.key].revision, commandRows[index].revision);
+    assert.equal(after.items[command.key].attempts, 8);
+    assert.equal(after.items[command.key].parkedReason, "review_retry_exhausted");
+    assert.equal(after.items[command.key].parkedRecoveryAttempts, 3);
+  }
+  assert.equal(
+    after.items[markerOnly.key].decision.commandStatusMarker,
+    "<!-- clawsweeper-command-status:114021:re_review:parked -->",
+  );
+  assert.equal(after.items[commentOnly.key].decision.statusCommentId, 914_022);
 });
 
 test("exact-review admission requeue_latest resets failures instead of parking at the review ceiling", async () => {
@@ -16129,6 +17753,129 @@ test("canonical tuple publication updates Worker authority without a git project
       ],
     },
   });
+});
+
+test("fallback tuple publication normalizes mixed-case keys onto existing lowercase storage", async () => {
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  const item =
+    "---\nrepo: steipete/CodexBar\nnumber: 2831\nreviewed_at: 2026-08-10T08:00:00.000Z\n---\n\nreview\n";
+  const mutation = {
+    deliveryId: "record-tuple:mixed-case:2831",
+    key: "steipete-CodexBar/2831",
+    operations: [
+      {
+        path: "records/steipete-codexbar/items/2831.md",
+        expectedDigest: null,
+        contentBase64: Buffer.from(item).toString("base64"),
+      },
+      { path: "records/steipete-codexbar/closed/2831.md", expectedDigest: null },
+      { path: "records/steipete-codexbar/plans/2831.md", expectedDigest: null },
+      {
+        path: "records/steipete-codexbar/decision-packets/2831.json",
+        expectedDigest: null,
+      },
+    ],
+  };
+
+  const accepted = await queue.fetch(stateAppendQueueRequest("/records/tuples", mutation));
+  assert.equal(accepted.status, 202);
+  assert.deepEqual(await accepted.json(), {
+    ok: true,
+    accepted: true,
+    deduped: false,
+    revision: 1,
+  });
+
+  const normalizedRetry = structuredClone(mutation);
+  normalizedRetry.key = "steipete-codexbar/2831";
+  const deduped = await queue.fetch(stateAppendQueueRequest("/records/tuples", normalizedRetry));
+  assert.equal(deduped.status, 202);
+  assert.deepEqual(await deduped.json(), {
+    ok: true,
+    accepted: false,
+    deduped: true,
+    revision: 1,
+  });
+
+  const canonical = await (
+    await queue.fetch(
+      new Request("https://queue/records/steipete-codexbar/items/2831", { method: "GET" }),
+    )
+  ).json();
+  assert.equal(canonical.content, item);
+  assert.equal(canonical.revision, 1);
+
+  const parallelNamespace = await queue.fetch(
+    new Request("https://queue/records/steipete-CodexBar/items/2831", { method: "GET" }),
+  );
+  assert.equal(parallelNamespace.status, 404);
+
+  const uppercasePaths = structuredClone(mutation);
+  uppercasePaths.deliveryId = "record-tuple:mixed-case:2831:uppercase-path";
+  uppercasePaths.operations = uppercasePaths.operations.map((operation) => ({
+    ...operation,
+    path: operation.path.replace("steipete-codexbar", "steipete-CodexBar"),
+  }));
+  const casingStorage = new MemoryDurableStorage();
+  const casingQueue = new ExactReviewQueue({ storage: casingStorage }, {});
+  const uppercaseAccepted = await casingQueue.fetch(
+    stateAppendQueueRequest("/records/tuples", uppercasePaths),
+  );
+  assert.equal(uppercaseAccepted.status, 202);
+  assert.equal((await uppercaseAccepted.json()).accepted, true);
+
+  const lowercasePathRetry = structuredClone(uppercasePaths);
+  lowercasePathRetry.operations = lowercasePathRetry.operations.map((operation) => ({
+    ...operation,
+    path: operation.path.replace("steipete-CodexBar", "steipete-codexbar"),
+  }));
+  const casingDeduped = await casingQueue.fetch(
+    stateAppendQueueRequest("/records/tuples", lowercasePathRetry),
+  );
+  assert.equal(casingDeduped.status, 202);
+  assert.deepEqual(await casingDeduped.json(), {
+    ok: true,
+    accepted: false,
+    deduped: true,
+    revision: 1,
+  });
+
+  const lowercaseCanonical = await casingQueue.fetch(
+    new Request("https://queue/records/steipete-codexbar/items/2831", { method: "GET" }),
+  );
+  assert.equal(lowercaseCanonical.status, 200);
+  assert.equal((await lowercaseCanonical.json()).content, item);
+  assert.equal(
+    (
+      await casingQueue.fetch(
+        new Request("https://queue/records/steipete-CodexBar/items/2831", { method: "GET" }),
+      )
+    ).status,
+    404,
+  );
+  const [uppercaseNamespaceRows] = Array.from(
+    casingStorage.sql.exec(
+      `SELECT
+         (SELECT COUNT(*) FROM exact_review_canonical_records
+           WHERE repo_slug = 'steipete-CodexBar') AS canonical_count,
+         (SELECT COUNT(*) FROM exact_review_record_export_index
+           WHERE repo_slug = 'steipete-CodexBar') AS export_count`,
+    ),
+  );
+  assert.equal(uppercaseNamespaceRows?.canonical_count, 0);
+  assert.equal(uppercaseNamespaceRows?.export_count, 0);
+
+  const differentRepository = structuredClone(mutation);
+  differentRepository.deliveryId = "record-tuple:mixed-case:2831:different-repository";
+  differentRepository.operations = differentRepository.operations.map((operation) => ({
+    ...operation,
+    path: operation.path.replace("steipete-codexbar", "steipete-other"),
+  }));
+  const rejected = await casingQueue.fetch(
+    stateAppendQueueRequest("/records/tuples", differentRepository),
+  );
+  assert.equal(rejected.status, 400);
+  assert.deepEqual(await rejected.json(), { error: "invalid_canonical_record_tuple" });
 });
 
 test("review coverage summarizes canonical item records per fleet", async () => {
@@ -16947,6 +18694,44 @@ test("authenticated legacy pull request intake reserves source authority", async
   assert.deepEqual(await accepted.json(), { ok: true, source_authority_seq: 1 });
 });
 
+test("authenticated legacy intake durably reserves missing branch authority", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const payload = JSON.stringify({
+    delivery_id: "legacy:branchless:858:1",
+    installation_id: 123,
+    decision: {
+      targetRepo: "openclaw/gogcli",
+      itemNumber: 858,
+      itemKind: "issue",
+      sourceEvent: "issues",
+      sourceAction: "legacy_dispatch",
+      supersedesInProgress: false,
+    },
+  });
+  const signature = `sha256=${createHmac("sha256", "test-secret").update(payload).digest("hex")}`;
+  const accepted = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/internal/exact-review/branch-authority", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": signature,
+      },
+      body: payload,
+    }),
+    {
+      CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+    },
+  );
+  assert.equal(accepted.status, 202);
+  assert.deepEqual(await accepted.json(), { ok: true, branch_authority_pending: true });
+  assert.equal(
+    storage.rawHas("exact-review-branch-authority-reservation:v1:legacy%3Abranchless%3A858%3A1"),
+    true,
+  );
+});
+
 test("exact-review queue rejects unbounded or unsafe command context", async () => {
   const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
   const invalidDecisions = [
@@ -17193,9 +18978,12 @@ test("exact-review queue automatically retries a parked dispatch rejection after
 
     dispatchStatus = 204;
     const due = (await storage.get("exact-review-queue")) as {
-      items: Record<string, { updatedAt: number }>;
+      items: Record<string, { updatedAt: number; parkedRecoveryAt?: number }>;
     };
-    due.items["openclaw/gogcli#600"].updatedAt = Date.now() - 6 * 60_000;
+    const parked = due.items["openclaw/gogcli#600"];
+    assert.ok(Number(parked.parkedRecoveryAt) >= parked.updatedAt + 3.75 * 60_000);
+    assert.ok(Number(parked.parkedRecoveryAt) <= parked.updatedAt + 7.5 * 60_000);
+    parked.parkedRecoveryAt = parked.updatedAt;
     await storage.put("exact-review-queue", due);
     await queue.alarm();
     const recovered = (await storage.get("exact-review-queue")) as {
@@ -19384,46 +21172,150 @@ test("failed shard recovery replaces an expired recovery lease", async () => {
 
 for (const retryKind of ["coordination", "throttle"] as const) {
   test(`exact-review queue defers ${retryKind} without spending review attempts`, async () => {
-    const storage = new MemoryDurableStorage();
-    const retryAt = Date.now() + 45 * 60_000;
-    const item = leasedExactReviewQueueItem(711, "7110");
-    item.attempts = 3;
-    item.reviewFailureAttempts = 2;
-    await storage.put("exact-review-queue", {
-      deliveries: {},
-      items: {
-        "openclaw/openclaw#711": item,
-      },
-    });
-    const queue = new ExactReviewQueue({ storage }, {});
+    const originalNow = Date.now;
+    let now = Date.parse("2026-08-08T13:00:00.000Z");
+    Date.now = () => now;
+    try {
+      const storage = new MemoryDurableStorage();
+      const retryAt = now + 45 * 60_000;
+      const item = leasedExactReviewQueueItem(711, "7110");
+      item.attempts = 3;
+      item.reviewFailureAttempts = 2;
+      await storage.put("exact-review-queue", {
+        deliveries: {},
+        items: {
+          "openclaw/openclaw#711": item,
+        },
+      });
+      if (retryKind === "throttle") {
+        await storage.put("exact-review-scheduled-feed:v1:global", {
+          tokens: 1,
+          updatedAt: now,
+          throttleObservedAt: now - 60_000,
+          throttleUntil: now + 90 * 60_000,
+          throttleSource: "review_completion",
+        });
+      }
+      const queue = new ExactReviewQueue({ storage }, {}, () => 0);
 
-    const response = await queue.fetch(
-      new Request("https://clawsweeper-exact-review-queue/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          lease_id: "lease-711",
-          item_key: "openclaw/openclaw#711",
-          lease_revision: 1,
-          claim_generation: 1,
-          run_id: "7110",
-          run_attempt: 1,
-          outcome: "failure",
-          retry_kind: retryKind,
-          retry_at: new Date(retryAt).toISOString(),
+      const response = await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            lease_id: "lease-711",
+            item_key: "openclaw/openclaw#711",
+            lease_revision: 1,
+            claim_generation: 1,
+            run_id: "7110",
+            run_attempt: 1,
+            outcome: "failure",
+            retry_kind: retryKind,
+            retry_at: new Date(retryAt).toISOString(),
+          }),
         }),
-      }),
-    );
+      );
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { ok: true, requeued: true });
-    const state = (await storage.get("exact-review-queue")) as {
-      items: Record<string, Record<string, unknown>>;
-    };
-    const deferred = state.items["openclaw/openclaw#711"];
-    assert.ok(Number(deferred.nextAttemptAt) >= retryAt);
-    assert.equal(deferred.attempts, 3);
-    assert.equal(deferred.reviewFailureAttempts, 2);
-    assert.equal(deferred.backoffReason, `${retryKind}_retry`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { ok: true, requeued: true });
+      const state = (await storage.get("exact-review-queue")) as {
+        items: Record<string, Record<string, unknown>>;
+      };
+      const deferred = state.items["openclaw/openclaw#711"];
+      assert.equal(
+        deferred.nextAttemptAt,
+        retryKind === "throttle" ? now + 33.75 * 60_000 : retryAt,
+      );
+      assert.equal(deferred.attempts, 3);
+      assert.equal(deferred.reviewFailureAttempts, 2);
+      assert.equal(deferred.backoffReason, `${retryKind}_retry`);
+      if (retryKind === "throttle") {
+        const stats = await (
+          await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+        ).json();
+        assert.equal(stats.scheduled_feed.throttle_source, "review_completion");
+        assert.equal(stats.scheduled_feed.throttle_observed_at, new Date(now).toISOString());
+        assert.equal(
+          stats.scheduled_feed.throttle_recovery_at,
+          new Date(now + 90 * 60_000).toISOString(),
+        );
+        assert.ok(stats.scheduled_feed.token_balance >= 0);
+      }
+      const scheduled = await queue.fetch(
+        buildExactReviewQueueRequest(
+          `scheduled-after-${retryKind}`,
+          712,
+          "scheduled_normal_backfill",
+        ),
+      );
+      assert.deepEqual(
+        await scheduled.json(),
+        retryKind === "throttle"
+          ? { ok: true, shed: true, reason: "scheduled_rate" }
+          : {
+              ok: true,
+              queued: true,
+              item_key: "openclaw/gogcli#712",
+              superseded_publications: 0,
+            },
+      );
+      for (const [index, sourceAction] of [
+        "failed_review_shard_recovery",
+        "artifact_retention_recovery",
+        "source_drift_requeue",
+      ].entries()) {
+        const background = await queue.fetch(
+          buildExactReviewQueueRequest(
+            `background-after-${retryKind}-${sourceAction}`,
+            713 + index,
+            sourceAction,
+          ),
+        );
+        assert.deepEqual(
+          await background.json(),
+          retryKind === "throttle"
+            ? { ok: true, shed: true, reason: "scheduled_rate" }
+            : {
+                ok: true,
+                queued: true,
+                item_key: `openclaw/gogcli#${713 + index}`,
+                superseded_publications: 0,
+              },
+        );
+      }
+      const interactive = await queue.fetch(
+        buildExactReviewQueueRequest(`interactive-after-${retryKind}`, 716, "opened"),
+      );
+      assert.deepEqual(await interactive.json(), {
+        ok: true,
+        queued: true,
+        item_key: "openclaw/gogcli#716",
+        superseded_publications: 0,
+      });
+      if (retryKind === "throttle") {
+        now += 91 * 60_000;
+        const recovered = await queue.fetch(
+          buildExactReviewQueueRequest(
+            "background-after-throttle-recovery",
+            717,
+            "source_drift_requeue",
+          ),
+        );
+        assert.deepEqual(await recovered.json(), {
+          ok: true,
+          queued: true,
+          item_key: "openclaw/gogcli#717",
+          superseded_publications: 0,
+        });
+        const recoveredStats = await (
+          await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+        ).json();
+        assert.equal("throttle_source" in recoveredStats.scheduled_feed, false);
+        assert.equal("throttle_observed_at" in recoveredStats.scheduled_feed, false);
+        assert.equal("throttle_recovery_at" in recoveredStats.scheduled_feed, false);
+      }
+    } finally {
+      Date.now = originalNow;
+    }
   });
 }
 
@@ -19460,6 +21352,7 @@ test("exact-review queue spends review attempts for an untyped retry deadline", 
   };
   assert.equal(state.items["openclaw/openclaw#711"].attempts, 1);
   assert.equal(state.items["openclaw/openclaw#711"].reviewFailureAttempts, 1);
+  assert.equal(state.items["openclaw/openclaw#711"].nextAttemptAt, retryAt);
 });
 
 test("exact-review queue does not carry an old coordination deadline to a newer revision", async () => {
@@ -20441,7 +22334,20 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.match(html, /Fleet Review Coverage/);
   assert.match(html, /id="review-coverage-body"/);
   assert.match(html, /\/api\/review-coverage/);
-  assert.ok(html.indexOf('id="review-coverage-body"') < html.indexOf("System Overview"));
+  assert.ok(html.indexOf("System Overview") < html.indexOf('id="review-coverage-body"'));
+  assert.match(html, /<details class="review-coverage">/);
+  assert.match(
+    html,
+    /<h2 id="review-coverage-title">Fleet Review Coverage<\/h2>\s*<details class="review-coverage">/,
+  );
+  assert.match(
+    html,
+    /<summary>\s*<span class="coverage-summary-content">\s*<span class="coverage-summary-label">Explore repository coverage<\/span>/,
+  );
+  assert.doesNotMatch(html, /<summary>(?:(?!<\/summary>)[\s\S])*<h2/);
+  assert.doesNotMatch(html, /\.review-coverage > summary \{[^}]*display: flex/);
+  assert.doesNotMatch(html, /<details class="review-coverage" open>/);
+  assert.match(html, /aria-labelledby="review-coverage-title"/);
   assert.match(html, /\/api\/apply-observability\?range=/);
   assert.match(html, /data-trend-range="6h"/);
   assert.match(html, /<details class="execution-alert">/);
@@ -23506,7 +25412,7 @@ test("dashboard counts active runs that are older than the latest unfiltered pag
   }
 });
 
-test("dashboard hides stale queue ghosts without suppressing queue health", async () => {
+test("dashboard surfaces stale queue ghosts as zombies without active cards", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -23571,8 +25477,11 @@ test("dashboard hides stale queue ghosts without suppressing queue health", asyn
     assert.equal(status.fleet.active_workflow_runs, 1);
     assert.equal(status.fleet.queued_workflow_runs, 1);
     assert.equal(status.operational_health.queued_runs, 2);
-    assert.equal(status.operational_health.queued_over_threshold, 1);
-    assert.equal(status.operational_health.status, "degraded");
+    assert.equal(status.operational_health.queued_over_threshold, 0);
+    assert.equal(status.operational_health.oldest_queued_minutes, 10);
+    assert.equal(status.operational_health.zombie_queued_runs, 1);
+    assert.equal(status.operational_health.oldest_zombie_queued_minutes, 7 * 24 * 60);
+    assert.equal(status.operational_health.status, "healthy");
     assert.deepEqual(
       status.pipeline.map((row: { id: number }) => row.id),
       [2],
@@ -25709,6 +27618,400 @@ test("hosted webhook ignores removal of non-close-guard labels", async () => {
   });
 });
 
+test("hosted pull request receipt fast acks precede verification and stay idempotent", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  type AckComment = {
+    id: number;
+    body: string;
+    created_at: string;
+    user: { login: string };
+  };
+  const comments = new Map<number, AckComment[]>();
+  const waitUntilPromises: Promise<unknown>[] = [];
+  const fastAckPostAttempts = new Map<number, number>();
+  const repository = {
+    full_name: "openclaw/gogcli",
+    default_branch: "trunk",
+    private: false,
+    archived: false,
+    fork: false,
+    has_issues: true,
+  };
+  const openedPullRequest = {
+    number: 597,
+    head: { sha: "a".repeat(40) },
+    updated_at: "2026-08-08T12:00:00Z",
+    body: "Ready for review.",
+  };
+  const fingerprint = createHash("sha256")
+    .update(
+      JSON.stringify({
+        version: 1,
+        target_repo: "openclaw/gogcli",
+        item_number: 597,
+        action: "opened",
+        head_sha: "a".repeat(40),
+        updated_at: "2026-08-08T12:00:00Z",
+        body: "Ready for review.",
+        label: "",
+      }),
+    )
+    .digest("hex");
+
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      assert.deepEqual(JSON.parse(String(init?.body)), {
+        repositories: ["gogcli"],
+        permissions: { issues: "write", pull_requests: "write" },
+      });
+      return jsonResponse({ token: "target-token" });
+    }
+    const pullMatch = /^\/repos\/openclaw\/gogcli\/pulls\/(\d+)$/.exec(url.pathname);
+    if (pullMatch) {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer verification-token");
+      const itemNumber = Number(pullMatch[1]);
+      if (itemNumber === 599) throw new Error("transient GitHub verification failure");
+      return jsonResponse({
+        head: {
+          sha:
+            itemNumber === 597
+              ? "a".repeat(40)
+              : itemNumber === 598
+                ? "b".repeat(40)
+                : itemNumber === 600
+                  ? "e".repeat(40)
+                  : "f".repeat(40),
+        },
+      });
+    }
+    const commentMatch = /^\/repos\/openclaw\/gogcli\/issues\/(\d+)\/comments$/.exec(url.pathname);
+    if (commentMatch && init?.method === "GET") {
+      return jsonResponse([...(comments.get(Number(commentMatch[1])) || [])]);
+    }
+    if (commentMatch && init?.method === "POST") {
+      const itemNumber = Number(commentMatch[1]);
+      fastAckPostAttempts.set(itemNumber, (fastAckPostAttempts.get(itemNumber) || 0) + 1);
+      if (itemNumber === 601) {
+        return new Response(JSON.stringify({ message: "Resource not accessible by integration" }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const body = JSON.parse(String(init.body || "{}"));
+      const comment = {
+        id: 9000 + itemNumber,
+        body: String(body.body || ""),
+        created_at: "2026-08-08T12:00:01Z",
+        user: { login: "openclaw-clawsweeper[bot]" },
+      };
+      comments.set(itemNumber, [...(comments.get(itemNumber) || []), comment]);
+      return jsonResponse(comment);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = {
+    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+    GITHUB_TOKEN: "verification-token",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const context = {
+    waitUntil: (promise: Promise<unknown>) => waitUntilPromises.push(promise),
+  };
+  const send = (deliveryId: string, action: string, pullRequest = openedPullRequest) =>
+    worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        deliveryId,
+        payload: {
+          action,
+          repository,
+          pull_request: pullRequest,
+          installation: { id: 123 },
+        },
+      }),
+      env,
+      context,
+    );
+
+  try {
+    const fallback = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "dispatcher-opened",
+        597,
+        "opened",
+        "pull_request",
+        "openclaw/gogcli",
+        { targetBranch: "trunk" },
+        { ingress: { route: "target_dispatcher", fingerprint } },
+      ),
+    );
+    assert.equal((await fallback.json()).queued, true);
+
+    assert.equal((await send("app-opened-1", "opened")).status, 202);
+    assert.equal((await send("app-opened-2", "opened")).status, 202);
+    assert.equal(fastAckPostAttempts.get(597), 1);
+    assert.equal(comments.get(597)?.length, 1);
+    assert.equal(
+      comments.get(597)?.[0]?.body,
+      [
+        "<!-- clawsweeper-pr-ack:opened item=597 -->",
+        "🦞👀",
+        "ClawSweeper picked this up.",
+        "",
+        "Pull request received. I will update this pull request when review starts.",
+      ].join("\n"),
+    );
+    assert.doesNotMatch(comments.get(597)?.[0]?.body || "", /clawsweeper-command-ack:/);
+    assert.doesNotMatch(comments.get(597)?.[0]?.body || "", /clawsweeper-review-status:started/);
+    assert.doesNotMatch(
+      comments.get(597)?.[0]?.body || "",
+      /^ClawSweeper status: review started\./,
+    );
+
+    assert.equal(
+      (
+        await send("app-synchronize", "synchronize", {
+          number: 598,
+          head: { sha: "b".repeat(40) },
+          updated_at: "2026-08-08T12:01:00Z",
+          body: "Follow-up push.",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(fastAckPostAttempts.has(598), false);
+    assert.equal(comments.has(598), false);
+
+    const deferred = await send("app-opened-deferred", "opened", {
+      number: 599,
+      head: { sha: "c".repeat(40) },
+      updated_at: "2026-08-08T12:02:00Z",
+      body: "Verification will be retried.",
+    });
+    assert.deepEqual(await deferred.json(), {
+      ok: true,
+      accepted: true,
+      deferred: true,
+      reason: "pull request head verification deferred",
+    });
+    assert.equal(fastAckPostAttempts.get(599), 1);
+    assert.equal(comments.get(599)?.length, 1);
+
+    const stale = await send("app-ready-stale", "ready_for_review", {
+      number: 600,
+      head: { sha: "d".repeat(40) },
+      updated_at: "2026-08-08T12:03:00Z",
+      body: "The webhook head is already stale.",
+    });
+    assert.deepEqual(await stale.json(), {
+      ok: true,
+      accepted: false,
+      reason: "stale pull request head",
+    });
+    assert.equal(fastAckPostAttempts.get(600), 1);
+    assert.equal(comments.get(600)?.length, 1);
+    assert.match(comments.get(600)?.[0]?.body || "", /clawsweeper-pr-ack:ready_for_review/);
+
+    const ackFailure = await send("app-opened-ack-failure", "opened", {
+      number: 601,
+      head: { sha: "f".repeat(40) },
+      updated_at: "2026-08-08T12:04:00Z",
+      body: "The ack write fails, but enqueue continues.",
+    });
+    assert.equal(ackFailure.status, 202);
+    assert.equal((await ackFailure.json()).queued, true);
+    assert.equal(fastAckPostAttempts.get(601), 1);
+    await Promise.all(waitUntilPromises);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("hosted pull request receipts dedupe across opened and ready_for_review", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  type AckComment = {
+    id: number;
+    body: string;
+    created_at: string;
+    user: { login: string };
+  };
+  const comments = new Map<number, AckComment[]>();
+  const waitUntilPromises: Promise<unknown>[] = [];
+  const fastAckPostAttempts = new Map<number, number>();
+  const deletedCommentIds: number[] = [];
+  const repository = {
+    full_name: "openclaw/gogcli",
+    default_branch: "trunk",
+    private: false,
+    archived: false,
+    fork: false,
+    has_issues: true,
+  };
+  const pullRequestFastAckBody = (itemNumber: number, sourceAction: string) =>
+    [
+      `<!-- clawsweeper-pr-ack:${sourceAction} item=${itemNumber} -->`,
+      "🦞👀",
+      "ClawSweeper picked this up.",
+      "",
+      "Pull request received. I will update this pull request when review starts.",
+    ].join("\n");
+
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    const pullMatch = /^\/repos\/openclaw\/gogcli\/pulls\/(\d+)$/.exec(url.pathname);
+    if (pullMatch) {
+      return jsonResponse({
+        head: { sha: Number(pullMatch[1]) === 640 ? "9".repeat(40) : "8".repeat(40) },
+      });
+    }
+    const commentsMatch = /^\/repos\/openclaw\/gogcli\/issues\/(\d+)\/comments$/.exec(url.pathname);
+    if (commentsMatch && init?.method === "GET") {
+      return jsonResponse([...(comments.get(Number(commentsMatch[1])) || [])]);
+    }
+    if (commentsMatch && init?.method === "POST") {
+      const itemNumber = Number(commentsMatch[1]);
+      fastAckPostAttempts.set(itemNumber, (fastAckPostAttempts.get(itemNumber) || 0) + 1);
+      const body = JSON.parse(String(init.body || "{}"));
+      const comment = {
+        id: 9000 + itemNumber + (comments.get(itemNumber)?.length || 0),
+        body: String(body.body || ""),
+        created_at: "2026-08-09T12:00:01Z",
+        user: { login: "openclaw-clawsweeper[bot]" },
+      };
+      comments.set(itemNumber, [...(comments.get(itemNumber) || []), comment]);
+      return jsonResponse(comment);
+    }
+    const deleteMatch = /^\/repos\/openclaw\/gogcli\/issues\/comments\/(\d+)$/.exec(url.pathname);
+    if (deleteMatch && init?.method === "DELETE") {
+      const commentId = Number(deleteMatch[1]);
+      deletedCommentIds.push(commentId);
+      for (const [itemNumber, list] of comments) {
+        comments.set(
+          itemNumber,
+          list.filter((comment) => comment.id !== commentId),
+        );
+      }
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = {
+    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+    GITHUB_TOKEN: "verification-token",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const context = {
+    waitUntil: (promise: Promise<unknown>) => waitUntilPromises.push(promise),
+  };
+  const send = (
+    deliveryId: string,
+    action: string,
+    pullRequest: { number: number; head: { sha: string }; updated_at: string; body: string },
+  ) =>
+    worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        deliveryId,
+        payload: {
+          action,
+          repository,
+          pull_request: pullRequest,
+          installation: { id: 123 },
+        },
+      }),
+      env,
+      context,
+    );
+
+  try {
+    // A ready_for_review arriving seconds after opened must reuse the opened
+    // receipt instead of posting a second, action-suffixed duplicate.
+    const opened = {
+      number: 640,
+      head: { sha: "9".repeat(40) },
+      updated_at: "2026-08-09T12:00:00Z",
+      body: "Opened, then marked ready seconds later.",
+    };
+    assert.equal((await send("pr-ack-dual-opened", "opened", opened)).status, 202);
+    assert.equal(fastAckPostAttempts.get(640), 1);
+    assert.equal(
+      (
+        await send("pr-ack-dual-ready", "ready_for_review", {
+          ...opened,
+          updated_at: "2026-08-09T12:00:05Z",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(fastAckPostAttempts.get(640), 1);
+    assert.equal(comments.get(640)?.length, 1);
+    assert.match(comments.get(640)?.[0]?.body || "", /clawsweeper-pr-ack:opened item=640/);
+
+    // A pair that already slipped through settles down to the earliest receipt.
+    comments.set(641, [
+      {
+        id: 9100,
+        body: pullRequestFastAckBody(641, "opened"),
+        created_at: "2026-08-09T12:01:01Z",
+        user: { login: "openclaw-clawsweeper[bot]" },
+      },
+      {
+        id: 9101,
+        body: pullRequestFastAckBody(641, "ready_for_review"),
+        created_at: "2026-08-09T12:01:03Z",
+        user: { login: "openclaw-clawsweeper[bot]" },
+      },
+    ]);
+    assert.equal(
+      (
+        await send("pr-ack-settle-ready", "ready_for_review", {
+          number: 641,
+          head: { sha: "8".repeat(40) },
+          updated_at: "2026-08-09T12:01:10Z",
+          body: "Duplicate receipts already exist.",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(fastAckPostAttempts.has(641), false);
+    assert.deepEqual(deletedCommentIds, [9101]);
+    assert.equal(comments.get(641)?.length, 1);
+    assert.equal(comments.get(641)?.[0]?.id, 9100);
+    assert.match(comments.get(641)?.[0]?.body || "", /clawsweeper-pr-ack:opened item=641/);
+    await Promise.all(waitUntilPromises);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("hosted webhook reuses existing fast ack comments on redelivery", async () => {
   const originalFetch = globalThis.fetch;
   const { privateKey } = generateKeyPairSync("rsa", {
@@ -25931,7 +28234,16 @@ test("hosted webhook coalesces concurrent duplicate fast ack comments", async ()
     assert.equal(fastAckPosts, 1);
     assert.equal(reactions, 2);
     assert.equal(comments.length, 1);
-    assert.match(comments[0]?.body || "", /clawsweeper-command-ack:456/);
+    assert.equal(
+      comments[0]?.body,
+      [
+        "<!-- clawsweeper-command-ack:456 -->",
+        "🦞👀",
+        "ClawSweeper picked this up.",
+        "",
+        "Command router queued. I will update this comment with the next step.",
+      ].join("\n"),
+    );
     assert.equal(dispatchBodies.length, 2);
     assert.deepEqual(
       dispatchBodies.map(
@@ -26395,6 +28707,7 @@ function createExactReviewAdmissionHarness(
     publicationBatchSize?: string;
     publicationFreshLane?: boolean;
     captureBatchDispatch?: boolean;
+    workflow?: () => Response | Promise<Response>;
     targetInstallation?: (targetRepo: string) => Response | Promise<Response>;
     targetRepository?: (targetRepo: string) => Response | Promise<Response>;
     targetItem?: (targetRepo: string) => Response | Promise<Response>;
@@ -26420,7 +28733,7 @@ function createExactReviewAdmissionHarness(
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/workflows/sweep.yml") {
-      return jsonResponse({ state: "active" });
+      return options.workflow?.() ?? jsonResponse({ state: "active" });
     }
     const installation = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/);
     if (installation) {
@@ -26793,86 +29106,7 @@ function unclaimedExactReviewQueueItem(itemNumber: number) {
   };
 }
 
-test("exact-review queue durably stores and queries per-item review telemetry", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, {});
-  const now = Date.now();
-  const refreshing = {
-    repo: "openclaw/openclaw",
-    item_number: 674,
-    run_id: "12345",
-    run_attempt: 2,
-    status: "refreshing",
-    outcome: null,
-    started_at: new Date(now - 60_000).toISOString(),
-    updated_at: new Date(now).toISOString(),
-    lease_expires_at: new Date(now + 60 * 60_000).toISOString(),
-    phase_durations_ms: { queue: 10_000, claim: 2_000 },
-  };
-  const recorded = await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(refreshing),
-    }),
-  );
-  assert.equal(recorded.status, 200);
-
-  const completed = {
-    ...refreshing,
-    status: "completed",
-    outcome: "succeeded",
-    updated_at: new Date(now - 10_000).toISOString(),
-    lease_expires_at: null,
-    phase_durations_ms: { ...refreshing.phase_durations_ms, review: 180_000, total: 250_000 },
-    generation: 7,
-    operation_id: "review:674:7",
-  };
-  await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify(completed),
-    }),
-  );
-  // Neither a delayed heartbeat nor a conflicting terminal retry can rewrite
-  // the first terminal truth.
-  await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify({ ...refreshing, updated_at: new Date(now).toISOString() }),
-    }),
-  );
-  await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify({
-        ...completed,
-        outcome: "failed",
-        updated_at: new Date(now + 1_000).toISOString(),
-      }),
-    }),
-  );
-
-  const response = await queue.fetch(
-    new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=674"),
-  );
-  assert.equal(response.status, 200);
-  const body = (await response.json()) as { reviews: unknown[] };
-  assert.deepEqual(body.reviews, [completed]);
-
-  const restarted = new ExactReviewQueue({ storage }, {});
-  const afterRestart = await restarted.fetch(
-    new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=674"),
-  );
-  assert.deepEqual((await afterRestart.json()) as { reviews: unknown[] }, {
-    ok: true,
-    repo: "openclaw/openclaw",
-    item_number: 674,
-    reviews: [completed],
-  });
-});
-
-test("exact-review queue incrementally indexes the v1 review telemetry table", async () => {
+test("exact-review queue drops the retired per-item review telemetry table", async () => {
   const storage = new MemoryDurableStorage();
   storage.sql.exec(
     `CREATE TABLE exact_review_review_telemetry (
@@ -26882,399 +29116,92 @@ test("exact-review queue incrementally indexes the v1 review telemetry table", a
        run_attempt INTEGER NOT NULL,
        status TEXT NOT NULL,
        updated_at INTEGER NOT NULL,
-       lease_expires_at INTEGER,
        record_json TEXT NOT NULL,
        PRIMARY KEY (repo, item_number, run_id, run_attempt)
      ) STRICT`,
   );
+  storage.sql.exec(
+    `CREATE INDEX exact_review_review_telemetry_status
+       ON exact_review_review_telemetry (status, updated_at)`,
+  );
+  storage.sql.exec(
+    `CREATE INDEX exact_review_review_telemetry_aggregate
+       ON exact_review_review_telemetry (repo, updated_at)`,
+  );
+  storage.sql.exec(
+    `CREATE INDEX exact_review_review_telemetry_operation
+       ON exact_review_review_telemetry (run_id, run_attempt)`,
+  );
+
   const queue = new ExactReviewQueue({ storage }, {});
-  const now = new Date().toISOString();
-  const response = await queue.fetch(
-    new Request("https://queue/review-telemetry", {
+  const response = await queue.fetch(new Request("https://queue/stats"));
+  assert.equal(response.status, 200);
+  const stats = (await response.json()) as Record<string, unknown>;
+  assert.ok(!Object.hasOwn(stats, "review_telemetry_health"));
+  assert.deepEqual(
+    Array.from(
+      storage.sql.exec(
+        `SELECT name FROM sqlite_master
+          WHERE name LIKE 'exact_review_review_telemetry%' ORDER BY name`,
+      ),
+    ),
+    [],
+  );
+  assert.equal(
+    Array.from(
+      storage.sql.exec(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'exact_review_run_telemetry'`,
+      ),
+    ).length,
+    1,
+  );
+});
+
+test("removed per-item review telemetry write routes return not found", async () => {
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-token-placeholder",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const queuePost = await queue.fetch(
+    new Request("https://queue/review-telemetry", { method: "POST", body: "{}" }),
+  );
+  const queueGet = await queue.fetch(new Request("https://queue/review-telemetry"));
+  const internal = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/internal/exact-review/review-telemetry", {
       method: "POST",
-      body: JSON.stringify({
-        repo: "openclaw/openclaw",
-        item_number: 674,
-        run_id: "44000",
-        run_attempt: 1,
-        status: "completed",
-        outcome: "superseded",
-        started_at: now,
-        updated_at: now,
-        lease_expires_at: null,
-        phase_durations_ms: { total: 12_000 },
-        generation: 2,
-        operation_id: "review:674:2",
-        trigger_lane: "exact_event",
-        trigger_origin: "webhook",
-        terminal_at: now,
-        terminal_reason: "generation_superseded",
-      }),
+      body: "{}",
     }),
+    env,
+  );
+  assert.deepEqual([queuePost.status, queueGet.status, internal.status], [404, 404, 404]);
+});
+
+test("public per-item review read contract returns a stable empty envelope", async () => {
+  const response = await worker.fetch(
+    new Request(
+      "https://clawsweeper.openclaw.ai/api/exact-review-queue/reviews?repo=openclaw%2Fopenclaw&item_number=674&limit=100",
+    ),
+    {},
   );
   assert.equal(response.status, 200);
-  const columns = Array.from(
-    storage.sql.exec(
-      "SELECT name FROM pragma_table_info('exact_review_review_telemetry') ORDER BY name",
-    ),
-    (row) => row.name,
-  );
-  for (const column of [
-    "generation",
-    "operation_id",
-    "outcome",
-    "terminal_at",
-    "total_ms",
-    "trigger_lane",
-    "trigger_origin",
-  ]) {
-    assert.ok(columns.includes(column));
-  }
-});
-
-test("terminal workflow observer conservatively completes only unleased refreshing telemetry", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
-  const now = Date.now();
-  const refreshing = (itemNumber: number, leaseExpiresAt: string | null) => ({
+  assert.deepEqual(await response.json(), {
+    ok: true,
     repo: "openclaw/openclaw",
-    item_number: itemNumber,
-    run_id: "55555",
-    run_attempt: 1,
-    status: "refreshing",
-    outcome: null,
-    started_at: new Date(now - 10 * 60_000).toISOString(),
-    updated_at: new Date(now - 5 * 60_000).toISOString(),
-    lease_expires_at: leaseExpiresAt,
-    phase_durations_ms: { queue: 1_000 },
-    trigger_lane: "exact_event",
-    trigger_origin: "webhook",
+    item_number: 674,
+    reviews: [],
   });
-  for (const record of [
-    refreshing(674, null),
-    refreshing(675, new Date(now + 60 * 60_000).toISOString()),
-    { ...refreshing(676, null), run_attempt: 2 },
-  ]) {
-    assert.equal(
-      (
-        await queue.fetch(
-          new Request("https://queue/review-telemetry", {
-            method: "POST",
-            body: JSON.stringify(record),
-          }),
-        )
-      ).status,
-      200,
-    );
-  }
-  const run = {
-    run_id: "55555",
-    run_attempt: 1,
-    workflow_outcome: "cancelled",
-    trigger_lane: "exact_event",
-    trigger_origin: "webhook",
-    target_repo: "openclaw/openclaw",
-    started_at: new Date(now - 10 * 60_000).toISOString(),
-    completed_at: new Date(now).toISOString(),
-    run_url: "https://github.com/openclaw/clawsweeper/actions/runs/55555",
-    plan_count: 1,
-    item_count: 2,
-    publication_count: 0,
-    source_event: "repository_dispatch",
-    review_jobs: [
-      { name: "Review item 674", conclusion: "cancelled", item_number: 674 },
-      { name: "Review item 675", conclusion: "cancelled", item_number: 675 },
-    ],
-  };
-  assert.equal(
-    (
-      await queue.fetch(
-        new Request("https://queue/review-run-telemetry", {
-          method: "POST",
-          body: JSON.stringify(run),
-        }),
-      )
-    ).status,
-    200,
-  );
-  const first = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=674"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(first.reviews[0].outcome, "cancelled");
-  assert.equal(first.reviews[0].terminal_reason, "workflow_cancelled");
-  const leased = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=675"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(leased.reviews[0].status, "refreshing");
-  const scheduledReconcile = await storage.getAlarm();
-  assert.ok(scheduledReconcile !== null && scheduledReconcile <= now + 60 * 60_000);
-  const otherAttempt = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=676"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(otherAttempt.reviews[0].status, "refreshing");
-
-  const aggregate = (await (
-    await queue.fetch(
-      new Request("https://queue/review-observability?range=24h&repo=openclaw%2Fopenclaw"),
-    )
-  ).json()) as Record<string, any>;
-  assert.equal(aggregate.outcomes.cancelled, 1);
-  assert.equal(aggregate.unexpected_cancelled, 1);
-  assert.match(aggregate.anomalies[0].run_url, /\/actions\/runs\/55555$/);
-  assert.equal(
-    (
-      await queue.fetch(
-        new Request("https://queue/review-observability?range=30d&repo=openclaw%2Fopenclaw"),
-      )
-    ).status,
-    400,
-  );
-
-  const originalNow = Date.now;
-  Date.now = () => now + 61 * 60_000;
-  try {
-    await queue.alarm();
-  } finally {
-    Date.now = originalNow;
-  }
-  const reconciled = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=675"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(reconciled.reviews[0].outcome, "cancelled");
-  assert.equal(reconciled.reviews[0].terminal_reason, "workflow_cancelled");
 });
 
-test("terminal workflow evidence reconciles telemetry that arrives later", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
-  const now = Date.now();
-  const run = {
-    run_id: "56565",
-    run_attempt: 1,
-    workflow_outcome: "failure",
-    trigger_lane: "normal_backfill",
-    trigger_origin: "schedule",
-    target_repo: "openclaw/openclaw",
-    started_at: new Date(now - 10 * 60_000).toISOString(),
-    completed_at: new Date(now - 60_000).toISOString(),
-    run_url: "https://github.com/openclaw/clawsweeper/actions/runs/56565",
-    plan_count: 1,
-    item_count: 2,
-    publication_count: 0,
-    review_jobs: [
-      { name: "Review item 701", conclusion: "failure", item_number: 701 },
-      { name: "Review shard 2", conclusion: "success", item_number: null },
-    ],
-  };
-  assert.equal(
-    (
-      await queue.fetch(
-        new Request("https://queue/review-run-telemetry", {
-          method: "POST",
-          body: JSON.stringify(run),
-        }),
-      )
-    ).status,
-    200,
+test("public per-item review read contract rejects invalid queries", async () => {
+  const response = await worker.fetch(
+    new Request(
+      "https://clawsweeper.openclaw.ai/api/exact-review-queue/reviews?repo=openclaw&item_number=0&limit=101",
+    ),
+    {},
   );
-  for (const itemNumber of [701, 702]) {
-    assert.equal(
-      (
-        await queue.fetch(
-          new Request("https://queue/review-telemetry", {
-            method: "POST",
-            body: JSON.stringify({
-              repo: "openclaw/openclaw",
-              item_number: itemNumber,
-              run_id: run.run_id,
-              run_attempt: 1,
-              status: "refreshing",
-              outcome: null,
-              started_at: new Date(now - 9 * 60_000).toISOString(),
-              updated_at: new Date(now - 2 * 60_000).toISOString(),
-              lease_expires_at: null,
-              phase_durations_ms: {},
-              trigger_lane: "normal_backfill",
-              trigger_origin: "schedule",
-            }),
-          }),
-        )
-      ).status,
-      200,
-    );
-    const telemetry = (await (
-      await queue.fetch(
-        new Request(
-          `https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=${itemNumber}`,
-        ),
-      )
-    ).json()) as { reviews: Array<Record<string, unknown>> };
-    if (itemNumber === 701) {
-      assert.equal(telemetry.reviews[0].outcome, "interrupted");
-      assert.equal(telemetry.reviews[0].terminal_reason, "workflow_terminal");
-    } else {
-      assert.equal(telemetry.reviews[0].status, "refreshing");
-    }
-  }
-  assert.equal(await storage.getAlarm(), null);
-});
-
-test("terminal workflow evidence records only attributable success", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
-  const now = Date.now();
-  const refreshing = (itemNumber: number, repo = "openclaw/openclaw") => ({
-    repo,
-    item_number: itemNumber,
-    run_id: "57575",
-    run_attempt: 1,
-    status: "refreshing",
-    outcome: null,
-    started_at: new Date(now - 5 * 60_000).toISOString(),
-    updated_at: new Date(now - 2 * 60_000).toISOString(),
-    lease_expires_at: null,
-    phase_durations_ms: {},
-    trigger_lane: "normal_backfill",
-    trigger_origin: "schedule",
-  });
-  for (const itemNumber of [801, 802]) {
-    await queue.fetch(
-      new Request("https://queue/review-telemetry", {
-        method: "POST",
-        body: JSON.stringify(refreshing(itemNumber)),
-      }),
-    );
-  }
-  const run = {
-    run_id: "57575",
-    run_attempt: 1,
-    workflow_outcome: "success",
-    trigger_lane: "normal_backfill",
-    trigger_origin: "schedule",
-    target_repo: "openclaw/openclaw",
-    started_at: new Date(now - 6 * 60_000).toISOString(),
-    completed_at: new Date(now - 60_000).toISOString(),
-    run_url: "https://github.com/openclaw/clawsweeper/actions/runs/57575",
-    plan_count: 1,
-    item_count: 2,
-    publication_count: 1,
-    review_jobs: [
-      { name: "Review item 801", conclusion: "success", item_number: 801 },
-      { name: "Review shard 2", conclusion: "success", item_number: null },
-    ],
-  };
-  assert.equal(
-    (
-      await queue.fetch(
-        new Request("https://queue/review-run-telemetry", {
-          method: "POST",
-          body: JSON.stringify(run),
-        }),
-      )
-    ).status,
-    200,
-  );
-  for (const [itemNumber, expectedStatus] of [
-    [801, "completed"],
-    [802, "refreshing"],
-  ] as const) {
-    const telemetry = (await (
-      await queue.fetch(
-        new Request(
-          `https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=${itemNumber}`,
-        ),
-      )
-    ).json()) as { reviews: Array<Record<string, unknown>> };
-    assert.equal(telemetry.reviews[0].status, expectedStatus);
-    if (itemNumber === 801) {
-      assert.equal(telemetry.reviews[0].outcome, "succeeded");
-      assert.equal(telemetry.reviews[0].terminal_reason, "workflow_job_succeeded");
-    }
-  }
-  await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify(refreshing(801, "openclaw/clawhub")),
-    }),
-  );
-  const otherRepo = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fclawhub&item_number=801"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(otherRepo.reviews[0].status, "refreshing");
-  assert.equal(await storage.getAlarm(), null);
-});
-
-test("workflow observer replay reconciles only from immutable first-writer evidence", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
-  const now = Date.now();
-  const baseRun = {
-    run_id: "58585",
-    run_attempt: 1,
-    workflow_outcome: "success",
-    trigger_lane: "exact_event",
-    trigger_origin: "webhook",
-    target_repo: "openclaw/clawhub",
-    started_at: new Date(now - 5 * 60_000).toISOString(),
-    completed_at: new Date(now - 60_000).toISOString(),
-    run_url: "https://github.com/openclaw/clawsweeper/actions/runs/58585",
-    plan_count: 1,
-    item_count: 1,
-    publication_count: 0,
-    review_jobs: [{ name: "Review item 901", conclusion: "success", item_number: 901 }],
-  };
-  await queue.fetch(
-    new Request("https://queue/review-run-telemetry", {
-      method: "POST",
-      body: JSON.stringify(baseRun),
-    }),
-  );
-  await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify({
-        repo: "openclaw/openclaw",
-        item_number: 901,
-        run_id: "58585",
-        run_attempt: 1,
-        status: "refreshing",
-        outcome: null,
-        started_at: new Date(now - 4 * 60_000).toISOString(),
-        updated_at: new Date(now - 2 * 60_000).toISOString(),
-        lease_expires_at: null,
-        phase_durations_ms: {},
-        trigger_lane: "exact_event",
-        trigger_origin: "webhook",
-      }),
-    }),
-  );
-  await queue.fetch(
-    new Request("https://queue/review-run-telemetry", {
-      method: "POST",
-      body: JSON.stringify({
-        ...baseRun,
-        workflow_outcome: "cancelled",
-        target_repo: "openclaw/openclaw",
-        review_jobs: [{ name: "Review item 901", conclusion: "cancelled", item_number: 901 }],
-      }),
-    }),
-  );
-  const telemetry = (await (
-    await queue.fetch(
-      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=901"),
-    )
-  ).json()) as { reviews: Array<Record<string, unknown>> };
-  assert.equal(telemetry.reviews[0].status, "refreshing");
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "invalid_review_telemetry_query" });
 });
 
 test("review observer write is signed while aggregate telemetry remains read-only", async () => {
@@ -27322,114 +29249,10 @@ test("review observer write is signed while aggregate telemetry remains read-onl
     env,
   );
   assert.equal(aggregate.status, 200);
-  assert.equal(((await aggregate.json()) as { mode: string }).mode, "passive");
-});
-
-test("exact-review health includes the oldest refreshing row beyond operator page bounds", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
-  await queue.fetch(new Request("https://queue/stats"));
-  const now = Date.now();
-  for (let index = 0; index <= 10_000; index += 1) {
-    const old = index === 0;
-    const updatedAt = old ? now - 151 * 60_000 : now - 60_000;
-    const record = {
-      repo: "openclaw/openclaw",
-      item_number: index + 1,
-      run_id: String(index + 1),
-      run_attempt: 1,
-      status: "refreshing",
-      outcome: null,
-      started_at: new Date(updatedAt - 60_000).toISOString(),
-      updated_at: new Date(updatedAt).toISOString(),
-      lease_expires_at: null,
-      phase_durations_ms: {},
-    };
-    storage.sql.exec(
-      `INSERT INTO exact_review_review_telemetry
-       (repo, item_number, run_id, run_attempt, status, updated_at, record_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      record.repo,
-      record.item_number,
-      record.run_id,
-      record.run_attempt,
-      record.status,
-      updatedAt,
-      JSON.stringify(record),
-    );
-  }
-
-  const response = await queue.fetch(new Request("https://queue/stats"));
-  const stats = (await response.json()) as {
-    review_telemetry_health: {
-      status: string;
-      refreshing: number;
-      orphan_refreshing: number;
-      orphans: Array<{ age_seconds: number }>;
-    };
+  const body = (await aggregate.json()) as {
+    mode: string;
+    sources: Array<{ lane: string; run_count: number }>;
   };
-  const oldestRefreshingAgeSeconds = stats.review_telemetry_health.orphans[0]?.age_seconds;
-  assert.ok(oldestRefreshingAgeSeconds !== undefined && oldestRefreshingAgeSeconds >= 9060);
-  assert.deepEqual(stats.review_telemetry_health, {
-    status: "critical",
-    refreshing: 10_001,
-    slow_refreshing: 1,
-    orphan_refreshing: 1,
-    degraded_after_seconds: 1800,
-    orphan_after_seconds: 9000,
-    orphans: [
-      {
-        repo: "openclaw/openclaw",
-        item_number: 1,
-        run_id: "1",
-        run_attempt: 1,
-        updated_at: new Date(now - 151 * 60_000).toISOString(),
-        age_seconds: oldestRefreshingAgeSeconds,
-        lease_expires_at: null,
-      },
-    ],
-  });
-  const aggregate = (await (
-    await queue.fetch(new Request("https://queue/review-observability?range=24h&repo=all"))
-  ).json()) as { health: string; orphan: number; telemetry_complete: boolean };
-  assert.equal(aggregate.telemetry_complete, false);
-  assert.equal(aggregate.orphan, 1);
-  assert.equal(aggregate.health, "critical");
-});
-
-test("review observability retains refreshing attempts older than the selected range", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue(
-    { storage },
-    { REVIEW_OBSERVABILITY_REQUIRED: "1", REVIEW_RECOVERY_ENABLED: "0" },
-  );
-  const now = Date.now();
-  const response = await queue.fetch(
-    new Request("https://queue/review-telemetry", {
-      method: "POST",
-      body: JSON.stringify({
-        repo: "openclaw/openclaw",
-        item_number: 674,
-        run_id: "70000",
-        run_attempt: 1,
-        status: "refreshing",
-        outcome: null,
-        started_at: new Date(now - 26 * 60 * 60_000).toISOString(),
-        updated_at: new Date(now - 25 * 60 * 60_000).toISOString(),
-        lease_expires_at: null,
-        phase_durations_ms: {},
-        trigger_lane: "exact_event",
-        trigger_origin: "webhook",
-      }),
-    }),
-  );
-  assert.equal(response.status, 200);
-  const aggregate = (await (
-    await queue.fetch(
-      new Request("https://queue/review-observability?range=24h&repo=openclaw%2Fopenclaw"),
-    )
-  ).json()) as { refreshing: number; orphan: number; health: string };
-  assert.equal(aggregate.refreshing, 1);
-  assert.equal(aggregate.orphan, 1);
-  assert.equal(aggregate.health, "critical");
+  assert.equal(body.mode, "passive");
+  assert.equal(body.sources.find((source) => source.lane === "normal_backfill")?.run_count, 1);
 });

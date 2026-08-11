@@ -1,8 +1,13 @@
 import { spawnSync } from "node:child_process";
+import { appendFileSync, closeSync, openSync } from "node:fs";
 import type { GitHubRuntimeBudget } from "./clawsweeper-types.js";
 import { codexEnv } from "./codex-env.js";
 import { resolveCommand } from "./command.js";
-import { exactPublicationPublicReadToken } from "./github-public-read.js";
+import {
+  exactPublicationPublicReadToken,
+  isPublicOpenClawReadOnlyRequest,
+} from "./github-public-read.js";
+import { GitHubRateLimitError, ghRetryKind, type GitHubCredentialScope } from "./github-retry.js";
 
 interface CreateGitHubRuntimeDependencies {
   ROOT: string;
@@ -14,8 +19,12 @@ interface CreateGitHubRuntimeDependencies {
   targetRepo: () => string;
 }
 
+const claimedPublicReadFallbackTokens = new Set<string>();
+const RATE_LIMIT_LOOKUP_TIMEOUT_MS = 20_000;
+
 export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencies) {
   const { ROOT, run, targetRepo } = dependencies;
+  const inspectedRateLimitScopes = new Set<GitHubCredentialScope>();
 
   const GITHUB_RUNTIME_REPORT_FLUSH_RESERVE_MS = 1_000;
 
@@ -98,13 +107,228 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     sleepMs(waitMs);
   }
 
-  function ghWithPreparedTimeout(args: string[], timeoutMs: number | undefined): string {
-    const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
-    const publicReadToken = exactPublicationPublicReadToken(resolvedArgs, targetRepo());
-    return run("gh", resolvedArgs, {
-      timeoutMs,
-      ...(publicReadToken ? { env: { GH_TOKEN: publicReadToken } } : {}),
+  function publicReadToken(
+    args: readonly string[],
+    overrides: NodeJS.ProcessEnv = {},
+  ): string | null {
+    const publicToken = process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN?.trim();
+    const env = { ...process.env, ...overrides };
+    if (
+      !publicToken ||
+      Object.hasOwn(overrides, "GH_TOKEN") ||
+      Object.hasOwn(overrides, "GITHUB_TOKEN") ||
+      (env.GH_HOST && env.GH_HOST.toLowerCase() !== "github.com") ||
+      !isPublicOpenClawReadOnlyRequest(args)
+    ) {
+      return null;
+    }
+    return publicToken;
+  }
+
+  function preparedGitHubEnv(
+    args: readonly string[],
+    overrides: NodeJS.ProcessEnv = {},
+  ): NodeJS.ProcessEnv | undefined {
+    const hasExplicitToken =
+      Object.hasOwn(overrides, "GH_TOKEN") || Object.hasOwn(overrides, "GITHUB_TOKEN");
+    const token =
+      publicReadToken(args, overrides) ??
+      (hasExplicitToken
+        ? null
+        : exactPublicationPublicReadToken(args, targetRepo(), {
+            ...process.env,
+            ...overrides,
+          }));
+    if (token) return { ...overrides, GH_TOKEN: token };
+    return Object.keys(overrides).length > 0 ? overrides : undefined;
+  }
+
+  function githubRequestScope(
+    args: readonly string[],
+    overrides: NodeJS.ProcessEnv = {},
+  ): GitHubCredentialScope {
+    const publicToken =
+      publicReadToken(args, overrides) ??
+      exactPublicationPublicReadToken(args, targetRepo(), {
+        ...process.env,
+        ...overrides,
+      });
+    const selectedToken =
+      overrides.GH_TOKEN?.trim() ||
+      overrides.GITHUB_TOKEN?.trim() ||
+      publicToken ||
+      process.env.GH_TOKEN?.trim() ||
+      process.env.GITHUB_TOKEN?.trim() ||
+      "";
+    const repositoryTokens = [
+      process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN?.trim(),
+      process.env.REPO_TOKEN?.trim(),
+      process.env.GITHUB_TOKEN?.trim(),
+    ].filter((token): token is string => Boolean(token));
+    return repositoryTokens.includes(selectedToken) ? "repository_actions" : "target_app";
+  }
+
+  function rateLimitObservationPath(): string | null {
+    return process.env.CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH?.trim() || null;
+  }
+
+  function githubRequestMetricsPath(): string | null {
+    return process.env.CLAWSWEEPER_GITHUB_REQUEST_METRICS_PATH?.trim() || null;
+  }
+
+  function appendJsonLine(path: string | null, value: Record<string, unknown>): void {
+    if (!path) return;
+    appendFileSync(path, `${JSON.stringify(value)}\n`, "utf8");
+  }
+
+  function githubEndpointCategory(args: readonly string[]): string {
+    const text = args.join(" ").toLowerCase();
+    if (/\brate_limit\b/.test(text)) return "rate_status";
+    if (/\brun download\b/.test(text)) return "artifact_download";
+    if (/\/comments(?:\?|\s|$)/.test(text)) return "comments";
+    if (/\/labels(?:\?|\s|$)/.test(text)) return "labels";
+    if (/\/reviews(?:\?|\s|$)/.test(text)) return "reviews";
+    if (/\bworkflow run\b/.test(text)) return "workflow_dispatch";
+    if (/\/issues\/\d+|\/pulls\/\d+/.test(text)) return "item_metadata";
+    return "other";
+  }
+
+  function recordGitHubRequest(
+    args: readonly string[],
+    scope: GitHubCredentialScope,
+    outcome: "success" | "throttle" | "transient" | "error",
+  ): void {
+    appendJsonLine(githubRequestMetricsPath(), {
+      scope,
+      category: githubEndpointCategory(args),
+      mode: isPublicOpenClawReadOnlyRequest(args) ? "read" : "mutation_or_private_read",
+      outcome,
+      repeat_revision: process.env.CLAWSWEEPER_GITHUB_REQUEST_REPEAT === "true",
+      count: 1,
     });
+  }
+
+  function rateLimitStatusRetryAt(scope: GitHubCredentialScope, token: string): number | null {
+    if (!rateLimitObservationPath() || inspectedRateLimitScopes.has(scope) || !token) return null;
+    inspectedRateLimitScopes.add(scope);
+    try {
+      closeSync(openSync(`${rateLimitObservationPath()}.lookup-${scope}.lock`, "wx"));
+    } catch {
+      return null;
+    }
+    try {
+      const raw = run(
+        "gh",
+        [
+          "api",
+          "rate_limit",
+          "--jq",
+          "{remaining:.resources.core.remaining,reset:.resources.core.reset}",
+        ],
+        {
+          timeoutMs: RATE_LIMIT_LOOKUP_TIMEOUT_MS,
+          env: { ...process.env, GH_TOKEN: token },
+        },
+      );
+      recordGitHubRequest(["api", "rate_limit"], scope, "success");
+      const status = JSON.parse(raw) as { remaining?: unknown; reset?: unknown };
+      const remaining = Number(status.remaining);
+      const reset = Number(status.reset);
+      return remaining <= 0 && Number.isSafeInteger(reset) && reset > 0 ? reset * 1_000 : null;
+    } catch (error) {
+      const kind = ghRetryKind(error);
+      recordGitHubRequest(
+        ["api", "rate_limit"],
+        scope,
+        kind === "throttle" ? "throttle" : kind === "transient" ? "transient" : "error",
+      );
+      return null;
+    }
+  }
+
+  function githubRateLimitError(
+    cause: unknown,
+    args: readonly string[],
+    overrides: NodeJS.ProcessEnv = {},
+  ): GitHubRateLimitError {
+    const scope = githubRequestScope(args, overrides);
+    const prepared = preparedGitHubEnv(args, overrides) ?? overrides;
+    const token =
+      prepared.GH_TOKEN?.trim() ||
+      prepared.GITHUB_TOKEN?.trim() ||
+      process.env.GH_TOKEN?.trim() ||
+      process.env.GITHUB_TOKEN?.trim() ||
+      "";
+    const hinted = new GitHubRateLimitError(cause, Date.now(), { scope });
+    const statusRetryAt = hinted.authoritative ? null : rateLimitStatusRetryAt(scope, token);
+    const error = statusRetryAt
+      ? new GitHubRateLimitError(cause, Date.now(), {
+          scope,
+          retryAt: statusRetryAt,
+          provenance: "rate_limit_status",
+          authoritative: true,
+        })
+      : hinted;
+    appendJsonLine(rateLimitObservationPath(), {
+      scope: error.scope,
+      ...(error.scope === "target_app"
+        ? { target_owner: targetRepo().split("/", 1)[0]?.toLowerCase() }
+        : {}),
+      observed_at: new Date().toISOString(),
+      retry_at: error.retryAt,
+      provenance: error.provenance,
+      authoritative: error.authoritative,
+    });
+    recordGitHubRequest(args, scope, "throttle");
+    return error;
+  }
+
+  function claimPublicReadFallback(args: readonly string[]): NodeJS.ProcessEnv | null {
+    const publicToken =
+      publicReadToken(args) ?? exactPublicationPublicReadToken(args, targetRepo(), process.env);
+    const appToken = process.env.GH_TOKEN?.trim();
+    if (
+      !publicToken ||
+      !appToken ||
+      publicToken === appToken ||
+      claimedPublicReadFallbackTokens.has(appToken)
+    ) {
+      return null;
+    }
+    const observationPath = rateLimitObservationPath();
+    if (observationPath) {
+      try {
+        closeSync(openSync(`${observationPath}.fallback-target_app.lock`, "wx"));
+      } catch {
+        return null;
+      }
+    }
+    claimedPublicReadFallbackTokens.add(appToken);
+    return { GH_TOKEN: appToken };
+  }
+
+  function ghWithPreparedTimeout(
+    args: string[],
+    timeoutMs: number | undefined,
+    env: NodeJS.ProcessEnv = {},
+  ): string {
+    const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
+    const preparedEnv = preparedGitHubEnv(resolvedArgs, env);
+    const scope = githubRequestScope(resolvedArgs, env);
+    try {
+      const result = run("gh", resolvedArgs, {
+        timeoutMs,
+        ...(preparedEnv ? { env: preparedEnv } : {}),
+      });
+      recordGitHubRequest(resolvedArgs, scope, "success");
+      return result;
+    } catch (error) {
+      const retryKind = ghRetryKind(error);
+      if (retryKind !== "throttle") {
+        recordGitHubRequest(resolvedArgs, scope, retryKind === "transient" ? "transient" : "error");
+      }
+      throw error;
+    }
   }
 
   function gh(args: string[]): string {
@@ -113,11 +337,10 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
 
   function ghOnce(args: string[], timeoutMs: number): string {
     const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
-    const publicReadToken = exactPublicationPublicReadToken(resolvedArgs, targetRepo());
     const env = {
       ...process.env,
       GIT_OPTIONAL_LOCKS: "0",
-      ...(publicReadToken ? { GH_TOKEN: publicReadToken } : {}),
+      ...preparedGitHubEnv(resolvedArgs),
     };
     const command = resolveCommand("gh", resolvedArgs, env);
     const commandTimeoutMs = githubCommandTimeoutMs(timeoutMs) ?? timeoutMs;
@@ -181,12 +404,14 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
 
   return {
     GitHubRuntimeBudgetError,
+    claimPublicReadFallback,
     ensureGitHubRetryFits,
     ensureGitHubRuntimeAvailable,
     ensureRuntimeDelayFits,
     gh,
     ghOnce,
     ghWithPreparedTimeout,
+    githubRateLimitError,
     githubCommandTimeoutMs,
     githubRuntimeBudgetError,
     sleepBeforeGitHubRetry,

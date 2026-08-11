@@ -1,5 +1,13 @@
 # Live Dashboard
 
+- Status: active observer and operator reference
+- Owner: ClawSweeper maintainers and the designated Cloudflare operator
+- Source of truth: `dashboard/worker.ts`, `dashboard/exact-review-queue.ts`,
+  `dashboard/wrangler.toml`, dashboard tests, and deployed read-only endpoints
+- Last verified: `openclaw/clawsweeper@9c32c14c65b0551b43a10c2086c0031338ae41e7`
+- Update when: routes, public fields, queue projections, capacity, alerts,
+  deployment, or state-writer telemetry changes
+
 Read when changing the Cloudflare status dashboard, status ingest contract, or
 operator-facing ClawSweeper observability.
 
@@ -119,9 +127,10 @@ is absent or a cache event lands in another Cloudflare colo.
 - a budget-sized capacity rail plus lane filters for issue-to-PR, PR repair,
   review, repair, commit, assist, and other workers
 - queued/waiting run count
-- operational health derived from queue age and running age: queued runs become
-  degraded after 30 minutes, and in-progress runs become stalled after 150
-  minutes
+- operational health derived from queue age and running age: queued runs from
+  30 through 1440 minutes old degrade operational health; queued runs older
+  than 1440 minutes are reported separately as zombies; approval-gated runs are
+  also reported separately; in-progress runs become stalled after 150 minutes
 - 24-hour and seven-day health trends for total queue depth, over-age queue
   depth, and the oldest queued/running ages
 - job-level worker attempt error rate, recovery rate, and unresolved failures,
@@ -224,16 +233,23 @@ rate appears about five minutes after deployment.
 Operational health remains a current-snapshot alert rather than a historical
 chart. `/api/status` classifies the already-fetched active workflow runs as:
 
-- `healthy`: complete telemetry and no over-age runs;
-- `degraded`: at least one queued run is 30 minutes old;
+- `healthy`: complete telemetry and no non-zombie over-age runs;
+- `degraded`: at least one queued run is from 30 through 1440 minutes old;
 - `stalled`: at least one in-progress run is 150 minutes old;
 - `unknown`: one or more actionable-status reads failed.
 
-Healthy status stays hidden. A queued run over 30 minutes, an in-progress run
-over 150 minutes, or incomplete Actions telemetry opens the expandable “Work
-execution needs attention” alert. This live diagnostic reuses the status
-snapshot's Actions reads; the history cron no longer stores queue pressure or
-oldest-run values.
+Healthy status stays hidden. A non-zombie queued run at least 30 minutes old, an
+in-progress run at least 150 minutes old, or incomplete Actions telemetry opens the
+expandable “Work execution needs attention” alert. This live diagnostic reuses
+the status snapshot's Actions reads; the history cron no longer stores queue
+pressure or oldest-run values.
+
+Queued runs older than 1440 minutes are reported separately as zombies and do
+not contribute to `queued_over_threshold` or `oldest_queued_minutes`; they
+therefore do not make an otherwise healthy snapshot degraded. The API exposes
+them as `zombie_queued_runs` and `oldest_zombie_queued_minutes`. Runs waiting on
+deployment approval are also excluded from queue pressure and exposed as
+`approval_gated_runs` and `oldest_approval_gated_minutes`.
 
 ## Boundaries
 
@@ -337,6 +353,32 @@ fields remain available for older consumers. Both lanes additionally report
 recovery progress, and last classified GitHub pressure failure. `/api/status` retains its
 `control_plane` compatibility field, but the dashboard no longer renders that
 low-actionability section.
+
+Production overrides publication minimum, base, and maximum capacity to 8, 32,
+and 40, while source fallback values are 4, 24, and 48. The controller records
+failure, cooldown, recovery, and demand telemetry and scales within the
+production range. The publication lane also
+exposes `batches` and `direct`: production enables up to 8 concurrent size-8
+batches, reserves two fresh-lane members per batch, and enables direct
+publication with retry/batch fallback. Document effective production values from
+`dashboard/wrangler.toml`, not only fallback constants in
+`dashboard/exact-review-queue.ts`.
+
+The publication lane exposes two additional observer-only surfaces:
+
+- `credential_circuits` lists the redacted pool class, optional target owner,
+  observation time, `blocked_until`, reset source, authority flag, active state,
+  and affected pending count. `active: true` with free publication slots means
+  credential-blocked, not capacity-starved or healthy-idle.
+- `github_request_metrics` contains cumulative redacted counters keyed by pool
+  class, endpoint category, operation class, outcome, and whether the item
+  revision was already retried. These counters are for request-budget analysis;
+  they never contain raw URLs, item content, credentials, or local paths.
+
+Bay renders these fields as health context only. It has no circuit reset,
+workflow dispatch, queue retry, replay, acknowledgement, or gate control.
+Expired circuit observations remain visible as `active: false` for diagnosis;
+new work resumes automatically after the deadline and bounded item jitter.
 
 The standalone **State writer** panel separates the repo-wide serialization
 boundary from exact-review materialization telemetry. After the coordinator

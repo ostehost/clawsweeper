@@ -4,6 +4,9 @@ export const AUTOMERGE_METRICS_EVENT_KEY_PREFIX = `${AUTOMERGE_METRICS_STORE_KEY
 export const AUTOMERGE_METRICS_EVENT_ID_KEY_PREFIX = `${AUTOMERGE_METRICS_STORE_KEY}:id:`;
 export const AUTOMERGE_METRICS_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const AUTOMERGE_METRICS_EVENT_LIMIT = 20_000;
+// Active-session reconciliation considers seven days of lifecycle activity. Preserve that full
+// horizon plus one day for delayed terminal delivery when a requested window starts mid-session.
+export const AUTOMERGE_METRICS_SESSION_CONTEXT_MS = 8 * 24 * 60 * 60 * 1000;
 
 const RANGE_CONFIG = {
   "6h": { durationMs: 6 * 60 * 60 * 1000, bucketMs: 30 * 60 * 1000 },
@@ -12,6 +15,14 @@ const RANGE_CONFIG = {
 } as const;
 
 export type AutomergeMetricRange = keyof typeof RANGE_CONFIG;
+
+export function automergeMetricRange(value: unknown): AutomergeMetricRange {
+  return isRange(value) ? value : "7d";
+}
+
+export function automergeMetricRangeStart(range: AutomergeMetricRange, nowMs: number) {
+  return nowMs - RANGE_CONFIG[range].durationMs;
+}
 export type AutomergeMetricPhase =
   | "activated"
   | "repair_dispatched"
@@ -120,7 +131,7 @@ export function summarizeAutomergeMetrics(
     sessionLimit?: number;
   } = {},
 ) {
-  const range = isRange(options.range) ? options.range : "7d";
+  const range = automergeMetricRange(options.range);
   const nowMs = Date.parse(options.now ?? new Date().toISOString());
   const config = RANGE_CONFIG[range];
   const rangeStart = nowMs - config.durationMs;

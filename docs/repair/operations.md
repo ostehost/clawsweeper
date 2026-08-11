@@ -1,8 +1,21 @@
 # Operations
 
+- Status: active canonical repair operator runbook
+- Owner: ClawSweeper maintainers and the authorized repair operator
+- Source of truth: repair workflows/source, current gates, focused tests, and
+  live read-only GitHub state where needed
+- Last verified: `openclaw/clawsweeper@9c32c14c65b0551b43a10c2086c0031338ae41e7`
+- Update when: commands, trust checks, gates, tokens, runners, routing,
+  publication, recovery, or promotion rules change
+
+This is the canonical live-operations page. Use the
+[repair entry point](README.md) for concepts and the local CLI catalog, the
+[internal feature map](internal-features.md) for implementation structure, and
+[auto-update PRs](auto-update-prs.md) for the trusted PR state contract.
+
 For the internal feature map across job creation, PR generation, comment
 commands, finalizers, self-heal, gates, and ledgers, see
-[`docs/INTERNAL_FEATURES.md`](INTERNAL_FEATURES.md).
+[`internal-features.md`](internal-features.md).
 
 For the trusted ClawSweeper-to-ClawSweeper PR repair loop, see
 [`docs/repair/auto-update-prs.md`](auto-update-prs.md).
@@ -72,7 +85,8 @@ pnpm run status -- \
 
 ## Manual Fix PR From Issue or PR Refs
 
-Use `scripts/create-job.ts` when ClawSweeper or a maintainer has identified a
+Use `pnpm run repair:create-job` (implemented by
+`src/repair/create-job.ts`) when ClawSweeper or a maintainer has identified a
 valid issue/PR cluster that should get one implementation PR. It writes one
 idempotent job file and checks for an existing open PR or branch before creating
 another job.
@@ -118,22 +132,12 @@ Keep `CLAWSWEEPER_ALLOW_MERGE=0` unless a human explicitly opens the merge gate.
 
 ## Manual Fix PR From Commit Finding
 
-Use the `commit finding intake` workflow for a ClawSweeper commit report:
-
-```bash
-gh workflow run repair-commit-finding-intake.yml \
-  --repo openclaw/clawsweeper \
-  -f target_repo=openclaw/openclaw \
-  -f commit_sha=<sha> \
-  -f report_repo=openclaw/clawsweeper \
-  -f report_path=records/openclaw-openclaw/commits/<sha>.md
-```
-
-The workflow is idempotent for the commit SHA. It updates the same audit file,
-job file, branch, and PR path on rerun.
-
-If latest `main` no longer needs a fix, the generated artifact allows a clean
-no-PR outcome and the audit file records the skip.
+The hosted commit-review and commit-finding intake workflows were retired in
+July 2026. Do not dispatch `repair-commit-finding-intake.yml`; that workflow no
+longer exists. Existing durable jobs with `job_intent: commit_finding` remain
+executable through the ordinary cluster worker for compatibility. New work
+should start from current issue/PR references or an explicitly prepared manual
+repair job after verifying the finding still applies to current `main`.
 
 ## Security Boundary
 
@@ -302,11 +306,17 @@ This avoids failing on GitHub's "No commits between" response when the repair is
 already represented on `main` or the resumed replacement branch collapsed to an
 empty diff after rebase.
 
-Runs for the same job path and mode share a concurrency group. Different cluster jobs can still run in parallel.
+Ordinary runs for the same job path share one concurrency group across modes.
+Different job paths can still run in parallel, and explicit requeues use a
+dedicated run-specific group.
 
 Live preflight hydrates job-provided refs by default and records linked refs without expanding them. Set repo variables `CLAWSWEEPER_MAX_LINKED_REFS` above `0` only for small clusters that need first-hop context and `CLAWSWEEPER_HYDRATE_COMMENTS=1` when comment bodies are necessary evidence; normal scale runs use issue/PR metadata, body excerpts, PR files, and PR checks.
 
-Exact-review producers normally deliver GitHub effects and submit prepared state mutations directly to the dashboard Worker. The legacy exact-review batch publisher remains enabled only to drain already-enqueued and direct-publication fallback items; it is scheduled for removal after that queue stays empty through the migration window.
+Exact-review producers normally deliver GitHub effects and submit prepared state
+mutations directly to the dashboard Worker. Production also keeps batch
+publication enabled for queued and direct-publication fallback items. Treat that
+as an active recovery path: do not remove or bypass it without a separately
+approved retirement plan, an empty-queue observation window, and rollback proof.
 
 ## Maintainer Comment Routing
 

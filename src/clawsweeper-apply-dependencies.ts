@@ -51,6 +51,7 @@ export interface CreateApplyDecisionWorkflowDependencies {
   actionLedgerItemKey: (item: Pick<Item, "repo" | "number">) => string;
   activeApplyMutationRunner: MutationRunner | null;
   addIssueLabel: (number: number, label: string, onMutation?: () => void) => void;
+  beginIssueLabelMutationBatch: (number: number) => void;
   applyAuthorPrBudgetStateToReport: (markdown: string, state: AuthorPrBudgetApplyState) => string;
   applyBlockingProtectedLabels: (labels: readonly string[], closeReason: unknown) => string[];
   applyClosedUnmergedCanonicalBlockedReport: (
@@ -151,6 +152,7 @@ export interface CreateApplyDecisionWorkflowDependencies {
   ) => boolean;
   coveringPrCloseCoveragePullRequestSnapshotSha256: (number: number) => string;
   decisionPacketsDirFromArgs: (args: Args, itemsDir: string, closedDir: string) => string;
+  discardIssueLabelMutationBatch: (number: number) => void;
   defaultClosedDir: (profile?: RepositoryProfile) => string;
   defaultItemsDir: (profile?: RepositoryProfile) => string;
   defaultPlansDir: (profile?: RepositoryProfile) => string;
@@ -190,6 +192,15 @@ export interface CreateApplyDecisionWorkflowDependencies {
     attempt: ApplyMutationAttempt;
     outcome: "accepted" | "rejected" | "unknown";
   }) => string | null;
+  flushIssueLabelMutationBatch: (
+    number: number,
+    beforeItemMutation?: () => void,
+    afterItemMutation?: (confirmed: boolean) => void,
+  ) => {
+    itemMutationPublished: boolean;
+    repositoryDefinitionMutated: boolean;
+    skippedAdditions: string[];
+  };
   freshPullRequestReviewHead: (markdown: string, context: ItemContext) => boolean;
   frontMatterBoolean: (markdown: string, key: string) => boolean;
   frontMatterStringArray: (markdown: string, key: string) => string[];
@@ -360,6 +371,7 @@ export interface CreateApplyDecisionWorkflowDependencies {
   reportRealBehaviorProof: (markdown: string) => RealBehaviorProof;
   reportSecurityReview: (markdown: string) => SecurityReview;
   reportTelegramVisibleProof: (markdown: string) => TelegramVisibleProof;
+  resetGuardReadCache: () => void;
   reviewCommentBodyDigest: (body: string) => string;
   reviewCommentHasCloseVerdictForCanonical: (
     comment: Record<string, unknown> | undefined,

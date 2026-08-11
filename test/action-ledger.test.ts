@@ -40,7 +40,6 @@ import {
   readActionEvent,
   readActionEventShard,
   readAllSpooledActionEvents,
-  readSpooledActionEvents,
   validateActionEvent,
   writeActionEvent,
   writeActionEventShard,
@@ -302,7 +301,6 @@ test("spool directories isolate lossy repository slugs and readers verify canoni
   );
   fs.mkdirSync(path.dirname(misplacedPath), { recursive: true });
   fs.copyFileSync(event.path, misplacedPath);
-  assert.throws(() => readSpooledActionEvents(root, secondRepository), /spool repository mismatch/);
   assert.throws(() => readAllSpooledActionEvents(root), /spool path is not canonical/);
 });
 
@@ -439,14 +437,11 @@ test("canonical identity hashing rejects excessive depth, nodes, and input size 
   );
 });
 
-test("ledger ordering is binary and locale independent without changing shared stable JSON", () => {
-  const sharedValue = { "\u00e4": 1, z: 2 };
-  const sharedExpected = JSON.stringify(
-    Object.fromEntries(
-      Object.entries(sharedValue).sort(([left], [right]) => left.localeCompare(right)),
-    ),
-  );
-  assert.equal(stableJson(sharedValue), sharedExpected);
+test("ledger and shared JSON ordering are both binary and locale independent", () => {
+  // The shared serializer used to order keys by locale collation, and this test
+  // pinned that difference. It now uses the same code-unit comparator as the
+  // ledger, so "z" (0x7A) precedes "\u00e4" (0xE4) in both.
+  assert.equal(stableJson({ "\u00e4": 1, z: 2 }), '{"z":2,"\u00e4":1}');
   assert.equal(
     actionLedgerJson({ "2": "two", "10": "ten", "\u00e4": 1, z: 2 }),
     '{"10":"ten","2":"two","z":2,"\u00e4":1}',
@@ -463,9 +458,15 @@ test("ledger ordering is binary and locale independent without changing shared s
     event.evidence?.map((entry) => entry.report_path),
     ["records/Z.md", "records/a.md"],
   );
-  const moduleUrl = pathToFileURL(path.join(process.cwd(), "dist", "action-ledger.js")).href;
-  const script = `import { actionLedgerJson } from ${JSON.stringify(moduleUrl)};
-process.stdout.write(actionLedgerJson({ "2": "two", "10": "ten", "\\u00e4": 1, z: 2 }));`;
+  const ledgerUrl = pathToFileURL(path.join(process.cwd(), "dist", "action-ledger.js")).href;
+  const stableJsonUrl = pathToFileURL(path.join(process.cwd(), "dist", "stable-json.js")).href;
+  // Both serializers must be locale independent. sv-SE sorts "\u00e4" after "z" while
+  // en-US sorts it immediately after "a", so a locale-sensitive comparator would
+  // disagree between these two child processes.
+  const script = `import { actionLedgerJson } from ${JSON.stringify(ledgerUrl)};
+import { stableJson } from ${JSON.stringify(stableJsonUrl)};
+const value = { "2": "two", "10": "ten", "\\u00e4": 1, z: 2 };
+process.stdout.write(JSON.stringify([actionLedgerJson(value), stableJson(value)]));`;
   const outputs = ["en_US.UTF-8", "sv_SE.UTF-8"].map((locale) => {
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
       encoding: "utf8",
@@ -474,10 +475,16 @@ process.stdout.write(actionLedgerJson({ "2": "two", "10": "ten", "\\u00e4": 1, z
     assert.equal(child.status, 0, child.stderr);
     return child.stdout;
   });
-  assert.deepEqual(outputs, [
+  // The two serializers differ on integer-like keys and that is expected:
+  // actionLedgerJson builds its JSON text directly, so it can emit "10" before
+  // "2", while stableJson rebuilds the object through Object.fromEntries and the
+  // engine re-applies its own ascending-numeric order for array-index keys. That
+  // ordering is specified and locale independent, so both children still agree.
+  const expected = JSON.stringify([
     '{"10":"ten","2":"two","z":2,"\u00e4":1}',
-    '{"10":"ten","2":"two","z":2,"\u00e4":1}',
+    '{"2":"two","10":"ten","z":2,"\u00e4":1}',
   ]);
+  assert.deepEqual(outputs, [expected, expected]);
 });
 
 test("every event persists the required correlation envelope", () => {
@@ -705,10 +712,7 @@ test("event readers reject forged confidential event-key scopes", () => {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, `${actionLedgerJson(forged)}\n`, "utf8");
 
-  assert.throws(
-    () => readSpooledActionEvents(root, valid.subject.repository),
-    /confidential identifier/,
-  );
+  assert.throws(() => readAllSpooledActionEvents(root), /confidential identifier/);
 });
 
 test("the standard taxonomy covers six families without orphaned or duplicate types", () => {
@@ -1360,7 +1364,7 @@ test(
     }) as typeof fs.openSync;
     try {
       assert.throws(
-        () => readSpooledActionEvents(root, "openclaw/openclaw"),
+        () => readAllSpooledActionEvents(root),
         /changed action event spool entry file/,
       );
     } finally {
@@ -1393,7 +1397,7 @@ test(
       return originalOpenSync(filePath, flags, mode);
     }) as typeof fs.openSync;
     try {
-      assert.throws(() => readSpooledActionEvents(root, "openclaw/openclaw"), /refusing non-file/);
+      assert.throws(() => readAllSpooledActionEvents(root), /refusing non-file/);
     } finally {
       fs.openSync = originalOpenSync;
       if (fs.existsSync(written.path)) fs.rmSync(written.path);
@@ -1407,10 +1411,7 @@ test("spool readers reject unsafe entry types instead of skipping them", () => {
   const root = tempRoot();
   const written = writeActionEvent(root, reviewInput());
   fs.mkdirSync(path.join(path.dirname(written.path), "poison.json"));
-  assert.throws(
-    () => readSpooledActionEvents(root, "openclaw/openclaw"),
-    /refusing unsafe action event spool entry/,
-  );
+  assert.throws(() => readAllSpooledActionEvents(root), /refusing unsafe action event spool entry/);
 
   fs.rmSync(path.join(path.dirname(written.path), "poison.json"), { recursive: true });
   fs.writeFileSync(path.join(root, ".clawsweeper-repair", "action-events", "poison"), "data");
@@ -1522,16 +1523,13 @@ test("event readers reject duplicate keys and noncanonical durable JSON bytes", 
 
     assert.match(fs.readFileSync(written.path, "utf8"), new RegExp(concealed));
     assert.throws(
-      () => readSpooledActionEvents(root, "openclaw/openclaw"),
+      () => readAllSpooledActionEvents(root),
       /action event JSON contains a duplicate object key/,
     );
   }
 
   fs.writeFileSync(written.path, canonical.replace('{"action":', '{ "action":'));
-  assert.throws(
-    () => readSpooledActionEvents(root, "openclaw/openclaw"),
-    /action event JSON is not canonical/,
-  );
+  assert.throws(() => readAllSpooledActionEvents(root), /action event JSON is not canonical/);
 });
 
 test("direct event and shard reads enforce bounded allocation", () => {
@@ -2192,7 +2190,7 @@ test("spooled events remain independent and read in occurrence order", () => {
 
   assert.notEqual(later.path, earlier.path);
   assert.deepEqual(
-    readSpooledActionEvents(root, "openclaw/openclaw").map((event) => event.event_type),
+    readAllSpooledActionEvents(root).map((event) => event.event_type),
     [ACTION_EVENT_TYPES.reviewStarted, ACTION_EVENT_TYPES.reviewCompleted],
   );
 });
@@ -2661,7 +2659,7 @@ test("checked-in schema rejects values rejected by runtime normalization", () =>
         const event = JSON.parse(fs.readFileSync(written.path, "utf8"));
         event.evidence = [];
         fs.writeFileSync(written.path, `${JSON.stringify(event)}\n`);
-        return readSpooledActionEvents(root, "openclaw/openclaw");
+        return readAllSpooledActionEvents(root);
       },
     },
   ];
@@ -2716,7 +2714,7 @@ test("ledger file reads reject malformed UTF-8 and dot-only path segments", () =
   const content = fs.readFileSync(written.path);
   content[0] = 0xff;
   fs.writeFileSync(written.path, content);
-  assert.throws(() => readSpooledActionEvents(root, "openclaw/openclaw"), /invalid UTF-8/);
+  assert.throws(() => readAllSpooledActionEvents(root), /invalid UTF-8/);
 });
 
 test("event readers reject unknown fields instead of carrying unhashed data into shards", () => {
@@ -2726,10 +2724,7 @@ test("event readers reject unknown fields instead of carrying unhashed data into
   value.prompt = "unhashed private text";
   fs.writeFileSync(written.path, `${JSON.stringify(value)}\n`);
 
-  assert.throws(
-    () => readSpooledActionEvents(root, "openclaw/openclaw"),
-    /unknown or non-canonical fields/,
-  );
+  assert.throws(() => readAllSpooledActionEvents(root), /unknown or non-canonical fields/);
 });
 
 test("run URLs are limited to public GitHub workflow evidence", () => {

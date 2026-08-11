@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  OPERATIONAL_QUEUE_ZOMBIE_MS,
   exactReviewHistorySample,
   mergeHealthHistorySample,
   normalizeHealthHistorySample,
@@ -73,6 +74,44 @@ test("operational health reports approval-gated runs outside queue congestion", 
   assert.equal(health.oldest_approval_gated_minutes, 7 * 24 * 60);
 });
 
+test("operational health surfaces zombie queue entries without degrading", () => {
+  const health = summarizeOperationalHealth(
+    [run("queued", "2026-07-14T13:00:00Z")],
+    CHECKED_AT,
+    true,
+  );
+  assert.equal(health.status, "healthy");
+  assert.equal(health.queued_runs, 1);
+  assert.equal(health.queued_over_threshold, 0);
+  assert.equal(health.oldest_queued_minutes, 0);
+  assert.equal(health.zombie_queued_runs, 1);
+  assert.equal(health.oldest_zombie_queued_minutes, 25 * 60);
+});
+
+test("operational health keeps fresh queue pressure alongside zombies", () => {
+  const health = summarizeOperationalHealth(
+    [run("queued", "2026-07-14T13:00:00Z"), run("queued", "2026-07-15T13:29:00Z")],
+    CHECKED_AT,
+    true,
+  );
+  assert.equal(health.status, "degraded");
+  assert.equal(health.queued_runs, 2);
+  assert.equal(health.queued_over_threshold, 1);
+  assert.equal(health.oldest_queued_minutes, 31);
+  assert.equal(health.zombie_queued_runs, 1);
+  assert.equal(health.oldest_zombie_queued_minutes, 25 * 60);
+});
+
+test("operational health treats exactly 24 hours as live queue pressure", () => {
+  const boundary = new Date(Date.parse(CHECKED_AT) - OPERATIONAL_QUEUE_ZOMBIE_MS).toISOString();
+  const health = summarizeOperationalHealth([run("queued", boundary)], CHECKED_AT, true);
+  assert.equal(health.status, "degraded");
+  assert.equal(health.queued_over_threshold, 1);
+  assert.equal(health.oldest_queued_minutes, 24 * 60);
+  assert.equal(health.zombie_queued_runs, 0);
+  assert.equal(health.oldest_zombie_queued_minutes, 0);
+});
+
 test("operational health fails closed when active-run telemetry is incomplete", () => {
   const health = summarizeOperationalHealth([], CHECKED_AT, false);
   assert.equal(health.status, "unknown");
@@ -135,12 +174,21 @@ test("health history preserves legacy samples and normalizes exact-review backlo
       },
       publication: { pending: 1502, enqueued_total: 50, completed_total: 42 },
     },
+    handoff_health: {
+      status: "degraded",
+      phases: {
+        pending: { count: 317 },
+        dispatching: { count: 8 },
+        leased: { count: 34 },
+      },
+    },
   });
   const normalized = normalizeHealthHistorySample({ ...legacy, exact_review: exactReview });
   assert.deepEqual(normalized?.exact_review, {
     collection_ok: true,
     review: { pending: 317, enqueued_total: 90, completed_total: 70, shed_total: 3 },
     publication: { pending: 1502, enqueued_total: 50, completed_total: 42 },
+    handoff: { status: "degraded", pending: 317, dispatching: 8, leased: 34 },
   });
   assert.deepEqual(normalizeHealthHistorySample({ at: CHECKED_AT, exact_review: exactReview }), {
     at: CHECKED_AT,
