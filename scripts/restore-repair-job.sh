@@ -254,22 +254,30 @@ The self-heal exact-head verifier will skip this job unless the durable state fi
 EOF
 }
 
+# `job_authoritative` is 1 only when the job was read from durable state ground
+# truth. Every reconstructed job is planning-only input: the worker downgrades
+# non-authoritative dispatches to plan mode and the execute job refuses to run.
 if [ -f "$JOB_PATH" ]; then
   write_output job_exists 1
+  write_output job_authoritative 1
 elif [[ "$JOB_PATH" == jobs/*/inbox/automerge-*.md ]]; then
   if ! restore_automerge_job; then
     echo "Refusing to restore an unverified automerge repair job: $JOB_PATH" >&2
     exit 1
   fi
   write_output job_exists 1
+  write_output job_authoritative 0
   echo "::notice title=Restored automerge repair job::Job file '$JOB_PATH' was missing from the state checkout; reconstructed it from the workflow input."
 elif restore_issue_implementation_job; then
   write_output job_exists 1
+  write_output job_authoritative 0
   echo "::notice title=Restored issue implementation job::Job file '$JOB_PATH' was missing from the state checkout; reconstructed it from the workflow input."
 elif restore_self_heal_job; then
   write_output job_exists 1
+  write_output job_authoritative 0
   echo "::notice title=Restored self-heal repair job::Job file '$JOB_PATH' was missing from the state checkout; reconstructed a non-mutating placeholder from the workflow input."
 else
   write_output job_exists 0
+  write_output job_authoritative 0
   echo "::notice title=Stale repair dispatch::Job file '$JOB_PATH' no longer exists on the current state checkout; skipping $SKIP_TARGET."
 fi
