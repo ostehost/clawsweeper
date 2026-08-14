@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -1834,6 +1834,59 @@ test("exact event workflow keeps both queue protocol versions live during rollin
   assert.match(completeStep, /protocolVersion !== 1 && protocolVersion !== 2/);
   assert.match(completeStep, /protocolVersion === 2/);
   assert.match(completeStep, /: \{\}\),/);
+});
+
+test("exact-review lease identity is shape-validated before it reaches GITHUB_OUTPUT", () => {
+  type Step = { name?: string; run?: string; env?: Record<string, string> };
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<string, { steps: Step[] }>;
+  };
+  const claim = workflow.jobs["event-review-apply"]!.steps.find(
+    (step) => step.name === "Claim exact-review queue lease",
+  );
+  const run = claim?.run ?? "";
+  assert.ok(run, "event-review-apply must claim the exact-review queue lease");
+
+  // The lease identity arrives as untrusted repository_dispatch payload data...
+  assert.equal(claim?.env?.QUEUE_LEASE_ID, "${{ github.event.client_payload.queue_lease_id }}");
+  // ...and is echoed verbatim into GITHUB_OUTPUT, where an embedded newline or carriage
+  // return would forge step outputs that later privileged steps consume.
+  const sink = "lease_id=${process.env.QUEUE_LEASE_ID}";
+  assert.ok(run.includes(sink), "the claim step must still emit the lease identity as an output");
+
+  const guard = /if ! \[\[ "\$QUEUE_LEASE_ID" =~ (\S+) \]\]; then/.exec(run);
+  assert.ok(guard, "the claim step must shape-validate QUEUE_LEASE_ID before using it");
+  const pattern = guard[1]!;
+  assert.ok(
+    run.indexOf(guard[0]) < run.indexOf(sink),
+    "the lease identity validator must run before the identity is consumed",
+  );
+
+  const probe = (value: string) =>
+    spawnSync("bash", ["-c", '[[ "$VALUE" =~ $PATTERN ]]'], {
+      env: { ...process.env, PATTERN: pattern, VALUE: value },
+      encoding: "utf8",
+    }).status;
+
+  // Negative fixture: the workflow's own pattern must reject every one of these. Deleting the
+  // guard, dropping either anchor, or widening the character class turns this red.
+  const lease = "de305d54-75b4-431b-adb2-eb6b9e546014";
+  for (const hostile of [
+    "",
+    `${lease}\nspoofed_output=1`,
+    `${lease}\ritem_key=attacker/repo#1`,
+    `${lease} decision={}`,
+    "$(id)",
+    "../../etc/passwd",
+    `-${lease}`,
+    "a".repeat(129),
+  ]) {
+    assert.notEqual(probe(hostile), 0, JSON.stringify(hostile));
+  }
+  // The identities the queue actually mints keep passing.
+  for (const legitimate of [lease, `a${"b".repeat(127)}`]) {
+    assert.equal(probe(legitimate), 0, legitimate);
+  }
 });
 
 test("dashboard syncs Worker secrets with durable lifecycle storage", () => {

@@ -462,7 +462,10 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          test -n "$QUEUE_LEASE_ID"
+          if ! [[ "$QUEUE_LEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "Invalid exact-review queue lease identity." >&2
+            exit 1
+          fi
           printf 'claimed=false\ndecision={}\n' >> "$GITHUB_OUTPUT"
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
