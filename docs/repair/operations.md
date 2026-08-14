@@ -384,7 +384,11 @@ single ClawSweeper implementation PR. The generated job uses
 close actions, and reuses `clawsweeper/issue-<repo>-<number>` on reruns.
 Workers can reconstruct this minimal job from the requested `jobs/.../issue-*.md`
 path when a dispatch races ahead of state propagation, so the request does not
-silently skip as stale.
+silently skip as stale, but reconstructed jobs are planning-only. The planner
+records `job_authoritative=0` for every reconstruction, downgrades the run to
+plan mode, and the execute job refuses to start. Execution waits for the
+authoritative job to be visible in durable state and for a later dispatch whose
+job bytes match the reviewed `job_sha256` digest.
 After opening the PR, the worker updates the existing ClawSweeper command status
 comment with the generated PR link.
 If an issue implementation request is refused, the visible status comment must
