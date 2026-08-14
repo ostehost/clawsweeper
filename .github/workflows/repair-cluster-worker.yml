@@ -181,6 +181,8 @@ jobs:
       allow_fix_pr: ${{ steps.capture_gates.outputs.allow_fix_pr }}
       allow_merge: ${{ steps.capture_gates.outputs.allow_merge }}
       job_exists: ${{ steps.check_job.outputs.job_exists }}
+      job_authoritative: ${{ steps.check_job.outputs.job_authoritative }}
+      job_sha256: ${{ steps.job_digest.outputs.job_sha256 }}
       effective_mode: ${{ steps.run_worker.outputs.effective_mode }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
@@ -266,6 +268,15 @@ jobs:
           JOB_PATH: ${{ inputs.job }}
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
+
+      - name: Pin authoritative job digest
+        id: job_digest
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        run: |
+          set -euo pipefail
+          job_sha256="$(sha256sum "$CLUSTER_JOB_PATH" | cut -d' ' -f1)"
+          printf '%s' "$job_sha256" | grep -Eq '^[0-9a-f]{64}$'
+          echo "job_sha256=$job_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Capture execution gates
         id: capture_gates
@@ -361,8 +372,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          JOB_AUTHORITATIVE: ${{ steps.check_job.outputs.job_authoritative }}
         run: |
           worker_mode="$CLUSTER_WORKER_MODE"
+          if [ "$worker_mode" != "plan" ] && [ "$JOB_AUTHORITATIVE" != "1" ]; then
+            echo "The job was reconstructed rather than read from durable state ground truth; rendering plan-only output for requested $worker_mode run"
+            worker_mode="plan"
+          fi
           if [ "$worker_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then
             echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; rendering plan-only output for requested $worker_mode run"
             worker_mode="plan"
@@ -456,7 +472,7 @@ jobs:
   execute:
     name: Execute and apply cluster actions
     needs: cluster
-    if: ${{ needs.cluster.result == 'success' && needs.cluster.outputs.job_exists == '1' && needs.cluster.outputs.allow_execute == '1' && (needs.cluster.outputs.effective_mode == 'execute' || needs.cluster.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
+    if: ${{ needs.cluster.result == 'success' && needs.cluster.outputs.job_exists == '1' && needs.cluster.outputs.job_authoritative == '1' && needs.cluster.outputs.allow_execute == '1' && (needs.cluster.outputs.effective_mode == 'execute' || needs.cluster.outputs.effective_mode == 'autonomous') && !inputs.dry_run }}
     runs-on: ${{ inputs.execution_runner }}
     timeout-minutes: 120
     permissions:
@@ -560,6 +576,27 @@ jobs:
           JOB_PATH: ${{ inputs.job }}
           GH_TOKEN: ${{ steps.target_write_token.outputs.token }}
         run: scripts/restore-repair-job.sh "$JOB_PATH" "execute"
+
+      - name: Verify authoritative job digest
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          EXPECTED_JOB_SHA256: ${{ needs.cluster.outputs.job_sha256 }}
+          JOB_AUTHORITATIVE: ${{ steps.check_job.outputs.job_authoritative }}
+        run: |
+          set -euo pipefail
+          if [ "$JOB_AUTHORITATIVE" != "1" ]; then
+            echo "Refusing execution: the execution job file was reconstructed rather than read from durable state ground truth." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$EXPECTED_JOB_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "Refusing execution: the reviewed job digest is missing or malformed." >&2
+            exit 1
+          fi
+          actual_job_sha256="$(sha256sum "$CLUSTER_JOB_PATH" | cut -d' ' -f1)"
+          if [ "$actual_job_sha256" != "$EXPECTED_JOB_SHA256" ]; then
+            echo "Refusing execution: job digest mismatch; expected $EXPECTED_JOB_SHA256, got $actual_job_sha256" >&2
+            exit 1
+          fi
 
       - name: Recheck execution merge authorization
         id: execution_gates
