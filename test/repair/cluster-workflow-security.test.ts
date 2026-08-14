@@ -10,9 +10,13 @@ type Workflow = {
   jobs?: Record<
     string,
     {
+      if?: string;
       env?: Record<string, string>;
+      outputs?: Record<string, string>;
       steps?: Array<{
         name?: string;
+        id?: string;
+        if?: string;
         run?: string;
         env?: Record<string, string>;
         uses?: string;
@@ -386,6 +390,114 @@ test("missing PR repair jobs preserve only live authorized automerge", () => {
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
+});
+
+test("reconstructed repair jobs are never authoritative", () => {
+  const temporary = fs.mkdtempSync(path.join(tmpdir(), "clawsweeper-job-authority-"));
+  const output = path.join(temporary, "github-output");
+  const restore = (relativeJobPath: string) => {
+    fs.writeFileSync(output, "");
+    const result = spawnSync(
+      "bash",
+      [path.join(process.cwd(), "scripts/restore-repair-job.sh"), relativeJobPath],
+      {
+        cwd: temporary,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_OUTPUT: output,
+          CLAWSWEEPER_REQUESTED_ALLOW_MERGE: "0",
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return fs.readFileSync(output, "utf8");
+  };
+
+  try {
+    // Every reconstruction path must mark the job as non-authoritative.
+    for (const reconstructed of [
+      "jobs/openclaw/inbox/automerge-openclaw-openclaw-1.md",
+      "jobs/openclaw/inbox/issue-openclaw-openclaw-2.md",
+      "jobs/openclaw/inbox/self-heal-openclaw-openclaw-3.md",
+    ]) {
+      const emitted = restore(reconstructed);
+      assert.match(emitted, /^job_exists=1$/m, reconstructed);
+      assert.match(emitted, /^job_authoritative=0$/m, reconstructed);
+      assert.doesNotMatch(emitted, /^job_authoritative=1$/m, reconstructed);
+      assert.equal(fs.existsSync(path.join(temporary, reconstructed)), true, reconstructed);
+    }
+
+    // A job read from durable state ground truth is the only authoritative case.
+    const durable = "jobs/openclaw/cluster-001.md";
+    fs.mkdirSync(path.dirname(path.join(temporary, durable)), { recursive: true });
+    fs.writeFileSync(path.join(temporary, durable), "existing job\n");
+    const durableOutput = restore(durable);
+    assert.match(durableOutput, /^job_exists=1$/m);
+    assert.match(durableOutput, /^job_authoritative=1$/m);
+
+    // A stale dispatch that cannot be reconstructed is neither present nor authoritative.
+    const stale = restore("jobs/openclaw/inbox/custom-4.md");
+    assert.match(stale, /^job_exists=0$/m);
+    assert.match(stale, /^job_authoritative=0$/m);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cluster worker pins execution to the authoritative reviewed job", () => {
+  const workflow = parse(
+    fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8"),
+  ) as Workflow;
+  const cluster = workflow.jobs?.cluster;
+  const execute = workflow.jobs?.execute;
+  assert.ok(cluster && execute);
+
+  assert.equal(
+    cluster.outputs?.job_authoritative,
+    "${{ steps.check_job.outputs.job_authoritative }}",
+  );
+  assert.equal(cluster.outputs?.job_sha256, "${{ steps.job_digest.outputs.job_sha256 }}");
+
+  const digest = cluster.steps?.find((step) => step.name === "Pin authoritative job digest");
+  assert.equal(digest?.id, "job_digest");
+  assert.equal(digest?.if, "${{ steps.check_job.outputs.job_exists == '1' }}");
+  assert.match(digest?.run ?? "", /sha256sum "\$CLUSTER_JOB_PATH"/);
+  assert.match(digest?.run ?? "", /\^\[0-9a-f\]\{64\}\$/);
+
+  // The planner downgrades a reconstructed job to plan mode before the worker runs.
+  const runWorker = cluster.steps?.find((step) => step.name === "Run worker");
+  assert.equal(
+    runWorker?.env?.JOB_AUTHORITATIVE,
+    "${{ steps.check_job.outputs.job_authoritative }}",
+  );
+  assert.match(
+    runWorker?.run ?? "",
+    /\[ "\$JOB_AUTHORITATIVE" != "1" \][\s\S]*?worker_mode="plan"/,
+  );
+
+  // The execute job refuses non-authoritative dispatches at the job boundary.
+  assert.match(execute.if ?? "", /needs\.cluster\.outputs\.job_authoritative == '1'/);
+
+  // …and re-verifies the exact reviewed job bytes on its own checkout.
+  const verify = execute.steps?.find((step) => step.name === "Verify authoritative job digest");
+  assert.equal(verify?.env?.EXPECTED_JOB_SHA256, "${{ needs.cluster.outputs.job_sha256 }}");
+  assert.equal(verify?.env?.JOB_AUTHORITATIVE, "${{ steps.check_job.outputs.job_authoritative }}");
+  assert.match(verify?.run ?? "", /\[ "\$JOB_AUTHORITATIVE" != "1" \][\s\S]*?exit 1/);
+  assert.match(verify?.run ?? "", /actual_job_sha256/);
+  assert.match(
+    verify?.run ?? "",
+    /\[ "\$actual_job_sha256" != "\$EXPECTED_JOB_SHA256" \][\s\S]*?exit 1/,
+  );
+  const verifyIndex = execute.steps?.findIndex(
+    (step) => step.name === "Verify authoritative job digest",
+  );
+  const checkIndex = execute.steps?.findIndex((step) => step.name === "Check job file");
+  const gateIndex = execute.steps?.findIndex(
+    (step) => step.name === "Recheck execution merge authorization",
+  );
+  assert.ok((checkIndex ?? -1) >= 0 && (verifyIndex ?? -1) > (checkIndex ?? -1));
+  assert.ok((gateIndex ?? -1) > (verifyIndex ?? -1));
 });
 
 test("repair jobs hydrate exactly their issue or pull-request record", () => {
