@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
 
 import type {
   ExactReviewBatchCompletion,
@@ -331,6 +331,7 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
         ...(item.errorFingerprint ? { error_fingerprint: item.errorFingerprint } : {}),
         ...(item.retryAt ? { retry_at: item.retryAt } : {}),
         ...(item.attempted !== undefined ? { attempted: item.attempted } : {}),
+        ...(item.poolClass ? { pool_class: item.poolClass } : {}),
       })),
       ...(input.stateCommitSha ? { state_commit_sha: input.stateCommitSha } : {}),
       ...(input.failureFingerprint ? { failure_fingerprint: input.failureFingerprint } : {}),
@@ -406,17 +407,6 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
     }
     return objectValue(parsed);
   }
-}
-
-export function verifyExactReviewBatchSignature(
-  body: string,
-  signature: string,
-  webhookSecret: string,
-): boolean {
-  const expected = `sha256=${createHmac("sha256", webhookSecret).update(body).digest("hex")}`;
-  const left = Buffer.from(signature);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function parseQueueItem(value: unknown): ExactReviewBatchQueueItem {

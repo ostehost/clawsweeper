@@ -4,7 +4,7 @@
 - Owner: ClawSweeper maintainers
 - Source of truth: the linked repository files and their owning code,
   configuration, workflows, and tests
-- Last verified: `openclaw/clawsweeper@9c32c14c65b0551b43a10c2086c0031338ae41e7`
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
 - Update when: a document is added, retired, moved, changes lifecycle, or gains a
   new canonical owner
 
@@ -61,6 +61,8 @@ everything else requires human comparison with current main.
   boundaries
 - [Work lane](work-lane.md) — active; bounded workflow admission
 - [Review cache](review-cache.md) — active; reusable review-state contract
+- [GitHub webhook read model](github-webhook-read-model.md) — active; signed
+  ingress, App subscriptions, snapshot freshness, repair, and safety boundary
 
 ## Configuration and repository onboarding
 
@@ -88,6 +90,8 @@ everything else requires human comparison with current main.
 
 - [Live dashboard](live-dashboard.md) — active; Worker status and operational
   telemetry
+- [GitHub publication egress telemetry](github-egress-telemetry.md) — active;
+  wire denominator, credential attribution, completeness, and retention
 - [OpenClaw Bay](openclaw-bay-demo.md) — active; public six-lane visualization
 - [Triage dashboard](triage-dashboard.md) — active; cached issue triage
 - [PR proof triage](pr-proof-triage-dashboard.md) — active; maintainer proof
@@ -101,9 +105,24 @@ everything else requires human comparison with current main.
 - [PR review comments](pr-review-comments.md) — active; review-thread handling
 - [Related issue discovery](related-issue-discovery.md) — active; duplicate and
   adjacent-report context
+- [Live proof](live-proof.md) — active; secretless browser/terminal execution,
+  trusted media attachment, and local simulation
 
 `docs/proof/**` contains inspectable artifacts for specific changes. Those
 files support their recorded claim but do not override current runbooks.
+
+### Proof media retention
+
+Commit lightweight, diffable proof records: the claim and limits, exact source
+or head SHA, reproduction command, provider/image/lease provenance, fixture
+hashes, observable assertions, and compact normalized JSON. Full-resolution
+screenshots, videos, and traces may be committed while a pull request is under
+review, but prune them from `main` after merge once the durable review and proof
+record exist; git history retains the review-time bytes.
+
+Keep a heavy binary only when an active canonical document embeds or links it,
+or when runtime or test tooling consumes it. Prefer one current compressed
+poster or WebP over accumulated before/after sets.
 
 ## Repair and automerge
 
@@ -150,6 +169,8 @@ Review the relevant pages in the same change when any of these surfaces move:
   batching, direct publication, or state writing: scheduler, limits, dashboard,
   Bay, and queue runbooks
 - dashboard route, projection, or public-field changes: dashboard and Bay docs
+- publication GitHub request paths, credential selection, or egress fields:
+  GitHub egress telemetry and public API docs
 - mutation, close, proof, repair, or merge policy changes: policy pages,
   CONTRIBUTING, AGENTS, and repair operations
 - workflow retirement or replacement: every command example and compatibility

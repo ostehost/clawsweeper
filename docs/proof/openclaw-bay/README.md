@@ -1,14 +1,26 @@
 # Historical OpenClaw Bay deterministic browser proof
 
-Status: historical evidence for behavior source
-`0cf6b147fe86f56e4ec8c77352e3d31433e3a1d2`. This package is retained for
-auditability and is not the active exact-head proof for later commits.
+Status: reusable deterministic runner with historical checked-in artifacts.
+The recorded artifact source, `0cf6b147fe86f56e4ec8c77352e3d31433e3a1d2`,
+is not reachable from current repository history, so the checked-in report and
+storyboard must not be treated as current exact-head proof. A new runner receipt
+and artifacts must name their exact source SHA.
 
 This proof package exercises the real `/bay` page and its checked-in
 artwork in Chromium. Playwright replaces the dashboard's status, history, and
 triage reads with fully synthetic, redacted fixtures so stage changes,
 telemetry controls, and navigation can be reproduced without live dashboard
 data, credentials, or GitHub API traffic.
+
+The post-privacy-boundary throttle chart has a focused runnable entry point:
+
+```bash
+bash docs/proof/openclaw-bay/run-throttle-proof.sh
+```
+
+It supplies the strict aggregate-only public status shape and verifies the
+6-hour, 24-hour, and 7-day throttle fetches, interval summaries, accessible
+403/429 series, physical-pool totals, reset-header boundary, and screenshots.
 
 The sequence proves:
 
@@ -27,6 +39,9 @@ The sequence proves:
 - the read-only drawer's safe GitHub item, job, and workflow-run links;
 - readable overflow controls that open the known queue sample and explicitly explain when aggregate queue IDs are outside the bounded public projection;
 - compact review-admission, result-publication, and State writer charts with labelled y-axes, exact point hover labels, and cached 6-hour, 24-hour, and 7-day range controls;
+- closed-bucket GitHub throttle history across those ranges, split by 403/429,
+  summarized by physical pool class, and explicit about the 24-hour
+  reset-header-detail boundary;
 - lightweight hover/focus explanations on the beach lane signs;
 - the local-only tide preview advancing through incoming, crest, backwash, and restored states while preserving terminal keys and count;
 - the short static reduced-motion tide cue preserving the same preview state;
@@ -41,11 +56,19 @@ The sequence proves:
 
 ## Artifacts
 
-- [`playwright-proof-storyboard.jpg`](playwright-proof-storyboard.jpg) is a
-  labelled 23-state contact sheet that can be inspected without video codecs.
-- [`trace.zip`](trace.zip) is the Playwright action, DOM snapshot, and network
-  trace. Open it with
-  `npx --yes playwright@1.60.0 show-trace docs/proof/openclaw-bay/trace.zip`.
+- The labelled 23-state storyboard and Playwright action, DOM snapshot, and
+  network trace were introduced in commit
+  `1a5becc69fc1bdbc11e16aa22f5caaa44f05a59d`. They were pruned from the docs
+  tree after review and remain available through git history. To inspect the
+  historical trace without restoring it to the working tree:
+
+  ```bash
+  bay_trace_dir="$(mktemp -d)"
+  git show 1a5becc69fc1bdbc11e16aa22f5caaa44f05a59d:docs/proof/openclaw-bay/trace.zip \
+    > "$bay_trace_dir/trace.zip"
+  npx --yes playwright@1.60.0 show-trace "$bay_trace_dir/trace.zip"
+  ```
+
 - [`proof-summary.json`](proof-summary.json) records all 51 passing assertions
   from its accompanying deterministic proof run,
   sanitized request/response metadata, safe drawer links, the unchanged
@@ -55,6 +78,8 @@ The sequence proves:
   artifact renderer. [`run-proof.sh`](run-proof.sh) installs the pinned
   Playwright package in `/tmp`, starts the real local Wrangler Worker, and runs
   that script without changing repository dependencies.
+  [`run-throttle-proof.sh`](run-throttle-proof.sh) selects the focused
+  aggregate-only throttle proof path.
 - [`fixtures/`](fixtures/) contains the exact three checked-in synthetic
   `/api/status` transition responses. The runner derives dense-terminal and
   real-tide responses from the final fixture, provides a synthetic in-memory
@@ -62,8 +87,8 @@ The sequence proves:
   SHA-256 in the summary. It
   fails before launching Chromium if the checked-in sequence drifts.
 
-The compact trace intentionally omits Playwright's continuous screenshot film
-strip; the storyboard supplies the visual milestones while the trace supplies
+The historical compact trace omitted Playwright's continuous screenshot film
+strip; the storyboard supplied the visual milestones while the trace supplied
 the independently inspectable DOM, action, and network record.
 
 From the repository root, reproduce the proof with the known Playwright image:
@@ -83,7 +108,8 @@ crabbox run \
 
 ## Provenance and privacy
 
-- captured behavior source: `0cf6b147fe86f56e4ec8c77352e3d31433e3a1d2`
+- recorded historical behavior source (not reachable from current history):
+  `0cf6b147fe86f56e4ec8c77352e3d31433e3a1d2`
 - provider: direct local Docker under the user-authorized CSW-124 fallback;
   this is not a successful Crabbox lease receipt
 - image: `mcr.microsoft.com/playwright:v1.60.0-noble`
@@ -110,5 +136,5 @@ private payloads.
 
 This is deterministic interaction proof, not a claim that synthetic state is
 live operational evidence. The separate deployment smoke covers the canonical
-`/bay` route, the query-preserving legacy redirect, response headers, shared
+`/bay` route, the query-stripping legacy redirect, response headers, shared
 schema, and static assets.
