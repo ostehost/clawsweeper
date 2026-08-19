@@ -70,7 +70,7 @@ export function loadSnapshot(text) {
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    throw new Error(`snapshot is not valid JSON: ${error.message}`);
+    throw new Error(`snapshot is not valid JSON: ${error.message}`, { cause: error });
   }
 
   let items;

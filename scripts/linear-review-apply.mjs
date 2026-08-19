@@ -184,6 +184,7 @@ export function buildScopeSpec(options, deps = {}) {
     } catch (error) {
       throw new Error(
         `failed to read --from-file ${options.fromFile}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
     const extractOptions = options.listField !== "" ? { listField: options.listField } : {};
@@ -795,6 +796,7 @@ async function main() {
       } catch (error) {
         throw new Error(
           `failed to read --approvals ${options.approvals}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
       }
       approvals = loadApprovals(parsed);

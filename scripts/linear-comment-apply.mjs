@@ -143,6 +143,7 @@ function parseDryRunReceipt(raw, path) {
   } catch (error) {
     throw new Error(
       `failed to parse --dry-run-receipt ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
